@@ -748,9 +748,8 @@ pub fn launch_claude_code(
         // M18); then it is reaped, and what is left gets its grace.
         #[cfg(unix)]
         if exited_unreaped(pid).context("wait for claude")? {
-            term_group(pid);
-            let status = child.wait().context("reap claude")?;
-            finish_group(pid);
+            let status =
+                settle_and_reap(&mut child, || ()).context("settle claude's group and reap it")?;
             break reason_from(status);
         }
         #[cfg(not(unix))]
@@ -889,9 +888,10 @@ fn kill_tree(child: &mut Child) {
 }
 
 /// How long what the child left behind gets between `SIGTERM` and `SIGKILL`
-/// once the child itself has exited.
+/// once the child itself has exited. Public for the M18 test's bound only.
 #[cfg(unix)]
-const GROUP_GRACE: Duration = Duration::from_secs(2);
+#[doc(hidden)]
+pub const GROUP_GRACE: Duration = Duration::from_secs(2);
 
 /// Has the child exited, **without reaping it**? `waitid` with `WNOWAIT`
 /// leaves it a zombie for `Child::wait` to collect; `WNOHANG` makes this a
@@ -961,18 +961,29 @@ fn finish_group(pid: u32) {
     }
 }
 
-/// Wait for a child that leads its own process group, settling the group in
-/// the order above: notice the exit without reaping, `SIGTERM` the group,
-/// reap, then the grace and the `SIGKILL`. What the launch loop does, for a
-/// test to drive on a child of its own.
+/// Settle a child that leads its own process group, in the order M18 asks
+/// for: notice the exit **without reaping**, `SIGTERM` the group while the
+/// leader is still a zombie (its pgid pinned, so the id cannot be reused
+/// underneath the signal), reap it, then the grace and the `SIGKILL` for
+/// what ignored the `SIGTERM`. The one copy of that sequence: the launch
+/// loop calls it with nothing between the signal and the reap, and the M18
+/// test calls it with a closure that waits, at that moment, for the group's
+/// member to record what it saw of its leader — a seam for the test, not a
+/// second copy of the sequence (Task 10 review, Minor 4). A child that has
+/// not exited yet is waited for, unreaped; the loop calls this once
+/// `exited_unreaped` said so, so that wait is empty there.
 #[cfg(unix)]
 #[doc(hidden)]
-pub fn settle_and_reap(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+pub fn settle_and_reap(
+    child: &mut Child,
+    between_signal_and_reap: impl FnOnce(),
+) -> std::io::Result<std::process::ExitStatus> {
     let pid = child.id();
     while !exited_unreaped(pid)? {
         std::thread::sleep(Duration::from_millis(10));
     }
     term_group(pid);
+    between_signal_and_reap();
     let status = child.wait()?;
     finish_group(pid);
     Ok(status)

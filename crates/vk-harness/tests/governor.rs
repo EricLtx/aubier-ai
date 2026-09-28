@@ -289,14 +289,33 @@ mod job_object {
 
 /// What a child leaves running in its process group is signalled while the
 /// child is still a zombie (Task 4 review, M18): an unreaped leader pins its
-/// pgid, so the id cannot be reused underneath the signal. After
-/// `settle_and_reap`, the group is empty and the status is the child's own.
+/// pgid, so the id cannot be reused underneath the signal. The group's
+/// member traps `SIGTERM` and, when it arrives, records the leader's state
+/// as `ps` reports it — `Z`, a zombie: exited and not yet reaped — then
+/// exits. The test drives the one settle sequence the launch loop uses
+/// (`settle_and_reap`), using its seam between the signal and the reap to
+/// wait for that record, and pins three things: the member saw `Z`, the
+/// group is empty afterwards, and the whole settle took less than
+/// `GROUP_GRACE` — the member went on the `SIGTERM`, not on the grace
+/// timeout and the `SIGKILL` (Task 10 review, Minor 4).
 #[cfg(unix)]
 #[test]
 fn a_childs_process_group_is_settled_before_the_child_is_reaped() {
     use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("leader-state");
+    let ready = dir.path().join("ready");
+    // The leader (`sh`, leading its own group) forks a member that traps TERM
+    // to record the leader's state, says it is ready, and then exits — leaving
+    // the member (and its `sleep`) behind in the group.
+    let script = format!(
+        "leader=$$; ( trap 'ps -o stat= -p $leader > \"{record}\"; exit 0' TERM; : > \"{ready}\"; \
+         sleep 30 & wait ) & while [ ! -e \"{ready}\" ]; do sleep 0.01; done; exit 0",
+        record = record.display(),
+        ready = ready.display()
+    );
     let mut child = std::process::Command::new("sh")
-        .args(["-c", "sleep 30 & exit 0"])
+        .args(["-c", &script])
         .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -305,8 +324,25 @@ fn a_childs_process_group_is_settled_before_the_child_is_reaped() {
         .unwrap();
     let pgid = i32::try_from(child.id()).unwrap();
     let started = std::time::Instant::now();
-    let status = vk_harness::launch::settle_and_reap(&mut child).unwrap();
+    let status = vk_harness::launch::settle_and_reap(&mut child, || {
+        // Between the SIGTERM and the reap: the moment the member looks at
+        // its leader. Wait for its record, bounded by the grace itself.
+        let deadline = std::time::Instant::now() + vk_harness::launch::GROUP_GRACE;
+        while std::fs::metadata(&record)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    })
+    .unwrap();
     assert!(status.success(), "{status}");
+    let seen = std::fs::read_to_string(&record).unwrap_or_default();
+    assert!(
+        seen.trim_start().starts_with('Z'),
+        "when the SIGTERM reached the member, its leader was a zombie — exited, not reaped: {seen:?}"
+    );
     // The group can no longer be signalled: no live member is left. `kill(-pgid,
     // 0)` returns -1, with `ESRCH` (no such process, Linux's answer for an empty
     // group) or `EPERM` (macOS's answer once the last member has been reparented
@@ -324,8 +360,8 @@ fn a_childs_process_group_is_settled_before_the_child_is_reaped() {
         "the group is gone (ESRCH) or unsignallable (EPERM): {errno:?}"
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(10),
-        "the helper went on SIGTERM, not on the grace timeout: {:?}",
+        started.elapsed() < vk_harness::launch::GROUP_GRACE,
+        "the member went on the SIGTERM, not on the grace timeout and the SIGKILL: {:?}",
         started.elapsed()
     );
 }

@@ -4,9 +4,11 @@
 //! founder decision stands between the mechanism here and a shipped restricted
 //! harness (see `crates/vk-harness/src/restrict.rs`'s "Measured limit" note and
 //! the Task 10 report's `NEEDS_CONTEXT`), so they do not gate CI; run them with
-//! `cargo test -p vk-harness --test restricted -- --ignored --test-threads=1`
-//! (one thread: they read and set the DACLs of this session's window station
-//! and desktop, which every test in the binary shares).
+//! `cargo test -p vk-harness --test restricted -- --ignored`. The tests that
+//! grant on this session's window station and desktop are serialised within
+//! the process by the module's own lock, so they need no `--test-threads=1`;
+//! two *processes* running this suite at once are not serialised and are
+//! unsupported.
 //!
 //! What they establish:
 //!
@@ -21,6 +23,8 @@
 //!   DACLs come back exactly as they were.
 //! * `a_test_that_fails_while_holding_the_grant_still_restores` — the guard
 //!   restores on unwinding too, so a failing assertion leaves nothing behind.
+//! * `a_second_holder_waits_for_the_first_to_restore` — two holders in one
+//!   process are serialised, so a snapshot is never restored over a later one.
 //! * `the_winsta_and_desktop_carry_no_restricted_ace` — the session invariant
 //!   the two above rely on; run it before and after them for the record.
 //! * `strip_restricted_aces_left_by_an_unrestored_run` — the cleanup for a run
@@ -32,6 +36,8 @@
 //! and the trustee's SID bytes), never on an SDDL rendering (Ruling 35).
 #![cfg(windows)]
 
+use std::os::windows::io::RawHandle;
+use vk_harness::confine::Governor;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use vk_harness::restrict::{
@@ -43,8 +49,14 @@ use vk_harness::restrict::{
 type Dacls = (Vec<AceView>, Vec<AceView>);
 
 /// Run `cmd /c echo hi` under `token`, in `cwd`, to completion (or a deadline),
-/// returning its exit code and captured stdout.
-fn cmd_echo(token: &RestrictedToken, cwd: &Path, cfg: &Path) -> (i32, String) {
+/// returning its exit code and captured stdout. `contain` is what the spawn
+/// calls on the suspended child before resuming it.
+fn cmd_echo(
+    token: &RestrictedToken,
+    cwd: &Path,
+    cfg: &Path,
+    contain: impl FnOnce(RawHandle, u32) -> anyhow::Result<()>,
+) -> (i32, String) {
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| String::from("C:\\Windows"));
     let out = cfg.join("out.txt");
     let err = cfg.join("err.txt");
@@ -55,6 +67,7 @@ fn cmd_echo(token: &RestrictedToken, cwd: &Path, cfg: &Path) -> (i32, String) {
         cwd,
         &out,
         &err,
+        contain,
     )
     .expect("spawn a restricted cmd.exe");
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -88,7 +101,11 @@ fn restricted_count((winsta, desktop): &Dacls) -> (usize, usize) {
 }
 
 /// The mechanism runs a deprivileged child (no restricting SIDs): the
-/// `CreateRestrictedToken` + `CreateProcessAsUserW` path is sound.
+/// `CreateRestrictedToken` + `CreateProcessAsUserW` path is sound — and the
+/// child is contained before it runs: inside `contain` it is still suspended
+/// and has written nothing, the Job Object takes it and reads back that it
+/// holds it, and only then does it run and produce its output (Task 10
+/// review, Minor 10). No window-station grant is involved here.
 #[test]
 #[ignore = "group G is a founder decision; run manually with --ignored"]
 fn the_mechanism_launches_a_deprivileged_child() {
@@ -98,7 +115,17 @@ fn the_mechanism_launches_a_deprivileged_child() {
     grant_restricting_sid(cfg.path()).unwrap();
     // A deprivileged token, no restricting SIDs: an ordinary child.
     let token = RestrictedToken::build(&[], false, true).expect("a deprivileged token");
-    let (code, out) = cmd_echo(&token, ws.path(), cfg.path());
+    let governor = vk_harness::confine::JobGovernor::new(256 << 20, None).expect("a job object");
+    let out_path = cfg.path().join("out.txt");
+    let (code, out) = cmd_echo(&token, ws.path(), cfg.path(), |handle, pid| {
+        assert_eq!(
+            std::fs::read_to_string(&out_path).unwrap_or_default(),
+            "",
+            "the child ran before it was contained"
+        );
+        governor.contain_process(handle, pid)
+    });
+    assert!(governor.governed(), "the Job Object read back that it holds the child");
     assert_eq!(code, 0, "the deprivileged child must run: {out:?}");
     assert!(out.contains("hi"), "and produce its output: {out:?}");
 }
@@ -128,7 +155,7 @@ fn a_restricting_sid_child_cannot_initialise() {
     );
 
     let token = RestrictedToken::for_this_process().expect("the restricting token");
-    let (code, out) = cmd_echo(&token, ws.path(), cfg.path());
+    let (code, out) = cmd_echo(&token, ws.path(), cfg.path(), |_, _| Ok(()));
 
     // Restore explicitly, so a failure to restore fails the test rather than
     // being a line on stderr from the guard's `Drop`.
@@ -174,6 +201,32 @@ fn a_test_that_fails_while_holding_the_grant_still_restores() {
         after, before,
         "the guard's Drop must have restored both DACLs"
     );
+}
+
+/// Two holders in one process are serialised (Task 10 review, Minor 7): the
+/// second grant blocks until the first guard has restored, so a snapshot is
+/// never restored over a later one.
+#[test]
+#[ignore = "group G is a founder decision; run manually with --ignored"]
+fn a_second_holder_waits_for_the_first_to_restore() {
+    let before = winsta_desktop_aces().expect("read both DACLs before");
+    let first = grant_restricted_on_winsta_desktop().expect("the first grant");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let second = std::thread::spawn(move || {
+        let guard = grant_restricted_on_winsta_desktop().expect("the second grant");
+        tx.send(()).expect("report the grant");
+        guard.restore().expect("restore the second");
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the second holder must wait while the first is held"
+    );
+    first.restore().expect("restore the first");
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("the second holder proceeds once the first has restored");
+    second.join().expect("the second holder's thread");
+    let after = winsta_desktop_aces().expect("read both DACLs after");
+    assert_eq!(after, before, "both DACLs are exactly what they were");
 }
 
 /// The session invariant: neither this window station nor this desktop names

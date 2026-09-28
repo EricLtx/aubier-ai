@@ -42,10 +42,12 @@
 //!   and write `OUT/` (and its captured stdout, which lives in the config
 //!   directory, outside the workspace the model may read);
 //! * the **state directory**, the **keyring** and the **user's profile** are
-//!   not, so the child is denied them — and so is the **daemon's pipe**, whose
-//!   DACL admits the interactive user and the service account and nobody else,
-//!   which is what closes the pipe-as-same-user caveat: a restricted harness
-//!   cannot open the endpoint and act as the operator.
+//!   not, so the child *would be* denied them — and so *would* the **daemon's
+//!   pipe** be, whose DACL admits the interactive user and the service account
+//!   and nobody else, which is what *would* close the pipe-as-same-user
+//!   caveat: a restricted harness could not open the endpoint and act as the
+//!   operator. None of this was measured: no restricting-SID child ever
+//!   initialised on this machine (the "Measured limit" note below).
 //!
 //! **Privileges.** Every privilege is deleted except `SeChangeNotify` — the
 //! bypass-traverse right. Without it a token with `DISABLE_MAX_PRIVILEGE` must
@@ -117,9 +119,9 @@ use windows::Win32::Security::{
 /// constant under `System::SystemServices` as a signed `i32`.
 const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, ResumeThread,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 /// The fixed restricting SIDs (the logon SID is added at build time): the
@@ -129,8 +131,11 @@ use windows::Win32::System::Threading::{
 pub const RESTRICTING_SIDS: &[&str] = &["S-1-5-12", "S-1-5-32-545", "S-1-1-0"];
 
 /// The one restricting SID the workspace and config directory are granted, so
-/// the child can reach them. `RESTRICTED` — granted to nothing else on this
-/// machine, so a grant of it is unmistakably ours.
+/// the child can reach them: `RESTRICTED` (`S-1-5-12`), the well-known SID
+/// Windows defines for exactly this use — a restricting-SID sandbox's own
+/// trustee. Chromium-family sandboxes use it too, so a grant of it on a
+/// shared object is *of this shape*, not provably ours (Task 10 review,
+/// Minor 7).
 pub const WORKSPACE_GRANT_SID: &str = "S-1-5-12";
 
 /// A primary token that is a restricted copy of this process's own: every
@@ -612,16 +617,35 @@ pub fn winsta_desktop_aces() -> Result<(Vec<AceView>, Vec<AceView>)> {
     ))
 }
 
+/// One holder of the window-station/desktop grant at a time, process-wide:
+/// the guard restores a *snapshot*, so two live holders would undo each
+/// other (A saves S0 and grants, B saves S1 and grants, A restores S0, B
+/// restores S1 — A's entry is back on). Held for the guard's whole life and
+/// by the strip for its duration, so the tests no longer depend on
+/// `--test-threads=1`. Two *processes* are not serialised: running the
+/// ignored suite from two processes at once is unsupported.
+static WINSTA_GRANT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn hold_winsta_grant_lock() -> std::sync::MutexGuard<'static, ()> {
+    // A holder that panicked has restored in its `Drop` already; the poison
+    // says nothing about the objects' state.
+    WINSTA_GRANT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The window-station and desktop grant, held: both DACLs were copied before
 /// the entry was added and are set back, byte for byte, when this is dropped —
 /// so a test that fails while holding it still leaves the session's window
-/// station and desktop exactly as it found them.
+/// station and desktop exactly as it found them. Holds
+/// [`WINSTA_GRANT_LOCK`] for its whole life (released after the restore).
 pub struct WinstaDesktopGrant {
     winsta: HANDLE,
     desktop: HANDLE,
     saved_winsta: DaclCopy,
     saved_desktop: DaclCopy,
     restored: bool,
+    _held: std::sync::MutexGuard<'static, ()>,
 }
 
 impl WinstaDesktopGrant {
@@ -663,10 +687,14 @@ impl Drop for WinstaDesktopGrant {
 /// grant is idempotent.
 ///
 /// This touches the daemon's own window station (`WinSta0` interactively,
-/// `Service-0x0-…$` under the service). It grants only `RESTRICTED`, which
-/// nothing else on the machine holds, so the widening is to this harness alone
-/// — and it is undone when the returned guard drops.
+/// `Service-0x0-…$` under the service). It grants only `RESTRICTED`, which no
+/// ordinary process holds as a group and only a restricting-SID sandbox —
+/// this one, or a Chromium-family browser's — makes use of, so the widening
+/// is to such sandboxes alone; it is undone when the returned guard drops.
+/// Holders are serialised process-wide by [`WINSTA_GRANT_LOCK`]: the guard
+/// restores a snapshot, and a second live holder would undo the first.
 pub fn grant_restricted_on_winsta_desktop() -> Result<WinstaDesktopGrant> {
+    let held = hold_winsta_grant_lock();
     let (winsta, desktop) = winsta_and_desktop()?;
     let guard = WinstaDesktopGrant {
         winsta,
@@ -674,6 +702,7 @@ pub fn grant_restricted_on_winsta_desktop() -> Result<WinstaDesktopGrant> {
         saved_winsta: DaclCopy::read(winsta).context("window station")?,
         saved_desktop: DaclCopy::read(desktop).context("desktop")?,
         restored: false,
+        _held: held,
     };
     // From here a failure drops `guard`, which puts back what was saved.
     grant_restricted_on_object(winsta).context("window station")?;
@@ -682,11 +711,17 @@ pub fn grant_restricted_on_winsta_desktop() -> Result<WinstaDesktopGrant> {
 }
 
 /// Remove, from this process's window station and desktop, every entry that
-/// is exactly what the grant adds ([`AceView::is_the_grant`]) — the cleanup
-/// for a run that ended before its guard could restore (a process killed
-/// mid-test). Returns how many entries each object lost. Nothing else is
-/// touched: an entry that differs in type, flags, mask or trustee stays.
+/// is exactly the *shape* the grant leaves ([`AceView::is_the_grant`]): the
+/// cleanup for a run that ended before its guard could restore (a process
+/// killed mid-test). It matches shape, not origin — an entry of this exact
+/// shape that another restricting-SID sandbox put there (a Chromium-family
+/// browser's, say) is indistinguishable and would go too. A documented tool
+/// for orphaned grants of this shape, run by hand from the ignored test, and
+/// nothing more: no production path calls it. Returns how many entries each
+/// object lost; an entry that differs in type, flags, mask or trustee stays.
+/// Serialised with the guard by [`WINSTA_GRANT_LOCK`].
 pub fn strip_restricted_from_winsta_desktop() -> Result<(usize, usize)> {
+    let _held = hold_winsta_grant_lock();
     let (winsta, desktop) = winsta_and_desktop()?;
     let mut counts = (0, 0);
     for (handle, count, on, what) in [
@@ -795,9 +830,17 @@ pub fn grant_restricting_sid(dir: &Path) -> Result<()> {
 
 /// A child launched under a [`RestrictedToken`], its stdin from the null
 /// device and its stdout and stderr redirected to files the caller names (in
-/// the run's config directory, which the model may not read). A thin wrapper
-/// over the raw process handle: it exposes the pid and the handle the Job
-/// Object contains, polls without reaping, and terminates on a timeout or STOP.
+/// the run's config directory, which the model may not read). Created
+/// **suspended**, handed to the caller to contain (the Job Object), and only
+/// then resumed — contain-before-run, so not one instruction of it executes
+/// outside the governor (Task 10 review, Minor 10). A thin wrapper over the
+/// raw process handle: it exposes the pid, polls without reaping, and
+/// terminates on a timeout or STOP.
+///
+/// Parked with the group G founder decision, not done here: the child still
+/// inherits every inheritable handle of this process (`bInheritHandles`)
+/// rather than a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` of its three, and this
+/// module's split into token, spawn, icacls and window-object parts.
 pub struct RestrictedChild {
     process: OwnedHandle,
     _thread: OwnedHandle,
@@ -806,9 +849,13 @@ pub struct RestrictedChild {
 
 impl RestrictedChild {
     /// Launch `program args` under `token`, in `cwd`, stdin from `NUL`, stdout
-    /// to `stdout_path`, stderr to `stderr_path`. The child inherits only those
-    /// three handles (marked inheritable); every other handle stays private, so
-    /// nothing of the daemon's leaks in.
+    /// to `stdout_path`, stderr to `stderr_path`. The three handles are marked
+    /// inheritable for the call (any other handle of this process that is
+    /// inheritable comes along too — the handle list is parked, see the type's
+    /// doc). The child is created suspended; `contain` is called with its
+    /// process handle and pid before it has run an instruction, and a refusal
+    /// kills it there — it never runs uncontained (Ruling 21.8); then it is
+    /// resumed.
     pub fn spawn(
         token: &RestrictedToken,
         program: &Path,
@@ -816,6 +863,7 @@ impl RestrictedChild {
         cwd: &Path,
         stdout_path: &Path,
         stderr_path: &Path,
+        contain: impl FnOnce(RawHandle, u32) -> Result<()>,
     ) -> Result<RestrictedChild> {
         let nul = inheritable_read("NUL".as_ref())?;
         let out = inheritable_write(stdout_path)?;
@@ -838,8 +886,8 @@ impl RestrictedChild {
         let mut pi = PROCESS_INFORMATION::default();
         // SAFETY: `token` is a live primary token; `cmdline`/`cwd_wide` are
         // NUL-terminated UTF-16 buffers that outlive the call; `si` names three
-        // live inheritable handles; `pi` is a live out-parameter. Only those
-        // three handles are inheritable, so the child inherits nothing else.
+        // live inheritable handles; `pi` is a live out-parameter. The child
+        // starts suspended: nothing of it runs until `ResumeThread` below.
         let created = unsafe {
             CreateProcessAsUserW(
                 Some(handle_of(&token.0)),
@@ -848,7 +896,7 @@ impl RestrictedChild {
                 None,
                 None,
                 true,
-                CREATE_NO_WINDOW,
+                CREATE_NO_WINDOW | CREATE_SUSPENDED,
                 None,
                 PCWSTR(cwd_wide.as_ptr()),
                 &si,
@@ -866,10 +914,34 @@ impl RestrictedChild {
             )
         })?;
         // SAFETY: both handles came from a successful call; each closed once.
+        let process = unsafe { OwnedHandle::from_raw_handle(pi.hProcess.0 as RawHandle) };
+        let thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread.0 as RawHandle) };
+        let pid = pi.dwProcessId;
+        // Contain-before-run: the child has executed nothing yet. A refusal
+        // kills it here, before it ever runs.
+        if let Err(e) = contain(process.as_raw_handle(), pid) {
+            // SAFETY: the process handle is live; the suspended child dies.
+            unsafe {
+                let _ = TerminateProcess(handle_of(&process), 1);
+            }
+            return Err(e.context(format!(
+                "process {pid} was not contained; killed before it ran"
+            )));
+        }
+        // SAFETY: the thread handle is live; `u32::MAX` is the call's failure.
+        let previous = unsafe { ResumeThread(handle_of(&thread)) };
+        if previous == u32::MAX {
+            let e = windows::core::Error::from_thread();
+            // SAFETY: as above.
+            unsafe {
+                let _ = TerminateProcess(handle_of(&process), 1);
+            }
+            return Err(e).with_context(|| format!("ResumeThread on contained process {pid}"));
+        }
         Ok(RestrictedChild {
-            process: unsafe { OwnedHandle::from_raw_handle(pi.hProcess.0 as RawHandle) },
-            _thread: unsafe { OwnedHandle::from_raw_handle(pi.hThread.0 as RawHandle) },
-            pid: pi.dwProcessId,
+            process,
+            _thread: thread,
+            pid,
         })
     }
 

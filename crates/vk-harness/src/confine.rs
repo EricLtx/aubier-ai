@@ -112,7 +112,7 @@ mod job {
     use anyhow::{bail, Context, Result};
     use std::ffi::c_void;
     use std::mem::size_of;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::process::Child;
     use std::sync::atomic::{AtomicBool, Ordering};
     use windows::core::BOOL;
@@ -276,8 +276,16 @@ mod job {
         /// cause, looked up: the process gone already, or a job it is already
         /// in that would not nest this one.
         fn assign(&self, child: &Child) -> Result<()> {
-            let pid = child.id();
-            let process = HANDLE(child.as_raw_handle());
+            self.assign_handle(child.as_raw_handle(), child.id())
+        }
+
+        /// [`assign`](Self::assign) for a process this crate holds as a raw
+        /// handle rather than a `Child` — the restricted launch, which
+        /// creates its child suspended and contains it before resuming it
+        /// (Task 10 review, Minor 10). The caller keeps the handle open for
+        /// the call.
+        fn assign_handle(&self, process: RawHandle, pid: u32) -> Result<()> {
+            let process = HANDLE(process);
             if self
                 .holds(process)
                 .with_context(|| format!("IsProcessInJob on process {pid}"))?
@@ -308,17 +316,29 @@ mod job {
         }
     }
 
-    impl Governor for JobGovernor {
-        /// [`JobGovernor::assign`], remembered: a positive read-back is what
-        /// makes [`governed`](Governor::governed) true, and a failure is what
-        /// makes it false from then on.
-        fn contain(&self, child: &Child) -> Result<()> {
-            let outcome = self.assign(child);
+    impl JobGovernor {
+        /// [`Governor::contain`] for a process held as a raw handle and its
+        /// pid: the same assignment, the same read-back, the same memory of
+        /// the outcome. For the restricted launch's contain-before-run.
+        pub fn contain_process(&self, process: RawHandle, pid: u32) -> Result<()> {
+            self.remember(self.assign_handle(process, pid))
+        }
+
+        fn remember(&self, outcome: Result<()>) -> Result<()> {
             match &outcome {
                 Ok(()) => self.verified.store(true, Ordering::SeqCst),
                 Err(_) => self.refused.store(true, Ordering::SeqCst),
             }
             outcome
+        }
+    }
+
+    impl Governor for JobGovernor {
+        /// [`JobGovernor::assign`], remembered: a positive read-back is what
+        /// makes [`governed`](Governor::governed) true, and a failure is what
+        /// makes it false from then on.
+        fn contain(&self, child: &Child) -> Result<()> {
+            self.remember(self.assign(child))
         }
 
         fn governed(&self) -> bool {

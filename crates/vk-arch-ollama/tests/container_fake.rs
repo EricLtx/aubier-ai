@@ -346,6 +346,7 @@ fn a_container_is_adopted_only_when_it_is_the_one_this_mount_asks_for() {
     );
 
     let state = tempfile::tempdir().expect("state dir");
+    vk_contracts::testing::guard_state_dir(state.path());
     let mut kernel = RealKernel::open(
         state.path(),
         vk_store::keys::KeySource::File(state.path().join("master.key")),

@@ -1387,12 +1387,14 @@ impl RealKernel {
             .kv_list_prefix("stats:")
             .map_err(store_failed)?
         {
-            if let (Some(arch), Ok(stats)) = (
-                key.strip_prefix("stats:"),
-                serde_json::from_str::<ArchStats>(&value),
-            ) {
-                v.arches.insert(arch.into(), stats);
-            }
+            let Some(arch) = key.strip_prefix("stats:") else {
+                continue;
+            };
+            // A row that does not parse is a store that cannot answer, not an
+            // arch with zero calls (Task 10 review, Minor 9).
+            let stats: ArchStats = serde_json::from_str(&value)
+                .map_err(|e| store_failed(format!("stats row {key} cannot be read: {e}")))?;
+            v.arches.insert(arch.into(), stats);
         }
         // Every arch mounted right now, whether or not it has ever been
         // called: an operator asking which arches this node has, and which of

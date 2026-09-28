@@ -28,9 +28,11 @@ impl Drop for Daemon {
 /// daemon itself; an infer's `cmd.exe` or a harness's `vk-mcp` is a
 /// grandchild, and an orphaned one keeps a handle to the state directory that
 /// would outlive the test's `TempDir` (Task 10 group F). On Windows
-/// `taskkill /T` walks the tree; on Unix the daemon's own children are reaped
-/// as it dies (the harness runs under a Job Object that closes with it), so
-/// the direct kill is enough.
+/// `taskkill /T` walks the tree. On Unix there is no Job Object: a killed
+/// daemon's children are re-parented to `init` and run on until they finish
+/// of their own accord — but Unix removes a directory whose files are still
+/// open, and these tests' daemons spawn only short-lived children, so the
+/// direct kill is enough there.
 fn kill_tree(pid: u32) {
     #[cfg(windows)]
     {

@@ -1248,17 +1248,25 @@ impl RealKernel {
 
     /// The rows, with their keys, so `boot` can say which it has reported.
     /// The watermark lives under the same prefix and is not a row: excluded
-    /// by name, not left to a parse that happens to fail.
+    /// by name, not left to a parse that happens to fail. Any other row under
+    /// the prefix that does not parse is damage to append-only evidence
+    /// (Ruling 34) and is reported as a Store error, never dropped (Task 10
+    /// review, Minor 9).
     fn rebase_rows(&self) -> Result<Vec<(String, FsckRebase)>, KernelError> {
-        Ok(self
-            .store
+        self.store
             .db
             .kv_list_prefix(REBASE_PREFIX)
             .map_err(store_failed)?
             .into_iter()
             .filter(|(k, _)| k != REBASE_REPORTED_THROUGH)
-            .filter_map(|(k, v)| serde_json::from_str(&v).ok().map(|r| (k, r)))
-            .collect())
+            .map(|(k, v)| {
+                serde_json::from_str::<FsckRebase>(&v)
+                    .map_err(|e| {
+                        store_failed(format!("rebase evidence row {k} cannot be read: {e}"))
+                    })
+                    .map(|r| (k, r))
+            })
+            .collect()
     }
 
     /// The rebases no `boot` event has named yet — every one since the last
@@ -3183,6 +3191,45 @@ mod tests {
         assert_eq!(k.task(&machine(2), &t.id).unwrap(), None);
         assert!(k.tasks(&machine(2)).unwrap().is_empty());
         assert!(k.top(&machine(2)).unwrap().tasks.is_empty());
+    }
+
+    /// An unreadable row under the rebase prefix is damage to append-only
+    /// evidence (Ruling 34) and is reported as a Store error — not dropped out
+    /// of `rebase_history` and `vk status` (Task 10 review, Minor 9). The
+    /// watermark is excluded by name and never parsed.
+    #[test]
+    fn an_unreadable_rebase_row_is_a_store_error_not_a_missing_entry() {
+        let d = tempfile::tempdir().unwrap();
+        let k = open(d.path());
+        k.store()
+            .db
+            .kv_set(&format!("{REBASE_PREFIX}0000000000000099"), "{not json")
+            .unwrap();
+        let err = k
+            .rebase_history()
+            .expect_err("damaged evidence is reported, not dropped");
+        assert!(matches!(err, KernelError::Store(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("ledger.head.rebase.0000000000000099"), "{msg}");
+        assert!(msg.contains("cannot be read"), "{msg}");
+    }
+
+    /// An unreadable `stats:` row fails `top` as a Store error instead of
+    /// showing that arch with zeros (Task 10 review, Minor 9; Ruling 8).
+    #[test]
+    fn an_unreadable_stats_row_fails_top_instead_of_showing_zeros() {
+        let d = tempfile::tempdir().unwrap();
+        let k = open(d.path());
+        k.store()
+            .db
+            .kv_set("stats:broken-arch", "{not json")
+            .unwrap();
+        let err = k
+            .top(&machine(2))
+            .expect_err("a store that cannot answer fails the screen");
+        assert!(matches!(err, KernelError::Store(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("stats:broken-arch"), "{msg}");
     }
 
     /// A stats row written before `tokens_in_measured` and `cost_list_usd`

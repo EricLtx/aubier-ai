@@ -28,12 +28,22 @@ pub fn state_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
 /// A directory that is already there must be **this user's** (SP1a review
 /// M6), and that is checked before its mode is touched: a `0700` directory
 /// another account made looks right and is not, and `chmod` on it would fail
-/// with a message about permissions when the fact is ownership.
+/// with a message about permissions when the fact is ownership. And it must
+/// be a directory, not a link to one (Task 10 review, Minor 3): a link owned
+/// by another account that points at a `0700` directory of this user's would
+/// pass both checks through `metadata`, and its owner can re-point it later —
+/// so the path is read with `symlink_metadata` and a link is refused as one.
 pub fn private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-        if let Ok(meta) = std::fs::metadata(dir) {
+        if let Ok(meta) = std::fs::symlink_metadata(dir) {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} is a symbolic link; refusing to use it", dir.display()),
+                ));
+            }
             // SAFETY: `geteuid` reads the process's effective uid and nothing else.
             let me = unsafe { libc::geteuid() };
             if meta.uid() != me {
@@ -234,6 +244,30 @@ mod tests {
         // And one of our own passes, and is tightened.
         let d = tempfile::tempdir().unwrap();
         private_dir(d.path()).unwrap();
+    }
+
+    /// A symbolic link is refused as a link, whatever it points at (Task 10
+    /// review, Minor 3): a link somebody else owns to a `0700` directory of
+    /// this user's would otherwise pass the owner and mode checks through
+    /// `metadata`, and its owner could re-point it later. The link here is
+    /// this user's own — a second account cannot be had in a test — so what
+    /// is pinned is that a link is refused *as a link*, by name, before any
+    /// ownership question is asked.
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_is_refused_as_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = private_dir(&link).expect_err("a link is not a directory of ours");
+        let msg = err.to_string();
+        assert!(msg.contains("is a symbolic link"), "{msg}");
+        assert!(msg.contains(&link.display().to_string()), "{msg}");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        // The directory it points at is fine, reached directly.
+        private_dir(&real).unwrap();
     }
 
     /// A junction or symlink into a synced folder is caught through the link

@@ -203,6 +203,15 @@ async fn the_scheduled_sweep_removes_a_stale_usage_row_on_its_own() {
     assert_eq!(rows(&k), 0, "the sweep ran on its interval");
     sweeper.abort();
     let _ = sweeper.await;
+    // The abort cancels the loop, not a sweep already running in
+    // `spawn_blocking` — and that one holds a clone of the kernel. Wait for
+    // it to let go before the directory is removed, as `shutdown` does
+    // (Task 10 review, Minor 6).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while Arc::strong_count(&k) > 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(Arc::strong_count(&k), 1, "a sweep still holds the kernel");
     drop(k);
     d.close().unwrap();
 }

@@ -64,7 +64,7 @@ table or, with `--json`, as the daemon's own answer.
 | `vk secret set NAME` | the credential store: a secret this node's daemon reads, put in this account's OS keyring without ever being echoed or printed |
 | `vk task submit` / `step` / `show` | processes: a task is the unit of work, its register is its address space |
 | `vk stop [SCOPE]`, `vk resume ID` | signals: a STOP halts a scope until a human lifts it |
-| `vk approve ID [--passkey]` | the human ceremony: an approval of a kernel-minted challenge, signed by this node's device key or by a passkey in the browser (invariant I1). **The trust model without a passkey:** the node's device key sits in this account's OS keyring, so every process running as this user can sign with it — every same-user process counts as "the human" until `--passkey` moves the human key into Windows Hello or a phone (SP1a's stand-in, Rulings 17/20; `contracts/tcb.md`) |
+| `vk approve ID [--passkey]` | the human ceremony: an approval of a kernel-minted challenge, signed by this node's device key or by a passkey in the browser (invariant I1). **The trust model:** the node's device key sits in this account's OS keyring, so every process running as this user can sign with it — every same-user process counts as "the human" for as long as the node key is enrolled. A passkey (Windows Hello, a phone) adds a **second** human key; it does not retire the first, and nothing revokes the node key yet — the revocation gap is stated in `contracts/tcb.md` (SP1a's stand-in, Rulings 17/20) |
 | `vk passkey enroll [--open]`, `vk passkey ls` | the human's own device: a passkey (Windows Hello, a phone) enrolled through the browser |
 | `vk dmesg -n N` | the kernel ring buffer: the tail of the hash-chained ledger |
 | `vk ledger verify` | `fsck` for the record: does the hash chain recompute |
@@ -338,6 +338,17 @@ the store verifies
 
 A shredded subject is **skipped**, not failed: its DEK was deleted on purpose
 and its ciphertext is meant to stay unreadable for ever.
+
+**Store-format break (SP1b, Ruling 38).** Since SP1b each subject's DEK is
+wrapped with the subject id as associated data, so a `.dek` file moved between
+subjects does not unwrap and a `shred` cannot be pointed at somebody else's
+key. A state directory written **before** that — any SP1a-era store, and the
+SP1b demo stores made before the change — does not open its subjects any more:
+`get` and `put` fail, `shred` refuses, and `vk fsck` fails the `keys` tier,
+each naming the three things it can be (written before SP1b's subject
+binding, moved between subjects, wrong master key). There is no legacy read
+path and no migration, on purpose: no production store exists, and such a
+directory is recreated.
 
 A node with a record and **no recorded head** does not serve without `--force`
 either. Cutting a tail is caught by the head; cutting a tail *and* deleting the

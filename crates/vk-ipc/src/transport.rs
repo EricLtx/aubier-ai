@@ -1019,16 +1019,29 @@ pub mod os {
     /// closed to others: a pre-created world-writable directory of the same
     /// name would otherwise let another account swap the socket underneath
     /// us. The `0700` parent is also what closes the window between `bind`
-    /// and the `0600` on the socket itself.
+    /// and the `0600` on the socket itself. A symbolic link is refused as a
+    /// link (Task 10 review, Minor 3): read through `metadata`, a link owned
+    /// by another account that points at a `0700` directory of this user's
+    /// passes both checks below, and its owner can re-point it later — which
+    /// bites exactly where the `/tmp/vk-<user>` fallback lives.
     fn private_dir(dir: &Path) -> Result<()> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-        if !dir.exists() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)?;
-        }
-        let meta = std::fs::metadata(dir)?;
+        let meta = match std::fs::symlink_metadata(dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir)?;
+                std::fs::symlink_metadata(dir)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        anyhow::ensure!(
+            !meta.file_type().is_symlink(),
+            "{} is a symbolic link; refusing to listen there",
+            dir.display()
+        );
         // Ownership before mode (SP1a review M6): a `0700` directory of the
         // same name that another account made would otherwise pass this and
         // fail the bind with a message about permissions, when the fact is
@@ -1132,6 +1145,29 @@ pub mod os {
             let msg = err.to_string();
             assert!(msg.contains("owned by uid 0"), "{msg}");
             assert!(msg.contains("not this user"), "{msg}");
+            assert!(!Path::new(&ep.0).exists(), "nothing was bound there");
+        }
+
+        /// A socket directory that is a symbolic link is refused as a link
+        /// (Task 10 review, Minor 3), before its owner or mode is looked at:
+        /// a link another account owns to a `0700` directory of this user's
+        /// would pass both through `metadata`. The link here is this user's
+        /// own — a second account cannot be had in a test — so what is pinned
+        /// is the refusal of the link as such, by name.
+        #[tokio::test]
+        async fn a_socket_directory_that_is_a_link_is_refused() {
+            let d = tempfile::tempdir().unwrap();
+            let real = d.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            let link = d.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let ep = Endpoint(link.join("vk.sock").display().to_string());
+            let Err(err) = bind(&ep).await else {
+                panic!("a linked socket directory must not be listened in");
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("is a symbolic link"), "{msg}");
+            assert!(msg.contains(&link.display().to_string()), "{msg}");
             assert!(!Path::new(&ep.0).exists(), "nothing was bound there");
         }
 

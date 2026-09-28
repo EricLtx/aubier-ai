@@ -214,16 +214,19 @@ function Add-ToPath([string]$dir) {
     }
 }
 
+# $true when the entry was there and its removal ran (or would have, under
+# -DryRun); $false when it was not on PATH. A Step that throws propagates.
 function Remove-FromPath([string]$dir) {
     if (-not (Test-InPath $dir)) {
         Write-Host "-> $dir is not on $PathScope $PathVarName"
-        return
+        return $false
     }
     $target = $dir.TrimEnd('\')
-    Step "remove $dir from $PathScope $PathVarName" {
+    $null = Step "remove $dir from $PathScope $PathVarName" {
         $entries = @(Get-PathEntries) | Where-Object { $_.TrimEnd('\') -ine $target }
         [Environment]::SetEnvironmentVariable($PathVarName, ($entries -join ';'), $PathScope)
     }
+    return $true
 }
 
 function Test-DockerDesktop {
@@ -296,12 +299,16 @@ function Do-Uninstall {
     # As Do-Install: a thrown Step must still leave the operator with the
     # summary, which is what says how far the uninstall got.
     $serviceOutcome = 'not installed'
+    # Reported as removed only once Remove-FromPath has actually run: a Step
+    # that throws before it leaves this line saying so (Task 10 review, Minor 11).
+    $pathOutcome = 'not changed (the uninstall stopped before that step)'
     $removed = @()
     try {
 
     $svc = Get-Service -Name 'vkd' -ErrorAction SilentlyContinue
     if ($svc) {
         if (-not (Test-Elevated)) {
+            $serviceOutcome = 'installed; not removed (needs an elevated shell - see above)'
             Warn 'a vkd service is installed; removing it needs an elevated shell. From an elevated PowerShell:'
             Warn ("    " + (Get-ElevatedCommand @('-Uninstall', '-Root', (Quote-Arg $Root))))
         } else {
@@ -315,6 +322,7 @@ function Do-Uninstall {
                 }
                 $serviceOutcome = 'removed'
             } else {
+                $serviceOutcome = "installed; not removed ($svcBin is missing - sc.exe stop vkd, then sc.exe delete vkd)"
                 Warn "vkd service is installed but $svcBin is gone; remove it directly: sc.exe stop vkd, then sc.exe delete vkd"
             }
         }
@@ -322,7 +330,11 @@ function Do-Uninstall {
         Write-Host '-> no vkd service is installed'
     }
 
-    Remove-FromPath $Root
+    if (Remove-FromPath $Root) {
+        $pathOutcome = if ($NoAct) { "[dry-run] $Root would be taken off this account's PATH" } else { "$Root taken off this account's PATH (open a new shell)" }
+    } else {
+        $pathOutcome = "$Root was not on this account's PATH"
+    }
 
     foreach ($b in $Binaries) {
         $p = Join-Path $Root $b
@@ -349,7 +361,7 @@ function Do-Uninstall {
         Write-Host "root:      $Root"
         Write-Host ("binaries:  removed {0}" -f $(if ($removed.Count -gt 0) { $removed -join ', ' } else { 'none' }))
         Write-Host "service:   $serviceOutcome"
-        Write-Host "path:      $Root taken off this account's PATH (open a new shell)"
+        Write-Host "path:      $pathOutcome"
         Write-Host '=========================='
         Write-Host ''
         Write-Host "Left untouched, on purpose: %ProgramData%\VerticalAI\vk (the node's store) and this" -ForegroundColor DarkGray

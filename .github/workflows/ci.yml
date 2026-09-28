@@ -50,11 +50,42 @@ jobs:
           Write-Output "OPENSSL_SRC_PERL=$perl ($os)"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Ruling 37: a Windows suite that leaves a state directory behind leaves
+      # a `.tmp*` entry in `%TEMP%`, and the runner is alone on its `%TEMP%`,
+      # so the count before and after the suite attributes a leak to the
+      # suite (on a developer's machine it cannot — other processes and other
+      # sessions write there — which is why the in-process guard,
+      # `vk_contracts::testing::guard_state_dir`, registers directories
+      # per process instead). The path is the one `tempfile` uses: `TMP`,
+      # then `TEMP`, as `GetTempPath` reads them.
+      - name: Count the temp directories before the suite
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          tmp=$(cygpath -u "${TMP:-${TEMP:-$RUNNER_TEMP}}")
+          before=$(ls -d "$tmp"/.tmp* 2>/dev/null | wc -l)
+          echo "TMP_DIRS_BEFORE=$before" >> "$GITHUB_ENV"
+          echo "temp directories before the suite: $before (in $tmp)"
       - name: cargo test --workspace
         shell: bash
         run: |
           set -o pipefail
           cargo test --workspace --no-fail-fast 2>&1 | tee test.log
+      - name: The suite left no temp directory behind
+        if: always() && runner.os == 'Windows'
+        shell: bash
+        run: |
+          tmp=$(cygpath -u "${TMP:-${TEMP:-$RUNNER_TEMP}}")
+          after=$(ls -d "$tmp"/.tmp* 2>/dev/null | wc -l)
+          before="${TMP_DIRS_BEFORE:-0}"
+          echo "temp directories after the suite: $after (before: $before)"
+          if [ "$after" -gt "$before" ]; then
+            printf '::error title=temp leak::%s\n' "the suite left $((after - before)) .tmp* director(y/ies) in $tmp: a store was open when its TempDir dropped"
+            ls -d "$tmp"/.tmp* | while IFS= read -r d; do
+              printf '::error title=temp leak::%s\n' "$d: $(ls "$d" 2>/dev/null | tr '\n' ' ')"
+            done
+            exit 1
+          fi
       # Raw job logs need a GitHub login; annotations and the step summary
       # do not. On failure, surface every failing test by name so a public
       # reader (and the API) can see what broke without the log.
@@ -72,10 +103,10 @@ jobs:
           grep -E "^test result:" test.log | grep -v " 0 failed" | while IFS= read -r line; do
             printf '::error title=suite::%s\n' "$line"
           done
-          # The temp-directory leak guard (Windows): a suite that left `.tmp*`
-          # directories behind names them on its way out.
-          grep -E -A 8 "^temp-leak guard:" test.log | head -40 | while IFS= read -r line; do
-            printf '::error title=temp leak::%s\n' "$line"
+          # The in-process leak guard (Windows) names, on its way out, every
+          # state directory a test binary registered and left on disk.
+          grep -E -A 8 "^state-directory leak guard:" test.log | head -40 | while IFS= read -r line; do
+            printf '::error title=state-directory leak::%s\n' "$line"
           done
       # The other half of the `bedrock` feature gate. The default build has no
       # AWS SDK in it (Ruling 30), so `cargo test --workspace` above exercises

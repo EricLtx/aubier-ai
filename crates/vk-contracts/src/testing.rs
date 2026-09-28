@@ -46,10 +46,13 @@ pub trait KernelTestHooks: Kernel {
 /// the process names it and exits `101`, which fails `cargo test`.
 ///
 /// Only the directories **this** process registered are checked — never a
-/// bare scan of `%TEMP%` — so the test binaries `cargo test` runs in parallel
-/// cannot mistake one another's live directories for a leak. A no-op off
-/// Windows: other platforms remove an open file's directory happily, and the
-/// leak is a Windows one.
+/// bare scan of `%TEMP%`: other processes and other sessions write there too
+/// (a concurrent cargo in another worktree, anything else on the machine),
+/// so a count of `%TEMP%` cannot attribute a leak to this suite, while a
+/// per-process registration can. (CI counts `%TEMP%` around the whole suite
+/// as well, from outside — Ruling 37 — which is the other half: the runner
+/// is alone on its `%TEMP%`.) A no-op off Windows: other platforms remove an
+/// open file's directory happily, and the leak is a Windows one.
 pub fn guard_state_dir(dir: &std::path::Path) {
     #[cfg(windows)]
     leak_guard::register(dir);
@@ -96,7 +99,9 @@ mod leak_guard {
             return;
         }
         eprintln!(
-            "state-directory leak guard: {} test state director{} still on disk at exit — a              store was open when its TempDir dropped (a kernel, a connection task or a child              process still held it):",
+            "state-directory leak guard: {} test state director{} still on disk at exit — a \
+             store was open when its TempDir dropped (a kernel, a connection task or a child \
+             process still held it):",
             leaked.len(),
             if leaked.len() == 1 { "y is" } else { "ies are" }
         );

@@ -107,14 +107,20 @@ impl BlobStore {
     }
 
     /// Unwrap what is filed under `key_id` as `key_id`'s key, naming the
-    /// subject when it is not: the same words `get`, `shred` and `fsck` all
-    /// use for it.
+    /// three things it can be when it is not: the same words `get`, `shred`
+    /// and `fsck` all use for it. The first cause is the SP1b format break
+    /// (Ruling 38): a `.dek` written before the subject binding of Task 10
+    /// group A carries no subject in its tag and does not unwrap here — on
+    /// purpose, with no legacy path and no migration; the state directory is
+    /// recreated. The message names the case; nothing probes for it.
     fn unwrap_for(&self, key_id: &str, wrapped: &[u8]) -> Result<KeyBytes> {
         self.master.unwrap_dek(key_id, wrapped).map_err(|_| {
             anyhow::anyhow!(
-                "the wrapped key filed under {key_id} failed its integrity check: it was not \
-                 wrapped for this subject under this master key (a .dek file moved from another \
-                 subject, or a master key that is not the one it was written with)"
+                "the wrapped key filed under {key_id} failed its integrity check: it is not this \
+                 subject's key under this master key. One of three things: the .dek was written \
+                 before SP1b's subject binding (Ruling 38 — a state directory written before \
+                 SP1b must be recreated; there is no migration), it was moved from another \
+                 subject, or the master key is not the one it was written with"
             )
         })
     }
@@ -585,6 +591,13 @@ mod tests {
         let why = s
             .dek_unwraps("subject-2")
             .expect_err("a moved key does not unwrap");
+        // The refusal names its three possible causes (Ruling 38), the format
+        // break first: an operator with a pre-SP1b store reads why here.
+        let msg = format!("{why:#}");
+        assert!(msg.contains("before SP1b's subject binding"), "{msg}");
+        assert!(msg.contains("must be recreated"), "{msg}");
+        assert!(msg.contains("moved from another subject"), "{msg}");
+        assert!(msg.contains("master key is not the one"), "{msg}");
         assert!(why.to_string().contains("subject-2"), "{why:#}");
 
         // The shred: refused, nothing destroyed, nothing recorded.
