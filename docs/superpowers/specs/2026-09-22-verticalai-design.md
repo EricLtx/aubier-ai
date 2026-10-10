@@ -3,7 +3,7 @@
 **Status:** approved in brainstorming, pending founder review of this document
 **Date:** 2026-09-22
 **Scope:** the whole system (kernel + userland + distribution + federation) at design level, and the ordering of sub-projects. Each sub-project gets its own implementation plan; SP0 is next.
-**Inputs:** brainstorming session of 2026-09-22; literature brief (`01_Architectural_Documentation/2026-09-22_userland-self-improvement_literature-brief.md`, 32 sources); adversarial design review (`01_Architectural_Documentation/2026-09-22_design-redteam-review.md`, 40 confirmed findings); founder's pattern sheet (`SoftwareEngineeringPatterns.pdf`).
+**Inputs:** brainstorming session of 2026-09-22; a literature review and an adversarial design review (kept private); a software-engineering pattern catalogue.
 
 ---
 
@@ -17,14 +17,12 @@ VerticalAI is a **self-improving, peer-to-peer, local-first orchestration runtim
 
 **The OS approach, kept in the architecture (decided 2026-09-23):** internally the kernel is `vk` and **VerticalAI is the distribution** — kernel + userland + the signed module repository, the way a Linux distribution relates to its kernel. The OS correspondences are explicit and deliberate: syscalls and interceptors (kernel/user split), tasks and harnesses under leases (processes), the scheduler and resource governor (preemption), labels with join-on-write and clearance (mandatory access control), principals and scopes (users and privilege), arches and drivers behind manifests (devices), the ledger (audit log), the TUF-signed federation (package repository). Three OS surfaces are added: a **unified namespace** (`/arches`, `/tasks`, `/artefacts`, `/modules`, `/policies`, `/devices`, `/ledger`) that syscalls address by path; a **shell**, `vk` (`boot`, `ps`, `top`, `stop`, `resume`, `approve`, `ls`, `mount`, `dmesg`, `man`), whose man pages are generated from the contracts; and a **boot sequence** (verify the ledger, load policies, enumerate arches, drivers and enrolled keys, announce presence) of which the SP2 baseline inventory is the userland continuation.
 
-**First trade:** freelancers and SMEs selling services or products, in any craft (design, consulting, content, AI-native platforms…). **First user:** the founder's one-person company (sole-trader mode). Workplace mode (nodes whose user is not the owner) is deferred.
-
-**Commercial model (decided):** commercial first, to build activity; the kernel is open-sourced later to democratise the commercial offering (userland, federation, support). The CRA analysis in §5.6 assumes a commercial product; it is revisited at open-sourcing.
+**Deployment modes:** single-owner mode first; workplace mode (nodes whose user is not the owner) is deferred.
 
 ### 1.1 Value ladder
 
 1. **Baseline** — one local workspace inventorying every model and tool the business already uses, with metadata (conversations, usage, licences, master prompts, cost, locality, jurisdiction). Valuable alone; also the register every later decision is measured against.
-2. **Shadowing + technology watch** — with a valid lawful basis (consent for a sole trader; see §5.6 for workplaces), the node observes the owner's usage; in parallel the technology watch observes the outside.
+2. **Shadowing + technology watch** — with a valid lawful basis, the node observes the owner's usage; in parallel the technology watch observes the outside.
 3. **Proposals** — once a two-dimensional threshold is crossed (data maturity *and* verifier readiness), the vertical process proposes candidate modules, shown as outcomes.
 4. **Promotion and delegation** — the owner promotes, tunes, and chooses which kinds of promotion to auto-approve; later, promotes modules to business and vertical scope.
 
@@ -52,7 +50,7 @@ Cybersecurity and privacy by design; user-centric; organic and autonomous constr
 | D12 | Sole-trader mode first; workplace mode deferred until DPIA/LIA/works-council objects exist | |
 | D13 | EU-hosted frontier arch as first-class adapter ("your data, your jurisdiction") | Anthropic first-party API has no EU inference geography |
 | D14 | Spec-first, then a Rust user-space kernel; SP1 demo gated on isolation and code signing | |
-| D15 | Commercial first; kernel open-sourced later | |
+| D15 | Licensing model | kept private |
 
 ---
 
@@ -174,7 +172,7 @@ Six families, all versioned, all with a classification label and a provenance ma
 |---|---|---|
 | **Arch inventory** | every model/tool with metadata; credential *references* only (fingerprint + holding node) | `infer()` to a cloud arch routes to a node holding the credential |
 | **Knowledge** | itemised entries with stable IDs and helpful/harmful counters; never prose blobs | ACE-style; mergeable as G-set + PN-counters + tombstones |
-| **Modules** | *skill* (capability + tools + description), *process* (skills composed with checkpoints, carrying a CARS-style autonomy profile), *automation* (process bound to a trigger); compact directories; **no scripts and no validators in anything machine-evolved** | |
+| **Modules** | *skill* (capability + tools + description), *process* (skills composed with checkpoints, carrying an autonomy profile), *automation* (process bound to a trigger); compact directories; **no scripts and no validators in anything machine-evolved** | |
 | **Validators** | structural checks per artefact type, with anchor suites; authored by humans or by a frontier arch under a human approval; community validators need two signers | excluded from machine evolution (D11) |
 | **Policies** | consent/lawful-basis records, classification rules, autonomy profiles, merge rules, thresholds, learning modes, delegations, driver allow-lists | read-only for machine principals; most-restrictive-wins |
 | **Integrations** | drivers exposing artefacts and events, each with a deny-by-default allow-list contract | |
@@ -217,23 +215,9 @@ Seven panels, each a view over userland objects: **Baseline** (inventory/registe
 
 **SP2 addition (from review):** a browser-extension capture driver that records conversations from ChatGPT/Claude/Gemini/Midjourney web apps under the same lawful-basis record, and a receipts importer (IMAP or drop-folder of invoices) for licences, cost and renewals — so the baseline has real content in week one.
 
-### 4.6 Compliance mapping (corrected after review)
+### 4.6 Compliance
 
-| Obligation | Applies | Mechanism |
-|---|---|---|
-| GDPR lawful basis for shadowing | now | Sole trader: consent. Workplace: Art. 6(1)(f) legitimate interest + Art. 88 national rules + mandatory DPIA (Art. 35(3)(a)); works-council/CSE attestation object (FR: L2312-38). Employee consent is *not* a lawful basis. |
-| e-Privacy Art. 5(3) | now | Browser/app drivers need the *device user's* consent; sole-trader self-install fits the requested-service exception |
-| GDPR Art. 28 | now | Client artefacts are processed as processor; data class `third-party-mandated` restricts learning to local/on-prem arches absent documented instructions |
-| GDPR Art. 17 erasure | now | Per-subject keys + signed shred events (§3.9) |
-| GDPR Art. 22 | now | `decision_about_person` modules cannot be auto-approved; ledger entry is the intervention record |
-| AI Act Art. 50 transparency | 2 Aug 2026 | Output-marking gate for every `generate` arch: C2PA/IPTC for media, provenance record for text; interaction disclosure in channels |
-| AI Act Art. 25(2) | now | Instructions for use + machine-unwritable policies declare the system "is not to be changed into a high-risk AI system"; Annex III classifier runs at `propose_candidate`, `promote`, `import` **and on the shadowing configuration itself** (Annex III 4(b)); Art. 6(3) derogation documented where used |
-| AI Act Arts. 9, 12, 14, 26, 43(4) / Art. 3(23) | conditional, high-risk only; Annex III from 2 Dec 2027 (Reg. 2026/1744) | Ledger, STOP + liveness lease + hardware-key approvals, pre-determined-change envelope per trade. The design prevents high-risk use by default; these mechanisms exist so a deployer who chooses a high-risk purpose can comply |
-| CRA (Reg. 2024/2847) | reporting from 11 Sep 2026; main application 11 Dec 2027 | Integrity of programs/config against unauthorised modification ↔ approval-gated, logged self-modification; SBOM incl. weights and runtimes; default-on security updates with opt-out; 24h/72h/14d reporting via ENISA (opt-in security-event telemetry); 5-year support; **identity/key/signer component packaged separately** (class I "identity management") |
-| Product Liability Directive 2024/2853 | 9 Dec 2026 | Software is a product; signer and vendor liability documented in federation terms |
-| NIS 2 | customer-side | Logs, access control and incident evidence supplied to essential/important entities |
-
-All citations are to be re-verified against the consolidated Official Journal text before any external publication.
+The kernel's mechanisms — hash-chained ledger, STOP and liveness lease, hardware-key approvals, information-flow labels, erasure by key shredding, output marking, approval-gated self-modification — are mapped to the obligations that apply to the product and to its deployers. The detailed legal analysis is maintained privately and re-verified before any release.
 
 ---
 
@@ -256,7 +240,7 @@ All citations are to be re-verified against the consolidated Official Journal te
 | **SP2 — Baseline userland** | Browser-extension capture driver, receipts importer, itemised knowledge store, classification and data-class assignment, policies, local web UI v0 (Baseline, Lawful basis, Arch routing) | One workspace holding a freelancer's real conversations, licences and costs |
 | **SP3 — Vertical process v1** | Allow-listed shadowing drivers (files, browser, a few apps), origin taint, threshold (maturity + readiness), Cold/Warm/Hot with snapshot cut-off and hold-out, validators class, proposals panel, tech-watch v0, output-marking gate | First self-built module promoted by its owner under a hardware-key approval |
 | **SP4 — P2P** | Node identity and enrolment, discovery (LAN-first) and relay role, metadata replication + blob fetch, merge rules, lock homes and fences, STOP propagation, liveness leases, Hot-pending re-rehearsal, phone thin node | Two laptops + a phone, one business, partition test suite green |
-| **SP5 — Federation** | TUF roles and threshold root, declassification gate with test suite, signer admission, import/export, revocation, CRA/PLD artefacts (SBOM, test records, terms) | First module shared into a trade under the founder's signature |
+| **SP5 — Federation** | TUF roles and threshold root, declassification gate with test suite, signer admission, import/export, revocation, CRA/PLD artefacts (SBOM, test records, terms) | First module shared into a trade under the curator's signature |
 
 Cross-cutting from SP0: compliance substrate, sandboxed rehearsals, property tests, technology watch on dependencies.
 
@@ -271,7 +255,4 @@ Cross-cutting from SP0: compliance substrate, sandboxed rehearsals, property tes
 
 ## 8. References
 
-- `01_Architectural_Documentation/2026-09-22_userland-self-improvement_literature-brief.md` — 32-source brief and bibliography
-- `01_Architectural_Documentation/2026-09-22_design-redteam-review.md` — 40 confirmed findings, amendments, legal corrections
-- `01_Architectural_Documentation/SoftwareEngineeringPatterns.pdf` — pattern vocabulary
 - Prior art: AIOS (COLM 2025), LiteCUA, AgentOS, Model-Native Computing Architecture; SkillsBench, VaG, ACE, SkillsVote, SkillForge, FederatedSkill, Keyhive, AGNTCY ADS (all in the brief)

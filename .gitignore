@@ -23,3 +23,14 @@ target/
 
 # Subagent-driven-development scratch (ledgers, briefs, review packages)
 .superpowers/
+
+# Third-party and business material — never published
+02_Consulting_Toolkit/
+docs/business/
+reports/
+research_notes/
+
+# Internal decision, review and status documents — kept private
+docs/decisions/
+docs/status/
+docs/superpowers/reviews/

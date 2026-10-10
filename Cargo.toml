@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2021"
 license = "SEE LICENSE IN LICENSE"
-repository = "https://github.com/EricLtx/VerticalAI"
+repository = "https://github.com/EricLtx/aubier-ai"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

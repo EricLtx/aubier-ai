@@ -30,7 +30,7 @@
 Cargo.toml                          workspace: members = ["crates/*"]
 rust-toolchain.toml
 README.md                           what SP0 is, how to run tests, MSRV
-LICENSE                             "All rights reserved" (commercial first, D15)
+LICENSE                             "All rights reserved"
 .github/workflows/ci.yml            fmt + clippy + test matrix + schema drift + signing scaffold
 contracts/
   README.md                         how schemas are generated; versioning rule
@@ -206,7 +206,6 @@ Copyright (c) 2026 VerticalAI. All rights reserved.
 
 This software and its documentation are proprietary. No licence is granted
 to use, copy, modify or distribute them without written permission.
-The kernel is planned for a later open-source release (see design D15).
 ```
 
 - [ ] **Step 5: CI skeleton**
