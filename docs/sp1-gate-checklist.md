@@ -96,7 +96,7 @@ The gate VM is stock — no Rust toolchain — so point `spike-6a.ps1` at the
 signed binaries item 1 already installed rather than at its own
 `cargo build` default:
 ```
-net user vk-gate-second VkGate2026Temp /add              # elevated, once
+net user vk-gate-second * /add                           # elevated, once; prompts for a throwaway password
 .\scripts\spike-6a.ps1 -ServiceBinary "$env:LOCALAPPDATA\Programs\VerticalAI\vkd-service.exe" -SecondUser vk-gate-second
 net user vk-gate-second /delete                          # elevated, cleanup
 ```
