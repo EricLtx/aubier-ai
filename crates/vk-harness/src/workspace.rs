@@ -57,8 +57,9 @@ pub trait Host {
     /// clearance — which is how the projection learns to refuse it.
     fn read_artefact(&self, ctx: &Ctx, hash: &str) -> std::result::Result<Vec<u8>, KernelError>;
     /// The label an artefact carries, for the projection record; `None` when the
-    /// artefact is not there.
-    fn artefact_label(&self, hash: &str) -> Option<Label>;
+    /// artefact is not there, an error when it is there and cannot be read
+    /// (Ruling 43).
+    fn artefact_label(&self, hash: &str) -> std::result::Result<Option<Label>, KernelError>;
     /// Record one projection on the ledger.
     fn log_projection(
         &mut self,
@@ -129,6 +130,7 @@ impl Workspace {
         for (i, art) in reg.artefacts.iter().enumerate() {
             let scope = host
                 .artefact_label(&art.hash)
+                .with_context(|| format!("read the label of artefact {}", art.hash))?
                 .map(|l| scope_name(l.scope))
                 .unwrap_or_else(|| "unknown".into());
             match host.read_artefact(ctx, &art.hash) {

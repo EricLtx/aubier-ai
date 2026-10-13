@@ -3815,6 +3815,7 @@ dependencies = [
  "hex",
  "keyring",
  "rand 0.8.8",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

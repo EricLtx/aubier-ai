@@ -701,7 +701,7 @@ fn dispatch(
             // There is no policy engine in SP1a, but a placeholder nothing can
             // read is a predecessor the first real policy set cannot migrate
             // from.
-            "policies_version": k.policies_version(),
+            "policies_version": k.policies_version().map_err(kerr)?,
             "state_dir": k.store().state_dir.display().to_string(),
             // Where a `release` step's `to_dir` is resolved: the client names a
             // subpath and prints the resolved path, so "where did my artefact

@@ -40,8 +40,8 @@ impl Host for FakeHost {
         }
         Ok(bytes.clone())
     }
-    fn artefact_label(&self, hash: &str) -> Option<Label> {
-        self.blobs.get(hash).map(|(l, _)| l.clone())
+    fn artefact_label(&self, hash: &str) -> Result<Option<Label>, KernelError> {
+        Ok(self.blobs.get(hash).map(|(l, _)| l.clone()))
     }
     fn log_projection(&mut self, _now_ms: u64, rec: &ProjectionRecord) -> Result<(), KernelError> {
         self.projections.push(rec.clone());

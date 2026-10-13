@@ -1452,9 +1452,10 @@ impl RealKernel {
 
     /// The policy set this node runs under, as the store has it — `None` on a
     /// node that has never booted. Read-only, so a status call can report the
-    /// version without being the thing that decides it.
-    pub fn policies_version(&self) -> Option<String> {
-        self.store.db.kv_get(POLICIES_VERSION).ok().flatten()
+    /// version without being the thing that decides it. A store that cannot
+    /// answer is a Store error, not "never booted" (Ruling 43).
+    pub fn policies_version(&self) -> Result<Option<String>, KernelError> {
+        self.store.db.kv_get(POLICIES_VERSION).map_err(store_failed)
     }
 
     /// The boot step that loads it. SP1a has no policy engine, so the key is
@@ -2210,9 +2211,14 @@ impl RealKernel {
 
     /// The label an artefact carries, or `None` when it is not there. Read for
     /// the workspace projection's record (`vk_harness::ProjectionRecord`), which
-    /// names the class of data admitted to a harness.
-    pub fn artefact_label(&self, hash: &str) -> Option<Label> {
-        self.store.blobs.envelope(hash).ok().map(|e| e.label)
+    /// names the class of data admitted to a harness. An envelope that is there
+    /// and cannot be read is a Store error, not an absent artefact (Ruling 43).
+    pub fn artefact_label(&self, hash: &str) -> Result<Option<Label>, KernelError> {
+        match self.store.blobs.envelope(hash).map_err(blob_failed) {
+            Ok(env) => Ok(Some(env.label)),
+            Err(KernelError::NotFound(_)) => Ok(None),
+            Err(damaged) => Err(damaged),
+        }
     }
 
     /// Where a task's harness workspace lives: `<state_dir>/harness/<task_id>`,
@@ -2427,7 +2433,7 @@ impl vk_harness::Host for RealKernel {
         RealKernel::read_artefact(self, ctx, hash)
     }
 
-    fn artefact_label(&self, hash: &str) -> Option<Label> {
+    fn artefact_label(&self, hash: &str) -> std::result::Result<Option<Label>, KernelError> {
         RealKernel::artefact_label(self, hash)
     }
 
@@ -3270,6 +3276,63 @@ mod tests {
                 "{table}: {mounts:?}"
             );
         }
+    }
+
+    /// Drop `table` from the store's database under a running kernel: the
+    /// shape a database fault takes, for the read surfaces that must say so.
+    fn drop_table(dir: &std::path::Path, table: &str) {
+        rusqlite::Connection::open(dir.join("vk.sqlite"))
+            .unwrap()
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .unwrap();
+    }
+
+    /// Ruling 43: the policy version, read from a store that cannot answer, is
+    /// a Store error — not "this node has never booted".
+    #[test]
+    fn an_unreadable_policies_version_is_a_store_error_not_none() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        k.boot().unwrap();
+        drop_table(d.path(), "kv");
+        let got = format!("{:?}", k.policies_version());
+        assert!(got.contains("Err(Store("), "{got}");
+    }
+
+    /// Ruling 43: `/devices` and `/devices/<id>` on a store that cannot be
+    /// read are Store errors — not an empty list, not "no such device".
+    #[test]
+    fn the_devices_namespace_fails_loudly_on_a_store_that_cannot_be_read() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        k.enroll_device_persisted("phone-1", [7u8; 32]).unwrap();
+        drop_table(d.path(), "devices");
+        let ctx = machine(2);
+        for path in ["/devices", "/devices/phone-1"] {
+            let got = ns::resolve(&k, &ctx, path);
+            assert!(matches!(got, Err(KernelError::Store(_))), "{path}: {got:?}");
+        }
+    }
+
+    /// Ruling 43: the label of an artefact whose envelope is there and cannot
+    /// be read is a Store error, not "no such artefact".
+    #[test]
+    fn an_unreadable_envelope_fails_artefact_label() {
+        let d = tempfile::tempdir().unwrap();
+        let k = open(d.path());
+        let env = k
+            .store()
+            .blobs
+            .put("subject-1", Label::bottom(), b"hello")
+            .unwrap();
+        let file = d
+            .path()
+            .join("blobs")
+            .join(format!("{}.json", env.hash.trim_start_matches("sha256:")));
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let got = format!("{:?}", k.artefact_label(&env.hash));
+        assert!(got.contains("Err(Store("), "{got}");
     }
 
     /// Final review I-3: a `devices` row that does not parse is a store

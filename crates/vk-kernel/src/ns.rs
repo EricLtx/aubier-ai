@@ -115,7 +115,9 @@ pub fn resolve(k: &RealKernel, ctx: &Ctx, path: &str) -> Result<Entry, KernelErr
                 .store()
                 .db
                 .list_json::<serde_json::Value>("devices")
-                .unwrap_or_default()
+                // A store that cannot list them fails the read (Ruling 43):
+                // an empty listing would say no device is enrolled.
+                .map_err(crate::store_failed)?
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect(),
@@ -127,8 +129,7 @@ pub fn resolve(k: &RealKernel, ctx: &Ctx, path: &str) -> Result<Entry, KernelErr
             .store()
             .db
             .get_json::<serde_json::Value>("devices", id)
-            .ok()
-            .flatten()
+            .map_err(crate::store_failed)?
             .map(|_| Entry::Device { id: (*id).into() })
             .ok_or_else(|| KernelError::NotFound(path.into())),
         ["ledger"] => Ok(Entry::LedgerTail {
