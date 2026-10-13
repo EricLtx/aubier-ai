@@ -1160,21 +1160,28 @@ impl RealKernel {
     fn fsck_mounts(&self) -> vk_store::FsckTier {
         // A table that cannot be read fails the tier (final review I-3):
         // swallowed into an empty list it read as a green `checked 0`.
+        //
+        // Either table unreadable and the tier reports the table, not a guess
+        // per row: without the specs "no mount spec" would be said of every
+        // arch, and without the manifests "half-written" of every spec (final
+        // re-review N-3).
         let mut problems = Vec::new();
-        let manifests: Vec<(String, ArchManifest)> =
-            self.store.db.list_json("arches").unwrap_or_else(|e| {
-                problems.push(format!("the arches table cannot be read: {e:#}"));
-                Vec::new()
-            });
-        let specs: BTreeMap<String, arch::MountSpec> = match self.store.db.list_json("mounts") {
-            Ok(rows) => rows.into_iter().collect(),
-            Err(e) => {
-                problems.push(format!("the mounts table cannot be read: {e:#}"));
-                // Without the specs, "no mount spec" would be said of every
-                // arch: the tier reports the table, not a guess per arch.
-                return vk_store::FsckTier::new("mounts", manifests.len() as u64, 0, problems);
-            }
+        let manifests = self
+            .store
+            .db
+            .list_json::<ArchManifest>("arches")
+            .map_err(|e| problems.push(format!("the arches table cannot be read: {e:#}")))
+            .ok();
+        let specs = self
+            .store
+            .db
+            .list_json::<arch::MountSpec>("mounts")
+            .map_err(|e| problems.push(format!("the mounts table cannot be read: {e:#}")))
+            .ok();
+        let (Some(manifests), Some(specs)) = (manifests, specs) else {
+            return vk_store::FsckTier::new("mounts", 0, 0, problems);
         };
+        let specs: BTreeMap<String, arch::MountSpec> = specs.into_iter().collect();
         for (id, m) in &manifests {
             match specs.get(id) {
                 None => problems.push(format!(
@@ -3276,6 +3283,32 @@ mod tests {
                 "{table}: {mounts:?}"
             );
         }
+    }
+
+    /// Final re-review N-3: with the `arches` table unreadable, a spec that is
+    /// there is not reported as "half-written" — without the manifests there is
+    /// nothing to say it has no arch beside it. The tier reports the table.
+    #[test]
+    fn an_unreadable_arches_table_does_not_call_every_spec_half_written() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(local(personal()));
+        k.store()
+            .db
+            .put_json("arches", "broken", &serde_json::json!("not a manifest"))
+            .unwrap();
+        let mounts = k
+            .fsck()
+            .tiers
+            .into_iter()
+            .find(|t| t.tier == "mounts")
+            .expect("a mounts tier");
+        assert!(!mounts.ok, "{mounts:?}");
+        assert!(
+            !mounts.problems.iter().any(|p| p.contains("half-written")),
+            "{arch}'s spec is not half-written: {mounts:?}"
+        );
+        assert_eq!(mounts.failed, 1, "the table, once: {mounts:?}");
     }
 
     /// Drop `table` from the store's database under a running kernel: the
