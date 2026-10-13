@@ -1,0 +1,66 @@
+{
+  "customer_id": "C001",
+  "identity": {
+    "last_name": "Dupont",
+    "first_name": "Marie",
+    "birth_date": "1985-03-04",
+    "nir": "2 85 03 69 123 456 78"
+  },
+  "contacts": {
+    "email": "marie.dupont@example.fr",
+    "mobile": "07 61 22 33 44",
+    "previous_mobile": "06 12 34 56 78",
+    "address": {
+      "line1": "12 rue des Lilas",
+      "postal_code": "69003",
+      "city": "Lyon"
+    }
+  },
+  "bank": {
+    "iban": "FR76 3000 6000 0112 3456 7890 189",
+    "bic": "AGRIFRPP"
+  },
+  "consents": [
+    {
+      "purpose": "relances_par_email",
+      "granted": true,
+      "date": "2023-01-15"
+    },
+    {
+      "purpose": "prospection_commerciale",
+      "granted": false,
+      "date": "2024-06-02"
+    },
+    {
+      "purpose": "partage_partenaires",
+      "granted": true,
+      "date": "2023-01-15",
+      "withdrawn": "2025-11-20"
+    },
+    {
+      "purpose": "sms_rappels",
+      "granted": true,
+      "date": "2026-02-10"
+    }
+  ],
+  "gdpr_requests": [
+    {
+      "type": "acces",
+      "date": "2024-03-11",
+      "status": "closed"
+    },
+    {
+      "type": "rectification",
+      "date": "2026-09-30",
+      "status": "closed",
+      "detail": "nouveau numero de mobile"
+    },
+    {
+      "type": "acces",
+      "date": "2026-10-01",
+      "status": "open"
+    }
+  ],
+  "balance_eur": 3460,
+  "notes": "Locataire depuis 02/2023. Arret maladie signale le 14/10/2026."
+}

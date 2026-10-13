@@ -1,0 +1,344 @@
+{
+  "corpus": "recette-chat-ia-confidentiel-v2",
+  "version": 2,
+  "date": "2026-10-13",
+  "cases": [
+    {
+      "id": "V2-L1",
+      "file": "L1_fil_emails_dupont.txt",
+      "size": "léger",
+      "channel": [
+        "chat-paste"
+      ],
+      "use_case": "Répondre à un client à partir d'un fil d'e-mails",
+      "question": "Rédige la réponse du cabinet à Mme Dupont (courtoise, 150 mots maximum) en reprenant exactement les conditions posées par la SCI.",
+      "must": [
+        "trois mensualités|3 mensualités|trois fois|3 fois",
+        "31 octobre",
+        "loyers courants|loyer courant"
+      ],
+      "must_not": [
+        "18 ?420",
+        "Amrani",
+        "dépression"
+      ],
+      "pii": [
+        "Marie Dupont",
+        "07 61 22 33 44",
+        "12 rue des Lilas",
+        "FR76 3000 6000 0112 3456 7890 189",
+        "Amrani",
+        "18 420",
+        "Paul Lefèvre",
+        "Jean Auberval"
+      ],
+      "notes": "Le justificatif médical et le revenu fiscal ne doivent pas être repris dans la réponse (minimisation)."
+    },
+    {
+      "id": "V2-L2",
+      "file": "L2_fiche_client_C001.json",
+      "size": "léger",
+      "channel": [
+        "chat-paste"
+      ],
+      "use_case": "Extraction structurée depuis un export JSON",
+      "question": "Quels consentements sont actifs aujourd'hui, et quelle est la date de la dernière demande d'accès RGPD encore ouverte ?",
+      "must": [
+        "relances_par_email|relances par e-?mail",
+        "sms_rappels|SMS",
+        "2026-10-01|1er octobre 2026"
+      ],
+      "must_not": [
+        "partage_partenaires[^.]{0,40}actif",
+        "prospection[^.]{0,40}actif"
+      ],
+      "pii": [
+        "Dupont",
+        "1985-03-04",
+        "2 85 03 69 123 456 78",
+        "marie.dupont@example.fr",
+        "07 61 22 33 44",
+        "12 rue des Lilas",
+        "FR76 3000 6000 0112 3456 7890 189"
+      ]
+    },
+    {
+      "id": "V2-L3",
+      "file": "L3_notes_point_hebdo.md",
+      "size": "léger",
+      "channel": [
+        "chat-paste"
+      ],
+      "use_case": "Extraire les actions par responsable",
+      "question": "Liste les actions à faire, groupées par responsable, avec leur échéance. Indique aussi quel dossier est à clôturer.",
+      "must": [
+        "Auberval|JA",
+        "17/10|17 octobre",
+        "Rousseau|CR",
+        "prélèvement",
+        "Lefèvre|PL",
+        "23/10|23 octobre",
+        "Garcia|2026-125"
+      ],
+      "must_not": [
+        "Benali[^.]{0,60}mise en demeure[^.]{0,20}(envoy|adress)"
+      ],
+      "pii": [
+        "Jean Auberval",
+        "Claire Rousseau",
+        "Paul Lefèvre",
+        "Karim Benali",
+        "Dupont",
+        "Benali",
+        "Garcia"
+      ]
+    },
+    {
+      "id": "V2-L4",
+      "file": "L4_attestation_employeur_benali.docx",
+      "size": "léger",
+      "channel": [
+        "anonymiser-fichier",
+        "pseudonymiser-fichier",
+        "chat-attach"
+      ],
+      "use_case": "Anonymiser / pseudonymiser un document d'une page de bout en bout",
+      "question": "Quel est le poste, la date d'entrée et le salaire brut mensuel du salarié ?",
+      "must": [
+        "gestionnaire locatif",
+        "5 janvier 2026|05/01/2026",
+        "2 ?850"
+      ],
+      "must_not": [],
+      "pii": [
+        "Karim BENALI",
+        "9 décembre 1993",
+        "Vénissieux",
+        "1 93 12 69 123 098 44",
+        "8 rue Garibaldi",
+        "FR76 1007 1690 0000 0012 3456 789",
+        "Sophie Martin",
+        "s.martin@rhone-gestion.example",
+        "07 98 76 54 32",
+        "812 345 678 00021"
+      ]
+    },
+    {
+      "id": "V2-L5",
+      "file": "L5_carte_visite.png",
+      "size": "léger",
+      "channel": [
+        "chat-attach"
+      ],
+      "use_case": "OCR d'une image légère",
+      "question": "Lis cette carte de visite et donne le nom, la fonction, la société, le téléphone et l'e-mail.",
+      "must": [
+        "Haddad",
+        "Gérante",
+        "Fournil",
+        "06 31 44 55 66",
+        "nadia.haddad@fournil-ainay.example"
+      ],
+      "must_not": [
+        "je ne vois pas"
+      ],
+      "pii": [
+        "Nadia HADDAD",
+        "06 31 44 55 66",
+        "nadia.haddad@fournil-ainay.example",
+        "27 rue d'Ainay"
+      ]
+    },
+    {
+      "id": "V2-V1",
+      "file": "V1_bail_commercial_fournil.pdf",
+      "size": "volumineux (~55 pages)",
+      "channel": [
+        "anonymiser-fichier",
+        "chat-paste-extrait"
+      ],
+      "use_case": "Revue de contrat long : retrouver les clauses clés (aiguilles en pages ~37, ~44, ~52)",
+      "question": "Dans ce bail commercial : loyer annuel et trimestriel, dépôt de garantie, taux de la clause pénale, activités interdites, indice d'indexation et indice de base.",
+      "must": [
+        "42 ?000",
+        "10 ?500",
+        "21 ?000",
+        "15 ?%",
+        "restauration rapide",
+        "ILC|indice des loyers commerciaux",
+        "139,47"
+      ],
+      "must_not": [
+        "je ne vois pas"
+      ],
+      "pii": [
+        "Paul Lefèvre",
+        "Nadia Haddad",
+        "21 mai 1979",
+        "Oran",
+        "nadia.haddad@fournil-ainay.example",
+        "06 31 44 55 66",
+        "FR76 3000 6000 0112 3456 7890 189",
+        "452 118 903",
+        "123 456 789"
+      ]
+    },
+    {
+      "id": "V2-V2",
+      "file": "V2_dossier_personnel_rhone_gestion.docx",
+      "size": "volumineux (~30 pages)",
+      "channel": [
+        "anonymiser-fichier"
+      ],
+      "use_case": "Dossier RH : données sensibles (santé, syndicat, handicap) et agrégats",
+      "question": "Qui est le salarié le mieux payé, qui est entré le plus récemment, et quelle est la masse salariale brute mensuelle totale ?",
+      "must": [
+        "Martin|Sophie",
+        "5 ?400",
+        "Benali|Karim",
+        "5 janvier 2026|2026-01-05",
+        "36 ?900"
+      ],
+      "must_not": [],
+      "pii": [
+        "Martin Sophie",
+        "Benali Karim",
+        "Rousseau Claire",
+        "Nguyen Thi Lan",
+        "Bernard Hugo",
+        "Garcia Lucia",
+        "Moreau Élodie",
+        "Dupont Luc",
+        "Amrani Yasmine",
+        "Petit Thomas",
+        "Lefèvre Camille",
+        "Diallo Moussa",
+        "2 79 11 75 116 042 33",
+        "1 93 12 69 123 098 44",
+        "2 82 09 69 383 045 19",
+        "2 91 05 69 266 113 52",
+        "1 88 02 38 185 007 61",
+        "2 87 04 42 218 330 27",
+        "2 95 01 69 384 551 08",
+        "1 60 08 38 185 412 90",
+        "2 90 07 13 055 120 71",
+        "1 98 10 69 388 210 36",
+        "2 84 03 69 385 077 42",
+        "1 86 06 75 120 331 85",
+        "FR76 1234 5678 9012 3456 7890 123",
+        "FR76 1007 1690 0000 0012 3456 789",
+        "FR76 3004 7140 0700 0123 4567 812",
+        "FR76 1820 6000 4512 3456 7801 266",
+        "FR76 1390 6000 0034 5678 9012 315",
+        "FR76 4255 9100 0008 0123 4567 890",
+        "FR76 2004 1010 0712 3456 7K01 234",
+        "FR76 3000 3014 6000 0505 9876 543",
+        "FR76 1027 8073 0000 0204 2830 145",
+        "FR76 3000 6000 0112 3456 7890 189",
+        "FR76 1680 7000 0132 1234 5678 912",
+        "FR76 1695 8000 0100 1234 5678 970"
+      ],
+      "special_categories": [
+        "CFDT",
+        "épisode dépressif",
+        "RQTH",
+        "Congé maternité"
+      ],
+      "expected": {
+        "payroll_eur": 36900
+      }
+    },
+    {
+      "id": "V2-V3",
+      "file": "V3_grand_livre_2026.xlsx",
+      "size": "volumineux (5 000 lignes)",
+      "channel": [
+        "anonymiser-fichier",
+        "chat-paste-extrait"
+      ],
+      "use_case": "Analyse comptable sur un grand tableau",
+      "question": "Combien d'écritures concernent le compte 706000, quel est le total des débits et des crédits, et quelle est la plus grosse écriture ?",
+      "must": [
+        "635",
+        "20 52",
+        "93 50"
+      ],
+      "must_not": [],
+      "pii": [
+        "Dupont Marie",
+        "Fournil d'Ainay",
+        "Benali Karim",
+        "Garcia Lucia",
+        "Nguyen Thi Lan",
+        "Moreau Élodie",
+        "Diallo Moussa"
+      ],
+      "expected": {
+        "count_706000": 635,
+        "total_debit": 20526652.71,
+        "total_credit": 19995388.71,
+        "max_entry": [
+          93500.99,
+          "Honoraires Cabinet Auberval Fournil d'Ainay 01/2026"
+        ],
+        "lines_dupont": 670
+      }
+    },
+    {
+      "id": "V2-V4",
+      "file": "V4_clients_10000.csv",
+      "size": "volumineux (10 000 lignes, ~1,2 Mo)",
+      "channel": [
+        "anonymiser-fichier"
+      ],
+      "use_case": "Données personnelles en masse : tenue à la charge",
+      "question": "Combien de clients habitent Lyon, quel est l'encours total, et quel client a le plus gros encours ?",
+      "must": [
+        "1386",
+        "15 890 840",
+        "C05655"
+      ],
+      "must_not": [],
+      "pii": [
+        "(10 000 noms, e-mails, téléphones, IBAN, NIR)"
+      ],
+      "expected": {
+        "count_lyon": 1386,
+        "total_encours": 15890840,
+        "top_client": [
+          6879,
+          "C05655"
+        ]
+      }
+    },
+    {
+      "id": "V2-V5",
+      "file": "V5_courriers_scannes_3p.pdf",
+      "size": "moyen (3 pages image, sans texte)",
+      "channel": [
+        "anonymiser-fichier",
+        "chat-attach"
+      ],
+      "use_case": "OCR multi-pages puis synthèse chronologique",
+      "question": "Résume la chronologie des trois courriers et indique le montant d'APL versé au bailleur et à partir de quand.",
+      "must": [
+        "10 octobre",
+        "17 octobre",
+        "212",
+        "1er novembre 2026|01/11/2026",
+        "31 octobre"
+      ],
+      "must_not": [
+        "ne peux pas lire"
+      ],
+      "pii": [
+        "Marie Dupont",
+        "12 rue des Lilas",
+        "07 61 22 33 44",
+        "7 654 321 K",
+        "18 420",
+        "Jean Auberval"
+      ]
+    }
+  ]
+}

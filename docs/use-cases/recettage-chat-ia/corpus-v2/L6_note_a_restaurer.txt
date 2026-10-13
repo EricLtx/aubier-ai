@@ -1,0 +1,6 @@
+Note interne (document fictif de recette) - a restaurer avec la table du fichier 02_mise_en_demeure_dupont-pseudonymise.docx
+
+Rappeler <PERSON_3> au sujet du logement situe <ADDRESS_1>, bail signe le <DATE_1>.
+Le cabinet est joignable au <PHONE_4> ou par courriel a <EMAIL_1>.
+Le SIREN du bailleur est <PHONE_3>. Un jeton inconnu reste tel quel : <PERSON_9>.
+Signataire : <PERSON_2>.

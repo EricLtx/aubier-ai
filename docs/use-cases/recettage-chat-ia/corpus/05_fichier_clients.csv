@@ -1,0 +1,11 @@
+id;nom;prenom;email;telephone;ville;iban;numero_securite_sociale;encours_eur
+C001;Dupont;Marie;marie.dupont@example.fr;06 12 34 56 78;Lyon;FR76 3000 6000 0112 3456 7890 189;2 85 03 69 123 456 78;3460
+C002;Martin;Sophie;sophie.martin@example.org;07 98 76 54 32;Paris;FR76 1234 5678 9012 3456 7890 123;2 79 11 75 116 042 33;0
+C003;Lefèvre;Paul;paul.lefevre@sci-tilleuls.example;06 98 76 54 32;Lyon;FR76 1027 8073 0000 0204 2830 145;1 70 07 69 381 221 07;0
+C004;Nguyen;Thi Lan;thilan.nguyen@example.net;06 45 67 89 01;Villeurbanne;FR76 1820 6000 4512 3456 7801 266;2 91 05 69 266 113 52;1250
+C005;Bernard;Hugo;hugo.bernard@example.com;07 11 22 33 44;Grenoble;FR76 1390 6000 0034 5678 9012 315;1 88 02 38 185 007 61;480
+C006;Rousseau;Claire;claire.rousseau@example.fr;04 78 11 22 33;Lyon;FR76 3004 7140 0700 0123 4567 812;2 82 09 69 383 045 19;0
+C007;Benali;Karim;karim.benali@example.org;06 77 88 99 00;Lyon;FR76 1007 1690 0000 0012 3456 789;1 93 12 69 123 098 44;2100
+C008;Garcia;Lucia;lucia.garcia@example.es;06 21 43 65 87;Saint-Étienne;FR76 4255 9100 0008 0123 4567 890;2 87 04 42 218 330 27;0
+C009;Dupont;Luc;luc.dupont@example.fr;06 55 44 33 22;Grenoble;FR76 3000 3014 6000 0505 9876 543;1 60 08 38 185 412 90;0
+C010;Moreau;Élodie;elodie.moreau@example.com;07 66 55 44 33;Lyon;FR76 2004 1010 0712 3456 7K01 234;2 95 01 69 384 551 08;760
