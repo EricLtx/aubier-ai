@@ -691,7 +691,7 @@ serve nobody.
 | endpoint ACL | the creating account's — Unix: `0600` in a `0700` directory; Windows: `D:(A;;GA;;;<that account>)` | `--as-service`: `D:(A;;GA;;;<service SID>)(A;;GA;;;<--user-sid>)` |
 | state directory ACL | Unix `0700`; Windows, the parent's (per user under `%LOCALAPPDATA%`) | `--as-service`: the service account, SYSTEM and the administrators, protected and inherited |
 | passkey pages | `http://localhost:7734`, on loopback only | `--web-port PORT` (`0`: one the OS picks) |
-| Claude Code binary (`claude-code` arches) | `claude` on the daemon's `PATH` (`claude.exe` on Windows), found at start | `vkd --claude-bin PATH`, `vk boot --claude-bin PATH`, `vkd-service install --claude-bin PATH` |
+| Claude Code binary (`claude-code` arches) | `claude` on the daemon's `PATH` (`claude.exe` on Windows), found and pinned at start; under `--as-service` a start that finds none is refused, while an interactive daemon looks again at each mount (never at call time) | `vkd --claude-bin PATH`, `vk boot --claude-bin PATH`, `vkd-service install --claude-bin PATH` |
 
 `$VK_ENDPOINT` and `$VK_NODE_KEY_FILE` are read by `vk` only: a daemon on a
 non-default endpoint is always started with `--endpoint`, and `vk boot` passes

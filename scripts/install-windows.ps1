@@ -62,7 +62,7 @@
     PATH) with no `..`, resolving to a file on a local fixed drive outside
     every user profile and synced folder -- and writes the resolved path into
     the service's ImagePath. Without it the service looks up `claude` on its
-    own PATH.
+    own PATH when it starts, and refuses to start when there is none.
 
 .PARAMETER Uninstall
     Reverse the install instead of performing one.

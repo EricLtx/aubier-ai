@@ -76,7 +76,8 @@ struct InstallArgs {
     /// `..`, resolving to a file on a local fixed drive outside every user
     /// profile and synced folder — and written into the `ImagePath` as
     /// `vkd --claude-bin <resolved path>`. Without it the service looks up
-    /// `claude` on its own PATH when it starts.
+    /// `claude` on its own PATH when it starts, and refuses to start when there
+    /// is none.
     #[arg(long)]
     claude_bin: Option<PathBuf>,
     /// Run `docker info` as the service account at every start and record the

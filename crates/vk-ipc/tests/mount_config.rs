@@ -239,6 +239,20 @@ async fn a_claude_code_mount_runs_the_daemons_binary() {
     n.stop().await;
 }
 
+/// Fix round 1, I-1: a daemon left at start with a bare name it did not find
+/// re-resolves it at the mount, with the start rule, and refuses the mount
+/// when it is still not there — nothing is spawned through a PATH lookup.
+#[tokio::test]
+async fn a_bare_name_the_daemon_did_not_find_is_resolved_again_at_mount() {
+    let n = Node::start_with(std::path::PathBuf::from("vk-no-such-claude-anywhere")).await;
+    let err = n
+        .refused("claude-code", json!({ "model": "m" }), true)
+        .await;
+    bad_request(&err, "PATH", "a bare name still not on the PATH");
+    assert!(err.message.contains("--claude-bin"), "{err:?}");
+    n.stop().await;
+}
+
 /// A spec persisted by SP1b still carries the binary its request named. Boot
 /// re-creation accepts it, ignores the field — the daemon's binary is what
 /// runs — and says so in the log, naming what it ignored. No migration: the

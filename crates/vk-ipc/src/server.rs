@@ -162,10 +162,22 @@ pub fn claude_binary_on(
             let label = format!("{} (found on PATH at {})", named.display(), found.display());
             checked_claude_path(&found, &label, as_service)
         }
+        // Under the service the binary is pinned at start or the daemon does
+        // not run (fix round 1, I-1): a `claude` that appeared on the
+        // service's PATH later would otherwise run as its account unchecked.
+        None if asked.is_none() && as_service => anyhow::bail!(
+            "--claude-bin was not given and there is no `{}` on the service's PATH{}: the \
+             service pins its Claude Code binary at start or does not run. Install Claude Code \
+             where only administrators may write and pass --claude-bin <path> \
+             (vkd-service install --claude-bin)",
+            named.display(),
+            if cfg!(windows) { " (as an .exe)" } else { "" }
+        ),
         None if asked.is_none() => {
             tracing::warn!(
-                "no `{}` on this daemon's PATH{}: every claude-code mount will be refused until \
-                 vkd is started with --claude-bin <path>",
+                "no `{}` on this daemon's PATH{}: each claude-code mount looks for it again, by \
+                 the same rule, and is refused while it is not there (or start vkd with \
+                 --claude-bin <path>)",
                 named.display(),
                 if cfg!(windows) { " (as an .exe)" } else { "" }
             );
@@ -181,6 +193,30 @@ pub fn claude_binary_on(
             }
         ),
     }
+}
+
+/// The executable a `claude-code` adapter is built on, at a mount or a boot
+/// re-creation (fix round 1, I-1). A path is what [`claude_binary_on`]
+/// pinned at start and is used as it is. A bare name is only ever here on an
+/// **interactive** daemon whose default `claude` was not on its `PATH` at
+/// start — the service refuses to start in that case — and it is resolved
+/// again now, against `path_var`, by the same rule, as an explicit name: found,
+/// it is checked and the adapter gets the resolved path; not found, the mount
+/// is refused. No adapter is ever handed a bare name, so nothing is looked up
+/// on a `PATH` at call time.
+pub fn claude_binary_for_mount(
+    claude_bin: &std::path::Path,
+    path_var: &std::ffi::OsStr,
+) -> Result<PathBuf> {
+    if !is_bare_name(claude_bin) {
+        return Ok(claude_bin.to_path_buf());
+    }
+    claude_binary_on(Some(claude_bin), false, path_var)
+}
+
+/// [`claude_binary_for_mount`] against this process's own `PATH`.
+fn claude_binary_now(claude_bin: &std::path::Path) -> Result<PathBuf> {
+    claude_binary_for_mount(claude_bin, &std::env::var_os("PATH").unwrap_or_default())
 }
 
 /// A name with no directory in it: what `PATH` is for.
@@ -734,9 +770,11 @@ fn dispatch(
     // (`vkd --claude-bin`); the request's config is checked against its
     // closed shape before anything is run.
     let claude = (req.method == "arch.mount" && req.params["kind"] == "claude-code")
-        .then(|| -> anyhow::Result<String> {
+        .then(|| -> anyhow::Result<(PathBuf, String)> {
             let _: ClaudeCodeMountConfig = claude_mount_config(&req.params["config"])?;
-            claude_code_version(&config.claude_bin)
+            let binary = claude_binary_now(&config.claude_bin)?;
+            let version = claude_code_version(&binary)?;
+            Ok((binary, version))
         })
         .transpose()
         .map_err(|e| bad(&format!("{e:#}")))?;
@@ -935,10 +973,10 @@ fn dispatch(
             let spec = mount_spec_of(kind, &p["config"])?;
             let adapter: Arc<dyn ArchAdapter> = match kind {
                 "claude-code" => {
-                    let version = claude.ok_or_else(|| internal("no claude version"))?;
+                    let (binary, version) = claude.ok_or_else(|| internal("no claude version"))?;
                     let state_dir = k.store().state_dir.clone();
                     Arc::new(
-                        claude_code_adapter(&state_dir, &p["config"], &version, &config.claude_bin)
+                        claude_code_adapter(&state_dir, &p["config"], &version, &binary)
                             .map_err(|e| bad(&format!("{e:#}")))?,
                     )
                 }
@@ -1584,12 +1622,10 @@ pub fn adapter_factory(
             "claude-code" => {
                 let config = without_legacy_binary(&spec.config, &claude_bin);
                 let _: ClaudeCodeMountConfig = closed_config("claude-code", &config)?;
-                let version = claude_code_version(&claude_bin)?;
+                let binary = claude_binary_now(&claude_bin)?;
+                let version = claude_code_version(&binary)?;
                 Ok(Box::new(claude_code_adapter(
-                    &state_dir,
-                    &config,
-                    &version,
-                    &claude_bin,
+                    &state_dir, &config, &version, &binary,
                 )?))
             }
             "ollama" => Ok(Box::new(ollama_adapter(&spec.config)?)),

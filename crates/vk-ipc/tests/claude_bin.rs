@@ -359,3 +359,48 @@ fn the_service_accepts_a_clean_absolute_path() {
         resolved(&system)
     );
 }
+
+/// Fix round 1, I-1: under the service the binary is pinned at start or the
+/// daemon does not run. A default `claude` that is not on the service's PATH
+/// is a refused start, not a warning: otherwise a `claude` appearing later on
+/// that PATH would be run as the service account without the rule.
+#[test]
+fn the_service_refuses_to_start_when_the_default_is_not_on_its_path() {
+    let err = claude_binary_on(None, true, &empty_path())
+        .expect_err("the service does not start without a pinned binary");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("--claude-bin") && msg.contains("PATH"),
+        "{msg}"
+    );
+    // Interactively the default may stay a bare name (a warning at start).
+    assert_eq!(
+        claude_binary_on(None, false, &empty_path()).unwrap(),
+        PathBuf::from("claude")
+    );
+}
+
+/// Fix round 1, I-1: an interactive daemon that started without finding
+/// `claude` re-resolves the name at each mount (and each boot re-creation)
+/// with the same rule and hands the adapter the resolved path — never a bare
+/// name for a lookup at call time. Still not there: refused, saying so.
+#[test]
+fn a_bare_name_left_at_start_is_resolved_and_checked_again_at_mount() {
+    use vk_ipc::server::claude_binary_for_mount;
+    let d = scratch();
+    let found = file_at(d.path(), on_path_name());
+    let pinned =
+        claude_binary_for_mount(Path::new("claude"), &OsString::from(d.path())).expect("found now");
+    assert_eq!(pinned, resolved(&found));
+    assert!(pinned.is_absolute());
+    let err =
+        claude_binary_for_mount(Path::new("claude"), &empty_path()).expect_err("still not there");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("--claude-bin") && msg.contains("PATH"),
+        "{msg}"
+    );
+    // A path pinned at start is used as it is.
+    let bin = stand_in(d.path());
+    assert_eq!(claude_binary_for_mount(&bin, &empty_path()).unwrap(), bin);
+}
