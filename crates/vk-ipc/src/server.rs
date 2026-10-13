@@ -65,10 +65,14 @@ pub struct ServerConfig {
     /// 2026-10-13, after final review I-1; Rulings 41 and 43). Daemon
     /// configuration, never a request field: `vkd --claude-bin`, settled by
     /// [`claude_binary_at_start`] before the daemon serves anything, so what
-    /// is here has already passed the rule — an absolute, resolved path, or
-    /// the bare default `claude` when this daemon's `PATH` had none at start.
-    /// Under the service the rule was the service's (Ruling 43), which is why
-    /// the transport no longer needs to know which mode it is in.
+    /// is here has already passed the rule: an absolute, resolved path —
+    /// always, under the service, which refuses to start without one — or,
+    /// on an interactive daemon only, the bare default `claude` when its
+    /// `PATH` had none at start. That bare name is never handed to an
+    /// adapter: each mount and boot re-creation resolves it again by the same
+    /// rule ([`claude_binary_for_mount`]) or refuses. Under the service the
+    /// rule was the service's (Ruling 43), which is why the transport no
+    /// longer needs to know which mode it is in.
     pub claude_bin: PathBuf,
 }
 
@@ -129,9 +133,13 @@ pub fn claude_binary_at_start(
 /// `PATH` — on Windows as `<name>.exe`, never a `.cmd` or `.bat` shim, which
 /// would start the real binary as a grandchild — and pinned to what was
 /// found, which is then held to the same rule as a path. An explicit name
-/// that is not there is refused; the **default** that is not there is a
-/// warning and stays `claude`, because a node starts without Claude Code
-/// installed and a `claude-code` mount then fails saying why.
+/// that is not there is refused. The **default** that is not there is
+/// refused **under the service** (`as_service`), which pins its binary at
+/// start or does not run (fix round 1, I-1); on an interactive daemon it is
+/// a warning and stays `claude`, because a node starts without Claude Code
+/// installed — each `claude-code` mount and boot re-creation then looks for
+/// it again ([`claude_binary_for_mount`]) and fails saying why while it is
+/// not there.
 ///
 /// A **path**, on every daemon, must be absolute (a relative one resolves
 /// against whatever the daemon's working directory is), have no `..`
@@ -210,6 +218,15 @@ pub fn claude_binary_for_mount(
 ) -> Result<PathBuf> {
     if !is_bare_name(claude_bin) {
         return Ok(claude_bin.to_path_buf());
+    }
+    // Only the default gets here unfound (an explicit name that was not on
+    // the PATH refused the start), so it gets the default's own refusal.
+    if find_on_path(claude_bin, path_var).is_none() {
+        anyhow::bail!(
+            "no `{}` on the daemon's PATH{}: start vkd with --claude-bin <absolute path>",
+            claude_bin.display(),
+            if cfg!(windows) { " (as an .exe)" } else { "" }
+        );
     }
     claude_binary_on(Some(claude_bin), false, path_var)
 }

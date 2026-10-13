@@ -253,6 +253,33 @@ async fn a_bare_name_the_daemon_did_not_find_is_resolved_again_at_mount() {
     n.stop().await;
 }
 
+/// Re-review: boot re-creation on an interactive daemon that found no
+/// `claude` at start goes through the same re-resolution as a mount — the
+/// factory refuses, with the default's own message, instead of handing the
+/// adapter a bare name to look up at call time.
+#[test]
+fn boot_re_creation_resolves_a_bare_name_again_and_refuses_it_when_absent() {
+    use vk_kernel::arch::MountSpec;
+    let d = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(d.path());
+    let factory = vk_ipc::server::adapter_factory(
+        d.path().to_path_buf(),
+        vk_arch_anthropic::KeySource::Keyring,
+        vk_arch_anthropic::DEFAULT_BASE_URL.to_string(),
+        std::path::PathBuf::from("vk-no-such-claude-anywhere"),
+    );
+    let spec = MountSpec::new("claude-code", json!({"model": "m"})).unwrap();
+    let err = match factory(&spec) {
+        Ok(_) => panic!("a bare name that is not on the PATH must not build an arch"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("no `vk-no-such-claude-anywhere` on the daemon's PATH")
+            && err.contains("--claude-bin <absolute path>"),
+        "{err}"
+    );
+}
+
 /// A spec persisted by SP1b still carries the binary its request named. Boot
 /// re-creation accepts it, ignores the field — the daemon's binary is what
 /// runs — and says so in the log, naming what it ignored. No migration: the
