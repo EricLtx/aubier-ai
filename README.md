@@ -392,6 +392,17 @@ itself, the rows are also on the surfaces a live operator reads — `vk status`
 marks the node `head rebased`, `vk status --json` and `vk fsck --json` carry
 the whole history — for as long as the node exists.
 
+**A damaged rebase evidence row.** Because those rows are append-only
+evidence, a row under `ledger.head.rebase.` that no longer parses is not
+skipped: `vkd` refuses to boot (and on a daemon already running, `vk status`
+and `vk fsck` fail), naming the row (`rebase evidence row ledger.head.rebase.…
+cannot be read`). Nothing repairs, skips or deletes it — there is no command
+for that, on purpose — and `--force` does not get past it, because `boot` reads
+the rows before it decides whether to serve. The remedy is the state directory
+itself: stop the daemon, keep the damaged directory as it is (it is the
+evidence of what happened to it), and restore a whole copy of the state
+directory taken before the damage.
+
 ### The SP1 demo
 
 `scripts/demo-sp1.ps1` is the milestone end to end, and the shortest way to see

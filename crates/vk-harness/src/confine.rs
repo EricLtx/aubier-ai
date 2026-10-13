@@ -294,8 +294,10 @@ mod job {
             }
 
             // SAFETY: both handles are open for the duration of the call: the
-            // job is owned by `self`, the process by `child`, which the borrow
-            // keeps alive; the OS reads nothing else.
+            // job is owned by `self`, and the process handle is the one the
+            // caller keeps open for the call (a `Child`'s, held by the borrow
+            // in `assign`, or the restricted launch's own); the OS reads
+            // nothing else.
             let assigned = unsafe { AssignProcessToJobObject(self.handle(), process) };
             if let Err(e) = assigned {
                 return Err(e).with_context(|| {

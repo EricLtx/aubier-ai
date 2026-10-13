@@ -118,9 +118,9 @@ impl BlobStore {
             anyhow::anyhow!(
                 "the wrapped key filed under {key_id} failed its integrity check: it is not this \
                  subject's key under this master key. One of three things: the .dek was written \
-                 before SP1b's subject binding (Ruling 38 — a state directory written before \
-                 SP1b must be recreated; there is no migration), it was moved from another \
-                 subject, or the master key is not the one it was written with"
+                 before SP1b's subject binding (the SP1b format change: a state directory \
+                 written before SP1b must be recreated; there is no migration), it was moved \
+                 from another subject, or the master key is not the one it was written with"
             )
         })
     }

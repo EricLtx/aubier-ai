@@ -300,8 +300,8 @@ function Do-Uninstall {
     # summary, which is what says how far the uninstall got.
     $serviceOutcome = 'not installed'
     # Reported as removed only once Remove-FromPath has actually run: a Step
-    # that throws before it leaves this line saying so (Task 10 review, Minor 11).
-    $pathOutcome = 'not changed (the uninstall stopped before that step)'
+    # that throws at or before it leaves this line saying so (Task 10 review, Minor 11).
+    $pathOutcome = 'not changed (the uninstall stopped at or before that step - see the error above)'
     $removed = @()
     try {
 

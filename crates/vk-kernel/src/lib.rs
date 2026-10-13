@@ -1262,7 +1262,13 @@ impl RealKernel {
             .map(|(k, v)| {
                 serde_json::from_str::<FsckRebase>(&v)
                     .map_err(|e| {
-                        store_failed(format!("rebase evidence row {k} cannot be read: {e}"))
+                        store_failed(format!(
+                            "rebase evidence row {k} cannot be read: {e}. It is append-only \
+                             evidence of a head rebase: nothing repairs, skips or deletes it, \
+                             and --force does not help (boot reads it before it serves). \
+                             Keep this state directory as it is, and restore one copied \
+                             before the damage (README: \"A damaged rebase evidence row\")"
+                        ))
                     })
                     .map(|r| (k, r))
             })
@@ -3212,6 +3218,15 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("ledger.head.rebase.0000000000000099"), "{msg}");
         assert!(msg.contains("cannot be read"), "{msg}");
+        // The error carries the remedy (re-review N5): there is no repair
+        // command, `--force` does not get past it, and the README says what to do.
+        assert!(msg.contains("--force does not help"), "{msg}");
+        assert!(msg.contains("A damaged rebase evidence row"), "{msg}");
+        // And boot itself refuses, with the same words: the README's claim.
+        let mut k = k;
+        let boot = k.boot().expect_err("boot reads the rows before it serves");
+        assert!(matches!(boot, KernelError::Store(_)), "{boot:?}");
+        assert!(boot.to_string().contains("--force does not help"), "{boot}");
     }
 
     /// An unreadable `stats:` row fails `top` as a Store error instead of

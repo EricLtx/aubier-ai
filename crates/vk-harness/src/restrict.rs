@@ -656,17 +656,6 @@ impl WinstaDesktopGrant {
         self.restore_inner()
     }
 
-    /// Let go of the guard **without** restoring: the grant stays on both
-    /// objects, as a process killed mid-test would leave it, and the lock is
-    /// released. For the strip's own test, which makes such a leftover on
-    /// purpose — `std::mem::forget` would leave the same DACLs but keep
-    /// [`WINSTA_GRANT_LOCK`] held for ever, and the strip that follows takes
-    /// it. Not for any other use.
-    #[doc(hidden)]
-    pub fn abandon_without_restoring(mut self) {
-        self.restored = true;
-    }
-
     fn restore_inner(&mut self) -> Result<()> {
         if self.restored {
             return Ok(());
@@ -728,17 +717,20 @@ pub fn grant_restricted_on_winsta_desktop() -> Result<WinstaDesktopGrant> {
 /// cleanup for a run that ended before its guard could restore (a process
 /// killed mid-test). It matches shape, not origin — an entry of this exact
 /// shape that another restricting-SID sandbox put there (a Chromium-family
-/// browser's, say) is indistinguishable and would go too. A documented tool
-/// for orphaned grants of this shape, run by hand from the ignored test, and
-/// nothing more: no production path calls it. Measured 2026-10-13: a fresh
-/// logon session on this machine carried, before any grant of this module's
-/// had been made in it, `RESTRICTED` entries of the re-merged shapes on both
-/// objects (window station `(0x0b, 0xF000_0000)` and `(0x04, 0x000F_037F)`, desktop
-/// `(0x00, 0x000F_01FF)`) — so the strip would remove those too. Read both
-/// DACLs first and run it only on entries known to be a leftover of this
-/// module's. Returns how many entries each object lost; an entry that differs
-/// in type, flags, mask or trustee stays.
-/// Serialised with the guard by [`WINSTA_GRANT_LOCK`].
+/// browser's, say) is indistinguishable and would go too.
+///
+/// **An operator's hand tool, unsafe by default (Ruling 40).** Measured
+/// 2026-10-13: a fresh logon session on this machine carried, before any
+/// grant of this module's had been made in it, `RESTRICTED` entries of the
+/// re-merged shapes on both objects (window station `(0x0b, 0xF000_0000)` and
+/// `(0x04, 0x000F_037F)`, desktop `(0x00, 0x000F_01FF)`) — so the strip would
+/// remove those too. No production path and no test calls it; read both DACLs
+/// first and run it only on entries known to be a leftover of this module's.
+/// Its predicate is unit-tested below on synthetic entries.
+///
+/// Returns how many entries each object lost; an entry that differs in type,
+/// flags, mask or trustee stays. Serialised with the guard by
+/// [`WINSTA_GRANT_LOCK`].
 pub fn strip_restricted_from_winsta_desktop() -> Result<(usize, usize)> {
     let _held = hold_winsta_grant_lock();
     let (winsta, desktop) = winsta_and_desktop()?;
@@ -1116,5 +1108,87 @@ pub fn current_user_sid() -> Result<String> {
         let sid = text.to_string().context("the token SID is not UTF-16");
         let _ = LocalFree(Some(HLOCAL(text.0 as *mut c_void)));
         sid
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The strip's predicate on synthetic entries: no window station, no
+    //! desktop, nothing of the session touched (Ruling 40).
+    use super::*;
+
+    /// An entry as `DaclCopy::aces` would read it, built in memory: the SID's
+    /// binary form comes from `ConvertStringSidToSidW`, as Windows stores it.
+    fn entry(ace_type: u8, flags: u8, mask: u32, sid: &str) -> AceView {
+        let parsed = Sid::parse(sid).expect("a SID Windows can read");
+        // SAFETY: `parsed` holds a valid SID for the duration of both calls.
+        let sid_bytes = unsafe {
+            let len = GetLengthSid(parsed.psid()) as usize;
+            std::slice::from_raw_parts(parsed.psid().0 as *const u8, len).to_vec()
+        };
+        AceView {
+            ace_type,
+            flags,
+            mask,
+            sid: sid_string(&sid_bytes),
+            sid_bytes,
+        }
+    }
+
+    const ALLOW: u8 = ACCESS_ALLOWED_ACE_TYPE;
+
+    #[test]
+    fn every_stored_shape_of_the_grant_is_the_grant_on_its_own_object() {
+        for (flags, mask) in STORED_GRANT_WINSTA {
+            let e = entry(ALLOW, flags, mask, WORKSPACE_GRANT_SID);
+            assert!(e.names_restricted(), "{e:?}");
+            assert!(e.is_the_grant(WindowObject::WindowStation), "{e:?}");
+        }
+        for (flags, mask) in STORED_GRANT_DESKTOP {
+            let e = entry(ALLOW, flags, mask, WORKSPACE_GRANT_SID);
+            assert!(e.is_the_grant(WindowObject::Desktop), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn an_entry_that_differs_in_type_trustee_mask_or_object_is_not_the_grant() {
+        let ws = WindowObject::WindowStation;
+        let dt = WindowObject::Desktop;
+        // A deny entry of the grant's exact shape.
+        assert!(!entry(1, 0x03, 0x000F_037F, WORKSPACE_GRANT_SID).is_the_grant(ws));
+        // The grant's shape for another trustee: SYSTEM, the logon-time
+        // entries' own shape, and Users.
+        assert!(!entry(ALLOW, 0x04, 0x000F_037F, "S-1-5-18").is_the_grant(ws));
+        assert!(!entry(ALLOW, 0x0b, 0xF000_0000, "S-1-5-18").is_the_grant(ws));
+        assert!(!entry(ALLOW, 0x00, 0x000F_01FF, "S-1-5-32-545").is_the_grant(dt));
+        // RESTRICTED with a mask the grant never stores.
+        assert!(!entry(ALLOW, 0x04, 0x0002_0363, WORKSPACE_GRANT_SID).is_the_grant(ws));
+        assert!(!entry(ALLOW, 0x00, 0x000F_00FF, WORKSPACE_GRANT_SID).is_the_grant(dt));
+        // A window-station shape is not a desktop grant, and back.
+        assert!(!entry(ALLOW, 0x04, 0x000F_037F, WORKSPACE_GRANT_SID).is_the_grant(dt));
+        assert!(!entry(ALLOW, 0x00, 0x000F_01FF, WORKSPACE_GRANT_SID).is_the_grant(ws));
+        // An entry whose SID this reader did not parse names nobody.
+        let unparsed = AceView {
+            ace_type: ALLOW,
+            flags: 0x03,
+            mask: 0x000F_037F,
+            sid: String::from("?"),
+            sid_bytes: Vec::new(),
+        };
+        assert!(!unparsed.names_restricted());
+        assert!(!unparsed.is_the_grant(ws));
+    }
+
+    /// Why the strip is unsafe by default (Ruling 40): the entries a fresh
+    /// logon session on this machine carried before any grant (measured
+    /// 2026-10-13) are, to the predicate, the grant. Shape, not origin.
+    #[test]
+    fn foreign_logon_time_entries_are_indistinguishable_from_the_grant() {
+        assert!(entry(ALLOW, 0x0b, 0xF000_0000, WORKSPACE_GRANT_SID)
+            .is_the_grant(WindowObject::WindowStation));
+        assert!(entry(ALLOW, 0x04, 0x000F_037F, WORKSPACE_GRANT_SID)
+            .is_the_grant(WindowObject::WindowStation));
+        assert!(entry(ALLOW, 0x00, 0x000F_01FF, WORKSPACE_GRANT_SID)
+            .is_the_grant(WindowObject::Desktop));
     }
 }
