@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LivenessRenewed",
+  "description": "Payload of the `liveness.renewed` ledger event (founder decision\n2026-10-13): who renewed which business's lease, until when, and what the\nlease said before. The ledger keeps this record's canonical hash, as for\nevery kind; the kernel and the stub build it here so both agree.",
+  "type": "object",
+  "properties": {
+    "business": {
+      "type": "string"
+    },
+    "device_id": {
+      "description": "The device that proved presence.",
+      "type": "string"
+    },
+    "previous_until_ms": {
+      "description": "The expiry the lease had before this renewal; `None` the first time.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "scope": {
+      "description": "The level of automation the lease bounds: only `\"automatic\"` today.",
+      "type": "string"
+    },
+    "until_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "business",
+    "device_id",
+    "until_ms",
+    "scope"
+  ]
+}

@@ -9,7 +9,9 @@ use vk_contracts::locks::{Lease, LockHome, LockTable};
 use vk_contracts::module::{GateKind, GateVerdict, ModuleManifest};
 use vk_contracts::principal::{Approval, ApprovalKind, Challenge, DeviceRegistry};
 use vk_contracts::register::{Register, RegisterId};
-use vk_contracts::stop::{LivenessLease, ResumeEvent, StopEvent, StopSet};
+use vk_contracts::stop::{
+    LivenessLease, LivenessRenewed, ResumeEvent, StopEvent, StopSet, LIVENESS_SCOPE_AUTOMATIC,
+};
 use vk_contracts::syscalls::{Ctx, InferOutcome, Kernel, KernelError};
 use vk_contracts::testing::KernelTestHooks;
 
@@ -335,6 +337,20 @@ impl KernelTestHooks for StubKernel {
         self.devices.register(device_id.into(), vk);
     }
     fn renew_liveness(&mut self, business: &str, device_id: &str, expires_at_ms: u64) {
+        let previous = self.liveness.get(business).map(|l| l.expires_at_ms);
+        // The hook takes no clock, so the wall time is 0 and the HLC's logical
+        // counter orders the event: deterministic, which is what the stub is for.
+        self.log(
+            "liveness.renewed",
+            0,
+            &LivenessRenewed {
+                business: business.into(),
+                device_id: device_id.into(),
+                until_ms: expires_at_ms,
+                previous_until_ms: previous,
+                scope: LIVENESS_SCOPE_AUTOMATIC.into(),
+            },
+        );
         self.liveness.insert(
             business.into(),
             LivenessLease {
@@ -553,6 +569,29 @@ mod tests {
             Err(KernelError::I1(_))
         ));
         assert!(k.stop(&human_ctx(1), "business:acme").is_ok());
+    }
+
+    /// The stub appends the same `liveness.renewed` record the real kernel
+    /// does, so the property tests agree.
+    #[test]
+    fn a_liveness_renewal_appends_one_event_with_the_previous_expiry() {
+        use vk_contracts::stop::LivenessRenewed;
+        let mut k = StubKernel::new("n1");
+        k.renew_liveness("acme", "phone-1", 100);
+        k.renew_liveness("acme", "phone-2", 200);
+        let events = k.ledger().events();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.kind == "liveness.renewed"));
+        assert_eq!(
+            events[1].payload_hash,
+            vk_contracts::hash_canonical(&LivenessRenewed {
+                business: "acme".into(),
+                device_id: "phone-2".into(),
+                until_ms: 200,
+                previous_until_ms: Some(100),
+                scope: "automatic".into(),
+            })
+        );
     }
 
     #[test]

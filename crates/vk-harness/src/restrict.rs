@@ -85,10 +85,10 @@
 //! those namespaces is a **session/machine-global** change, and the alternative
 //! that runs a process while confining it — a LowBox/AppContainer token — is a
 //! **different mechanism** from the spike's `CreateRestrictedToken`. Which of
-//! the two to take is a founder decision (Task 10 reported it as
-//! `NEEDS_CONTEXT`); until then, restricted-token launch stays the open TCB
-//! item and the harness runs under the Job Object and Claude Code's own fence,
-//! as Task 4 shipped.
+//! the two to take was a founder decision, taken 2026-10-13 as the
+//! *execution context contract* in `contracts/tcb.md`: this module is kept as
+//! reference and is not wired into the launch, and the harness runs under the
+//! Job Object and Claude Code's own fence, as Task 4 shipped.
 //!
 //! Every `unsafe` block here carries the reason it is sound.
 #![cfg(windows)]

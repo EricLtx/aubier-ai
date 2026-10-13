@@ -12,6 +12,7 @@
 //! file with a passkey.
 mod man;
 mod render;
+mod until;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -48,6 +49,21 @@ struct Cli {
     endpoint: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum LivenessCmd {
+    /// Renew a business's liveness lease. Human: signed with this node's
+    /// device key. The renewal is on the ledger as `liveness.renewed`.
+    Renew {
+        /// The business whose automatic runs the lease allows.
+        #[arg(long)]
+        business: String,
+        /// Until when: a time from now (`+30d`, `+12h`, `+90m`) or an RFC 3339
+        /// timestamp. At most thirty days ahead.
+        #[arg(long, default_value = until::DEFAULT_UNTIL)]
+        until: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -99,6 +115,11 @@ enum Cmd {
     },
     /// Lift a STOP by its id. Human.
     Resume { stop_id: String },
+    /// The liveness lease: how long automation may run unattended.
+    Liveness {
+        #[command(subcommand)]
+        what: LivenessCmd,
+    },
     /// Approve a task's latest artefact. Human: signed with this node's
     /// device key, or — with --passkey — with a passkey in the browser.
     Approve {
@@ -833,6 +854,25 @@ async fn call(cli: &Cli) -> Result<()> {
                 render::stopped,
             )
         }
+        Cmd::Liveness {
+            what: LivenessCmd::Renew { business, until },
+        } => {
+            // The lease is a human's vouching, bounded in time (I4): signed
+            // with this node's device key like `stop` and `approve`, which
+            // refuses with the remedy when this account has no enrolled key.
+            let ttl_ms = until::ttl_ms(until, now_ms())?;
+            let proof = presence(&c).await?;
+            show(
+                cli,
+                c.call(
+                    "liveness.renew",
+                    json!({ "business": business, "ttl_ms": ttl_ms }),
+                    Some(proof),
+                )
+                .await?,
+                render::liveness_renewed,
+            )
+        }
         Cmd::Resume { stop_id } => {
             let proof = presence(&c).await?;
             show(
@@ -1117,6 +1157,13 @@ async fn challenge(c: &Client) -> Result<String> {
         &c.call("presence.challenge", json!({}), None).await?,
         "nonce",
     )
+}
+
+/// Wall-clock milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Proof that the device key was present for the next request.

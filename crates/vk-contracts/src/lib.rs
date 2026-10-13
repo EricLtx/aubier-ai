@@ -33,6 +33,10 @@ pub fn schema_registry() -> Vec<(&'static str, schemars::Schema)> {
         ("stop_event", schemars::schema_for!(stop::StopEvent)),
         ("resume_event", schemars::schema_for!(stop::ResumeEvent)),
         ("liveness_lease", schemars::schema_for!(stop::LivenessLease)),
+        (
+            "liveness_renewed",
+            schemars::schema_for!(stop::LivenessRenewed),
+        ),
         ("ledger_event", schemars::schema_for!(ledger::LedgerEvent)),
         (
             "blob_envelope",

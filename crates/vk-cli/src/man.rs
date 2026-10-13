@@ -55,6 +55,10 @@ pub const SCHEMAS: &[(&str, &str)] = &[
         include_str!("../../../contracts/schemas/liveness_lease.schema.json"),
     ),
     (
+        "liveness_renewed",
+        include_str!("../../../contracts/schemas/liveness_renewed.schema.json"),
+    ),
+    (
         "module_manifest",
         include_str!("../../../contracts/schemas/module_manifest.schema.json"),
     ),

@@ -934,6 +934,15 @@ pub fn stopped(v: &Value) -> String {
     format!("stopped; resume with: vk resume {}", text(&v["stop_id"]))
 }
 
+pub fn liveness_renewed(v: &Value) -> String {
+    format!(
+        "liveness of {} renewed until {} ms (unix) by {}; on the ledger as liveness.renewed",
+        text(&v["business"]),
+        text(&v["expires_at_ms"]),
+        text(&v["renewed_by_device"])
+    )
+}
+
 pub fn verified(v: &Value) -> String {
     let verdict = if v["ok"] == Value::Bool(true) {
         "verifies"

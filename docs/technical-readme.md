@@ -21,6 +21,7 @@ Plan for this stage: `docs/superpowers/plans/2026-09-22-sp0-contracts-and-kernel
 | `principal`, `challenge`, `approval` | principals, human ceremony, approval records (I1) | §3.6 |
 | `lease` | work-in-progress lease with fence | §3.4 |
 | `stop_event`, `resume_event`, `liveness_lease` | STOP primitive and autonomy liveness (I4) | §3.5 |
+| `liveness_renewed` | payload of the `liveness.renewed` ledger event: who renewed which business's lease, until when, and the expiry it replaced | §3.5 |
 | `ledger_event` | hash-chained ledger event with three stamps | §3.9 |
 | `blob_envelope`, `shred_event` | storage tiering and erasure | §3.9 |
 | `module_manifest`, `validator_manifest`, `gate_verdict` | userland object formats | §4.1, §4.3 |
@@ -64,6 +65,7 @@ table or, with `--json`, as the daemon's own answer.
 | `vk secret set NAME` | the credential store: a secret this node's daemon reads, put in this account's OS keyring without ever being echoed or printed |
 | `vk task submit` / `step` / `show` | processes: a task is the unit of work, its register is its address space |
 | `vk stop [SCOPE]`, `vk resume ID` | signals: a STOP halts a scope until a human lifts it |
+| `vk liveness renew --business ID [--until +30d\|RFC3339]` | the liveness lease (I4): a human opens or extends the window in which automatic runs are allowed (default `+7d`, at most thirty days). Signed with this node's device key like `vk approve` — refused with the remedy when this account has no enrolled key — and recorded on the ledger as one `liveness.renewed` event (`business`, `device_id`, `until_ms`, `previous_until_ms`, `scope: "automatic"`); `vk top` shows the expiry |
 | `vk approve ID [--passkey]` | the human ceremony: an approval of a kernel-minted challenge, signed by this node's device key or by a passkey in the browser (invariant I1). **The trust model:** the node's device key sits in this account's OS keyring, so every process running as this user can sign with it — every same-user process counts as "the human" for as long as the node key is enrolled. A passkey (Windows Hello, a phone) adds a **second** human key; it does not retire the first, and nothing revokes the node key yet — the revocation gap is stated in `contracts/tcb.md` (SP1a's stand-in, Rulings 17/20) |
 | `vk passkey enroll [--open]`, `vk passkey ls` | the human's own device: a passkey (Windows Hello, a phone) enrolled through the browser |
 | `vk dmesg -n N` | the kernel ring buffer: the tail of the hash-chained ledger |

@@ -29,8 +29,8 @@
 //! `--setting-sources ""` keeps the user's own settings out of the session,
 //! `--strict-mcp-config` keeps every MCP server but `vk` out. What this is
 //! not: OS-level isolation — a helper process the model cannot launch would
-//! not be bound by it. That arrives with the restricted token (plan, Task 10
-//! group G); `contracts/tcb.md` says so.
+//! not be bound by it. No OS-level isolation of a deliberate step is claimed;
+//! `contracts/tcb.md` records the execution context contract that bounds it.
 //!
 //! **The kernel drives this with its lock released.** The launched harness calls
 //! back over MCP (`harness.read_register`, `harness.attach_artefact`, …) while

@@ -34,6 +34,25 @@ impl LivenessLease {
     }
 }
 
+/// Payload of the `liveness.renewed` ledger event (founder decision
+/// 2026-10-13): who renewed which business's lease, until when, and what the
+/// lease said before. The ledger keeps this record's canonical hash, as for
+/// every kind; the kernel and the stub build it here so both agree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LivenessRenewed {
+    pub business: String,
+    /// The device that proved presence.
+    pub device_id: String,
+    pub until_ms: u64,
+    /// The expiry the lease had before this renewal; `None` the first time.
+    pub previous_until_ms: Option<u64>,
+    /// The level of automation the lease bounds: only `"automatic"` today.
+    pub scope: String,
+}
+
+/// The only scope a lease has today.
+pub const LIVENESS_SCOPE_AUTOMATIC: &str = "automatic";
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StopError {
     #[error("STOP and RESUME require a human principal")]

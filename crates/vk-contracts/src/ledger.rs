@@ -279,6 +279,10 @@ pub const ALLOWED_KINDS: &[&str] = &[
     // network activity by kind alone; `kind` stays a free string on the wire, so
     // this changes no schema, exactly as `boot.forced` did.
     "harness.connections",
+    // A human renewed a business's liveness lease (founder decision
+    // 2026-10-13): who, until when, and the expiry it replaced. The payload is
+    // `stop::LivenessRenewed`; a free string on the wire, like the rest.
+    "liveness.renewed",
     "shred",
 ];
 
@@ -420,5 +424,13 @@ mod tests {
     #[test]
     fn harness_connections_is_an_allowed_kind() {
         assert!(is_allowed_kind("harness.connections"));
+    }
+
+    /// Founder decision 2026-10-13: renewing the liveness lease is a human act
+    /// that lands on the record, as its own kind.
+    #[test]
+    fn liveness_renewed_is_an_allowed_kind() {
+        assert!(is_allowed_kind("liveness.renewed"));
+        assert!(!is_allowed_kind("liveness.renew"));
     }
 }
