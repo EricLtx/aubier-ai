@@ -854,6 +854,91 @@ fn fake_claude(dir: &std::path::Path) -> PathBuf {
     bin
 }
 
+/// Final review I-2: `vk` never mints a node key as a side effect of signing.
+/// A shell whose account has no key for this node — the interactive user
+/// beside a Windows service, whose key is the service account's — is refused
+/// before anything is signed, told what to do, and left with no key.
+#[test]
+fn vk_does_not_mint_a_device_key_it_was_never_enrolled_with() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    // The daemon enrolled `node.key`; this shell's account has none at all.
+    let absent = dir.path().join("absent.key");
+    let sh = Shell {
+        endpoint,
+        node_key: absent.clone(),
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    for verb in [
+        vec!["approve", "task-none"],
+        vec!["stop"],
+        vec!["resume", "stop-none"],
+    ] {
+        let out = sh.run(&verb);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "vk {verb:?} must be refused: {err}");
+        assert!(
+            err.contains("vk does not create one"),
+            "vk {verb:?} names the remedy: {err}"
+        );
+        assert!(
+            !absent.exists(),
+            "vk {verb:?} minted a key: the file is there"
+        );
+    }
+}
+
+/// The other half of I-2: a key this account does have, for a node that
+/// never enrolled it, is refused by `vk` with the remedy rather than signed
+/// with and refused by the daemon with none.
+#[test]
+fn vk_refuses_to_sign_with_a_key_the_node_never_enrolled() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    // A daemon that enrols nothing (no `--auto-enroll-node`).
+    let mut cmd = Command::new(vkd_exe());
+    cmd.arg("--state-dir")
+        .arg(dir.path())
+        .args(["--endpoint", &endpoint])
+        .arg("--master-key-file")
+        .arg(dir.path().join("master.key"))
+        .args(["--web-port", "0"]);
+    let _daemon = Daemon(
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    // A well-formed key of this account's own (32 zero bytes), never enrolled.
+    let key = dir.path().join("mine.key");
+    std::fs::write(&key, format!("{}=", "A".repeat(43))).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let before = std::fs::read(&key).unwrap();
+    let sh = Shell {
+        endpoint,
+        node_key: key.clone(),
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let out = sh.run(&["stop"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("is not enrolled on this node"), "{err}");
+    assert_eq!(std::fs::read(&key).unwrap(), before, "the key is untouched");
+}
+
 /// How `--bin` names the stand-in. On Windows the scratch directory is under
 /// `%TEMP%`, inside the user profile, where the daemon refuses a binary a
 /// request names by path (final review I-1): so there the stand-in is named

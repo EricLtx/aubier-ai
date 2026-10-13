@@ -522,7 +522,8 @@ copy "$env:CARGO_TARGET_DIR\release\vk*.exe" "$env:ProgramFiles\VerticalAI\"
 & "$env:ProgramFiles\VerticalAI\vkd-service.exe" install   # --user-sid defaults to you
 & "$env:ProgramFiles\VerticalAI\vkd-service.exe" start
 
-# from an ordinary shell, from then on -- nothing to configure
+# from an ordinary shell, from then on -- nothing to configure for the read
+# verbs; the human ones need the key set-up under "Human ceremonies" below
 vk status
 ```
 
@@ -585,8 +586,43 @@ the server's process, because an ordinary account may not open a service's
 process at all. The residual — a pipe whose owner cannot be read — is in
 `contracts/tcb.md`.
 
+#### Human ceremonies under the service
+
+`vk status`, `vk ls` and `vk ledger verify` need nothing. The **human verbs**
+— `vk approve`, `stop`, `resume`, `fsck --rebase-head`, `passkey enroll`, the
+cloud and `--external` mounts — sign a presence proof with the node's device
+key, `node:<node id>`, and that key is the one **the daemon enrolled when it
+started with `--auto-enroll-node`**, read from `--node-key-file` or, without
+it, from the daemon's own account's keyring. Under the service that account is
+`NT SERVICE\vkd`, whose keyring is not yours: a plain `vkd-service install`
+passes neither flag, so the service enrols no node key at all and every human
+verb is refused. `vk` never creates a key to make up for it: an account with
+no key, or with one the node has not enrolled, is refused before anything is
+signed, with a message pointing here.
+
+What the code supports today is one shared key file:
+
+```
+# elevated: the daemon makes the key at its first start and enrols it
+& "$env:ProgramFiles\VerticalAI\vkd-service.exe" install -- `
+    --node-key-file <path> --auto-enroll-node
+
+# your shell, from then on
+$env:VK_NODE_KEY_FILE = "<path>"
+vk stop; vk resume <stop id>; vk approve <task>
+```
+
+The file must be readable by both `NT SERVICE\vkd` (which creates it) and
+you — choose its directory and its ACL accordingly; nothing checks the
+Windows ACL of that file, and anyone who can read it holds the node's human
+key. With that key in place, `vk passkey enroll` enrols a passkey against the
+service's daemon, and `vk approve <task> --passkey` approves with it from
+then on. This path has not been run against a live service in SP1b (`scripts/spike-6a.ps1`
+exercises only the read verbs); `contracts/tcb.md` says which ceremonies work
+under the service.
+
 Two things the DACL does **not** cover. The passkey pages are still served on
-`127.0.0.1:7734`, and loopback has no ACL — what protects them is the
+`127.0.0.1:7734` and `[::1]:7734`, and loopback has no ACL — what protects them is the
 single-use link tokens minted only over the endpoint (`contracts/tcb.md`).
 And the service has no console: its log is `%ProgramData%\VerticalAI\vk\vkd.log`,
 the same `vkd.log` a detached `vk boot` daemon writes.

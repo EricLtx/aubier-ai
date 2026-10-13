@@ -1062,13 +1062,47 @@ fn settled(t: &Value) -> bool {
 /// This node's own device key, which in SP1a is the human's key: from
 /// `$VK_NODE_KEY_FILE` if it names one, else the OS keyring. The daemon says
 /// which node it is, so the key is the one enrolled as `node:<node_id>`.
+///
+/// **Loaded, never minted** (final review I-2). The key is created and
+/// enrolled by the daemon that serves the node — `vk boot`, which starts `vkd
+/// --auto-enroll-node` — and a key this shell made up would be one no node
+/// enrolled: every ceremony signed with it would be refused with nothing
+/// saying why. So an account with no key, or with one the node has not
+/// enrolled, is refused here, before anything is signed, with the remedy.
 async fn node_device(c: &Client) -> Result<NodeDevice> {
     let node_id = field(&c.call("boot.info", json!({}), None).await?, "node_id")?;
-    let source = match std::env::var_os("VK_NODE_KEY_FILE") {
-        Some(path) => KeySource::File(PathBuf::from(path)),
-        None => KeySource::Keyring,
+    let (source, place) = match std::env::var_os("VK_NODE_KEY_FILE") {
+        Some(path) => {
+            let place = format!("the file {}", PathBuf::from(&path).display());
+            (KeySource::File(PathBuf::from(path)), place)
+        }
+        None => (
+            KeySource::Keyring,
+            "this account's keyring (no VK_NODE_KEY_FILE)".to_string(),
+        ),
     };
-    NodeDevice::load_or_create(source, &node_id).context("this node's device key")
+    let device_id = format!("node:{node_id}");
+    let Some(device) = NodeDevice::load(source, &node_id).context("this node's device key")? else {
+        anyhow::bail!(
+            "this account has no device key for node {node_id} in {place}, and vk does not \
+             create one: a key this shell made would be one the node never enrolled. The \
+             daemon that serves the node creates and enrols it — `vk boot` does, for a daemon \
+             you start. Under the Windows service the node's key is the service account's, not \
+             yours: see README, \"Human ceremonies under the service\""
+        );
+    };
+    let enrolled = c.call("ns.ls", json!({ "path": "/devices" }), None).await?;
+    let listed = enrolled["entries"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(device_id.as_str())));
+    anyhow::ensure!(
+        listed,
+        "{device_id} is not enrolled on this node, so nothing signed with the key in {place} \
+         would be accepted. The daemon enrols the node's key when it starts with \
+         --auto-enroll-node (as `vk boot` starts it); under the Windows service, see README, \
+         \"Human ceremonies under the service\""
+    );
+    Ok(device)
 }
 
 /// A nonce this daemon issued: single use, and spent by the request that

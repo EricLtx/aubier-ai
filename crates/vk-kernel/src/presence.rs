@@ -38,15 +38,41 @@ pub struct NodeDevice {
 }
 
 impl NodeDevice {
+    /// Load the node's key, minting and storing one if there is none.
+    ///
+    /// Only the daemon's enrolment path calls this — `vkd --auto-enroll-node`,
+    /// which `vk boot` passes and which enrols what it made in the same breath.
+    /// A client never does (final review I-2): a key minted by the shell that
+    /// signs with it is a key no node ever enrolled, so every ceremony it
+    /// signed would be refused with nothing saying why. Clients use
+    /// [`NodeDevice::load`].
     pub fn load_or_create(source: KeySource, node_id: &str) -> Result<NodeDevice> {
         let seed = match source {
-            KeySource::Keyring => keyring_seed(node_id)?,
-            KeySource::File(path) => file_seed(&path)?,
+            KeySource::Keyring => keyring_seed(node_id, true)?,
+            KeySource::File(path) => file_seed(&path, true)?,
         };
-        Ok(NodeDevice {
+        Ok(NodeDevice::from_seed(
+            node_id,
+            &seed.expect("created when absent"),
+        ))
+    }
+
+    /// Load the node's key if this account has one, and never create it:
+    /// `Ok(None)` when the keyring entry or the file is not there. What `vk`
+    /// signs ceremonies with (final review I-2).
+    pub fn load(source: KeySource, node_id: &str) -> Result<Option<NodeDevice>> {
+        let seed = match source {
+            KeySource::Keyring => keyring_seed(node_id, false)?,
+            KeySource::File(path) => file_seed(&path, false)?,
+        };
+        Ok(seed.map(|s| NodeDevice::from_seed(node_id, &s)))
+    }
+
+    fn from_seed(node_id: &str, seed: &Seed) -> NodeDevice {
+        NodeDevice {
             node_id: node_id.into(),
-            key: SigningKey::from_bytes(&seed),
-        })
+            key: SigningKey::from_bytes(seed),
+        }
     }
 }
 
@@ -62,14 +88,17 @@ impl HumanKey for NodeDevice {
     }
 }
 
-fn keyring_seed(node_id: &str) -> Result<Seed> {
+/// The keyring's seed; when there is none, a fresh one stored there if
+/// `create`, else `None`.
+fn keyring_seed(node_id: &str, create: bool) -> Result<Option<Seed>> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, &format!("node-device:{node_id}"))?;
     match entry.get_password() {
-        Ok(b64) => decode(&Zeroizing::new(b64)),
+        Ok(b64) => decode(&Zeroizing::new(b64)).map(Some),
+        Err(keyring::Error::NoEntry) if !create => Ok(None),
         Err(keyring::Error::NoEntry) => {
             let seed = fresh();
             entry.set_password(&encode(&seed))?;
-            Ok(seed)
+            Ok(Some(seed))
         }
         Err(e) => Err(e.into()),
     }
@@ -78,7 +107,13 @@ fn keyring_seed(node_id: &str) -> Result<Seed> {
 /// Mirrors `vk_store::keys`: an atomic `create_new` so there is no
 /// exists-then-write window, born `0o600` on Unix, and an existing file that
 /// others could read is refused rather than trusted.
-fn file_seed(path: &Path) -> Result<Seed> {
+fn file_seed(path: &Path, create: bool) -> Result<Option<Seed>> {
+    if !create {
+        return match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            _ => read_seed_file(path).map(Some),
+        };
+    }
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -91,22 +126,30 @@ fn file_seed(path: &Path) -> Result<Seed> {
             let seed = fresh();
             file.write_all(encode(&seed).as_bytes())
                 .with_context(|| format!("write {}", path.display()))?;
-            Ok(seed)
+            Ok(Some(seed))
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(path)?.permissions().mode();
-                if mode & 0o077 != 0 {
-                    anyhow::bail!("{} is readable by others; refusing", path.display());
-                }
-            }
-            let text = Zeroizing::new(std::fs::read_to_string(path)?);
-            decode(text.trim())
+            read_seed_file(path).map(Some)
         }
         Err(err) => Err(err).with_context(|| format!("create {}", path.display())),
     }
+}
+
+/// An existing key file: refused when others could read it (Unix), else
+/// decoded.
+fn read_seed_file(path: &Path) -> Result<Seed> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            anyhow::bail!("{} is readable by others; refusing", path.display());
+        }
+    }
+    let text = Zeroizing::new(
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?,
+    );
+    decode(text.trim())
 }
 
 fn fresh() -> Seed {
@@ -179,6 +222,23 @@ mod tests {
         assert!(reg
             .verify(&b.device_id(), b"hello", &b.sign(b"hello"))
             .is_ok());
+    }
+
+    /// Final review I-2: `load` never mints a key — an absent file stays
+    /// absent — and reads back the one `load_or_create` made.
+    #[test]
+    fn load_never_creates_a_key() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("node.key");
+        assert!(NodeDevice::load(KeySource::File(path.clone()), "n1")
+            .unwrap()
+            .is_none());
+        assert!(!path.exists(), "nothing was written");
+        let made = NodeDevice::load_or_create(KeySource::File(path.clone()), "n1").unwrap();
+        let loaded = NodeDevice::load(KeySource::File(path), "n1")
+            .unwrap()
+            .expect("the key that is there");
+        assert_eq!(made.verifying_key_bytes(), loaded.verifying_key_bytes());
     }
 
     #[test]
