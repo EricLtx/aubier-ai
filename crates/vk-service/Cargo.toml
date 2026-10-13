@@ -39,3 +39,8 @@ sha1 = "0.10"
 # that answers the SCM inside `run`. 0.8.1 was the newest line when spike 6a
 # (2026-09-25) read its API; its own Win32 bindings are `windows-sys` 0.61.
 windows-service = "0.8"
+
+[dev-dependencies]
+# The `install --claude-bin` test makes its own synced-folder and profile
+# paths instead of assuming where the runner keeps its files.
+tempfile = "3"

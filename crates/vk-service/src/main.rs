@@ -1047,10 +1047,37 @@ mod tests {
             &["--", "--claude-bin", here.to_str().unwrap()],
             "install --claude-bin",
         );
-        // On Windows the test binary is under the profile (the target
-        // directory is), which is what the service may not run.
+        // The refusals by location, on paths this test makes itself rather
+        // than on where the runner happens to keep its target directory or
+        // its temp directory (CI run 38429982921: the Windows runner builds
+        // on `D:\a\`, outside every profile; the SP1b Ruling 35 lesson).
+        // A synced folder, on every OS:
+        let scratch = tempfile::tempdir().unwrap();
+        let synced = scratch.path().join("OneDrive");
+        std::fs::create_dir(&synced).unwrap();
+        let synced_bin = synced.join("claude.exe");
+        std::fs::write(&synced_bin, b"").unwrap();
+        refused(
+            &["--claude-bin", synced_bin.to_str().unwrap()],
+            "synced folder",
+        );
+        // And on Windows a file under `%USERPROFILE%`, by construction.
         #[cfg(windows)]
-        refused(&["--claude-bin", here.to_str().unwrap()], "user profile");
+        {
+            let profile = std::env::var("USERPROFILE").expect("USERPROFILE");
+            let home = tempfile::Builder::new()
+                .prefix(".vk-test-claude-bin-")
+                .tempdir_in(&profile)
+                .unwrap();
+            let mine = home.path().join("claude.exe");
+            std::fs::write(&mine, b"").unwrap();
+            assert!(
+                vk_store::paths::under_a_user_profile(&mine),
+                "the case this is for: {}",
+                mine.display()
+            );
+            refused(&["--claude-bin", mine.to_str().unwrap()], "user profile");
+        }
 
         let clean = if cfg!(windows) {
             std::path::PathBuf::from(
