@@ -94,14 +94,12 @@ struct Shell {
 
 impl Shell {
     fn run(&self, args: &[&str]) -> Output {
-        let mut c = Command::new(vk_exe());
-        c.args(args)
+        Command::new(vk_exe())
+            .args(args)
             .env("VK_ENDPOINT", &self.endpoint)
-            .env("VK_NODE_KEY_FILE", &self.node_key);
-        if let Some(dir) = self.node_key.parent() {
-            test_dir_first_on_path(&mut c, dir);
-        }
-        c.output().expect("run vk")
+            .env("VK_NODE_KEY_FILE", &self.node_key)
+            .output()
+            .expect("run vk")
     }
 
     /// The same, with something on stdin: `vk fsck --rebase-head` reads the
@@ -984,23 +982,12 @@ fn vk_passkey_ls_reports_an_unreadable_passkey_as_an_error() {
     assert!(text.contains("UNREADABLE"), "{text}");
 }
 
-/// How `--bin` names the stand-in. On Windows the scratch directory is under
-/// `%TEMP%`, inside the user profile, where the daemon refuses a binary a
-/// request names by path (final review I-1): so there the stand-in is named
-/// bare and found on the daemon's own `PATH`, which [`vkd_cmd`] starts with
-/// the test's directory. Elsewhere it is named by its absolute, resolved path,
-/// the form the refusals let through.
+/// How `--bin` names the stand-in: by its absolute path, which an
+/// interactive daemon accepts even under the user profile — where `%TEMP%`
+/// is on Windows (Ruling 43; the service refuses it, see
+/// `vk-ipc/tests/mount_config.rs`).
 fn bin_arg(fake: &std::path::Path) -> String {
-    if cfg!(windows) {
-        fake.file_name()
-            .expect("the stand-in has a file name")
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        // By its real path: the daemon refuses a binary reached through a
-        // symlink, and macOS's temp directory is under `/var`, which is one.
-        path_of(&std::fs::canonicalize(fake).expect("the stand-in is there"))
-    }
+    path_of(fake)
 }
 
 /// `vk mount claude-code` is the first verb that mounts a *real* adapter: two
@@ -1890,22 +1877,7 @@ fn vkd_cmd(dir: &std::path::Path, endpoint: &str, extra: &[&str]) -> Command {
         // parallel, and beside whatever daemon the machine's owner has up.
         .args(["--web-port", "0"])
         .args(extra);
-    test_dir_first_on_path(&mut c, dir);
     c
-}
-
-/// The test's directory first on a daemon's `PATH`, on Windows, where the
-/// Claude Code stand-in is found by its bare name (see `bin_arg`). Applied to
-/// `vkd` directly and to every `vk` a [`Shell`] runs, because `vk boot`
-/// starts its daemon with the shell's own environment.
-fn test_dir_first_on_path(c: &mut Command, dir: &std::path::Path) {
-    if cfg!(windows) {
-        let mut dirs = vec![dir.to_path_buf()];
-        dirs.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
-        c.env("PATH", std::env::join_paths(dirs).expect("a PATH"));
-    }
 }
 
 /// Wait for the daemon on this shell's endpoint to be there, or to be gone.

@@ -370,6 +370,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
             state_dir.clone(),
             anthropic_keys.clone(),
             anthropic_base_url.clone(),
+            a.as_service,
         ),
     )?;
     // The endpoint before the record. Binding is the other way a start can be
@@ -538,6 +539,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         web: Some(Arc::new(LinkMinter(web.links))),
         anthropic_keys,
         anthropic_base_url,
+        as_service: a.as_service,
     };
     vk_ipc::server::serve_on(kernel, listener, config).await
 }

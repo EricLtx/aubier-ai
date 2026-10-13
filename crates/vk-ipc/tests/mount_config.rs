@@ -65,7 +65,14 @@ struct Node {
 }
 
 impl Node {
+    /// An interactive daemon, as every Ollama test here wants.
     async fn start() -> Node {
+        Node::start_as(false).await
+    }
+
+    /// A daemon in either mode: `as_service` is the `ServerConfig` field
+    /// `vkd --as-service` sets (Ruling 43), not a request field.
+    async fn start_as(as_service: bool) -> Node {
         no_docker();
         let d = tempfile::tempdir().unwrap();
         let k = kernel(d.path());
@@ -77,7 +84,12 @@ impl Node {
                 .enroll_device("laptop", key.verifying_key_bytes());
         }
         let endpoint = vk_ipc::transport::test_endpoint();
-        let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+        let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+        let config = vk_ipc::server::ServerConfig {
+            as_service,
+            ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+        };
+        let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let c = Client::connect(&endpoint).await.unwrap();
         Node {
@@ -134,179 +146,246 @@ fn bad_request(err: &CallError, needle: &str, what: &str) {
     );
 }
 
-/// Final review I-1 (Ruling 41, minimum form): the Claude Code binary a
-/// request names is held to the rule `vkd-service install` applies to its own
-/// `ImagePath` — absolute, there, not in a synced folder, not under a user
-/// profile — and refused at mount, over the pipe, before it is ever run.
-#[tokio::test]
-async fn claude_code_refuses_a_binary_the_daemon_should_not_run() {
-    let n = Node::start().await;
-    let scratch_dir = tempfile::tempdir().unwrap();
-    vk_contracts::testing::guard_state_dir(scratch_dir.path());
-    let scratch = Real::of(scratch_dir.path());
-
-    let relative = n
-        .refused("claude-code", json!({"binary": "bin/claude"}), true)
-        .await;
-    bad_request(&relative, "relative", "a relative path");
-
-    let missing = scratch.path().join("nowhere").join("claude");
-    let missing = n
-        .refused("claude-code", json!({"binary": missing}), true)
-        .await;
-    bad_request(&missing, "does not exist", "a path with nothing there");
-
-    // A file that is there, in a synced folder. Not executable, so even a
-    // daemon that ran it would only fail.
-    let synced = scratch.path().join("OneDrive");
-    std::fs::create_dir(&synced).unwrap();
-    let synced = synced.join("claude.txt");
-    std::fs::write(&synced, "not a program").unwrap();
-    let synced = n
-        .refused("claude-code", json!({"binary": synced}), true)
-        .await;
-    bad_request(&synced, "synced folder", "a OneDrive path");
-
-    // On Windows the scratch directory is under `%TEMP%`, which is under the
-    // profile: the case the service would run as `NT SERVICE\vkd`.
-    if cfg!(windows) && vk_store::paths::under_a_user_profile(scratch.path()) {
-        let mine = scratch.path().join("claude.txt");
-        std::fs::write(&mine, "not a program").unwrap();
-        let mine = n
-            .refused("claude-code", json!({"binary": mine}), true)
-            .await;
-        bad_request(&mine, "user profile", "a file under the profile");
-    }
-
-    // Ruling 42: the claude-code config is a closed shape. `binary` stays a
-    // field this wave, through the refusals above.
-    let unknown = n
-        .refused(
-            "claude-code",
-            json!({"binary": "bin/claude", "endpoint": "x"}),
-            true,
-        )
-        .await;
-    bad_request(&unknown, "unknown field", "a field the shape does not have");
-    n.stop().await;
-}
-
-/// A directory spelled with no link in it: on macOS the temp directory is
-/// under `/var`, itself a symlink to `/private/var`, which the binary rule
-/// refuses on its own; the tests about other refusals start from the real
-/// path. On Windows the temp path is used as it is.
-struct Real(std::path::PathBuf);
-
-impl Real {
-    fn of(p: &std::path::Path) -> Real {
-        Real(if cfg!(unix) {
-            std::fs::canonicalize(p).unwrap()
-        } else {
-            p.to_path_buf()
-        })
-    }
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-/// I-1 addendum: the refusals run on the *resolved* path. A `..` component,
-/// and a symlink or junction anywhere on the way, are refused outright — a
-/// link inside an innocent directory that points under a user profile would
-/// otherwise pass a check made on the spelling.
-#[tokio::test]
-async fn claude_code_refuses_a_binary_reached_through_a_link_or_dot_dot() {
-    let n = Node::start().await;
-    let scratch_dir = tempfile::tempdir().unwrap();
-    vk_contracts::testing::guard_state_dir(scratch_dir.path());
-    let scratch = Real::of(scratch_dir.path());
-    let target = scratch.path().join("target");
-    std::fs::create_dir(&target).unwrap();
-    std::fs::write(target.join("claude.txt"), "not a program").unwrap();
-
-    let dotted = scratch
-        .path()
-        .join("target")
-        .join("..")
-        .join("target")
-        .join("claude.txt");
-    let err = n
-        .refused("claude-code", json!({"binary": dotted}), true)
-        .await;
-    bad_request(&err, "`..` component", "a path with a .. component");
-
-    let link = scratch.path().join("link");
+/// A stand-in `claude` in `dir` that answers `--version` and nothing else:
+/// enough for a mount to probe it. `.cmd` on Windows, a script elsewhere.
+fn stand_in(dir: &std::path::Path) -> std::path::PathBuf {
+    let bin = dir.join(if cfg!(windows) {
+        "fake-claude.cmd"
+    } else {
+        "fake-claude.sh"
+    });
+    let script = if cfg!(windows) {
+        "@echo off\r\nif \"%~1\"==\"--version\" echo 0.0.0-test\r\nexit /b 0\r\n"
+    } else {
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.0.0-test; fi\n"
+    };
+    std::fs::write(&bin, script).unwrap();
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&target, &link).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    bin
+}
+
+/// The path the daemon stores for `p`: canonical, with Windows' verbatim
+/// prefix removed — computed here independently of the daemon's own helper.
+fn resolved(p: &std::path::Path) -> String {
+    let c = std::fs::canonicalize(p).unwrap();
+    let s = c.to_string_lossy().into_owned();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) => rest.to_string(),
+        None => s,
+    }
+}
+
+/// A directory link at `link` to `target`: a symlink on Unix, a junction on
+/// Windows (no privilege needed, unlike a symlink there).
+fn dir_link(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
     #[cfg(windows)]
     {
-        // A directory junction: no privilege needed, unlike a symlink.
         let made = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(&target)
+            .arg(link)
+            .arg(target)
             .output()
             .unwrap();
         assert!(made.status.success(), "mklink /J: {made:?}");
     }
-    let err = n
-        .refused(
-            "claude-code",
-            json!({"binary": link.join("claude.txt")}),
-            true,
-        )
-        .await;
-    bad_request(
-        &err,
-        "symlink or junction",
-        "a binary reached through a link",
-    );
-    // The junction goes before the directory is removed, so the cleanup
-    // cannot follow it.
+}
+
+/// Remove a directory link without following it (before the tempdir goes).
+fn remove_dir_link(link: &std::path::Path) {
+    #[cfg(unix)]
+    std::fs::remove_file(link).unwrap();
     #[cfg(windows)]
-    std::fs::remove_dir(&link).unwrap();
+    std::fs::remove_dir(link).unwrap();
+}
+
+impl Node {
+    /// Mount a Claude Code arch on `binary` with a proof, and say what the
+    /// spec recorded as the binary.
+    async fn mounted_binary(&self, binary: &std::path::Path) -> Value {
+        let proof = self.proof().await;
+        // A model per directory: the arch id hashes the model and the
+        // version, so two stand-ins under one model would be one arch.
+        let model = binary
+            .parent()
+            .and_then(|d| d.file_name())
+            .map_or("m".into(), |n| n.to_string_lossy().into_owned());
+        let mounted = self
+            .c
+            .call(
+                "arch.mount",
+                json!({"kind": "claude-code", "config": {"binary": binary, "model": model}}),
+                Some(proof),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{} must be accepted: {e:#}", binary.display()));
+        let shown = self
+            .c
+            .call("arch.show", json!({"arch_id": mounted["arch_id"]}), None)
+            .await
+            .unwrap();
+        shown["config"]["binary"].clone()
+    }
+}
+
+/// Final review I-1, Ruling 43: the refusals every daemon makes — a relative
+/// path, a path with nothing there, a `..` component, a field the closed
+/// shape does not have — over the pipe, in both daemon modes.
+#[tokio::test]
+async fn claude_code_refuses_relative_missing_and_dot_dot_in_every_mode() {
+    for as_service in [false, true] {
+        let n = Node::start_as(as_service).await;
+        let scratch = tempfile::tempdir().unwrap();
+        vk_contracts::testing::guard_state_dir(scratch.path());
+        let bin = stand_in(scratch.path());
+        let mode = if as_service { "service" } else { "interactive" };
+
+        let err = n
+            .refused("claude-code", json!({"binary": "bin/claude"}), true)
+            .await;
+        bad_request(&err, "relative", &format!("{mode}: a relative path"));
+
+        let missing = scratch.path().join("nowhere").join("claude");
+        let err = n
+            .refused("claude-code", json!({"binary": missing}), true)
+            .await;
+        bad_request(&err, "does not exist", &format!("{mode}: nothing there"));
+
+        let dotted = scratch
+            .path()
+            .join("x")
+            .join("..")
+            .join(bin.file_name().unwrap());
+        let err = n
+            .refused("claude-code", json!({"binary": dotted}), true)
+            .await;
+        bad_request(&err, "`..` component", &format!("{mode}: a .. path"));
+
+        // A link loop resolves to nowhere (Unix: a Windows symlink needs a
+        // privilege the tests do not have).
+        #[cfg(unix)]
+        {
+            let (a, b) = (scratch.path().join("loop-a"), scratch.path().join("loop-b"));
+            std::os::unix::fs::symlink(&b, &a).unwrap();
+            std::os::unix::fs::symlink(&a, &b).unwrap();
+            let err = n
+                .refused("claude-code", json!({"binary": a.join("claude")}), true)
+                .await;
+            assert_eq!(err.code, vk_ipc::E_BAD_PARAMS, "{mode}: a loop: {err:?}");
+        }
+
+        // Ruling 42: the claude-code config is a closed shape.
+        let err = n
+            .refused(
+                "claude-code",
+                json!({"binary": "bin/claude", "endpoint": "x"}),
+                true,
+            )
+            .await;
+        bad_request(&err, "unknown field", &format!("{mode}: an unknown field"));
+        n.stop().await;
+    }
+}
+
+/// Ruling 43: an interactive daemon is the user's own process and may run the
+/// user's own binary — in a synced folder, and on Windows under the profile
+/// (`%TEMP%` is there) — and what it stores is the resolved path.
+#[tokio::test]
+async fn an_interactive_daemon_accepts_the_users_own_binary() {
+    let n = Node::start_as(false).await;
+    let scratch = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(scratch.path());
+
+    let mine = stand_in(scratch.path());
+    if cfg!(windows) {
+        assert!(
+            vk_store::paths::under_a_user_profile(&mine),
+            "the Windows case this test is for: an absolute path under the profile"
+        );
+    }
+    assert_eq!(n.mounted_binary(&mine).await, json!(resolved(&mine)));
+
+    let synced = scratch.path().join("OneDrive");
+    std::fs::create_dir(&synced).unwrap();
+    let synced = stand_in(&synced);
+    assert_eq!(n.mounted_binary(&synced).await, json!(resolved(&synced)));
     n.stop().await;
 }
 
-/// I-1 addendum: what is persisted and run is the resolved path, not the
-/// request's spelling. Unix only: an accepted path on Windows must be outside
-/// every user profile, and the test's scratch directory is inside one.
-#[cfg(unix)]
+/// Ruling 43: under the service, a binary that resolves into a synced folder
+/// or a user profile is refused — checked on the resolved path, so a link
+/// whose own spelling is clean does not get one through.
 #[tokio::test]
-async fn claude_code_persists_the_resolved_binary_path() {
-    use std::os::unix::fs::PermissionsExt;
-    let n = Node::start().await;
-    let scratch_dir = tempfile::tempdir().unwrap();
-    vk_contracts::testing::guard_state_dir(scratch_dir.path());
-    let scratch = Real::of(scratch_dir.path());
-    let fake = scratch.path().join("fake-claude.sh");
-    std::fs::write(
-        &fake,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.0.0-test; fi\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
-    // The same file, spelled with a doubled separator.
-    let spelled = format!("{}//fake-claude.sh", scratch.path().display());
-    let proof = n.proof().await;
-    let mounted =
-        n.c.call(
-            "arch.mount",
-            json!({"kind": "claude-code", "config": {"binary": spelled, "model": "m"}}),
-            Some(proof),
-        )
-        .await
-        .unwrap();
-    let shown =
-        n.c.call("arch.show", json!({"arch_id": mounted["arch_id"]}), None)
-            .await
-            .unwrap();
-    assert_eq!(
-        shown["config"]["binary"],
-        json!(std::fs::canonicalize(&fake).unwrap()),
-        "{shown}"
-    );
+async fn the_service_refuses_a_binary_that_resolves_where_the_user_can_replace_it() {
+    let n = Node::start_as(true).await;
+    let scratch = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(scratch.path());
+
+    let synced = scratch.path().join("OneDrive");
+    std::fs::create_dir(&synced).unwrap();
+    let synced_bin = stand_in(&synced);
+    let err = n
+        .refused("claude-code", json!({"binary": synced_bin}), true)
+        .await;
+    bad_request(&err, "synced folder", "a OneDrive path");
+
+    // A link spelled without any sync marker, whose target is in OneDrive.
+    let link = scratch.path().join("tools");
+    dir_link(&synced, &link);
+    let through = link.join(synced_bin.file_name().unwrap());
+    let err = n
+        .refused("claude-code", json!({"binary": through}), true)
+        .await;
+    bad_request(&err, "synced folder", "a link whose target is in OneDrive");
+    remove_dir_link(&link);
+
+    // On Windows the scratch directory is under `%TEMP%`, inside the profile:
+    // what the service would run as `NT SERVICE\vkd`.
+    if cfg!(windows) {
+        let mine = stand_in(scratch.path());
+        let err = n
+            .refused("claude-code", json!({"binary": mine}), true)
+            .await;
+        bad_request(&err, "user profile", "a file under the profile");
+    }
     n.stop().await;
+}
+
+/// Ruling 43: a link is followed, not refused. One whose target is clean is
+/// accepted, and the spec records the target. In the service mode on Unix
+/// (no Windows profile there) as well as interactively; on Windows the
+/// service has no clean target to point at in a test, since every scratch
+/// directory is under the profile.
+#[tokio::test]
+async fn a_link_to_a_clean_target_is_accepted_and_the_target_is_recorded() {
+    let modes: &[bool] = if cfg!(windows) {
+        &[false]
+    } else {
+        &[false, true]
+    };
+    for &as_service in modes {
+        let n = Node::start_as(as_service).await;
+        let scratch = tempfile::tempdir().unwrap();
+        vk_contracts::testing::guard_state_dir(scratch.path());
+        let target = scratch.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        let bin = stand_in(&target);
+        let link = scratch.path().join("link");
+        dir_link(&target, &link);
+        let through = link.join(bin.file_name().unwrap());
+        assert_eq!(
+            n.mounted_binary(&through).await,
+            json!(resolved(&bin)),
+            "as_service = {as_service}"
+        );
+        remove_dir_link(&link);
+        n.stop().await;
+    }
 }
 
 /// Ruling 42 (1): the Ollama config is a closed shape too — a field this

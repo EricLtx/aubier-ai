@@ -85,13 +85,15 @@ vk mount claude-code --draft-model claude-sonnet-5 --judge-model claude-opus-5 \
 ```
 
 `--bin` defaults to `claude`, found on **the daemon's** `PATH`. A path given
-instead is run by the daemon at mount, at every boot and at every call — under
-the Windows service as `NT SERVICE\vkd` — so it must be absolute, must exist,
-must be its real path (no `..`, symlink or junction on the way: the daemon checks and stores what it resolves to), and is
-refused inside a synced folder or under a user profile, the rule
-`vkd-service install` applies to its own binary (`contracts/tcb.md`, Claude
-Code adapter). A `claude` installed in your profile is reached by leaving
-`--bin` at its default with it on the daemon's `PATH`.
+instead is run by the daemon at mount, at every boot and at every call, so it
+must be absolute, have no `..`, and resolve to a file that exists; links are
+followed, and what is checked, stored and run is the path they resolve to.
+Under the Windows service, which runs it as `NT SERVICE\vkd`, that resolved
+path is also refused inside a synced folder or under a user profile — the rule
+`vkd-service install` applies to its own binary — so a service mounts a
+`claude` installed somewhere only administrators may write, or one on the
+service's own `PATH`. A daemon you started yourself may run the `claude` in
+your profile (`contracts/tcb.md`, Claude Code adapter).
 
 It runs on **the founder's own claude.ai subscription**, which is a person's
 and not a product's. Nothing is billed per call, so the manifest's
