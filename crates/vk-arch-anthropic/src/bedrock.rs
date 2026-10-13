@@ -12,12 +12,13 @@
 //! Everything a test can reach is unconditional: [`manifest_for`],
 //! [`converse_input`], [`check_region`] and [`model_id`]. The transport —
 //! [`BedrockAdapter`], the AWS SDK, the runtime — is behind the `bedrock`
-//! cargo feature, which is **on by default** because the measurement allowed
-//! it: 83 extra crates and about a minute on a clean Windows build of this
-//! crate (15 s to 1 m 15 s), well inside the budget that would have made it
-//! default-off. A node that wants neither the SDK nor those 83 crates in its
-//! supply chain builds `--no-default-features`, and `vk mount bedrock` is
-//! then refused by name and says how to get a build that has it.
+//! cargo feature, which is **off by default** (Ruling 30) — not for the build
+//! time, which was measured at 83 extra crates and about a minute on a clean
+//! Windows build of this crate (15 s to 1 m 15 s) and is affordable, but for
+//! the supply chain: those 83 crates do not belong in every node's trusted
+//! base for an arch most nodes never mount. A node that wants the EU arch
+//! builds `--features bedrock`; without it `vk mount bedrock` is refused by
+//! name and says how to get a build that has it.
 //!
 //! ## What is not pinned here
 //!

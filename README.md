@@ -472,7 +472,8 @@ take without taking any of them.
 
 Every Windows binary this repository ships — `vk`, `vkd`, `vk-mcp`,
 `vkd-service` — is signed by the `sign` job in `.github/workflows/ci.yml` (on
-every push) and by the Windows leg of `.github/workflows/release.yml` (on an
+pushes to `master`, on tags and on `workflow_dispatch` — not on branch pushes,
+which `test` covers on three operating systems) and by the Windows leg of `.github/workflows/release.yml` (on an
 `sp*`/`v*` release tag), so that gate item 1 — installing without a
 SmartScreen or Smart App Control prompt — has something to check. Neither
 job fails for a secret that does not exist yet, because the founder has not

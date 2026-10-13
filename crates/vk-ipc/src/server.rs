@@ -1647,8 +1647,8 @@ fn bedrock_adapter(config: &Value) -> anyhow::Result<Box<dyn ArchAdapter>> {
     // daemon was built.
     let _: BedrockMountConfig = mount_config("bedrock", config)?;
     anyhow::bail!(
-        "this build has no Bedrock support: it was built `--no-default-features`, which \
-         leaves out the `bedrock` cargo feature and the AWS SDK behind it. Rebuild with \
+        "this build has no Bedrock support: the `bedrock` cargo feature, and the AWS SDK \
+         behind it, is off by default (Ruling 30). Rebuild with \
          `--features bedrock`, or use `vk mount anthropic`, which needs no AWS SDK"
     )
 }
