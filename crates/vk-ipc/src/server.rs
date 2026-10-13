@@ -571,18 +571,31 @@ fn dispatch(
     // the slow work must not hold it; the `Ctx` it produces is what the mount
     // arm uses, so the proof is verified exactly once and the nonce — already
     // spent above — cannot be shown again.
-    let cloud_ctx = if req.method == "arch.mount"
-        && is_cloud_kind(req.params["kind"].as_str().unwrap_or_default())
-    {
+    let mount_kind = req.params["kind"].as_str().unwrap_or_default();
+    // An Ollama mount that names its own server, or an image other than the
+    // pinned one, is a human act too (Ruling 42 (4)): the shape is parsed here,
+    // before any proof is asked for, so an unknown field is a bad request.
+    let ollama_human = if req.method == "arch.mount" && mount_kind == "ollama" {
+        closed_config::<OllamaMountConfig>("ollama", &req.params["config"])
+            .map_err(|e| bad(&format!("{e:#}")))?
+            .needs_a_human()
+    } else {
+        false
+    };
+    let cloud_ctx = if req.method == "arch.mount" && (is_cloud_kind(mount_kind) || ollama_human) {
         let ctx = {
             let k = lock(kernel)?;
             ctx_for(&k, presence.take(), now)?
         };
         if !matches!(ctx.principal, Principal::Human { .. }) {
-            return Err(invariant(
+            return Err(invariant(if ollama_human {
+                "I1: mounting an Ollama this node did not start (--external) or from an \
+                 image it did not pin points the node at an engine it cannot govern, which \
+                 is a human act; re-run it with a presence proof"
+            } else {
                 "I1: mounting a cloud arch sends this node's registers to a third party, \
-                 which is a human act; re-run it with a presence proof",
-            ));
+                 which is a human act; re-run it with a presence proof"
+            }));
         }
         Some(ctx)
     } else {
@@ -1202,12 +1215,64 @@ fn dispatch(
     }
 }
 
-/// The `claude` binary a `config` names, defaulted.
-fn claude_binary(config: &Value) -> std::path::PathBuf {
-    config.get("binary").and_then(Value::as_str).map_or_else(
-        || ClaudeCodeConfig::default().binary,
-        std::path::PathBuf::from,
-    )
+/// Everything `arch.mount { kind: "claude-code" }` may say, and — because of
+/// `deny_unknown_fields` — nothing else (Ruling 42).
+///
+/// `binary` is still a request field this wave: moving it to daemon
+/// configuration (`vkd --claude-bin`, as `--harness-bin` is) is a public
+/// surface change and the founder's call (Ruling 41). Until then every value
+/// goes through [`claude_binary`]'s refusals, at mount and again at every boot
+/// that re-creates the arch from its spec.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeCodeMountConfig {
+    binary: Option<String>,
+    model: Option<String>,
+    max_turns: Option<u32>,
+    timeout_secs: Option<u32>,
+    context_ceiling: Option<u32>,
+}
+
+/// The `claude` binary a config names, defaulted, and held to the rule
+/// `vkd-service install` applies to its own `ImagePath` (final review I-1,
+/// Ruling 41, minimum form).
+///
+/// A bare name (`claude`, the default) is looked up on the **daemon's** own
+/// `PATH` when it is run, which is daemon configuration, not the request's.
+/// Anything with a separator is a path the request chose, and the daemon —
+/// under the Windows service, `NT SERVICE\vkd` — runs it at mount, at every
+/// boot and at every inference from the persisted spec. So it must be
+/// absolute (a relative one resolves against whatever the daemon's working
+/// directory is), it must be a file that is there, and it must not be
+/// somewhere another process of the user can replace it: not in a synced
+/// folder, not under a user profile.
+fn claude_binary(cfg: &ClaudeCodeMountConfig) -> anyhow::Result<std::path::PathBuf> {
+    let Some(named) = cfg.binary.as_deref() else {
+        return Ok(ClaudeCodeConfig::default().binary);
+    };
+    let p = std::path::PathBuf::from(named);
+    if p.components().count() == 1 && !p.is_absolute() {
+        return Ok(p);
+    }
+    anyhow::ensure!(
+        p.is_absolute(),
+        "binary {named} is a relative path: give an absolute path, or a bare name the daemon \
+         finds on its own PATH"
+    );
+    anyhow::ensure!(
+        p.is_file(),
+        "binary {named} does not exist (or is not a file)"
+    );
+    vk_store::paths::refuse_sync_folder(&p)
+        .map_err(|_| anyhow::anyhow!("binary {named} is inside a synced folder, which may replace the file under the daemon; install Claude Code somewhere else"))?;
+    anyhow::ensure!(
+        !vk_store::paths::under_a_user_profile(&p),
+        "binary {named} is inside a user profile, and the daemon runs it at every boot and \
+         call — under the service as NT SERVICE\\vkd: anything running as that user could \
+         replace it. Name a binary somewhere only administrators may write, or put `claude` \
+         on the daemon's PATH and leave --bin at its default"
+    );
+    Ok(p)
 }
 
 /// Ask that binary its version, and refuse the mount if it cannot say.
@@ -1218,7 +1283,7 @@ fn claude_binary(config: &Value) -> std::path::PathBuf {
 /// listening. Called before the kernel lock is taken, and again at boot by the
 /// factory, where a binary that is gone is what makes the arch unavailable.
 fn claude_code_version(config: &Value) -> anyhow::Result<String> {
-    let binary = claude_binary(config);
+    let binary = claude_binary(&closed_config("claude-code", config)?)?;
     vk_arch_claude_code::probe_version(&binary).ok_or_else(|| {
         anyhow::anyhow!(
             "cannot run `{} --version`: install Claude Code, or pass the binary's path",
@@ -1331,6 +1396,100 @@ fn mount_config<T: serde::de::DeserializeOwned + Default>(
         .map_err(|e| anyhow::anyhow!("{kind}: {e}; the endpoint is this daemon's to set"))
 }
 
+/// Parse a local arch's mount config into its closed shape (Ruling 42): a
+/// field the shape does not have is named and refused, never ignored.
+fn closed_config<T: serde::de::DeserializeOwned + Default>(
+    kind: &str,
+    config: &Value,
+) -> anyhow::Result<T> {
+    if config.is_null() {
+        return Ok(T::default());
+    }
+    serde_json::from_value(config.clone()).map_err(|e| anyhow::anyhow!("{kind}: {e}"))
+}
+
+/// Everything `arch.mount { kind: "ollama" }` may say, and nothing else
+/// (Ruling 42). `recreate` is an action, not a property, and never reaches the
+/// persisted spec ([`mount_spec_of`]).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaMountConfig {
+    base_url: Option<String>,
+    model: Option<String>,
+    num_ctx: Option<u32>,
+    max_tokens: Option<u32>,
+    seed: Option<u64>,
+    image: Option<String>,
+    memory: Option<String>,
+    cpus: Option<String>,
+    recreate: Option<bool>,
+}
+
+impl OllamaMountConfig {
+    /// Does this mount take a human (Ruling 42 (4))? An `--external` server is
+    /// one this node did not start and cannot cap, so pointing the node at it
+    /// is a human act like a cloud mount (Ruling 31); so is any image but the
+    /// pinned one — which [`checked_image`] then refuses anyway.
+    fn needs_a_human(&self) -> bool {
+        self.base_url.is_some()
+            || self
+                .image
+                .as_deref()
+                .is_some_and(|i| i != vk_arch_ollama::DEFAULT_IMAGE)
+    }
+}
+
+/// Docker's memory cap in its plain form, `^[0-9]+[kmg]?$` (Ruling 42 (2)):
+/// the value lands in `docker run`'s argv, so nothing but digits and one
+/// lowercase unit gets there.
+fn checked_memory(v: &str) -> anyhow::Result<String> {
+    let digits = v.strip_suffix(['k', 'm', 'g']).unwrap_or(v);
+    anyhow::ensure!(
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        "memory {v:?} is not in the accepted format: digits, then optionally k, m or g \
+         (lowercase), e.g. 12g"
+    );
+    Ok(v.to_string())
+}
+
+/// The CPU cap in its plain form, `^[0-9]+(\.[0-9]+)?$` (Ruling 42 (2)).
+fn checked_cpus(v: &str) -> anyhow::Result<String> {
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let ok = match v.split_once('.') {
+        Some((whole, frac)) => all_digits(whole) && all_digits(frac),
+        None => all_digits(v),
+    };
+    anyhow::ensure!(
+        ok,
+        "cpus {v:?} is not in the accepted format: a whole or decimal number, e.g. 6 or 1.5"
+    );
+    Ok(v.to_string())
+}
+
+/// The image is the plan's, pinned (Ruling 42 (3)): a request may only repeat
+/// it — by tag, by digest, or both — and anything else is refused. The image
+/// is in the arch identity; choosing one is daemon configuration.
+fn checked_image(asked: Option<&str>) -> anyhow::Result<String> {
+    use vk_arch_ollama::{DEFAULT_IMAGE, PINNED_IMAGE_DIGEST};
+    let Some(image) = asked else {
+        return Ok(DEFAULT_IMAGE.to_string());
+    };
+    let repository = DEFAULT_IMAGE
+        .split_once(':')
+        .map_or(DEFAULT_IMAGE, |(r, _)| r);
+    let pinned = [
+        DEFAULT_IMAGE.to_string(),
+        format!("{repository}@{PINNED_IMAGE_DIGEST}"),
+        format!("{DEFAULT_IMAGE}@{PINNED_IMAGE_DIGEST}"),
+    ];
+    anyhow::ensure!(
+        pinned.iter().any(|p| p == image),
+        "image {image} is not the pinned image {DEFAULT_IMAGE} ({PINNED_IMAGE_DIGEST}): the \
+         image is this daemon's to choose, and a request may only repeat it"
+    );
+    Ok(image.to_string())
+}
+
 /// Build the first-party Anthropic adapter `arch.mount { kind: "anthropic" }`
 /// asks for.
 ///
@@ -1436,15 +1595,7 @@ fn claude_code_adapter(
     claude_version: &str,
 ) -> anyhow::Result<ClaudeCodeAdapter> {
     let defaults = ClaudeCodeConfig::default();
-    let u32_of = |name: &str, fallback: u32| -> anyhow::Result<u32> {
-        match config.get(name) {
-            None | Some(Value::Null) => Ok(fallback),
-            Some(v) => v
-                .as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| anyhow::anyhow!("{name} must be a whole number of tokens")),
-        }
-    };
+    let asked: ClaudeCodeMountConfig = closed_config("claude-code", config)?;
     // One fixed, empty directory under the state directory, not a temp
     // directory per call: `claude` creates `~/.claude/projects/<mangled
     // cwd>/memory/` for wherever it runs, so a new directory each time would
@@ -1453,15 +1604,11 @@ fn claude_code_adapter(
     vk_store::paths::private_dir(&cwd).with_context(|| format!("create {}", cwd.display()))?;
     let default_timeout = u32::try_from(defaults.timeout.as_secs()).unwrap_or(u32::MAX);
     let cfg = ClaudeCodeConfig {
-        binary: claude_binary(config),
-        model: config
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or(&defaults.model)
-            .to_string(),
-        max_turns: u32_of("max_turns", defaults.max_turns)?,
-        timeout: Duration::from_secs(u64::from(u32_of("timeout_secs", default_timeout)?)),
-        context_ceiling: u32_of("context_ceiling", defaults.context_ceiling)?,
+        binary: claude_binary(&asked)?,
+        model: asked.model.clone().unwrap_or(defaults.model),
+        max_turns: asked.max_turns.unwrap_or(defaults.max_turns),
+        timeout: Duration::from_secs(u64::from(asked.timeout_secs.unwrap_or(default_timeout))),
+        context_ceiling: asked.context_ceiling.unwrap_or(defaults.context_ceiling),
         cwd,
     };
     // `with_version`, not `new`: the binary was already asked, before the lock.
@@ -1479,47 +1626,37 @@ fn claude_code_adapter(
 /// ungoverned arch is one a person has to ask for by name.
 fn ollama_adapter(config: &Value) -> anyhow::Result<OllamaAdapter> {
     let defaults = OllamaConfig::default();
-    let u32_of = |name: &str, fallback: u32| -> anyhow::Result<u32> {
-        match config.get(name) {
-            None | Some(Value::Null) => Ok(fallback),
-            Some(v) => v
-                .as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| anyhow::anyhow!("{name} must be a whole number")),
-        }
-    };
-    let string_of = |name: &str, fallback: &str| -> String {
-        config
-            .get(name)
-            .and_then(Value::as_str)
-            .unwrap_or(fallback)
-            .to_string()
-    };
+    let asked: OllamaMountConfig = closed_config("ollama", config)?;
     // Ungoverned only when the client names the server it wants: no `base_url`
-    // means the container, on loopback, under this node's caps.
-    let external = config.get("base_url").and_then(Value::as_str);
-    let container = external.is_none().then(|| ContainerSpec {
-        image: string_of("image", &ContainerSpec::default().image),
-        memory: string_of("memory", &ContainerSpec::default().memory),
-        cpus: string_of("cpus", &ContainerSpec::default().cpus),
-        ..ContainerSpec::default()
-    });
+    // means the container, on loopback, under this node's caps. The caps and
+    // the image are checked before anything reaches `docker run` (Ruling 42).
+    let container_defaults = ContainerSpec::default();
+    let container = match &asked.base_url {
+        Some(_) => None,
+        None => Some(ContainerSpec {
+            image: checked_image(asked.image.as_deref())?,
+            memory: match &asked.memory {
+                Some(m) => checked_memory(m)?,
+                None => container_defaults.memory.clone(),
+            },
+            cpus: match &asked.cpus {
+                Some(c) => checked_cpus(c)?,
+                None => container_defaults.cpus.clone(),
+            },
+            ..container_defaults
+        }),
+    };
     let cfg = OllamaConfig {
-        base_url: external.unwrap_or(&defaults.base_url).to_string(),
-        model: string_of("model", &defaults.model),
-        num_ctx: u32_of("num_ctx", defaults.num_ctx)?,
-        max_tokens: u32_of("max_tokens", defaults.max_tokens)?,
-        seed: match config.get("seed") {
-            None | Some(Value::Null) => defaults.seed,
-            Some(v) => v
-                .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("seed must be a whole number"))?,
-        },
+        base_url: asked.base_url.clone().unwrap_or(defaults.base_url),
+        model: asked.model.clone().unwrap_or(defaults.model),
+        num_ctx: asked.num_ctx.unwrap_or(defaults.num_ctx),
+        max_tokens: asked.max_tokens.unwrap_or(defaults.max_tokens),
+        seed: asked.seed.unwrap_or(defaults.seed),
         temperature: defaults.temperature,
         container,
         // Only ever what the client said, and only in container mode: this
         // one destroys a container, so it is never a default (Ruling 10).
-        recreate: config.get("recreate") == Some(&Value::Bool(true)),
+        recreate: asked.recreate == Some(true),
     };
     OllamaAdapter::mount(cfg)
 }
@@ -1911,6 +2048,27 @@ fn harness_run(kernel: &Shared, config: &ServerConfig, p: Value) -> Result<Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ruling 42: the plain values the CLI and the plan use pass; the pinned
+    /// image passes by tag, by digest and by both.
+    #[test]
+    fn the_plain_caps_and_the_pinned_image_pass() {
+        for m in ["12g", "512m", "1024k", "2147483648"] {
+            assert_eq!(checked_memory(m).unwrap(), m);
+        }
+        for c in ["6", "1.5", "0.25"] {
+            assert_eq!(checked_cpus(c).unwrap(), c);
+        }
+        let digest = vk_arch_ollama::PINNED_IMAGE_DIGEST;
+        for i in [
+            vk_arch_ollama::DEFAULT_IMAGE.to_string(),
+            format!("ollama/ollama@{digest}"),
+            format!("{}@{digest}", vk_arch_ollama::DEFAULT_IMAGE),
+        ] {
+            assert_eq!(checked_image(Some(&i)).unwrap(), i);
+        }
+        assert_eq!(checked_image(None).unwrap(), vk_arch_ollama::DEFAULT_IMAGE);
+    }
 
     #[test]
     fn a_challenge_expires_after_its_ttl_and_is_gone_once_spent() {

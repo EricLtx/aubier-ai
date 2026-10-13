@@ -81,8 +81,16 @@ on disk, and the prompt on stdin so no process list shows it.
 ```
 vk mount claude-code                                    # sonnet to draft, opus to judge
 vk mount claude-code --draft-model claude-sonnet-5 --judge-model claude-opus-5 \
-                     --bin /path/to/claude --timeout 180
+                     --bin /opt/claude/bin/claude --timeout 180
 ```
+
+`--bin` defaults to `claude`, found on **the daemon's** `PATH`. A path given
+instead is run by the daemon at mount, at every boot and at every call — under
+the Windows service as `NT SERVICE\vkd` — so it must be absolute, must exist,
+and is refused inside a synced folder or under a user profile, the rule
+`vkd-service install` applies to its own binary (`contracts/tcb.md`, Claude
+Code adapter). A `claude` installed in your profile is reached by leaving
+`--bin` at its default with it on the daemon's `PATH`.
 
 It runs on **the founder's own claude.ai subscription**, which is a person's
 and not a product's. Nothing is billed per call, so the manifest's
@@ -225,7 +233,10 @@ otherwise the mount is refused and names what differs, because a container
 started at 4 GiB is not a 12 GiB governor. `--recreate` replaces it and keeps
 the volume, so the models are not downloaded again. `--external` points at an
 Ollama somebody else is running: loopback only until SP4, never `governed`, and
-its clearance stops at Business.
+its clearance stops at Business, and since it is an engine this node cannot
+govern, mounting it takes a presence proof as a cloud mount does. The daemon
+takes the caps only in their plain forms (`--memory` digits then `k`, `m` or
+`g`; `--cpus` a whole or decimal number) and the image only as the pinned one.
 
 Its context ceiling is **half** the window asked for. Ollama 0.33.3 truncates
 an oversize prompt to `num_ctx / 2 + 3` tokens and answers `200 OK` with

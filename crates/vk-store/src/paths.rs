@@ -128,6 +128,32 @@ pub fn resolve_override(raw: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
+/// `C:\Users\…`, by either name the machine knows it under.
+///
+/// The rule `vkd-service install` applies to its own `ImagePath` and
+/// `arch.mount claude-code` applies to a `binary` it is asked to run (final
+/// review I-1, Ruling 41): a file under a user profile is one that user's
+/// processes can replace, and the daemon — under the service, `NT SERVICE\vkd`
+/// — would run the replacement at the next start or call. One predicate for
+/// both, here beside [`refuse_sync_folder`], the other half of the same rule.
+/// A pure function of the spelling and the environment: on Unix nothing is
+/// under a Windows profile, so it is `false` there.
+pub fn under_a_user_profile(p: &Path) -> bool {
+    let lower = p.to_string_lossy().to_lowercase().replace('/', "\\");
+    let roots = [
+        std::env::var("USERPROFILE").ok(),
+        std::env::var("PUBLIC").ok(),
+        std::env::var("SystemDrive")
+            .ok()
+            .map(|d| format!("{d}\\Users")),
+        Some(r"c:\users".into()),
+    ];
+    roots.into_iter().flatten().any(|root| {
+        let root = root.to_lowercase().replace('/', "\\");
+        !root.is_empty() && lower.starts_with(&format!("{}\\", root.trim_end_matches('\\')))
+    })
+}
+
 /// Public because it is not only the state directory that must not live in a
 /// synced folder: `vkd-service install` refuses to register a binary from one
 /// too, since OneDrive may replace or dehydrate the file a service starts from.
@@ -181,6 +207,33 @@ fn canonical_form(dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Moved from `vk-service` with the predicate (final review I-1).
+    #[test]
+    fn a_path_under_a_user_profile_is_recognised_by_either_spelling() {
+        let mut inside: Vec<String> = vec![
+            r"C:\Users\someone\.cargo-target\release\vkd-service.exe".into(),
+            r"c:\users\someone\vkd-service.exe".into(),
+            r"C:/Users/someone/vkd-service.exe".into(),
+        ];
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            inside.push(format!(r"{home}\build\release\vkd-service.exe"));
+        }
+        for p in &inside {
+            assert!(under_a_user_profile(Path::new(p)), "{p}");
+        }
+        for outside in [
+            r"C:\Program Files\VerticalAI\vkd-service.exe",
+            r"C:\vk\vkd-service.exe",
+            r"D:\opt\vk\vkd-service.exe",
+            // Not a profile: a directory that merely starts the same way.
+            r"C:\UsersBackup\vkd-service.exe",
+            "/usr/local/bin/claude",
+        ] {
+            assert!(!under_a_user_profile(Path::new(outside)), "{outside}");
+        }
+    }
+
     #[test]
     fn refuses_sync_folders() {
         for bad in [

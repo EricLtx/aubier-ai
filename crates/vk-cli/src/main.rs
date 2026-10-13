@@ -330,7 +330,8 @@ enum MountCmd {
         #[arg(long, conflicts_with = "external")]
         container: bool,
         /// Use an Ollama already serving at this URL instead. Not governed:
-        /// this node did not start that process and cannot cap it.
+        /// this node did not start that process and cannot cap it, so this
+        /// takes a presence proof. Loopback only (127.0.0.1, ::1, localhost).
         #[arg(long, value_name = "URL")]
         external: Option<String>,
         /// Context window asked of the server. Half of it is usable.
@@ -349,13 +350,14 @@ enum MountCmd {
         // than ignored: a cap named for a server this node does not start is
         // a cap that would never be applied, and silently dropping it is how
         // somebody ends up believing an ungoverned arch is capped.
-        /// Memory cap for the container, in Docker's syntax.
+        /// Memory cap for the container: digits, then optionally k, m or g.
         #[arg(long, default_value = "12g", conflicts_with = "external")]
         memory: String,
-        /// CPU cap for the container, in Docker's syntax.
+        /// CPU cap for the container: a whole or decimal number.
         #[arg(long, default_value = "6", conflicts_with = "external")]
         cpus: String,
-        /// The Ollama image. Pinned: the version is in the arch identity.
+        /// The Ollama image. Pinned: the version is in the arch identity, and
+        /// the daemon refuses any other image (it may only be repeated).
         #[arg(
             long,
             default_value = "ollama/ollama:0.33.3",
@@ -774,6 +776,13 @@ async fn call(cli: &Cli) -> Result<()> {
                 "max_tokens": max_tokens,
                 "seed": seed,
             });
+            // An engine this node did not start is one it cannot govern, so
+            // naming it is a human act and carries a presence proof (Ruling
+            // 42); the governed container takes none.
+            let proof = match external {
+                Some(_) => Some(presence(&c).await?),
+                None => None,
+            };
             match external {
                 Some(url) => config["base_url"] = json!(url),
                 None => {
@@ -788,7 +797,7 @@ async fn call(cli: &Cli) -> Result<()> {
                 c.call(
                     "arch.mount",
                     json!({ "kind": "ollama", "config": config }),
-                    None,
+                    proof,
                 )
                 .await?,
                 render::mounted_arch,

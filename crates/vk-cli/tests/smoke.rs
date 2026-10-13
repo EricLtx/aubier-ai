@@ -94,12 +94,14 @@ struct Shell {
 
 impl Shell {
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(vk_exe())
-            .args(args)
+        let mut c = Command::new(vk_exe());
+        c.args(args)
             .env("VK_ENDPOINT", &self.endpoint)
-            .env("VK_NODE_KEY_FILE", &self.node_key)
-            .output()
-            .expect("run vk")
+            .env("VK_NODE_KEY_FILE", &self.node_key);
+        if let Some(dir) = self.node_key.parent() {
+            test_dir_first_on_path(&mut c, dir);
+        }
+        c.output().expect("run vk")
     }
 
     /// The same, with something on stdin: `vk fsck --rebase-head` reads the
@@ -852,6 +854,23 @@ fn fake_claude(dir: &std::path::Path) -> PathBuf {
     bin
 }
 
+/// How `--bin` names the stand-in. On Windows the scratch directory is under
+/// `%TEMP%`, inside the user profile, where the daemon refuses a binary a
+/// request names by path (final review I-1): so there the stand-in is named
+/// bare and found on the daemon's own `PATH`, which [`vkd_cmd`] starts with
+/// the test's directory. Elsewhere it is named by its absolute path, the form
+/// the refusals let through.
+fn bin_arg(fake: &std::path::Path) -> String {
+    if cfg!(windows) {
+        fake.file_name()
+            .expect("the stand-in has a file name")
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        path_of(fake)
+    }
+}
+
 /// `vk mount claude-code` is the first verb that mounts a *real* adapter: two
 /// arches in one call, a draft and a judge, each named for its model and each
 /// with its own content-addressed id. Driven against the stand-in via `--bin`,
@@ -872,7 +891,7 @@ fn vk_mounts_two_claude_code_arches_and_a_task_runs_through_one() {
     let sh = Shell { endpoint, node_key };
     wait_until(&sh, true, "vkd did not answer").expect("status");
 
-    let claude = path_of(&fake_claude(dir.path()));
+    let claude = bin_arg(&fake_claude(dir.path()));
     let mounted = sh.json(&[
         "mount",
         "claude-code",
@@ -1739,7 +1758,22 @@ fn vkd_cmd(dir: &std::path::Path, endpoint: &str, extra: &[&str]) -> Command {
         // parallel, and beside whatever daemon the machine's owner has up.
         .args(["--web-port", "0"])
         .args(extra);
+    test_dir_first_on_path(&mut c, dir);
     c
+}
+
+/// The test's directory first on a daemon's `PATH`, on Windows, where the
+/// Claude Code stand-in is found by its bare name (see `bin_arg`). Applied to
+/// `vkd` directly and to every `vk` a [`Shell`] runs, because `vk boot`
+/// starts its daemon with the shell's own environment.
+fn test_dir_first_on_path(c: &mut Command, dir: &std::path::Path) {
+    if cfg!(windows) {
+        let mut dirs = vec![dir.to_path_buf()];
+        dirs.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        c.env("PATH", std::env::join_paths(dirs).expect("a PATH"));
+    }
 }
 
 /// Wait for the daemon on this shell's endpoint to be there, or to be gone.
@@ -2116,7 +2150,7 @@ fn a_real_arch_is_re_created_when_the_daemon_restarts_and_is_never_a_mock() {
         endpoint: endpoint.clone(),
         node_key: dir.path().join("node.key"),
     };
-    let claude = path_of(&fake_claude(dir.path()));
+    let claude = bin_arg(&fake_claude(dir.path()));
 
     // A node with a real arch on it, then stopped.
     let draft = {
@@ -2223,7 +2257,7 @@ fn an_arch_whose_engine_has_gone_comes_back_unavailable_and_refuses_to_run() {
         node_key: dir.path().join("node.key"),
     };
     let claude = fake_claude(dir.path());
-    let bin = path_of(&claude);
+    let bin = bin_arg(&claude);
 
     let draft = {
         let _daemon = Daemon(
@@ -2392,7 +2426,7 @@ fn a_node_with_slow_arches_serves_while_they_start_and_vk_boot_does_not_kill_it(
         node_key: dir.path().join("node.key"),
     };
     let claude = fake_claude(dir.path());
-    let bin = path_of(&claude);
+    let bin = bin_arg(&claude);
 
     // Two arches, mounted while the stand-in is still fast.
     let mounted = {

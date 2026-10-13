@@ -386,7 +386,7 @@ mod scm {
         );
         vk_store::paths::refuse_sync_folder(&abs).context("--binary")?;
         anyhow::ensure!(
-            !under_a_user_profile(&abs),
+            !vk_store::paths::under_a_user_profile(&abs),
             "{} is inside a user profile, and the service would run it as {} at every start: \
              anything running as that user could replace it and take the service account's \
              keyring with it. Copy the binaries somewhere only administrators may write — \
@@ -395,50 +395,6 @@ mod scm {
             pipe_acl::SERVICE_ACCOUNT
         );
         Ok(abs)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn a_binary_under_a_user_profile_is_not_registrable() {
-            let home = std::env::var("USERPROFILE").expect("Windows has one");
-            for inside in [
-                format!(r"{home}\build\release\vkd-service.exe"),
-                r"C:\Users\someone\.cargo-target\release\vkd-service.exe".into(),
-                r"c:\users\someone\vkd-service.exe".into(),
-                r"C:/Users/someone/vkd-service.exe".into(),
-            ] {
-                assert!(under_a_user_profile(Path::new(&inside)), "{inside}");
-            }
-            for outside in [
-                r"C:\Program Files\VerticalAI\vkd-service.exe",
-                r"C:\vk\vkd-service.exe",
-                r"D:\opt\vk\vkd-service.exe",
-                // Not a profile: a directory that merely starts the same way.
-                r"C:\UsersBackup\vkd-service.exe",
-            ] {
-                assert!(!under_a_user_profile(Path::new(outside)), "{outside}");
-            }
-        }
-    }
-
-    /// `C:\Users\…`, by either name the machine knows it under.
-    fn under_a_user_profile(p: &Path) -> bool {
-        let lower = p.to_string_lossy().to_lowercase().replace('/', "\\");
-        let roots = [
-            std::env::var("USERPROFILE").ok(),
-            std::env::var("PUBLIC").ok(),
-            std::env::var("SystemDrive")
-                .ok()
-                .map(|d| format!("{d}\\Users")),
-            Some(r"c:\users".into()),
-        ];
-        roots.into_iter().flatten().any(|root| {
-            let root = root.to_lowercase().replace('/', "\\");
-            !root.is_empty() && lower.starts_with(&format!("{}\\", root.trim_end_matches('\\')))
-        })
     }
 
     // -------------------------------------------------------------- uninstall
