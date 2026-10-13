@@ -57,13 +57,17 @@ jobs:
       # sessions write there — which is why the in-process guard,
       # `vk_contracts::testing::guard_state_dir`, registers directories
       # per process instead). The path is the one `tempfile` uses: `TMP`,
-      # then `TEMP`, as `GetTempPath` reads them.
+      # then `TEMP`, as `GetTempPath` reads them. The count is a `nullglob`
+      # array, not `ls | wc -l`: under the runner's `bash -e -o pipefail` an
+      # `ls` that matches nothing fails the step instead of counting 0.
       - name: Count the temp directories before the suite
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          shopt -s nullglob
           tmp=$(cygpath -u "${TMP:-${TEMP:-$RUNNER_TEMP}}")
-          before=$(ls -d "$tmp"/.tmp* 2>/dev/null | wc -l)
+          dirs=("$tmp"/.tmp*)
+          before=${#dirs[@]}
           echo "TMP_DIRS_BEFORE=$before" >> "$GITHUB_ENV"
           echo "temp directories before the suite: $before (in $tmp)"
       - name: cargo test --workspace
@@ -71,18 +75,22 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --no-fail-fast 2>&1 | tee test.log
+      # Only when the count before was taken: a run that stopped earlier (fmt,
+      # clippy) ran no suite, and comparing against a missing count is noise.
       - name: The suite left no temp directory behind
-        if: always() && runner.os == 'Windows'
+        if: always() && runner.os == 'Windows' && env.TMP_DIRS_BEFORE != ''
         shell: bash
         run: |
+          shopt -s nullglob
           tmp=$(cygpath -u "${TMP:-${TEMP:-$RUNNER_TEMP}}")
-          after=$(ls -d "$tmp"/.tmp* 2>/dev/null | wc -l)
-          before="${TMP_DIRS_BEFORE:-0}"
+          dirs=("$tmp"/.tmp*)
+          after=${#dirs[@]}
+          before="$TMP_DIRS_BEFORE"
           echo "temp directories after the suite: $after (before: $before)"
           if [ "$after" -gt "$before" ]; then
             printf '::error title=temp leak::%s\n' "the suite left $((after - before)) .tmp* director(y/ies) in $tmp: a store was open when its TempDir dropped"
-            ls -d "$tmp"/.tmp* | while IFS= read -r d; do
-              printf '::error title=temp leak::%s\n' "$d: $(ls "$d" 2>/dev/null | tr '\n' ' ')"
+            for d in "${dirs[@]}"; do
+              printf '::error title=temp leak::%s\n' "$d: $(ls -A "$d" 2>/dev/null | tr '\n' ' ' || true)"
             done
             exit 1
           fi
