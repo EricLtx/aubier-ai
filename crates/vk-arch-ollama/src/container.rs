@@ -291,15 +291,35 @@ pub fn inspected(spec: &ContainerSpec) -> Result<Option<Inspected>> {
     let Some(v) = inspect(&["container", "inspect", &spec.name])? else {
         return Ok(None);
     };
-    Ok(Some(Inspected {
+    inspected_from(&v).map(Some)
+}
+
+/// One `docker container inspect` object, read.
+fn inspected_from(v: &serde_json::Value) -> Result<Inspected> {
+    Ok(Inspected {
         id: v["Id"].as_str().unwrap_or_default().to_string(),
         running: v["State"]["Running"].as_bool().unwrap_or(false),
         governor: Governor {
             image: v["Image"].as_str().unwrap_or_default().to_string(),
-            memory_bytes: v["HostConfig"]["Memory"].as_u64().unwrap_or(0),
-            nano_cpus: v["HostConfig"]["NanoCpus"].as_u64().unwrap_or(0),
+            memory_bytes: cap_of(v, "Memory")?,
+            nano_cpus: cap_of(v, "NanoCpus")?,
         },
-    }))
+    })
+}
+
+/// `HostConfig.<field>` as Docker reported it: a whole number, `0` being
+/// Docker's own "uncapped". Anything else — absent, negative, a string — is an
+/// error naming the field (final review M-13): read as `0` it said
+/// "uncapped", the safe direction, but silently, about a container whose caps
+/// this node could not actually read.
+fn cap_of(v: &serde_json::Value, field: &str) -> Result<u64> {
+    let raw = &v["HostConfig"][field];
+    raw.as_u64().with_context(|| {
+        format!(
+            "docker container inspect reported HostConfig.{field} as {raw}, not a whole number: \
+             the cap in force cannot be read"
+        )
+    })
 }
 
 /// What is actually in force, for the mount that is about to claim it. An
@@ -499,6 +519,40 @@ fn no_docker(why: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Final review M-13: a cap Docker reports as anything but a whole number
+    /// is an error naming the field, not a silent "uncapped".
+    #[test]
+    fn a_cap_that_is_not_a_whole_number_is_an_error_not_uncapped() {
+        let with = |memory: serde_json::Value, cpus: serde_json::Value| {
+            serde_json::json!({
+                "Id": "c1", "Image": "sha256:i", "State": {"Running": true},
+                "HostConfig": {"Memory": memory, "NanoCpus": cpus}
+            })
+        };
+        let ok = inspected_from(&with(12_884_901_888u64.into(), 6_000_000_000u64.into())).unwrap();
+        assert_eq!(ok.governor.memory_bytes, 12_884_901_888);
+        assert_eq!(ok.governor.nano_cpus, 6_000_000_000);
+        // Zero is Docker's own "uncapped", and stays a reading.
+        assert_eq!(
+            inspected_from(&with(0.into(), 0.into()))
+                .unwrap()
+                .governor
+                .memory_bytes,
+            0
+        );
+        for (memory, cpus, field) in [
+            (serde_json::json!(-1), serde_json::json!(0), "Memory"),
+            (serde_json::json!("12g"), serde_json::json!(0), "Memory"),
+            (serde_json::Value::Null, serde_json::json!(0), "Memory"),
+            (serde_json::json!(0), serde_json::json!(1.5), "NanoCpus"),
+        ] {
+            let Err(e) = inspected_from(&with(memory.clone(), cpus.clone())) else {
+                panic!("{memory} / {cpus} must not read as a cap");
+            };
+            assert!(format!("{e:#}").contains(field), "{e:#}");
+        }
+    }
 
     #[test]
     fn the_published_endpoint_is_the_host_half_of_the_port_mapping() {
