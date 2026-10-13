@@ -606,8 +606,14 @@ fn dispatch(
     // the kernel lock, so a binary that is slow — or missing, and about to be
     // waited out — delays this one mount rather than every other syscall on
     // the node (SP1b review, Minor 8 / ruling 8).
-    let claude_version = (req.method == "arch.mount" && req.params["kind"] == "claude-code")
-        .then(|| claude_code_version(&req.params["config"]))
+    // The config comes back with `binary` resolved: that is what is asked,
+    // persisted and run from here on (I-1 addendum).
+    let claude = (req.method == "arch.mount" && req.params["kind"] == "claude-code")
+        .then(|| -> anyhow::Result<(Value, String)> {
+            let config = resolved_claude_config(&req.params["config"])?;
+            let version = claude_code_version(&config)?;
+            Ok((config, version))
+        })
         .transpose()
         .map_err(|e| bad(&format!("{e:#}")))?;
     // The same, and more so, for an Ollama arch: mounting one starts a
@@ -789,13 +795,19 @@ fn dispatch(
             // Recorded before anything is mounted, so a config this node could
             // not make a spec out of — one carrying a credential — is refused
             // rather than mounted into an arch no boot can bring back.
-            let spec = mount_spec_of(kind, &p["config"])?;
+            // A Claude Code config is the resolved one (I-1 addendum).
+            let mount_config = match &claude {
+                Some((resolved, _)) => resolved,
+                None => &p["config"],
+            };
+            let spec = mount_spec_of(kind, mount_config)?;
             let adapter: Arc<dyn ArchAdapter> = match kind {
                 "claude-code" => {
-                    let version = claude_version.ok_or_else(|| internal("no claude version"))?;
+                    let (resolved, version) =
+                        claude.ok_or_else(|| internal("no claude version"))?;
                     let state_dir = k.store().state_dir.clone();
                     Arc::new(
-                        claude_code_adapter(&state_dir, &p["config"], &version)
+                        claude_code_adapter(&state_dir, &resolved, &version)
                             .map_err(|e| bad(&format!("{e:#}")))?,
                     )
                 }
@@ -1260,19 +1272,100 @@ fn claude_binary(cfg: &ClaudeCodeMountConfig) -> anyhow::Result<std::path::PathB
          finds on its own PATH"
     );
     anyhow::ensure!(
+        !p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "binary {named} has a `..` component: name the binary by its own path"
+    );
+    anyhow::ensure!(
         p.is_file(),
         "binary {named} does not exist (or is not a file)"
     );
-    vk_store::paths::refuse_sync_folder(&p)
-        .map_err(|_| anyhow::anyhow!("binary {named} is inside a synced folder, which may replace the file under the daemon; install Claude Code somewhere else"))?;
+    // The refusals below are made on the path the OS will open, not on the
+    // request's spelling (I-1 addendum): a link inside an innocent directory
+    // could point anywhere, so no link is followed at all — every existing
+    // component, the file included, must be neither a symlink nor (Windows)
+    // any other reparse point such as a junction.
+    for at in p.ancestors() {
+        if at.parent().is_none() {
+            break; // the root or the drive itself
+        }
+        let meta = std::fs::symlink_metadata(at)
+            .with_context(|| format!("binary {named}: read {}", at.display()))?;
+        anyhow::ensure!(
+            !is_link(&meta),
+            "binary {named} is reached through a symlink or junction ({}): name the binary \
+             by its real path",
+            at.display()
+        );
+    }
+    let resolved = resolved_path(&p).with_context(|| format!("binary {named}: resolve it"))?;
+    vk_store::paths::refuse_sync_folder(&resolved).map_err(|_| {
+        anyhow::anyhow!(
+            "binary {} is inside a synced folder, which may replace the file under the \
+             daemon; install Claude Code somewhere else",
+            resolved.display()
+        )
+    })?;
     anyhow::ensure!(
-        !vk_store::paths::under_a_user_profile(&p),
-        "binary {named} is inside a user profile, and the daemon runs it at every boot and \
+        !vk_store::paths::under_a_user_profile(&resolved),
+        "binary {} is inside a user profile, and the daemon runs it at every boot and \
          call — under the service as NT SERVICE\\vkd: anything running as that user could \
          replace it. Name a binary somewhere only administrators may write, or put `claude` \
-         on the daemon's PATH and leave --bin at its default"
+         on the daemon's PATH and leave --bin at its default",
+        resolved.display()
     );
-    Ok(p)
+    Ok(resolved)
+}
+
+/// A symlink, or on Windows any reparse point (a junction is one and is not
+/// always reported as a symlink).
+fn is_link(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
+}
+
+/// The canonical form of a path that has no link in it — what it resolves to
+/// on disk (the case the file system stores, an 8.3 name expanded) — with
+/// Windows' verbatim `\\?\` prefix removed, so it can be printed, stored and
+/// compared with the profile and sync-folder spellings.
+fn resolved_path(p: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let canonical = std::fs::canonicalize(p)?;
+    #[cfg(windows)]
+    {
+        let s = canonical.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return Ok(std::path::PathBuf::from(format!(r"\\{rest}")));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return Ok(std::path::PathBuf::from(rest));
+        }
+    }
+    Ok(canonical)
+}
+
+/// The claude-code config as it is persisted: parsed into its closed shape,
+/// with `binary` replaced by the resolved path [`claude_binary`] will run, so
+/// the spec replayed at boot names what was checked rather than what was
+/// typed (I-1 addendum).
+fn resolved_claude_config(config: &Value) -> anyhow::Result<Value> {
+    let asked: ClaudeCodeMountConfig = closed_config("claude-code", config)?;
+    let mut config = if config.is_null() {
+        json!({})
+    } else {
+        config.clone()
+    };
+    if asked.binary.is_some() {
+        let binary = claude_binary(&asked)?;
+        config["binary"] = json!(binary.to_string_lossy());
+    }
+    Ok(config)
 }
 
 /// Ask that binary its version, and refuse the mount if it cannot say.

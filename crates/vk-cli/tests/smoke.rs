@@ -943,8 +943,8 @@ fn vk_refuses_to_sign_with_a_key_the_node_never_enrolled() {
 /// `%TEMP%`, inside the user profile, where the daemon refuses a binary a
 /// request names by path (final review I-1): so there the stand-in is named
 /// bare and found on the daemon's own `PATH`, which [`vkd_cmd`] starts with
-/// the test's directory. Elsewhere it is named by its absolute path, the form
-/// the refusals let through.
+/// the test's directory. Elsewhere it is named by its absolute, resolved path,
+/// the form the refusals let through.
 fn bin_arg(fake: &std::path::Path) -> String {
     if cfg!(windows) {
         fake.file_name()
@@ -952,7 +952,9 @@ fn bin_arg(fake: &std::path::Path) -> String {
             .to_string_lossy()
             .into_owned()
     } else {
-        path_of(fake)
+        // By its real path: the daemon refuses a binary reached through a
+        // symlink, and macOS's temp directory is under `/var`, which is one.
+        path_of(&std::fs::canonicalize(fake).expect("the stand-in is there"))
     }
 }
 

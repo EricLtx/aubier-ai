@@ -141,8 +141,9 @@ fn bad_request(err: &CallError, needle: &str, what: &str) {
 #[tokio::test]
 async fn claude_code_refuses_a_binary_the_daemon_should_not_run() {
     let n = Node::start().await;
-    let scratch = tempfile::tempdir().unwrap();
-    vk_contracts::testing::guard_state_dir(scratch.path());
+    let scratch_dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(scratch_dir.path());
+    let scratch = Real::of(scratch_dir.path());
 
     let relative = n
         .refused("claude-code", json!({"binary": "bin/claude"}), true)
@@ -187,6 +188,124 @@ async fn claude_code_refuses_a_binary_the_daemon_should_not_run() {
         )
         .await;
     bad_request(&unknown, "unknown field", "a field the shape does not have");
+    n.stop().await;
+}
+
+/// A directory spelled with no link in it: on macOS the temp directory is
+/// under `/var`, itself a symlink to `/private/var`, which the binary rule
+/// refuses on its own; the tests about other refusals start from the real
+/// path. On Windows the temp path is used as it is.
+struct Real(std::path::PathBuf);
+
+impl Real {
+    fn of(p: &std::path::Path) -> Real {
+        Real(if cfg!(unix) {
+            std::fs::canonicalize(p).unwrap()
+        } else {
+            p.to_path_buf()
+        })
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// I-1 addendum: the refusals run on the *resolved* path. A `..` component,
+/// and a symlink or junction anywhere on the way, are refused outright — a
+/// link inside an innocent directory that points under a user profile would
+/// otherwise pass a check made on the spelling.
+#[tokio::test]
+async fn claude_code_refuses_a_binary_reached_through_a_link_or_dot_dot() {
+    let n = Node::start().await;
+    let scratch_dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(scratch_dir.path());
+    let scratch = Real::of(scratch_dir.path());
+    let target = scratch.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("claude.txt"), "not a program").unwrap();
+
+    let dotted = scratch
+        .path()
+        .join("target")
+        .join("..")
+        .join("target")
+        .join("claude.txt");
+    let err = n
+        .refused("claude-code", json!({"binary": dotted}), true)
+        .await;
+    bad_request(&err, "`..` component", "a path with a .. component");
+
+    let link = scratch.path().join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(windows)]
+    {
+        // A directory junction: no privilege needed, unlike a symlink.
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J: {made:?}");
+    }
+    let err = n
+        .refused(
+            "claude-code",
+            json!({"binary": link.join("claude.txt")}),
+            true,
+        )
+        .await;
+    bad_request(
+        &err,
+        "symlink or junction",
+        "a binary reached through a link",
+    );
+    // The junction goes before the directory is removed, so the cleanup
+    // cannot follow it.
+    #[cfg(windows)]
+    std::fs::remove_dir(&link).unwrap();
+    n.stop().await;
+}
+
+/// I-1 addendum: what is persisted and run is the resolved path, not the
+/// request's spelling. Unix only: an accepted path on Windows must be outside
+/// every user profile, and the test's scratch directory is inside one.
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_code_persists_the_resolved_binary_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let n = Node::start().await;
+    let scratch_dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(scratch_dir.path());
+    let scratch = Real::of(scratch_dir.path());
+    let fake = scratch.path().join("fake-claude.sh");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.0.0-test; fi\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The same file, spelled with a doubled separator.
+    let spelled = format!("{}//fake-claude.sh", scratch.path().display());
+    let proof = n.proof().await;
+    let mounted =
+        n.c.call(
+            "arch.mount",
+            json!({"kind": "claude-code", "config": {"binary": spelled, "model": "m"}}),
+            Some(proof),
+        )
+        .await
+        .unwrap();
+    let shown =
+        n.c.call("arch.show", json!({"arch_id": mounted["arch_id"]}), None)
+            .await
+            .unwrap();
+    assert_eq!(
+        shown["config"]["binary"],
+        json!(std::fs::canonicalize(&fake).unwrap()),
+        "{shown}"
+    );
     n.stop().await;
 }
 

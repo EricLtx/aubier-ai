@@ -87,7 +87,8 @@ vk mount claude-code --draft-model claude-sonnet-5 --judge-model claude-opus-5 \
 `--bin` defaults to `claude`, found on **the daemon's** `PATH`. A path given
 instead is run by the daemon at mount, at every boot and at every call — under
 the Windows service as `NT SERVICE\vkd` — so it must be absolute, must exist,
-and is refused inside a synced folder or under a user profile, the rule
+must be its real path (no `..`, symlink or junction on the way: the daemon checks and stores what it resolves to), and is
+refused inside a synced folder or under a user profile, the rule
 `vkd-service install` applies to its own binary (`contracts/tcb.md`, Claude
 Code adapter). A `claude` installed in your profile is reached by leaving
 `--bin` at its default with it on the daemon's `PATH`.
