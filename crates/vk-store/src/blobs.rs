@@ -93,12 +93,14 @@ impl BlobStore {
             return Err(StorageError::Shredded.into());
         }
         let p = self.dek_path(key_id);
-        if p.exists() {
-            let wrapped = std::fs::read(&p).map_err(|_| StorageError::NotFound)?;
-            return self.unwrap_for(key_id, &wrapped);
-        }
-        if !create {
-            return Err(StorageError::NotFound.into());
+        // Only a true absence is `NotFound` (final review I-3): a key file
+        // that is there and cannot be read — a DACL or permission fault — is
+        // a store fault, and reading it as "no such blob" hid exactly the case
+        // the master fingerprint and the key tier exist to tell apart.
+        match read_existing(&p, "wrapped key")? {
+            Some(wrapped) => return self.unwrap_for(key_id, &wrapped),
+            None if !create => return Err(StorageError::NotFound.into()),
+            None => {}
         }
         let dek = crate::keys::fresh();
         let wrapped = self.master.wrap(key_id, &dek)?;
@@ -171,10 +173,20 @@ impl BlobStore {
         Ok(env)
     }
 
-    pub fn envelope(&self, hash: &str) -> Result<BlobEnvelope, StorageError> {
+    /// The envelope at `hash`. A malformed address or a true absence is
+    /// `StorageError::NotFound` (reachable through `downcast_ref`); an
+    /// envelope that is there and cannot be read, or does not parse, is a
+    /// store fault of its own (final review I-3) — the blob is there and
+    /// damaged, which is not the same answer as "no such blob".
+    pub fn envelope(&self, hash: &str) -> Result<BlobEnvelope> {
         let hex_hash = validate_hash(hash)?;
-        let text = std::fs::read(self.env_path(hex_hash)).map_err(|_| StorageError::NotFound)?;
-        serde_json::from_slice(&text).map_err(|_| StorageError::NotFound)
+        let text =
+            read_existing(&self.env_path(hex_hash), "envelope")?.ok_or(StorageError::NotFound)?;
+        serde_json::from_slice(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "blob {hash} failed its integrity check: its envelope does not parse: {e}"
+            )
+        })
     }
 
     /// The plaintext at `hash` — and only that: what comes back is held to
@@ -195,7 +207,8 @@ impl BlobStore {
             env.hash
         );
         let dek = self.dek_for(&env.key_id, false)?;
-        let sealed = std::fs::read(self.blob_path(hex_hash)).map_err(|_| StorageError::NotFound)?;
+        let sealed = read_existing(&self.blob_path(hex_hash), "ciphertext")?
+            .ok_or(StorageError::NotFound)?;
         let plaintext = open(&dek, hash.as_bytes(), &sealed).map_err(|_| {
             anyhow::anyhow!(
                 "blob {hash} failed its integrity check: the ciphertext on disk was not sealed \
@@ -253,11 +266,7 @@ impl BlobStore {
     /// The envelope `put(key_id, _, plaintext)` wrote, found by re-deriving
     /// the address rather than by remembering it. What a caller that still
     /// has the bytes uses to name the blob again.
-    pub fn envelope_of(
-        &self,
-        key_id: &str,
-        plaintext: &[u8],
-    ) -> Result<BlobEnvelope, StorageError> {
+    pub fn envelope_of(&self, key_id: &str, plaintext: &[u8]) -> Result<BlobEnvelope> {
         self.envelope(&address(key_id, plaintext))
     }
 
@@ -340,6 +349,23 @@ impl BlobStore {
         let wrapped = std::fs::read(&p).with_context(|| format!("read {}", p.display()))?;
         self.unwrap_for(key_id, &wrapped)?;
         Ok(())
+    }
+}
+
+/// One file of the payload tier, read whole: `None` when it is not there,
+/// and an error naming the file for every other failure (final review I-3).
+/// Only `ErrorKind::NotFound` is an absence; a file that exists and cannot be
+/// read is a fault the caller must not mistake for one.
+fn read_existing(path: &Path, what: &str) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "the {what} at {} is there and cannot be read (a permission or DACL fault?)",
+                path.display()
+            )
+        }),
     }
 }
 
@@ -650,5 +676,59 @@ mod tests {
         let (_d, s) = store();
         assert_storage_error(s.get("../../x"), StorageError::NotFound);
         assert_storage_error(s.get("sha256:zz"), StorageError::NotFound);
+    }
+
+    /// Put a directory where a file of the tier should be: the file is
+    /// *there* (the name exists) and cannot be read — the shape a DACL or
+    /// permission fault takes, on every OS, without needing a second account.
+    fn make_unreadable(path: &Path) {
+        std::fs::remove_file(path).unwrap();
+        std::fs::create_dir(path).unwrap();
+    }
+
+    /// A failed read that must be a store fault, never "not found".
+    fn assert_not_absent(r: Result<Vec<u8>>, what: &str) {
+        let err = r.expect_err("a file that is there and cannot be read fails the read");
+        assert_eq!(
+            err.downcast_ref::<StorageError>(),
+            None,
+            "{what} that is there and cannot be read is not `NotFound`: {err:#}"
+        );
+    }
+
+    /// Final review I-3: an I/O error on an existing `.dek` is a store fault.
+    /// Read as "no such blob" it hid exactly the case the master fingerprint
+    /// log line and the key tier exist to tell apart.
+    #[test]
+    fn an_unreadable_wrapped_key_is_a_store_fault_not_a_missing_blob() {
+        let (_d, s) = store();
+        let env = s.put("subject-1", Label::bottom(), b"hello").unwrap();
+        make_unreadable(&s.dek_path("subject-1"));
+        assert_not_absent(s.get(&env.hash), "a wrapped key");
+    }
+
+    /// Final review I-3: an envelope that cannot be read, or reads back
+    /// truncated, is damage to a blob that is there — not an absent one.
+    #[test]
+    fn an_unreadable_or_truncated_envelope_is_a_store_fault_not_a_missing_blob() {
+        let (_d, s) = store();
+        let env = s.put("subject-1", Label::bottom(), b"hello").unwrap();
+        let path = s.env_path(env.hash.trim_start_matches("sha256:"));
+        std::fs::write(&path, b"{\"hash\":").unwrap();
+        assert_not_absent(s.get(&env.hash), "a truncated envelope");
+        make_unreadable(&path);
+        assert_not_absent(s.get(&env.hash), "an envelope");
+        // A true absence is still `NotFound`.
+        std::fs::remove_dir(&path).unwrap();
+        assert_storage_error(s.get(&env.hash), StorageError::NotFound);
+    }
+
+    /// Final review I-3: ciphertext that is there and cannot be read.
+    #[test]
+    fn unreadable_ciphertext_is_a_store_fault_not_a_missing_blob() {
+        let (_d, s) = store();
+        let env = s.put("subject-1", Label::bottom(), b"hello").unwrap();
+        make_unreadable(&s.blob_path(env.hash.trim_start_matches("sha256:")));
+        assert_not_absent(s.get(&env.hash), "ciphertext");
     }
 }

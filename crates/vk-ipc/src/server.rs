@@ -882,7 +882,7 @@ fn dispatch(
                 .into_iter()
                 .find(|(a, _, _)| a == id)
                 .ok_or_else(|| not_found(id))?;
-            let spec = k.mount_spec(&arch_id);
+            let spec = k.mount_spec(&arch_id).map_err(kerr)?;
             Ok(json!({
                 "arch_id": arch_id,
                 "manifest": manifest,

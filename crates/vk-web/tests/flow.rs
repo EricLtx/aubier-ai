@@ -311,7 +311,7 @@ async fn a_passkey_enrols_through_the_pages_and_approves_a_waiting_task() {
         let rows = k.passkeys().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].device_id, device_id);
-        assert_eq!(k.device_ids(), vec![device_id.clone()]);
+        assert_eq!(k.device_ids().unwrap(), vec![device_id.clone()]);
         assert!(
             k.devices().ids().is_empty(),
             "a passkey is not an ed25519 key"

@@ -32,6 +32,19 @@ fn store_failed(e: impl std::fmt::Display) -> KernelError {
     KernelError::Store(e.to_string())
 }
 
+/// A payload-tier read that failed. Absent or shredded (`StorageError`) is
+/// `NotFound`; anything else means the store has bytes at this address and
+/// cannot read them or they are not the ones the address names — a swapped,
+/// restored or altered blob, an unreadable file (final review I-3). That is a
+/// store that cannot be trusted for this artefact, not an artefact that is
+/// not there.
+pub(crate) fn blob_failed(e: anyhow::Error) -> KernelError {
+    match e.downcast_ref::<StorageError>() {
+        Some(missing) => KernelError::NotFound(missing.to_string()),
+        None => KernelError::Store(format!("{e:#}")),
+    }
+}
+
 /// An artefact's `kind` is not free-form text: a `Release` step turns it into a
 /// file name (`<hash12>.<kind>`), so a kind containing a separator or a `..`
 /// would be a path, and a path is an escape from wherever the release was
@@ -1009,7 +1022,7 @@ impl RealKernel {
             arches: self.arches().into_iter().map(|(id, _)| id).collect(),
             unavailable_arches: self.unavailable.keys().cloned().collect(),
             starting_arches: self.starting.keys().cloned().collect(),
-            devices: self.device_ids(),
+            devices: self.device_ids()?,
             stopped_scopes: self.stops.stopped_scopes(),
             policies_version: self.load_policies_version()?,
             // Every rebase since the last boot that named one. Read here so
@@ -1145,16 +1158,23 @@ impl RealKernel {
     /// it from; `load_arches` marks it unavailable), and a spec whose
     /// manifest has gone (a mount half-written, which `load_arches` sweeps).
     fn fsck_mounts(&self) -> vk_store::FsckTier {
-        let manifests: Vec<(String, ArchManifest)> =
-            self.store.db.list_json("arches").unwrap_or_default();
-        let specs: BTreeMap<String, arch::MountSpec> = self
-            .store
-            .db
-            .list_json("mounts")
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        // A table that cannot be read fails the tier (final review I-3):
+        // swallowed into an empty list it read as a green `checked 0`.
         let mut problems = Vec::new();
+        let manifests: Vec<(String, ArchManifest)> =
+            self.store.db.list_json("arches").unwrap_or_else(|e| {
+                problems.push(format!("the arches table cannot be read: {e:#}"));
+                Vec::new()
+            });
+        let specs: BTreeMap<String, arch::MountSpec> = match self.store.db.list_json("mounts") {
+            Ok(rows) => rows.into_iter().collect(),
+            Err(e) => {
+                problems.push(format!("the mounts table cannot be read: {e:#}"));
+                // Without the specs, "no mount spec" would be said of every
+                // arch: the tier reports the table, not a guess per arch.
+                return vk_store::FsckTier::new("mounts", manifests.len() as u64, 0, problems);
+            }
+        };
         for (id, m) in &manifests {
             match specs.get(id) {
                 None => problems.push(format!(
@@ -1421,9 +1441,13 @@ impl RealKernel {
 
     /// The mount spec an arch was made from, for `arch.show`. `None` for an
     /// arch this node has never mounted, and for one mounted before specs
-    /// were recorded.
-    pub fn mount_spec(&self, arch_id: &str) -> Option<arch::MountSpec> {
-        self.store.db.get_json("mounts", arch_id).ok().flatten()
+    /// were recorded; a row that cannot be read is a Store error, never "no
+    /// spec" (final review I-3).
+    pub fn mount_spec(&self, arch_id: &str) -> Result<Option<arch::MountSpec>, KernelError> {
+        self.store
+            .db
+            .get_json("mounts", arch_id)
+            .map_err(|e| store_failed(format!("the mount spec of {arch_id} cannot be read: {e:#}")))
     }
 
     /// The policy set this node runs under, as the store has it — `None` on a
@@ -1705,17 +1729,15 @@ impl RealKernel {
     /// Every enrolled device, sorted: the device keys the registry holds and
     /// the passkeys beside them. What the boot report and `boot.info` count —
     /// a passkey is a device that speaks for a human, whatever verifies it.
-    pub fn device_ids(&self) -> Vec<String> {
+    ///
+    /// A `devices` row that cannot be read is a Store error, not a device
+    /// quietly left out of the count (final review I-3).
+    pub fn device_ids(&self) -> Result<Vec<String>, KernelError> {
         let mut ids = self.devices.ids();
-        ids.extend(
-            self.passkeys()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|p| p.device_id),
-        );
+        ids.extend(self.passkeys()?.into_iter().map(|p| p.device_id));
         ids.sort();
         ids.dedup();
-        ids
+        Ok(ids)
     }
 
     /// Enrol a human device. The `KernelTestHooks` hook of the same name cannot
@@ -2177,27 +2199,13 @@ impl RealKernel {
     }
 
     pub fn read_artefact(&self, ctx: &Ctx, hash: &str) -> Result<Vec<u8>, KernelError> {
-        let env = self
-            .store
-            .blobs
-            .envelope(hash)
-            .map_err(|e| KernelError::NotFound(e.to_string()))?;
+        let env = self.store.blobs.envelope(hash).map_err(blob_failed)?;
         if !env.label.flows_to(&ctx.clearance) {
             return Err(KernelError::I2(format!(
                 "artefact {hash} exceeds caller clearance"
             )));
         }
-        self.store
-            .blobs
-            .get(hash)
-            .map_err(|e| match e.downcast_ref::<StorageError>() {
-                Some(missing) => KernelError::NotFound(missing.to_string()),
-                // The store has bytes at this address and they are not the
-                // ones the address names: a swapped, restored or altered
-                // blob. That is a store that cannot be trusted for this
-                // artefact, not an artefact that is not there.
-                None => KernelError::Store(e.to_string()),
-            })
+        self.store.blobs.get(hash).map_err(blob_failed)
     }
 
     /// The label an artefact carries, or `None` when it is not there. Read for
@@ -3227,6 +3235,57 @@ mod tests {
         let boot = k.boot().expect_err("boot reads the rows before it serves");
         assert!(matches!(boot, KernelError::Store(_)), "{boot:?}");
         assert!(boot.to_string().contains("--force does not help"), "{boot}");
+    }
+
+    /// Final review I-3: a `mounts` or `arches` table that cannot be read
+    /// fails the mounts tier. Swallowed into an empty list it read as a green
+    /// tier with `checked 0` — on `vk fsck`, the one surface that exists to
+    /// say the store is damaged.
+    #[test]
+    fn an_unreadable_mounts_or_arches_row_fails_the_mounts_tier() {
+        for table in ["mounts", "arches"] {
+            let d = tempfile::tempdir().unwrap();
+            let k = open(d.path());
+            k.store()
+                .db
+                .put_json(
+                    table,
+                    "broken",
+                    &serde_json::json!("not a row of this table"),
+                )
+                .unwrap();
+            let report = k.fsck();
+            let mounts = report
+                .tiers
+                .iter()
+                .find(|t| t.tier == "mounts")
+                .expect("a mounts tier");
+            assert!(!mounts.ok, "{table}: {mounts:?}");
+            assert!(!report.ok, "{table}: {report:?}");
+            assert!(
+                mounts
+                    .problems
+                    .iter()
+                    .any(|p| p.contains(table) && p.contains("cannot be read")),
+                "{table}: {mounts:?}"
+            );
+        }
+    }
+
+    /// Final review I-3: a `devices` row that does not parse is a store
+    /// fault, not a device quietly left out of the boot report's count.
+    #[test]
+    fn an_unreadable_device_row_fails_the_device_count_instead_of_undercounting() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        k.store()
+            .db
+            .put_json("devices", "broken", &serde_json::json!("not a device row"))
+            .unwrap();
+        let err = k
+            .boot()
+            .expect_err("a boot report that cannot count its devices is not written");
+        assert!(matches!(err, KernelError::Store(_)), "{err:?}");
     }
 
     /// An unreadable `stats:` row fails `top` as a Store error instead of
@@ -4746,10 +4805,10 @@ mod tests {
             assert!(k.devices().ids().is_empty(), "no key in the registry");
             k.enroll_device_persisted("phone-1", [7u8; 32]).unwrap();
             assert_eq!(
-                k.device_ids(),
+                k.device_ids().unwrap(),
                 vec!["passkey:abc".to_string(), "phone-1".to_string()]
             );
-            assert_eq!(k.boot().unwrap().devices, k.device_ids());
+            assert_eq!(k.boot().unwrap().devices, k.device_ids().unwrap());
 
             // A counter moved: the row is replaced, nothing is appended.
             let moved = serde_json::json!({ "cred": { "id": "abc", "counter": 3 } });

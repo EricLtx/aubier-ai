@@ -106,7 +106,10 @@ pub fn resolve(k: &RealKernel, ctx: &Ctx, path: &str) -> Result<Entry, KernelErr
             .blobs
             .envelope(&format!("sha256:{}", hash.trim_start_matches("sha256:")))
             .map(Entry::Artefact)
-            .map_err(|_| KernelError::NotFound(path.into())),
+            .map_err(|e| match crate::blob_failed(e) {
+                KernelError::NotFound(_) => KernelError::NotFound(path.into()),
+                damaged => damaged,
+            }),
         ["devices"] => Ok(Entry::Dir {
             entries: k
                 .store()

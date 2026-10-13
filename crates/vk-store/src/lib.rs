@@ -392,8 +392,21 @@ impl Store {
             .last()
             .map(LedgerHead::of)
             .context("the ledger has no events, so there is no head to record")?;
-        let from = match self.db.kv_get(LEDGER_HEAD)? {
-            Some(json) => serde_json::from_str(&json).ok(),
+        // The evidence names the head it replaced, and never says "none" for
+        // one that was there and could not be read (final review M-10, the
+        // I-3 rule): a malformed row fails the rebase and is left in place.
+        // An empty row is no head, as `head_verdict` reads it.
+        let from = match self
+            .db
+            .kv_get(LEDGER_HEAD)?
+            .filter(|j| !j.trim().is_empty())
+        {
+            Some(json) => Some(serde_json::from_str(&json).with_context(|| {
+                format!(
+                    "the recorded {LEDGER_HEAD} cannot be read, so the rebase evidence could \
+                     not name the head it replaces; nothing was changed"
+                )
+            })?),
             None => None,
         };
         self.db
@@ -972,6 +985,26 @@ mod tests {
         assert_eq!(done.from, None, "{done:?}");
         assert_eq!(done.to.seq, 1, "{done:?}");
         assert!(s.fsck().ok, "{:?}", s.fsck());
+    }
+
+    /// The rebase evidence never says "no previous head" for a head that was
+    /// there and unreadable (final review M-10, the I-3 rule): a malformed
+    /// head row fails the rebase and is left as it was.
+    #[test]
+    fn a_rebase_over_an_unreadable_head_fails_instead_of_recording_none() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = open(d.path());
+        append(&mut s, "boot", 1);
+        s.db.kv_set(LEDGER_HEAD, "{not a head").unwrap();
+        let err = s
+            .rebase_head()
+            .expect_err("evidence does not say none for unreadable");
+        assert!(format!("{err:#}").contains("cannot be read"), "{err:#}");
+        assert_eq!(
+            s.db.kv_get(LEDGER_HEAD).unwrap().as_deref(),
+            Some("{not a head"),
+            "the row is left for a person to look at"
+        );
     }
 
     /// And an empty store, which has neither a record nor a head, is not

@@ -1038,6 +1038,48 @@ async fn arch_ls_says_whether_each_arch_is_ready() {
     shutdown(server, k, d).await;
 }
 
+/// Final review I-3: `arch.show` on an arch whose mount spec row does not
+/// parse is a store fault — not "no spec", the opposite of what `fsck` says.
+#[tokio::test]
+async fn arch_show_fails_loudly_on_a_spec_that_cannot_be_read() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    let arch = c
+        .call(
+            "arch.mount_mock",
+            json!({"name": "mock", "context_ceiling": 200}),
+            None,
+        )
+        .await
+        .unwrap()["arch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let shown = c
+        .call("arch.show", json!({"arch_id": arch}), None)
+        .await
+        .unwrap();
+    assert_eq!(shown["kind"], "mock", "{shown}");
+
+    k.lock()
+        .unwrap()
+        .store()
+        .db
+        .put_json("mounts", &arch, &json!("not a mount spec"))
+        .unwrap();
+    let err = c
+        .call("arch.show", json!({"arch_id": arch}), None)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_STORE, "{err}");
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
 /// Ruling 20: the harness binary, model and budget are the daemon's
 /// configuration. A `harness.run` that names any of them is refused as a bad
 /// request — before anything is looked up, leased or launched. Ruling 22
