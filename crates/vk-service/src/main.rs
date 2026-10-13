@@ -784,6 +784,14 @@ mod tests {
 
     const USER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
 
+    /// A Windows named-pipe name as `vkd` binds one: `\\.\pipe\<name>`, no
+    /// control characters. The endpoint fixtures below once held a vertical
+    /// tab where `\v` of `\vk-` was meant, and the round-trip tests passed
+    /// anyway because they compared the damaged string with itself (Ruling 43).
+    fn is_pipe_name(s: &str) -> bool {
+        s.starts_with(r"\\.\pipe\") && !s.chars().any(char::is_control)
+    }
+
     fn parse(args: &[&str]) -> Cmd {
         Cli::try_parse_from(args)
             .expect("these arguments parse")
@@ -895,10 +903,12 @@ mod tests {
             "--user-sid",
             USER,
             "--endpoint",
-            r"\.\pipek-eric",
+            r"\\.\pipe\vk-eric",
         ]) else {
             panic!("that is a run");
         };
+        let ep = with_ep.endpoint.clone().expect("an endpoint was given");
+        assert!(is_pipe_name(&ep), "the fixture is a pipe name: {ep:?}");
         assert_eq!(
             with_ep.daemon_argv(),
             [
@@ -907,7 +917,7 @@ mod tests {
                 "--user-sid",
                 USER,
                 "--endpoint",
-                r"\.\pipek-eric"
+                r"\\.\pipe\vk-eric"
             ]
         );
     }
@@ -940,15 +950,21 @@ mod tests {
     fn install_says_which_endpoint_it_would_bind() {
         let derived = describe(&parse(&["vkd-service", "install", "--user-sid", USER]));
         assert!(derived.contains("<that user's own endpoint>"), "{derived}");
-        let explicit = describe(&parse(&[
+        let explicit = parse(&[
             "vkd-service",
             "install",
             "--user-sid",
             USER,
             "--endpoint",
-            r"\.\pipek-elsewhere",
-        ]));
-        assert!(explicit.contains(r"\.\pipek-elsewhere"), "{explicit}");
+            r"\\.\pipe\vk-elsewhere",
+        ]);
+        let Cmd::Install(a) = &explicit else {
+            panic!("that is an install");
+        };
+        let ep = a.endpoint.clone().expect("an endpoint was given");
+        assert!(is_pipe_name(&ep), "the fixture is a pipe name: {ep:?}");
+        let explicit = describe(&explicit);
+        assert!(explicit.contains(r"\\.\pipe\vk-elsewhere"), "{explicit}");
     }
 
     #[test]
