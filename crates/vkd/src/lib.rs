@@ -275,6 +275,9 @@ impl vk_ipc::server::WebLinks for LinkMinter {
     fn approve_link(&self, task_id: &str, now_ms: u64) -> String {
         self.0.approve_link(task_id, now_ms)
     }
+    fn passkey_unreadable(&self, credential: &serde_json::Value) -> Option<String> {
+        vk_web::passkey::unreadable(credential)
+    }
 }
 
 /// Lock → bind → boot → serve. Returns only when the endpoint stops serving.

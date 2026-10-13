@@ -101,6 +101,13 @@ pub trait WebLinks: Send + Sync {
     fn enroll_link(&self, now_ms: u64) -> String;
     /// A link to the approval page of `task_id`, good for a few minutes.
     fn approve_link(&self, task_id: &str, now_ms: u64) -> String;
+    /// Why the verifier behind the pages cannot read this enrolled passkey
+    /// credential, or `None` when it can (final review M-11): `passkey.ls`
+    /// reports such a row as unreadable rather than listing it as one that
+    /// could approve.
+    fn passkey_unreadable(&self, _credential: &Value) -> Option<String> {
+        None
+    }
 }
 
 /// How this daemon launches a harness: `vkd --harness-bin`, `--harness-model`,
@@ -745,11 +752,24 @@ fn dispatch(
         // credential: a public key is a public value, but nothing outside the
         // verifier needs it and a listing that carries one invites it into a
         // log (SP1b Task 5).
+        // Each row says whether this daemon's verifier can read it (final
+        // review M-11): one it cannot is enrolled and cannot approve, and is
+        // reported as such rather than listed beside the good ones.
         "passkey.ls" => to_value(
             k.passkeys()
                 .map_err(kerr)?
                 .into_iter()
-                .map(|p| json!({ "device_id": p.device_id, "enrolled_ms": p.enrolled_ms }))
+                .map(|p| {
+                    let unreadable = config
+                        .web
+                        .as_ref()
+                        .and_then(|w| w.passkey_unreadable(&p.credential));
+                    json!({
+                        "device_id": p.device_id,
+                        "enrolled_ms": p.enrolled_ms,
+                        "unreadable": unreadable,
+                    })
+                })
                 .collect::<Vec<_>>(),
         ),
         // The read surfaces carry a `Ctx` too: a task shows its register's

@@ -1251,11 +1251,27 @@ async fn passkey(cli: &Cli, c: &Client, what: &PasskeyCmd) -> Result<()> {
             }
             show(cli, json!({ "url": url, "opened": open }), render::link)
         }
-        PasskeyCmd::Ls => show(
-            cli,
-            c.call("passkey.ls", json!({}), None).await?,
-            render::passkeys,
-        ),
+        PasskeyCmd::Ls => {
+            let listed = c.call("passkey.ls", json!({}), None).await?;
+            // An enrolled passkey the daemon's verifier cannot read is an
+            // error (final review M-11): shown in the list, and the verb
+            // fails, because that passkey cannot approve anything.
+            let unreadable: Vec<String> = listed
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|p| p["unreadable"].is_string())
+                .map(|p| p["device_id"].as_str().unwrap_or("?").to_string())
+                .collect();
+            show(cli, listed, render::passkeys)?;
+            anyhow::ensure!(
+                unreadable.is_empty(),
+                "UNREADABLE passkey(s) {}: enrolled, but this daemon's verifier cannot read \
+                 them, so they cannot approve; enrol the authenticator again",
+                unreadable.join(", ")
+            );
+            Ok(())
+        }
     }
 }
 

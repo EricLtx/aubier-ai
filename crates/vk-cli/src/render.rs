@@ -1010,6 +1010,10 @@ pub fn passkeys(v: &Value) -> String {
                             .as_u64()
                             .map(|ms| format!("{ms}"))
                             .unwrap_or_else(|| "-".into()),
+                        match p["unreadable"].as_str() {
+                            Some(why) => format!("UNREADABLE: {why}"),
+                            None => "ok".into(),
+                        },
                     ]
                 })
                 .collect::<Vec<_>>()
@@ -1018,7 +1022,7 @@ pub fn passkeys(v: &Value) -> String {
     if rows.is_empty() {
         "no passkey enrolled; run `vk passkey enroll`".into()
     } else {
-        table(&["DEVICE", "ENROLLED (ms)"], &rows)
+        table(&["DEVICE", "ENROLLED (ms)", "STATE"], &rows)
     }
 }
 

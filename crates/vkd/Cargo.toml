@@ -25,6 +25,8 @@ bedrock = ["vk-ipc/bedrock"]
 vk-kernel = { path = "../vk-kernel" }
 vk-store = { path = "../vk-store" }
 vk-ipc = { path = "../vk-ipc", default-features = false }
+# The credential `passkey.ls` hands the pages' verifier to read (M-11).
+serde_json.workspace = true
 # The API arches key source (`--anthropic-key-file`), nothing more.
 vk-arch-anthropic = { path = "../vk-arch-anthropic", default-features = false }
 # The passkey pages (SP1b Task 5), served on loopback beside the endpoint.

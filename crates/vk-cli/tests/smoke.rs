@@ -939,6 +939,51 @@ fn vk_refuses_to_sign_with_a_key_the_node_never_enrolled() {
     assert_eq!(std::fs::read(&key).unwrap(), before, "the key is untouched");
 }
 
+/// Final review M-11: an enrolled passkey this daemon's verifier cannot read
+/// cannot approve, so `vk passkey ls` reports it as an error instead of
+/// listing it beside the good ones as if it could.
+#[test]
+fn vk_passkey_ls_reports_an_unreadable_passkey_as_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    // A passkey row no verifier can read, written while no daemon holds the store.
+    {
+        let mut k = vk_kernel::RealKernel::open(
+            dir.path(),
+            vk_store::keys::KeySource::File(dir.path().join("master.key")),
+            "n1",
+        )
+        .expect("open the store");
+        k.enroll_passkey("passkey:broken", serde_json::json!({"not": "a passkey"}), 1)
+            .expect("enrol the row");
+    }
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &["--node-id", "n1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell {
+        endpoint,
+        node_key: dir.path().join("node.key"),
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let out = sh.run(&["passkey", "ls"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "an unreadable passkey is an error: {text}"
+    );
+    assert!(text.contains("passkey:broken"), "{text}");
+    assert!(text.contains("UNREADABLE"), "{text}");
+}
+
 /// How `--bin` names the stand-in. On Windows the scratch directory is under
 /// `%TEMP%`, inside the user profile, where the daemon refuses a binary a
 /// request names by path (final review I-1): so there the stand-in is named

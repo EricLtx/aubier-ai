@@ -62,6 +62,15 @@ pub fn device_id_of(cred_id: &CredentialID) -> String {
     )
 }
 
+/// Why the verifier cannot read this enrolled credential, or `None` when it
+/// can: the same parse [`load`] makes, for `passkey.ls` to report the row
+/// (final review M-11).
+pub fn unreadable(credential: &serde_json::Value) -> Option<String> {
+    serde_json::from_value::<Passkey>(credential.clone())
+        .err()
+        .map(|e| e.to_string())
+}
+
 /// The enrolled passkeys the kernel holds, parsed for the verifier. A row
 /// the verifier cannot read — one written by a later version, say — is
 /// logged and left out rather than failing every approval on the node: it
