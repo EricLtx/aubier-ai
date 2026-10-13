@@ -442,6 +442,33 @@ async fn ollama_refuses_an_image_that_is_not_the_pinned_one() {
     n.stop().await;
 }
 
+/// Final re-review N-1: the image check runs before the proof gate. The
+/// pinned image by digest (or tag and digest) is the pinned image and needs no
+/// proof — the CLI sends none for a container mount — and a foreign image is
+/// refused as a bad request, proof or not, never asked for a proof first.
+#[tokio::test]
+async fn the_pinned_image_by_digest_needs_no_proof_and_a_foreign_one_is_refused_outright() {
+    let n = Node::start().await;
+    for pinned in [
+        format!("ollama/ollama@{}", vk_arch_ollama::PINNED_IMAGE_DIGEST),
+        format!(
+            "{}@{}",
+            vk_arch_ollama::DEFAULT_IMAGE,
+            vk_arch_ollama::PINNED_IMAGE_DIGEST
+        ),
+    ] {
+        // Past the gate and the image check, it reaches Docker — which this
+        // test process has pointed at nothing.
+        let err = n.refused("ollama", json!({ "image": pinned }), false).await;
+        bad_request(&err, "docker", &pinned);
+    }
+    let err = n
+        .refused("ollama", json!({ "image": "ollama/ollama:latest" }), false)
+        .await;
+    bad_request(&err, "pinned", "a foreign image without a proof");
+    n.stop().await;
+}
+
 /// Ruling 42 (4): an `--external` server is a human act, like a cloud kind
 /// (Ruling 31) — and the loopback rule of I-4 still holds with the proof.
 #[tokio::test]

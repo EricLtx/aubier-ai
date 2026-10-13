@@ -587,13 +587,17 @@ fn dispatch(
     // arm uses, so the proof is verified exactly once and the nonce — already
     // spent above — cannot be shown again.
     let mount_kind = req.params["kind"].as_str().unwrap_or_default();
-    // An Ollama mount that names its own server, or an image other than the
-    // pinned one, is a human act too (Ruling 42 (4)): the shape is parsed here,
-    // before any proof is asked for, so an unknown field is a bad request.
+    // An Ollama mount that names its own server is a human act too (Ruling 42
+    // (4)). The shape is parsed here, before any proof is asked for, so an
+    // unknown field is a bad request; and so is the image checked — the pinned
+    // one by tag, digest or both passes with no proof, any other is refused
+    // outright rather than asked for a proof it could never be mounted with
+    // (final re-review N-1).
     let ollama_human = if req.method == "arch.mount" && mount_kind == "ollama" {
-        closed_config::<OllamaMountConfig>("ollama", &req.params["config"])
-            .map_err(|e| bad(&format!("{e:#}")))?
-            .needs_a_human()
+        let asked = closed_config::<OllamaMountConfig>("ollama", &req.params["config"])
+            .map_err(|e| bad(&format!("{e:#}")))?;
+        checked_image(asked.image.as_deref()).map_err(|e| bad(&format!("{e:#}")))?;
+        asked.needs_a_human()
     } else {
         false
     };
@@ -604,9 +608,9 @@ fn dispatch(
         };
         if !matches!(ctx.principal, Principal::Human { .. }) {
             return Err(invariant(if ollama_human {
-                "I1: mounting an Ollama this node did not start (--external) or from an \
-                 image it did not pin points the node at an engine it cannot govern, which \
-                 is a human act; re-run it with a presence proof"
+                "I1: mounting an Ollama this node did not start (--external) points the \
+                 node at an engine it cannot govern, which is a human act; re-run it with a \
+                 presence proof"
             } else {
                 "I1: mounting a cloud arch sends this node's registers to a third party, \
                  which is a human act; re-run it with a presence proof"
@@ -1544,14 +1548,11 @@ struct OllamaMountConfig {
 impl OllamaMountConfig {
     /// Does this mount take a human (Ruling 42 (4))? An `--external` server is
     /// one this node did not start and cannot cap, so pointing the node at it
-    /// is a human act like a cloud mount (Ruling 31); so is any image but the
-    /// pinned one — which [`checked_image`] then refuses anyway.
+    /// is a human act like a cloud mount (Ruling 31). The image is not part of
+    /// this: [`checked_image`] runs before the proof gate and refuses any image
+    /// but the pinned one outright (final re-review N-1).
     fn needs_a_human(&self) -> bool {
         self.base_url.is_some()
-            || self
-                .image
-                .as_deref()
-                .is_some_and(|i| i != vk_arch_ollama::DEFAULT_IMAGE)
     }
 }
 
