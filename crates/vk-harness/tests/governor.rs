@@ -5,15 +5,26 @@
 //! platform, the no-op governor, which contains nothing and says so.
 //!
 //! Every child is spawned behind [`Reaper`], so a failed assertion kills what
-//! it spawned, and no wait on a child is open-ended: [`wait_exit`] gives up at
-//! its deadline and the reaper does the rest.
+//! it spawned, and no wait on a child is open-ended: [`exit_within`] gives up
+//! at [`deadline`] and the reaper does the rest. The deadline only bounds the
+//! wait; what each test asserts is the outcome — the cap refused the
+//! allocation, the job killed the tree — never how long it took (Ruling 44).
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use vk_harness::confine::{for_this_platform, Governor, NoopGovernor};
 
-/// The longest any test waits on a child. Past it the assertion fails and the
+/// The longest any test waits on a child: 60 s on CI (the `CI` variable is
+/// set — GitHub's Windows runners start a capped PowerShell slowly enough that
+/// a fixed 10 s failed there, Ruling 44), 20 s otherwise. Past it the test
+/// fails saying how long it waited and what the child was doing, and the
 /// reaper kills the child; nothing is left running on the machine.
-const DEADLINE: Duration = Duration::from_secs(10);
+fn deadline() -> Duration {
+    if std::env::var_os("CI").is_some() {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(20)
+    }
+}
 
 /// A child that is killed and reaped when the test is done with it, whether
 /// the test passed or panicked.
@@ -26,15 +37,27 @@ impl Drop for Reaper {
     }
 }
 
-/// Polls the child until it exits or `max` has passed.
-fn wait_exit(child: &mut Child, max: Duration) -> Option<ExitStatus> {
+/// Polls the child until it exits, and fails at [`deadline`] naming `what`,
+/// the time waited and the child's state (Ruling 44).
+fn exit_within(child: &mut Child, what: &str) -> ExitStatus {
+    let max = deadline();
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait().expect("try_wait") {
-            return Some(status);
+            return status;
         }
         if start.elapsed() >= max {
-            return None;
+            let state = match child.try_wait() {
+                Ok(Some(status)) => format!("exited just now with {status}"),
+                Ok(None) => format!("still running, pid {}", child.id()),
+                Err(e) => format!("unreadable: {e}"),
+            };
+            panic!(
+                "{what}: no exit after {:.1} s (deadline {} s, CI={}); the child is {state}",
+                start.elapsed().as_secs_f64(),
+                max.as_secs(),
+                std::env::var_os("CI").is_some()
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -85,7 +108,7 @@ fn the_noop_governor_contains_nothing_and_says_so() {
         !governor.governed(),
         "a governor that enforces nothing must not claim to govern"
     );
-    let status = wait_exit(&mut child.0, DEADLINE).expect("the quick child exits");
+    let status = exit_within(&mut child.0, "the quick child");
     assert!(status.success(), "the child ran unhindered: {status}");
 }
 
@@ -133,8 +156,11 @@ mod job_object {
             .expect("spawn powershell")
     }
 
+    /// The tree would live thirty seconds on its own; it exits because the
+    /// job's last handle closed. Asserted on the exit, bounded by [`deadline`]
+    /// (Ruling 44) — not on how fast it came.
     #[test]
-    fn dropping_the_governor_kills_the_child_within_two_seconds() {
+    fn dropping_the_governor_kills_the_child() {
         let governor = JobGovernor::new(512 << 20, None).expect("a job object with a 512 MiB cap");
         assert!(
             !governor.governed(),
@@ -153,10 +179,7 @@ mod job_object {
             "the child lives while its governor does"
         );
         drop(governor);
-        assert!(
-            wait_exit(&mut child.0, Duration::from_secs(2)).is_some(),
-            "the child was still running 2 s after its governor was dropped"
-        );
+        exit_within(&mut child.0, "the child after its governor was dropped");
     }
 
     #[test]
@@ -168,10 +191,7 @@ mod job_object {
             .contain(&child.0)
             .expect("the second call finds the child contained and refuses nothing");
         drop(governor);
-        assert!(
-            wait_exit(&mut child.0, Duration::from_secs(2)).is_some(),
-            "the child was still running 2 s after its governor was dropped"
-        );
+        exit_within(&mut child.0, "the child after its governor was dropped");
     }
 
     /// Ruling 18: `governed()` is the OS's read-back, remembered — false
@@ -221,16 +241,14 @@ mod job_object {
         governor
             .contain(&capped.0)
             .expect("a running child is contained");
-        let status = wait_exit(&mut capped.0, DEADLINE)
-            .expect("the capped PowerShell did not exit within the deadline");
+        let status = exit_within(&mut capped.0, "the capped PowerShell");
         assert!(
             !status.success(),
             "a 256 MiB allocation went through under a 64 MiB cap: {status}"
         );
 
         let mut free = Reaper(allocate_256_mib());
-        let status = wait_exit(&mut free.0, DEADLINE)
-            .expect("the uncapped PowerShell did not exit within the deadline");
+        let status = exit_within(&mut free.0, "the uncapped PowerShell");
         assert!(
             status.success(),
             "the same allocation failed without a cap: {status}"
