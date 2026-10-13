@@ -287,6 +287,12 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     // (Ruling 22, M14); a bare name is pinned to what PATH holds now, or left
     // to refuse each run with a warning.
     let harness_bin = vk_ipc::server::harness_binary_at_start(&a.harness_bin)?;
+    // Whether this daemon is the Windows service: the Claude Code binary rule
+    // depends on it (Ruling 43). There is no service anywhere else.
+    #[cfg(windows)]
+    let as_service = a.as_service;
+    #[cfg(not(windows))]
+    let as_service = false;
     // `--as-service` exists only on Windows, and so does everything it
     // settles: the ProgramData state directory, the machine-wide pipe and the
     // DACL on it. On Unix the daemon below reads exactly as it did before.
@@ -370,7 +376,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
             state_dir.clone(),
             anthropic_keys.clone(),
             anthropic_base_url.clone(),
-            a.as_service,
+            as_service,
         ),
     )?;
     // The endpoint before the record. Binding is the other way a start can be
@@ -539,7 +545,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         web: Some(Arc::new(LinkMinter(web.links))),
         anthropic_keys,
         anthropic_base_url,
-        as_service: a.as_service,
+        as_service,
     };
     vk_ipc::server::serve_on(kernel, listener, config).await
 }
