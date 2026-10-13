@@ -81,19 +81,34 @@ on disk, and the prompt on stdin so no process list shows it.
 ```
 vk mount claude-code                                    # sonnet to draft, opus to judge
 vk mount claude-code --draft-model claude-sonnet-5 --judge-model claude-opus-5 \
-                     --bin /opt/claude/bin/claude --timeout 180
+                     --timeout 180
 ```
 
-`--bin` defaults to `claude`, found on **the daemon's** `PATH`. A path given
-instead is run by the daemon at mount, at every boot and at every call, so it
-must be absolute, have no `..`, and resolve to a file that exists; links are
-followed, and what is checked, stored and run is the path they resolve to.
-Under the Windows service, which runs it as `NT SERVICE\vkd`, that resolved
-path is also refused inside a synced folder or under a user profile — the rule
-`vkd-service install` applies to its own binary — so a service mounts a
-`claude` installed somewhere only administrators may write, or one on the
-service's own `PATH`. A daemon you started yourself may run the `claude` in
-your profile (`contracts/tcb.md`, Claude Code adapter).
+**Which `claude` runs is the daemon's to say, not the mount's.** By default it
+is `claude` on **the daemon's** `PATH` (`claude.exe` on Windows, never the
+`.cmd` shim), found when the daemon starts; another one is daemon
+configuration:
+
+```
+vkd --claude-bin /opt/claude/bin/claude                 # or:
+vk boot --claude-bin /opt/claude/bin/claude             # passed on to vkd
+vkd-service install --claude-bin "C:\Program Files\Claude\claude.exe"   # the service
+```
+
+The daemon checks it **once, when it starts**, and a path it refuses is a
+start that fails, naming `--claude-bin` and the rule: it runs that file at
+mount, at every boot and at every call, so it must be absolute, have no `..`,
+and resolve to a file that exists; links are followed, and what is checked and
+run is the path they resolve to. Under the Windows service, which runs it as
+`NT SERVICE\vkd`, it must also be on a local fixed drive and the resolved
+path is refused inside a synced folder or under a user profile — the rule
+`vkd-service install` applies to its own binary, and applies to
+`--claude-bin` before the service exists — so a service runs a `claude`
+installed somewhere only administrators may write, or one on the service's
+own `PATH`. A daemon you started yourself may run the `claude` in your profile
+(`contracts/tcb.md`, Claude Code adapter). `vk mount claude-code` has no
+`--bin`, and a mount request that names a `binary` is refused (founder
+decision 2026-10-13).
 
 It runs on **the founder's own claude.ai subscription**, which is a person's
 and not a product's. Nothing is billed per call, so the manifest's
@@ -363,6 +378,16 @@ each naming the three things it can be (written before SP1b's subject
 binding, moved between subjects, wrong master key). There is no legacy read
 path and no migration, on purpose: no production store exists, and such a
 directory is recreated.
+
+**Claude Code mount specs from SP1b (no migration).** Until 2026-10-13 the
+`claude` a Claude Code arch ran was a field of its mount request, and the
+spec the mount persisted carries it as `binary`. Such a spec is still read:
+at every boot that re-creates the arch the field is **ignored** — the daemon's
+own binary (`vkd --claude-bin`, default `claude` on its `PATH`) is what runs —
+and `vkd.log` gets a warning naming the path it ignored. Nothing rewrites the
+row; `vk arch show` still prints the old field. To be rid of both, start the
+daemon with the `--claude-bin` you meant and mount the arch again
+(`vk umount ID`, then `vk mount claude-code`): the new spec has no `binary`.
 
 A node with a record and **no recorded head** does not serve without `--force`
 either. Cutting a tail is caught by the head; cutting a tail *and* deleting the
@@ -644,7 +669,7 @@ elevated PowerShell and builds nothing:
 
 | `vkd-service` verb | what it does |
 |---|---|
-| `install [--user-sid S] [--binary PATH] [--endpoint EP] [--probe-docker] [-- <vkd args>]` | create the service under `NT SERVICE\vkd`, on that user's own endpoint unless one is named; print the SIDs, the account, the endpoint, the DACL and the `ImagePath` |
+| `install [--user-sid S] [--binary PATH] [--endpoint EP] [--claude-bin PATH] [--probe-docker] [-- <vkd args>]` | create the service under `NT SERVICE\vkd`, on that user's own endpoint unless one is named; print the SIDs, the account, the endpoint, the DACL and the `ImagePath`. `--claude-bin` is checked by the service's rule before anything is created and written into the `ImagePath` as `vkd --claude-bin <resolved path>`; given after `--` instead, it is refused |
 | `uninstall` | stop it if it is running, delete it |
 | `start` / `stop` | control it and wait for the new state |
 | `run --user-sid S [--endpoint EP]` | the service control manager's own entry point; it runs `vkd --as-service --user-sid S --endpoint EP` in this process, with the endpoint `install` resolved. Not for a terminal |
@@ -666,6 +691,7 @@ serve nobody.
 | endpoint ACL | the creating account's — Unix: `0600` in a `0700` directory; Windows: `D:(A;;GA;;;<that account>)` | `--as-service`: `D:(A;;GA;;;<service SID>)(A;;GA;;;<--user-sid>)` |
 | state directory ACL | Unix `0700`; Windows, the parent's (per user under `%LOCALAPPDATA%`) | `--as-service`: the service account, SYSTEM and the administrators, protected and inherited |
 | passkey pages | `http://localhost:7734`, on loopback only | `--web-port PORT` (`0`: one the OS picks) |
+| Claude Code binary (`claude-code` arches) | `claude` on the daemon's `PATH` (`claude.exe` on Windows), found at start | `vkd --claude-bin PATH`, `vk boot --claude-bin PATH`, `vkd-service install --claude-bin PATH` |
 
 `$VK_ENDPOINT` and `$VK_NODE_KEY_FILE` are read by `vk` only: a daemon on a
 non-default endpoint is always started with `--endpoint`, and `vk boot` passes
