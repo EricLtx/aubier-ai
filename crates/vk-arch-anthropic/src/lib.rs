@@ -664,7 +664,9 @@ pub fn check_base_url(raw: &str) -> Result<()> {
     // as well as at `/`, `?` and `#`, so a hand-rolled scan reads
     // `http://evil.example\@127.0.0.1` as loopback while the client posts to
     // `evil.example` (fix round 2, Minor A). One parser, one answer.
-    let url = url::Url::parse(raw).with_context(|| format!("{raw} is not a URL"))?;
+    // The loopback verdict is the shared one (final review I-4), so this
+    // adapter and the Ollama `--external` check cannot drift apart.
+    let (url, loopback) = vk_kernel::arch::origin_loopback(raw)?;
     match url.scheme() {
         "https" => {
             anyhow::ensure!(url.host().is_some(), "{raw} has no host in it");
@@ -674,13 +676,8 @@ pub fn check_base_url(raw: &str) -> Result<()> {
         // `localhost` is a name, and a name is whatever `hosts` says it is
         // today, which is not something to put an API key on.
         "http" => {
-            let loopback = match url.host() {
-                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-                _ => false,
-            };
             anyhow::ensure!(
-                loopback,
+                loopback == Some(vk_kernel::arch::Loopback::Address),
                 "{raw} is plaintext http:// to {}: this node will not put an API key on the wire in the clear to anywhere but a loopback address",
                 url.host_str().unwrap_or("nowhere")
             );

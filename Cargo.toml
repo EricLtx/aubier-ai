@@ -31,3 +31,7 @@ directories = "5"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 rand = "0.8"
+# The one URL parser every loopback check goes through — the crate `reqwest`
+# parses with, so the check and the client cannot disagree about the host
+# (`vk_kernel::arch::origin_loopback`, final review I-4).
+url = "2"

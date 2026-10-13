@@ -516,9 +516,15 @@ fn predict_tokens(cfg: &OllamaConfig, max_tokens: u32) -> u32 {
 /// and nothing here could say what the far end does with it. That arrives with
 /// SP4; until then it is refused at mount (Ruling 9c).
 fn check_loopback(base_url: &str) -> Result<()> {
-    let host = host_of(base_url)
+    // The shared check, parsed by the crate `reqwest` parses with (final
+    // review I-4): a hand-rolled scan read `http://evil.example\@127.0.0.1`
+    // as loopback while the client posted to `evil.example`.
+    let (url, loopback) = vk_kernel::arch::origin_loopback(base_url)
         .with_context(|| format!("--external {base_url} is not a URL with a host in it"))?;
-    if is_loopback(&host) {
+    let host = url
+        .host_str()
+        .with_context(|| format!("--external {base_url} is not a URL with a host in it"))?;
+    if loopback.is_some() {
         return Ok(());
     }
     bail!(
@@ -527,35 +533,6 @@ fn check_loopback(base_url: &str) -> Result<()> {
          with SP4; until then point --external at 127.0.0.1, ::1 or localhost, or mount the \
          governed container instead"
     )
-}
-
-/// The host out of `scheme://[user@]host[:port]/…`, lowercased, with the
-/// brackets of an IPv6 literal removed.
-fn host_of(url: &str) -> Option<String> {
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|a| !a.is_empty())?;
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = match authority.strip_prefix('[') {
-        // `[::1]:11434` — the colons inside the brackets are the address.
-        Some(rest) => rest.split_once(']').map(|(h, _)| h)?,
-        None => authority.split(':').next()?,
-    };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
-}
-
-/// 127.0.0.0/8, `::1` however it is spelled, and the name every platform
-/// resolves to one of them.
-fn is_loopback(host: &str) -> bool {
-    if host == "localhost" {
-        return true;
-    }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => ip.is_loopback(),
-        Err(_) => false,
-    }
 }
 
 /// `sha256:`-prefixed, whichever way the server spelled it, so two mounts of
@@ -878,6 +855,11 @@ mod tests {
             "http://ollama.example.com:11434",
             "http://[2001:db8::1]:11434",
             "http://10.0.0.1",
+            // WHATWG ends the authority of a special scheme at a backslash, so
+            // the host is `evil.example` and `\@127.0.0.1:11434` is a path:
+            // `reqwest` would post the prompt there. A scan that took the text
+            // after the last `@` read it as loopback (final review I-4).
+            r"http://evil.example\@127.0.0.1:11434",
         ] {
             let e = check_loopback(refused).unwrap_err().to_string();
             assert!(e.contains("LAN arches arrive with SP4"), "{refused}: {e}");

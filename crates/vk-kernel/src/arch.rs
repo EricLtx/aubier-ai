@@ -197,6 +197,40 @@ fn no_secrets(config: &serde_json::Value, under: Option<&str>) -> anyhow::Result
     }
 }
 
+/// How an origin reaches this machine, when it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loopback {
+    /// A loopback *address*: `127.0.0.0/8` or `::1`, however it is spelled.
+    Address,
+    /// Exactly the name `localhost` — which is whatever `hosts` says today, so
+    /// a check that will put a credential on the wire accepts only
+    /// [`Loopback::Address`].
+    Localhost,
+}
+
+/// Parse `raw` and say whether its host is this machine's loopback.
+///
+/// The one loopback check every adapter uses (final review I-4). The URL is
+/// parsed by the `url` crate — the parser `reqwest` uses — and never scanned by
+/// hand: WHATWG ends the authority of a special scheme at a backslash as well
+/// as at `/`, `?` and `#`, so a scan that took the text after the last `@`
+/// read `http://evil.example\@127.0.0.1` as loopback while the client posted
+/// to `evil.example`. One parser, one answer.
+///
+/// `Err` when `raw` is not an absolute URL; `Ok((url, None))` when it parses
+/// and its host (if any) is not loopback.
+pub fn origin_loopback(raw: &str) -> anyhow::Result<(url::Url, Option<Loopback>)> {
+    let url = url::Url::parse(raw).map_err(|e| anyhow::anyhow!("{raw} is not a URL: {e}"))?;
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => Some(Loopback::Address),
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => Some(Loopback::Address),
+        // The parser lowercases a domain, so `LOCALHOST` arrives as this.
+        Some(url::Host::Domain("localhost")) => Some(Loopback::Localhost),
+        _ => None,
+    };
+    Ok((url, loopback))
+}
+
 pub struct MockAdapter {
     pub manifest: ArchManifest,
     pub budget: u32,
@@ -378,5 +412,24 @@ pub fn raise(reg: &mut Register, role: &str, output: &str) {
         "plan" => reg.decisions.push(format!("plan: {}", output.trim())),
         "judge" => reg.open_questions.push(format!("judge: {}", output.trim())),
         _ => reg.decisions.push(format!("{role}: {}", output.trim())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{origin_loopback, Loopback};
+
+    /// The shared check reads the host the way `reqwest` will (final review
+    /// I-4): the backslash form is `evil.example`, not loopback.
+    #[test]
+    fn origin_loopback_reads_the_host_the_client_will_use() {
+        let verdict = |raw: &str| origin_loopback(raw).unwrap().1;
+        assert_eq!(verdict("http://127.0.0.1:11434"), Some(Loopback::Address));
+        assert_eq!(verdict("http://[::1]:11434"), Some(Loopback::Address));
+        assert_eq!(verdict("http://LOCALHOST:11434"), Some(Loopback::Localhost));
+        assert_eq!(verdict(r"http://evil.example\@127.0.0.1:11434"), None);
+        assert_eq!(verdict("http://user@evil.example"), None);
+        assert_eq!(verdict("http://127.example.com"), None);
+        assert!(origin_loopback("not a url at all").is_err());
     }
 }
