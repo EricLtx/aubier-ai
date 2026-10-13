@@ -728,6 +728,12 @@ pub fn grant_restricted_on_winsta_desktop() -> Result<WinstaDesktopGrant> {
 /// first and run it only on entries known to be a leftover of this module's.
 /// Its predicate is unit-tested below on synthetic entries.
 ///
+/// **There is no command for it** (re-review 2, D1): no binary, no example,
+/// no test. The one way to run it is a scratch program of the operator's own
+/// — a `main` that depends on this crate, prints both DACLs, and calls this
+/// function — written for the occasion, run once in the affected session,
+/// and thrown away.
+///
 /// Returns how many entries each object lost; an entry that differs in type,
 /// flags, mask or trustee stays. Serialised with the guard by
 /// [`WINSTA_GRANT_LOCK`].
@@ -1137,14 +1143,27 @@ mod tests {
 
     const ALLOW: u8 = ACCESS_ALLOWED_ACE_TYPE;
 
+    /// The measured shapes, written out here rather than read from the
+    /// constants the predicate uses (re-review 2, D4): a change to either
+    /// constant now fails this test instead of moving with it.
     #[test]
     fn every_stored_shape_of_the_grant_is_the_grant_on_its_own_object() {
-        for (flags, mask) in STORED_GRANT_WINSTA {
+        let winsta: [(u8, u32); 3] = [
+            (0x03, 0x000F_037F),
+            (0x0b, 0xF000_0000),
+            (0x04, 0x000F_037F),
+        ];
+        let desktop: [(u8, u32); 2] = [(0x03, 0x000F_01FF), (0x00, 0x000F_01FF)];
+        assert_eq!(STORED_GRANT_WINSTA, winsta);
+        assert_eq!(STORED_GRANT_DESKTOP, desktop);
+        for (flags, mask) in winsta {
             let e = entry(ALLOW, flags, mask, WORKSPACE_GRANT_SID);
             assert!(e.names_restricted(), "{e:?}");
             assert!(e.is_the_grant(WindowObject::WindowStation), "{e:?}");
+            // And not on the other object: the two are stored differently.
+            assert!(!e.is_the_grant(WindowObject::Desktop) || desktop.contains(&(flags, mask)));
         }
-        for (flags, mask) in STORED_GRANT_DESKTOP {
+        for (flags, mask) in desktop {
             let e = entry(ALLOW, flags, mask, WORKSPACE_GRANT_SID);
             assert!(e.is_the_grant(WindowObject::Desktop), "{e:?}");
         }

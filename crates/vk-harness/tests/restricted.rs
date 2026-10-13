@@ -13,7 +13,9 @@
 //! (`strip_restricted_from_winsta_desktop`) matches an entry's shape, not its
 //! origin, and sessions on this machine carry foreign `RESTRICTED` entries of
 //! exactly those shapes (measured 2026-10-13), so it is an operator's hand
-//! tool, unsafe by default, and no test calls it (Ruling 40). Its predicate,
+//! tool, unsafe by default, and no test calls it (Ruling 40). There is no
+//! command for it either: an operator calls it from a scratch program of
+//! their own (see its doc in `restrict.rs`). Its predicate,
 //! `AceView::is_the_grant`, is unit-tested in `restrict.rs` on synthetic
 //! entries, with no window station involved.
 //!
@@ -151,12 +153,16 @@ fn the_mechanism_launches_a_deprivileged_child() {
         anyhow::ensure!(early.is_empty(), "the child ran before it was contained");
         governor.contain_process(handle, pid)
     });
+    // The spawn's own error first (re-review 2, D2): a spawn that failed
+    // before `contain` was called leaves `seen_at_contain` at `None`, and the
+    // assert below would then blame early output for it. When `contain`
+    // refused for early output, `ran` already carries that message.
+    let (code, out) = ran.expect("spawn, contain and run the deprivileged cmd.exe");
     assert_eq!(
         seen_at_contain.as_deref(),
         Some(""),
         "the child ran before it was contained"
     );
-    let (code, out) = ran.expect("spawn, contain and run the deprivileged cmd.exe");
     assert!(
         governor.governed(),
         "the Job Object read back that it holds the child"
@@ -307,15 +313,8 @@ fn foreign_restricted_entries_survive_a_grant_and_restore() {
         .expect("restore the window station's and desktop's DACLs");
     let after = winsta_desktop_aces().expect("read both DACLs after the restore");
     show("after the restore", &after);
+    // Entry for entry, SID by value: the foreign RESTRICTED entries found
+    // above are therefore exactly the ones left (a per-object check of them
+    // would add nothing — re-review 2, D3).
     assert_eq!(after, before, "both DACLs are exactly what they were");
-    for (was, now, what) in [
-        (&found.0, &after.0, "window station"),
-        (&found.1, &after.1, "desktop"),
-    ] {
-        assert_eq!(
-            &restricted_entries(now),
-            was,
-            "the {what}'s RESTRICTED entries are the ones it was found with"
-        );
-    }
 }
