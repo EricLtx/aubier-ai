@@ -655,6 +655,21 @@ mod tests {
             keys.problems.iter().any(|p| p.contains("subject-b")),
             "the subject whose key is not its own is named: {keys:?}"
         );
+        // The problem names the three things it can be, the SP1b format break
+        // first (Ruling 38): an operator with a pre-SP1b store reads why here.
+        let named = keys
+            .problems
+            .iter()
+            .find(|p| p.contains("subject-b"))
+            .expect("subject-b's problem");
+        for cause in [
+            "before SP1b's subject binding",
+            "must be recreated",
+            "moved from another subject",
+            "master key is not the one",
+        ] {
+            assert!(named.contains(cause), "{cause:?} in {named}");
+        }
         // And subject-a, whose file is still its own, passes.
         assert!(
             !keys.problems.iter().any(|p| p.contains("subject-a")),

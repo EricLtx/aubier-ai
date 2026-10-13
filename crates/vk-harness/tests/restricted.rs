@@ -4,11 +4,13 @@
 //! founder decision stands between the mechanism here and a shipped restricted
 //! harness (see `crates/vk-harness/src/restrict.rs`'s "Measured limit" note and
 //! the Task 10 report's `NEEDS_CONTEXT`), so they do not gate CI; run them with
-//! `cargo test -p vk-harness --test restricted -- --ignored`. The tests that
-//! grant on this session's window station and desktop are serialised within
-//! the process by the module's own lock, so they need no `--test-threads=1`;
-//! two *processes* running this suite at once are not serialised and are
-//! unsupported.
+//! `cargo test -p vk-harness --test restricted -- --ignored`. Grants on this
+//! session's window station and desktop are serialised within the process by
+//! the module's own lock, and every test here that reads those DACLs to
+//! compare them holds [`session_objects`] for its whole body (a `before` read
+//! taken while another test's grant is held would compare against that
+//! grant), so the suite needs no `--test-threads=1`; two *processes* running
+//! it at once are not serialised and are unsupported.
 //!
 //! What they establish:
 //!
@@ -25,21 +27,24 @@
 //!   restores on unwinding too, so a failing assertion leaves nothing behind.
 //! * `a_second_holder_waits_for_the_first_to_restore` — two holders in one
 //!   process are serialised, so a snapshot is never restored over a later one.
-//! * `the_winsta_and_desktop_carry_no_restricted_ace` — the session invariant
-//!   the two above rely on; run it before and after them for the record.
+//! * `the_winsta_and_desktop_carry_no_restricted_ace` — a read of both
+//!   objects for the record. Not an invariant: a fresh logon session on this
+//!   machine already carried `RESTRICTED` entries (measured 2026-10-13).
 //! * `strip_restricted_aces_left_by_an_unrestored_run` — the cleanup for a run
 //!   that was killed before its guard could restore: it makes such a leftover
-//!   itself (grants, then forgets the guard), then removes exactly the grant's
-//!   entries and nothing else — any real leftover found on the way goes too.
+//!   itself (grants, then abandons the guard unrestored), then removes exactly
+//!   the grant's entries and nothing else — any leftover of that shape found on
+//!   the way goes too, whoever made it (the strip matches shape, not origin).
 //!
 //! Every DACL comparison here is on the entries as read back (type, flags, mask
 //! and the trustee's SID bytes), never on an SDDL rendering (Ruling 35).
 #![cfg(windows)]
 
 use std::os::windows::io::RawHandle;
-use vk_harness::confine::Governor;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use vk_harness::confine::Governor;
 use vk_harness::restrict::{
     grant_restricted_on_winsta_desktop, grant_restricting_sid, render_aces,
     strip_restricted_from_winsta_desktop, winsta_desktop_aces, AceView, RestrictedChild,
@@ -47,6 +52,18 @@ use vk_harness::restrict::{
 };
 
 type Dacls = (Vec<AceView>, Vec<AceView>);
+
+/// Held for the whole body of every test that reads this session's window
+/// station and desktop DACLs: the module's own lock serialises the grants,
+/// not a test's `before`/`after` reads around them.
+fn session_objects() -> MutexGuard<'static, ()> {
+    static SESSION_OBJECTS: Mutex<()> = Mutex::new(());
+    // A test that panicked restored in its guard's `Drop`; the poison says
+    // nothing about the objects.
+    SESSION_OBJECTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Run `cmd /c echo hi` under `token`, in `cwd`, to completion (or a deadline),
 /// returning its exit code and captured stdout. `contain` is what the spawn
@@ -125,7 +142,10 @@ fn the_mechanism_launches_a_deprivileged_child() {
         );
         governor.contain_process(handle, pid)
     });
-    assert!(governor.governed(), "the Job Object read back that it holds the child");
+    assert!(
+        governor.governed(),
+        "the Job Object read back that it holds the child"
+    );
     assert_eq!(code, 0, "the deprivileged child must run: {out:?}");
     assert!(out.contains("hi"), "and produce its output: {out:?}");
 }
@@ -137,6 +157,7 @@ fn the_mechanism_launches_a_deprivileged_child() {
 #[test]
 #[ignore = "group G is a founder decision; run manually with --ignored"]
 fn a_restricting_sid_child_cannot_initialise() {
+    let _serial = session_objects();
     let ws = tempfile::tempdir().unwrap();
     let cfg = tempfile::tempdir().unwrap();
     grant_restricting_sid(ws.path()).unwrap();
@@ -164,12 +185,11 @@ fn a_restricting_sid_child_cannot_initialise() {
         .expect("restore the window station's and desktop's DACLs");
     let after = winsta_desktop_aces().expect("read both DACLs after the restore");
     show("after the guard restored", &after);
+    // `after == before` is the whole claim. It is not "no RESTRICTED entry
+    // remains": a session can carry RESTRICTED entries of its own before any
+    // grant (measured 2026-10-13, see the invariant test below), and those
+    // must come back exactly as they were, not vanish.
     assert_eq!(after, before, "both DACLs must be exactly what they were");
-    assert_eq!(
-        restricted_count(&after),
-        (0, 0),
-        "no RESTRICTED entry may remain"
-    );
 
     assert_ne!(
         code, 0,
@@ -183,6 +203,7 @@ fn a_restricting_sid_child_cannot_initialise() {
 #[test]
 #[ignore = "group G is a founder decision; run manually with --ignored"]
 fn a_test_that_fails_while_holding_the_grant_still_restores() {
+    let _serial = session_objects();
     let before = winsta_desktop_aces().expect("read both DACLs before");
     let outcome = std::panic::catch_unwind(|| {
         let _grant = grant_restricted_on_winsta_desktop().expect("winsta/desktop grant");
@@ -209,6 +230,7 @@ fn a_test_that_fails_while_holding_the_grant_still_restores() {
 #[test]
 #[ignore = "group G is a founder decision; run manually with --ignored"]
 fn a_second_holder_waits_for_the_first_to_restore() {
+    let _serial = session_objects();
     let before = winsta_desktop_aces().expect("read both DACLs before");
     let first = grant_restricted_on_winsta_desktop().expect("the first grant");
     let (tx, rx) = std::sync::mpsc::channel();
@@ -229,13 +251,19 @@ fn a_second_holder_waits_for_the_first_to_restore() {
     assert_eq!(after, before, "both DACLs are exactly what they were");
 }
 
-/// The session invariant: neither this window station nor this desktop names
-/// `RESTRICTED`. Run it before and after the tests above for the record; if it
-/// fails, a run was killed before its guard could restore — run
-/// `strip_restricted_aces_left_by_an_unrestored_run`.
+/// Does this window station or this desktop name `RESTRICTED`? A record to
+/// read, not a Windows invariant: measured 2026-10-13 in a fresh logon
+/// session, before any test here had run in it, the window station carried
+/// `RESTRICTED` entries `(0x0b, 0xF000_0000)` and `(0x04, 0x000F_037F)` and the desktop
+/// one `(0x00, 0x000F_01FF)` — the very shapes the strip removes, and of an
+/// origin that is not this module's. So a failure here does not by itself
+/// mean a run left a grant behind: compare with what the session carried
+/// before any grant, and run `strip_restricted_aces_left_by_an_unrestored_run`
+/// only when what it would remove is known to be a leftover of this module's.
 #[test]
 #[ignore = "reads this session's window station and desktop; run manually with --ignored"]
 fn the_winsta_and_desktop_carry_no_restricted_ace() {
+    let _serial = session_objects();
     let now = winsta_desktop_aces().expect("read both DACLs");
     show("as found", &now);
     assert_eq!(
@@ -247,16 +275,20 @@ fn the_winsta_and_desktop_carry_no_restricted_ace() {
 
 /// The cleanup for a run killed before its guard could restore: remove exactly
 /// the entries the grant adds, and nothing else, from both objects. The test
-/// makes such a leftover itself — grants and forgets the guard, as a killed
+/// makes such a leftover itself — grants and abandons the guard, as a killed
 /// process would — so it proves the strip on the shape a real run leaves; a
 /// leftover already there when it starts is removed with it.
 #[test]
 #[ignore = "edits this session's window station and desktop; run manually with --ignored"]
 fn strip_restricted_aces_left_by_an_unrestored_run() {
+    let _serial = session_objects();
     let found = winsta_desktop_aces().expect("read both DACLs as found");
     show("as found", &found);
     let guard = grant_restricted_on_winsta_desktop().expect("winsta/desktop grant");
-    std::mem::forget(guard); // a run killed before its guard could restore
+    // A run killed before its guard could restore: the grant stays, and the
+    // module's lock is released (a `mem::forget` would keep it, and the strip
+    // below would wait on it for ever).
+    guard.abandon_without_restoring();
     let before = winsta_desktop_aces().expect("read both DACLs before the strip");
     show(
         "before the strip (a forgotten grant on top of what was found)",

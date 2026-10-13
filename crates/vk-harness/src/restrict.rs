@@ -120,8 +120,8 @@ use windows::Win32::Security::{
 const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, ResumeThread,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 /// The fixed restricting SIDs (the logon SID is added at build time): the
@@ -621,9 +621,11 @@ pub fn winsta_desktop_aces() -> Result<(Vec<AceView>, Vec<AceView>)> {
 /// the guard restores a *snapshot*, so two live holders would undo each
 /// other (A saves S0 and grants, B saves S1 and grants, A restores S0, B
 /// restores S1 — A's entry is back on). Held for the guard's whole life and
-/// by the strip for its duration, so the tests no longer depend on
-/// `--test-threads=1`. Two *processes* are not serialised: running the
-/// ignored suite from two processes at once is unsupported.
+/// by the strip for its duration, so two grants in one process can no longer
+/// interleave whatever `--test-threads` says (the ignored tests additionally
+/// serialise their own before/after DACL reads, which this lock does not
+/// cover). Two *processes* are not serialised: running the ignored suite
+/// from two processes at once is unsupported.
 static WINSTA_GRANT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn hold_winsta_grant_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -652,6 +654,17 @@ impl WinstaDesktopGrant {
     /// Put both DACLs back now, reporting a failure instead of swallowing it.
     pub fn restore(mut self) -> Result<()> {
         self.restore_inner()
+    }
+
+    /// Let go of the guard **without** restoring: the grant stays on both
+    /// objects, as a process killed mid-test would leave it, and the lock is
+    /// released. For the strip's own test, which makes such a leftover on
+    /// purpose — `std::mem::forget` would leave the same DACLs but keep
+    /// [`WINSTA_GRANT_LOCK`] held for ever, and the strip that follows takes
+    /// it. Not for any other use.
+    #[doc(hidden)]
+    pub fn abandon_without_restoring(mut self) {
+        self.restored = true;
     }
 
     fn restore_inner(&mut self) -> Result<()> {
@@ -717,8 +730,14 @@ pub fn grant_restricted_on_winsta_desktop() -> Result<WinstaDesktopGrant> {
 /// shape that another restricting-SID sandbox put there (a Chromium-family
 /// browser's, say) is indistinguishable and would go too. A documented tool
 /// for orphaned grants of this shape, run by hand from the ignored test, and
-/// nothing more: no production path calls it. Returns how many entries each
-/// object lost; an entry that differs in type, flags, mask or trustee stays.
+/// nothing more: no production path calls it. Measured 2026-10-13: a fresh
+/// logon session on this machine carried, before any grant of this module's
+/// had been made in it, `RESTRICTED` entries of the re-merged shapes on both
+/// objects (window station `(0x0b, 0xF000_0000)` and `(0x04, 0x000F_037F)`, desktop
+/// `(0x00, 0x000F_01FF)`) — so the strip would remove those too. Read both
+/// DACLs first and run it only on entries known to be a leftover of this
+/// module's. Returns how many entries each object lost; an entry that differs
+/// in type, flags, mask or trustee stays.
 /// Serialised with the guard by [`WINSTA_GRANT_LOCK`].
 pub fn strip_restricted_from_winsta_desktop() -> Result<(usize, usize)> {
     let _held = hold_winsta_grant_lock();
