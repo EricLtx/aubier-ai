@@ -12,15 +12,47 @@ use vk_contracts::syscalls::{Ctx, KernelError};
 /// short enough to print.
 const LEDGER_TAIL: usize = 50;
 
+/// One arch in the `/arches` listing: enough to choose one, and the state that
+/// says whether choosing it would work (SP1b ruling 14).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ArchRow {
+    pub arch_id: String,
+    pub name: String,
+    /// `ready` or `unavailable`.
+    pub state: &'static str,
+    /// Why it is not usable; absent for one that is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum Entry {
-    Dir { entries: Vec<String> },
-    Arch(ArchManifest),
+    Dir {
+        entries: Vec<String>,
+    },
+    /// `/arches`: a listing of its own rather than a directory of strings,
+    /// because an arch has a state and a line of text cannot be a column.
+    Arches {
+        arches: Vec<ArchRow>,
+    },
+    /// One arch: the manifest, flattened so the object still reads as the
+    /// manifest it always was, plus the state.
+    Arch {
+        #[serde(flatten)]
+        manifest: Box<ArchManifest>,
+        state: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     Task(Task),
     Artefact(BlobEnvelope),
-    Device { id: String },
-    LedgerTail { events: Vec<LedgerEvent> },
+    Device {
+        id: String,
+    },
+    LedgerTail {
+        events: Vec<LedgerEvent>,
+    },
 }
 
 /// Resolve `path` as `ctx` may see it. The namespace is a read surface like
@@ -38,24 +70,33 @@ pub fn resolve(k: &RealKernel, ctx: &Ctx, path: &str) -> Result<Entry, KernelErr
                 "ledger".into(),
             ],
         }),
-        ["arches"] => Ok(Entry::Dir {
-            entries: k
-                .arches()
+        ["arches"] => Ok(Entry::Arches {
+            arches: k
+                .arch_states()
                 .into_iter()
-                .map(|(id, m)| format!("{id}  {}", m.name))
+                .map(|(arch_id, m, state)| ArchRow {
+                    arch_id,
+                    name: m.name,
+                    state: state.name(),
+                    reason: state.reason().map(str::to_string),
+                })
                 .collect(),
         }),
         ["arches", id] => k
-            .arches()
+            .arch_states()
             .into_iter()
-            .find(|(i, _)| i == id)
-            .map(|(_, m)| Entry::Arch(m))
+            .find(|(i, _, _)| i == id)
+            .map(|(_, m, state)| Entry::Arch {
+                manifest: Box::new(m),
+                state: state.name(),
+                reason: state.reason().map(str::to_string),
+            })
             .ok_or_else(|| KernelError::NotFound(path.into())),
         ["tasks"] => Ok(Entry::Dir {
-            entries: k.tasks(ctx).into_iter().map(|t| t.id).collect(),
+            entries: k.tasks(ctx)?.into_iter().map(|t| t.id).collect(),
         }),
         ["tasks", id] => k
-            .task(ctx, id)
+            .task(ctx, id)?
             .map(Entry::Task)
             .ok_or_else(|| KernelError::NotFound(path.into())),
         // The envelope, never the plaintext: reading the bytes is `read_artefact`,
@@ -65,13 +106,18 @@ pub fn resolve(k: &RealKernel, ctx: &Ctx, path: &str) -> Result<Entry, KernelErr
             .blobs
             .envelope(&format!("sha256:{}", hash.trim_start_matches("sha256:")))
             .map(Entry::Artefact)
-            .map_err(|_| KernelError::NotFound(path.into())),
+            .map_err(|e| match crate::blob_failed(e) {
+                KernelError::NotFound(_) => KernelError::NotFound(path.into()),
+                damaged => damaged,
+            }),
         ["devices"] => Ok(Entry::Dir {
             entries: k
                 .store()
                 .db
                 .list_json::<serde_json::Value>("devices")
-                .unwrap_or_default()
+                // A store that cannot list them fails the read (Ruling 43):
+                // an empty listing would say no device is enrolled.
+                .map_err(crate::store_failed)?
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect(),
@@ -83,8 +129,7 @@ pub fn resolve(k: &RealKernel, ctx: &Ctx, path: &str) -> Result<Entry, KernelErr
             .store()
             .db
             .get_json::<serde_json::Value>("devices", id)
-            .ok()
-            .flatten()
+            .map_err(crate::store_failed)?
             .map(|_| Entry::Device { id: (*id).into() })
             .ok_or_else(|| KernelError::NotFound(path.into())),
         ["ledger"] => Ok(Entry::LedgerTail {

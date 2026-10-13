@@ -87,3 +87,7 @@ vk man                          # the contracts this kernel speaks
 ## Licence
 
 Proprietary — all rights reserved. See `LICENSE`.
+
+---
+
+**Technical documentation (SP0–SP1b: state directory, arches, harness, passkeys, Windows service, demo, recovery):** see `docs/technical-readme.md`.

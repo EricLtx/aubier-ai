@@ -46,6 +46,24 @@ pub enum KernelError {
     Gate(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// The arch is mounted and listed, and it cannot run: the factory could
+    /// not re-create it at boot, or the runtime behind it has changed (SP1b
+    /// ruling 14). Distinct from `NotFound`, which is an id this node has
+    /// never heard of — the difference is the difference between "no such
+    /// arch" and "that arch is not usable, here is why", and only the second
+    /// tells an operator what to go and fix.
+    #[error("arch unavailable: {0}")]
+    ArchUnavailable(String),
+    /// The arch is mounted and its adapter is still being built — a container
+    /// starting, a model loading, a binary being asked its version (SP1b Task
+    /// 1b). Nothing is wrong: the call is **retryable**, and the caller that
+    /// waits a moment and asks again gets an answer. Kept apart from
+    /// `ArchUnavailable` because the two demand opposite things of a caller —
+    /// one says try again, the other says go and fix something — and a
+    /// scheduler that cannot tell them apart must fail a step that only
+    /// needed to wait.
+    #[error("arch {0} is starting; retry")]
+    ArchStarting(String),
     /// A durable write or read failed. A syscall that cannot persist its effect
     /// must fail loudly: a swallowed write is an invariant that survives only
     /// until the next restart.

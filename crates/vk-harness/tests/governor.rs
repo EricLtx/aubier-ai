@@ -1,0 +1,385 @@
+//! The governor against real children: a `cmd /c ping` that outlives its
+//! governor by nothing, a PowerShell that cannot allocate past the cap, an
+//! assignment refused for a process that is already gone, a `governed()`
+//! that answers yes only for a containment the OS read back — and, on every
+//! platform, the no-op governor, which contains nothing and says so.
+//!
+//! Every child is spawned behind [`Reaper`], so a failed assertion kills what
+//! it spawned, and no wait on a child is open-ended: [`exit_within`] gives up
+//! at [`deadline`] and the reaper does the rest. The deadline only bounds the
+//! wait; what each test asserts is the outcome — the cap refused the
+//! allocation, the job killed the tree — never how long it took (Ruling 44).
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+use vk_harness::confine::{for_this_platform, Governor, NoopGovernor};
+
+/// The longest any test waits on a child: 60 s on CI (the `CI` variable is
+/// set — GitHub's Windows runners start a capped PowerShell slowly enough that
+/// a fixed 10 s failed there, Ruling 44), 20 s otherwise. Past it the test
+/// fails saying how long it waited and what the child was doing, and the
+/// reaper kills the child; nothing is left running on the machine.
+fn deadline() -> Duration {
+    if std::env::var_os("CI").is_some() {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(20)
+    }
+}
+
+/// A child that is killed and reaped when the test is done with it, whether
+/// the test passed or panicked.
+struct Reaper(Child);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Polls the child until it exits, and fails at [`deadline`] naming `what`,
+/// the time waited and the child's state (Ruling 44).
+fn exit_within(child: &mut Child, what: &str) -> ExitStatus {
+    let max = deadline();
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return status;
+        }
+        if start.elapsed() >= max {
+            let state = match child.try_wait() {
+                Ok(Some(status)) => format!("exited just now with {status}"),
+                Ok(None) => format!("still running, pid {}", child.id()),
+                Err(e) => format!("unreadable: {e}"),
+            };
+            panic!(
+                "{what}: no exit after {:.1} s (deadline {} s, CI={}); the child is {state}",
+                start.elapsed().as_secs_f64(),
+                max.as_secs(),
+                std::env::var_os("CI").is_some()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A child that exits with status 0 straight away, on any platform.
+fn quick_child() -> Child {
+    let mut cmd = if cfg!(windows) {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/c", "exit 0"]);
+        cmd
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 0"]);
+        cmd
+    };
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn a quick child")
+}
+
+/// A child that would live about thirty seconds on its own, on any platform.
+fn long_lived_child() -> Child {
+    let mut cmd = if cfg!(windows) {
+        let mut cmd = Command::new("ping");
+        cmd.args(["-n", "30", "127.0.0.1"]);
+        cmd
+    } else {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        cmd
+    };
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn a long-lived child")
+}
+
+#[test]
+fn the_noop_governor_contains_nothing_and_says_so() {
+    let governor = NoopGovernor::new();
+    let mut child = Reaper(quick_child());
+    governor
+        .contain(&child.0)
+        .expect("the no-op governor refuses nothing");
+    assert!(
+        !governor.governed(),
+        "a governor that enforces nothing must not claim to govern"
+    );
+    let status = exit_within(&mut child.0, "the quick child");
+    assert!(status.success(), "the child ran unhindered: {status}");
+}
+
+#[test]
+fn the_platform_governor_claims_only_what_it_enforces() {
+    let governor = for_this_platform(256 << 20, None).expect("every platform has a governor");
+    assert!(
+        !governor.governed(),
+        "nothing is governed before a containment, on any platform"
+    );
+    let child = Reaper(long_lived_child());
+    governor
+        .contain(&child.0)
+        .expect("a running child is contained, or the no-op governor refuses nothing");
+    assert_eq!(
+        governor.governed(),
+        cfg!(windows),
+        "only the Job Object governs in SP1b, and only once the OS read the containment back"
+    );
+}
+
+#[cfg(windows)]
+mod job_object {
+    use super::*;
+    use vk_harness::confine::JobGovernor;
+
+    /// A process tree — `cmd` and the `ping` it runs — that would live about
+    /// thirty seconds on its own.
+    fn ping_tree() -> Child {
+        Command::new("cmd")
+            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd /c ping")
+    }
+
+    /// A PowerShell that allocates 256 MiB in one array and exits.
+    fn allocate_256_mib() -> Child {
+        Command::new("powershell")
+            .args(["-NoProfile", "-c", "$a = New-Object byte[] 268435456"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn powershell")
+    }
+
+    /// The tree would live thirty seconds on its own; it exits because the
+    /// job's last handle closed. Asserted on the exit, bounded by [`deadline`]
+    /// (Ruling 44) — not on how fast it came.
+    #[test]
+    fn dropping_the_governor_kills_the_child() {
+        let governor = JobGovernor::new(512 << 20, None).expect("a job object with a 512 MiB cap");
+        assert!(
+            !governor.governed(),
+            "nothing is governed before a containment"
+        );
+        let mut child = Reaper(ping_tree());
+        governor
+            .contain(&child.0)
+            .expect("a running child is contained");
+        assert!(
+            governor.governed(),
+            "a containment the OS read back is governed"
+        );
+        assert!(
+            child.0.try_wait().expect("try_wait").is_none(),
+            "the child lives while its governor does"
+        );
+        drop(governor);
+        exit_within(&mut child.0, "the child after its governor was dropped");
+    }
+
+    #[test]
+    fn containing_a_child_twice_is_one_containment() {
+        let governor = JobGovernor::new(512 << 20, None).expect("a job object");
+        let mut child = Reaper(ping_tree());
+        governor.contain(&child.0).expect("the first call contains");
+        governor
+            .contain(&child.0)
+            .expect("the second call finds the child contained and refuses nothing");
+        drop(governor);
+        exit_within(&mut child.0, "the child after its governor was dropped");
+    }
+
+    /// Ruling 18: `governed()` is the OS's read-back, remembered — false
+    /// before any containment, true after one the OS confirmed, false for a
+    /// governor whose containment failed, and false again for a governor
+    /// that was refused a process after containing another.
+    #[test]
+    fn governed_is_true_only_after_a_verified_containment() {
+        let governor = JobGovernor::new(512 << 20, None).expect("a job object");
+        assert!(
+            !governor.governed(),
+            "a fresh governor has verified nothing"
+        );
+        let child = Reaper(ping_tree());
+        governor
+            .contain(&child.0)
+            .expect("a running child is contained");
+        assert!(
+            governor.governed(),
+            "a containment the OS read back is governed"
+        );
+
+        let mut gone = quick_child();
+        gone.wait().expect("wait");
+        let refused = JobGovernor::new(512 << 20, None).expect("a job object");
+        refused
+            .contain(&gone)
+            .expect_err("a process that is gone cannot be contained");
+        assert!(
+            !refused.governed(),
+            "a governor whose containment failed governs nothing"
+        );
+
+        governor
+            .contain(&gone)
+            .expect_err("a process that is gone cannot be contained");
+        assert!(
+            !governor.governed(),
+            "a governor refused one process cannot claim its tree is whole"
+        );
+    }
+
+    #[test]
+    fn a_64_mib_cap_refuses_a_256_mib_allocation() {
+        let governor = JobGovernor::new(64 << 20, None).expect("a job object with a 64 MiB cap");
+        let mut capped = Reaper(allocate_256_mib());
+        governor
+            .contain(&capped.0)
+            .expect("a running child is contained");
+        let status = exit_within(&mut capped.0, "the capped PowerShell");
+        assert!(
+            !status.success(),
+            "a 256 MiB allocation went through under a 64 MiB cap: {status}"
+        );
+
+        let mut free = Reaper(allocate_256_mib());
+        let status = exit_within(&mut free.0, "the uncapped PowerShell");
+        assert!(
+            status.success(),
+            "the same allocation failed without a cap: {status}"
+        );
+    }
+
+    #[test]
+    fn containing_an_exited_child_is_an_error_not_a_panic() {
+        let governor = JobGovernor::new(64 << 20, None).expect("a job object");
+        let mut child = Command::new("cmd")
+            .args(["/c", "exit 3"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd /c exit 3");
+        let status = child.wait().expect("wait");
+        assert_eq!(status.code(), Some(3));
+        let err = governor
+            .contain(&child)
+            .expect_err("a process that is gone cannot be contained");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("had already exited with code 3"),
+            "the error names the exit code it found: {text}"
+        );
+        assert!(
+            text.contains("0x80070005"),
+            "the OS refusal, ERROR_ACCESS_DENIED, stays in the chain: {text}"
+        );
+        assert!(
+            !governor.governed(),
+            "a refused containment governs nothing"
+        );
+    }
+
+    #[test]
+    fn caps_outside_their_range_are_refused_before_any_job_exists() {
+        assert!(
+            JobGovernor::new(0, None).is_err(),
+            "a cap of 0 bytes is not a cap"
+        );
+        assert!(
+            JobGovernor::new(64 << 20, Some(0)).is_err(),
+            "0 % of the CPU is not a rate"
+        );
+        assert!(
+            JobGovernor::new(64 << 20, Some(101)).is_err(),
+            "101 % of the CPU is not a rate"
+        );
+        let governor =
+            JobGovernor::new(64 << 20, Some(25)).expect("a hard cap of 25 % is accepted");
+        assert_eq!(governor.max_memory_bytes(), 64 << 20);
+        assert_eq!(governor.cpu_rate_percent(), Some(25));
+    }
+}
+
+/// What a child leaves running in its process group is signalled while the
+/// child is still a zombie (Task 4 review, M18): an unreaped leader pins its
+/// pgid, so the id cannot be reused underneath the signal. The group's
+/// member traps `SIGTERM` and, when it arrives, records the leader's state
+/// as `ps` reports it — `Z`, a zombie: exited and not yet reaped — then
+/// exits. The test drives the one settle sequence the launch loop uses
+/// (`settle_and_reap`), using its seam between the signal and the reap to
+/// wait for that record, and pins three things: the member saw `Z`, the
+/// group is empty afterwards, and the whole settle took less than
+/// `GROUP_GRACE` — the member went on the `SIGTERM`, not on the grace
+/// timeout and the `SIGKILL` (Task 10 review, Minor 4).
+#[cfg(unix)]
+#[test]
+fn a_childs_process_group_is_settled_before_the_child_is_reaped() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("leader-state");
+    let ready = dir.path().join("ready");
+    // The leader (`sh`, leading its own group) forks a member that traps TERM
+    // to record the leader's state, says it is ready, and then exits — leaving
+    // the member (and its `sleep`) behind in the group.
+    let script = format!(
+        "leader=$$; ( trap 'ps -o stat= -p $leader > \"{record}\"; exit 0' TERM; : > \"{ready}\"; \
+         sleep 30 & wait ) & while [ ! -e \"{ready}\" ]; do sleep 0.01; done; exit 0",
+        record = record.display(),
+        ready = ready.display()
+    );
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pgid = i32::try_from(child.id()).unwrap();
+    let started = std::time::Instant::now();
+    let status = vk_harness::launch::settle_and_reap(&mut child, || {
+        // Between the SIGTERM and the reap: the moment the member looks at
+        // its leader. Wait for its record, bounded by the grace itself.
+        let deadline = std::time::Instant::now() + vk_harness::launch::GROUP_GRACE;
+        while std::fs::metadata(&record)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    })
+    .unwrap();
+    assert!(status.success(), "{status}");
+    let seen = std::fs::read_to_string(&record).unwrap_or_default();
+    assert!(
+        seen.trim_start().starts_with('Z'),
+        "when the SIGTERM reached the member, its leader was a zombie — exited, not reaped: {seen:?}"
+    );
+    // The group can no longer be signalled: no live member is left. `kill(-pgid,
+    // 0)` returns -1, with `ESRCH` (no such process, Linux's answer for an empty
+    // group) or `EPERM` (macOS's answer once the last member has been reparented
+    // away and reaped). Both mean "gone"; the exact errno is the platform's.
+    // SAFETY: `kill(-pgid, 0)` delivers nothing; it only asks whether any member
+    // is left that this process could signal.
+    let left = unsafe { libc::kill(-pgid, 0) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!(
+        left, -1,
+        "the group must have no signallable member: {errno:?}"
+    );
+    assert!(
+        matches!(errno, Some(e) if e == libc::ESRCH || e == libc::EPERM),
+        "the group is gone (ESRCH) or unsignallable (EPERM): {errno:?}"
+    );
+    assert!(
+        started.elapsed() < vk_harness::launch::GROUP_GRACE,
+        "the member went on the SIGTERM, not on the grace timeout and the SIGKILL: {:?}",
+        started.elapsed()
+    );
+}

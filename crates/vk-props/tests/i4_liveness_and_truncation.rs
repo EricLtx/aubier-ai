@@ -12,7 +12,7 @@ fn local() -> ArchManifest {
         locality: Locality::Local,
         jurisdiction: "FR".into(),
         retention_days: None,
-        cost_per_1k_tokens_eur: 0.0,
+        cost_per_1k_tokens_eur: Some(0.0),
         latency_ms_p50: 1,
         context_ceiling: 64,
         determinism: Determinism::SeededDeterministic,
@@ -129,6 +129,7 @@ fn truncation_property<K: KernelTestHooks>(
 }
 
 fn real(dir: &std::path::Path) -> vk_kernel::RealKernel {
+    vk_contracts::testing::guard_state_dir(dir);
     vk_kernel::RealKernel::open(
         dir,
         vk_store::keys::KeySource::File(dir.join("master.key")),

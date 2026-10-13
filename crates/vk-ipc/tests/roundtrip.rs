@@ -23,7 +23,229 @@ where
     serde_json::from_str(&line).unwrap()
 }
 
+/// A register that cannot be read — a row that does not parse, a database
+/// fault — fails the task read surfaces loudly (Ruling 8; SP1a review N3)
+/// instead of quietly hiding the task from `ps`, `top` and `task.show` as
+/// if it were above the caller's clearance.
+#[tokio::test]
+async fn a_register_that_cannot_be_read_fails_the_task_surfaces_loudly() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    let task = c
+        .call(
+            "task.create",
+            json!({"goal": "g", "artefact_type": "note", "steps": []}),
+            None,
+        )
+        .await
+        .unwrap();
+    let id = task["id"].as_str().unwrap().to_string();
+    let register = task["register"].as_str().unwrap().to_string();
+    assert_eq!(
+        c.call("task.ls", json!({}), None)
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The register row is no longer a register.
+    k.lock()
+        .unwrap()
+        .store()
+        .db
+        .put_json("registers", &register, &json!("not a register"))
+        .unwrap();
+    for (method, params) in [
+        ("task.ls", json!({})),
+        ("task.show", json!({"task_id": id})),
+        ("top", json!({})),
+        ("ns.ls", json!({"path": "/tasks"})),
+    ] {
+        let err = c.call(method, params, None).await.unwrap_err();
+        assert_eq!(
+            code_of(&err),
+            vk_ipc::E_STORE,
+            "{method} must fail as a store fault, not hide the task: {err}"
+        );
+    }
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// `liveness.renew` (SP1a review M10): the admin syscall behind `vk top`'s
+/// liveness column. A human act — it says a human vouched for the business
+/// — so it takes a presence proof and records the device that made it.
+#[tokio::test]
+async fn liveness_renew_is_a_human_act_that_feeds_top() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    let err = c
+        .call(
+            "liveness.renew",
+            json!({"business": "acme", "ttl_ms": 60_000}),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+
+    let proof = prove(&c, &device).await;
+    let err = c
+        .call(
+            "liveness.renew",
+            json!({"business": "", "ttl_ms": 60_000}),
+            Some(proof),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{err}");
+
+    let proof = prove(&c, &device).await;
+    let renewed = c
+        .call(
+            "liveness.renew",
+            json!({"business": "acme", "ttl_ms": 60_000}),
+            Some(proof),
+        )
+        .await
+        .unwrap();
+    assert_eq!(renewed["business"], "acme");
+    assert_eq!(renewed["renewed_by_device"], "laptop");
+    let expires = renewed["expires_at_ms"].as_u64().unwrap();
+    assert!(expires > vk_kernel::now_ms());
+
+    let top = c.call("top", json!({}), None).await.unwrap();
+    assert_eq!(top["liveness"]["acme"].as_u64(), Some(expires));
+
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// No pipe method writes a register wholesale (SP1a review M1): the only
+/// writes over the transport go through the harness's lease-scoped verbs,
+/// which read the register first and change one field of it.
+#[tokio::test]
+async fn no_pipe_method_writes_a_register_wholesale() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    for method in ["register.write", "write_register", "register.put"] {
+        let err = c
+            .call(method, json!({"register": {}}), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&err), vk_ipc::E_METHOD, "{method}: {err}");
+    }
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// The daemon's scheduled retention sweep (Task 10 group C) runs the
+/// kernel's `sweep_retention` on its interval: a stale usage row is gone
+/// after a tick, with nothing on the pipe having asked for it.
+#[tokio::test]
+async fn the_scheduled_sweep_removes_a_stale_usage_row_on_its_own() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let ts = 1u64;
+    k.lock()
+        .unwrap()
+        .store()
+        .db
+        .put_json(
+            "usage",
+            &format!("{ts:013}-{:012}", 1),
+            &vk_kernel::UsageRow {
+                arch_id: "a".into(),
+                task_id: None,
+                step_index: None,
+                tokens_in: 1,
+                tokens_in_measured: 1,
+                tokens_out: 1,
+                cost_list_usd: None,
+                duration_ms: 1,
+                ts_ms: ts,
+            },
+        )
+        .unwrap();
+    let rows = |k: &Arc<Mutex<vk_kernel::RealKernel>>| {
+        k.lock()
+            .unwrap()
+            .usage(&local_ctx(), &vk_kernel::UsageFilter::All)
+            .unwrap()
+            .len()
+    };
+    assert_eq!(rows(&k), 1);
+    let sweeper = tokio::spawn(vk_ipc::server::sweep_retention_every(
+        k.clone(),
+        std::time::Duration::from_millis(20),
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while rows(&k) != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(rows(&k), 0, "the sweep ran on its interval");
+    sweeper.abort();
+    let _ = sweeper.await;
+    // The abort cancels the loop, not a sweep already running in
+    // `spawn_blocking` — and that one holds a clone of the kernel. Wait for
+    // it to let go before the directory is removed, as `shutdown` does
+    // (Task 10 review, Minor 6).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while Arc::strong_count(&k) > 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(Arc::strong_count(&k), 1, "a sweep still holds the kernel");
+    drop(k);
+    d.close().unwrap();
+}
+
+/// Stop a test's server and let go of its kernel before the state directory
+/// goes: the aborted server task is awaited, then the per-connection tasks
+/// it spawned — each holding a clone of the kernel — are given a moment to
+/// end, and only then is the directory removed, which on Windows fails
+/// while the store's files are open. `close()` rather than a drop, so a
+/// directory that could not be removed fails the test instead of leaking
+/// into `%TEMP%` (Task 10 group F).
+async fn shutdown(
+    server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    k: Arc<Mutex<vk_kernel::RealKernel>>,
+    d: tempfile::TempDir,
+) {
+    server.abort();
+    let _ = server.await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while Arc::strong_count(&k) > 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        Arc::strong_count(&k),
+        1,
+        "a connection task still holds the kernel"
+    );
+    drop(k);
+    d.close()
+        .expect("the state directory is removed once the store is closed");
+}
+
 fn kernel(dir: &std::path::Path) -> Arc<Mutex<vk_kernel::RealKernel>> {
+    vk_contracts::testing::guard_state_dir(dir);
     Arc::new(Mutex::new(
         vk_kernel::RealKernel::open(
             dir,
@@ -69,7 +291,8 @@ async fn cli_principal_cannot_stop_but_presence_proof_can() {
         use vk_contracts::testing::KernelTestHooks;
         assert!(k.lock().unwrap().stops().stopped("node"));
     }
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 #[tokio::test]
@@ -132,7 +355,8 @@ async fn ns_and_task_flow_over_ipc() {
         c.call("ledger.verify", json!({}), None).await.unwrap()["ok"],
         true
     );
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 #[tokio::test]
@@ -223,7 +447,8 @@ async fn a_presence_nonce_is_single_use_and_expires() {
         .await
         .unwrap();
     assert!(!stopped());
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 #[tokio::test]
@@ -310,7 +535,8 @@ async fn device_enroll_node_only_enrols_this_nodes_own_device() {
             .code,
         vk_ipc::E_BAD_PARAMS
     );
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 #[tokio::test]
@@ -369,7 +595,8 @@ async fn garbage_lines_get_a_parse_error_and_the_connection_survives() {
         c.call("boot.info", json!({}), None).await.unwrap()["node_id"],
         "n1"
     );
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// The JSON-RPC code the server answered with.
@@ -385,8 +612,20 @@ async fn prove(c: &Client, key: &impl HumanKey) -> PresenceProof {
     PresenceProof::sign(key, ch["nonce"].as_str().unwrap())
 }
 
-/// A full SP0 human approval of `subject` by `key`: the challenge names the
-/// subject as its action digest, and the key signs the challenge's digest.
+/// The challenge the kernel mints for a task waiting at its approve step
+/// (SP1b Task 5): what every human approval over the transport must answer.
+async fn mint(c: &Client, task_id: &str) -> Challenge {
+    serde_json::from_value(
+        c.call("approval.challenge", json!({"task_id": task_id}), None)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// A full SP0 human approval of `subject` by `key`, with a challenge the
+/// *client* made: what the ceremony looked like before SP1b Task 5, kept to
+/// show it is refused now.
 fn human_approval(key: &impl HumanKey, subject: &str) -> Approval {
     let challenge = Challenge {
         resource: "task".into(),
@@ -469,7 +708,7 @@ async fn approve_over_ipc_requires_presence_and_a_matching_human_approval() {
             partition: "local".into(),
             now_ms: vk_kernel::now_ms(),
         };
-        let register = kk.task(&ctx, &id).unwrap().register;
+        let register = kk.task(&ctx, &id).unwrap().unwrap().register;
         let reg = kk.read_register(&ctx, &register).unwrap();
         reg.artefacts
             .last()
@@ -478,10 +717,16 @@ async fn approve_over_ipc_requires_presence_and_a_matching_human_approval() {
     };
     let params = |a: Approval| json!({ "approval": a });
 
+    // Every human approval answers a challenge the kernel minted for the
+    // task (SP1b Task 5); each case below mints its own, because a challenge
+    // presented is a challenge spent, whatever the verdict.
+    let minted = mint(&c, &id).await;
+    assert_eq!(minted.action_digest, subject);
+
     // (a) No presence: the connection is a machine principal, and I1 refuses
     // a human approval that did not arrive on the human's own channel.
     let err = c
-        .call("approve", params(human_approval(&laptop, &subject)), None)
+        .call("approve", params(approval_of(&laptop, minted)), None)
         .await
         .unwrap_err();
     assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
@@ -489,13 +734,10 @@ async fn approve_over_ipc_requires_presence_and_a_matching_human_approval() {
 
     // (c) Presence from the laptop, approval signed by the tablet: the
     // approver is not the principal the connection proved.
+    let minted = mint(&c, &id).await;
     let proof = prove(&c, &laptop).await;
     let err = c
-        .call(
-            "approve",
-            params(human_approval(&tablet, &subject)),
-            Some(proof),
-        )
+        .call("approve", params(approval_of(&tablet, minted)), Some(proof))
         .await
         .unwrap_err();
     assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
@@ -521,20 +763,19 @@ async fn approve_over_ipc_requires_presence_and_a_matching_human_approval() {
     assert_eq!(step().await.unwrap()["status"], "waiting_human");
 
     // (b) Presence from the laptop and the laptop's own approval of the
-    // subject: accepted, and the waiting step completes the task.
+    // subject, answering a minted challenge: accepted, and the waiting step
+    // completes the task.
+    let minted = mint(&c, &id).await;
     let proof = prove(&c, &laptop).await;
     let ok = c
-        .call(
-            "approve",
-            params(human_approval(&laptop, &subject)),
-            Some(proof),
-        )
+        .call("approve", params(approval_of(&laptop, minted)), Some(proof))
         .await
         .unwrap();
     assert_eq!(ok["ok"], true);
     let done = step().await.unwrap();
     assert_eq!(done["status"], "done", "{done}");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// A client cannot read a register, so the subject of an approval is something
@@ -605,19 +846,34 @@ async fn task_subject_is_what_the_approve_step_accepts() {
         .to_string();
     assert!(subject.starts_with("sha256:"), "{subject}");
 
-    // An approval built from nothing but that answer completes the step.
+    // The challenge the kernel mints names exactly that subject, and an
+    // approval answering it completes the step. (A challenge the client
+    // builds around the same subject is refused since SP1b Task 5.)
+    let minted = mint(&c, &id).await;
+    assert_eq!(minted.action_digest, subject);
     let proof = prove(&c, &laptop).await;
-    let ok = c
+    let err = c
         .call(
             "approve",
             json!({ "approval": human_approval(&laptop, &subject) }),
             Some(proof),
         )
         .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    let proof = prove(&c, &laptop).await;
+    let ok = c
+        .call(
+            "approve",
+            json!({ "approval": approval_of(&laptop, minted) }),
+            Some(proof),
+        )
+        .await
         .unwrap();
     assert_eq!(ok["ok"], true);
     assert_eq!(step().await.unwrap()["status"], "done");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 #[tokio::test]
@@ -682,5 +938,902 @@ async fn a_presence_proof_on_a_method_that_takes_none_is_refused_and_still_spent
         .await
         .unwrap();
     assert!(stopped());
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// Ruling 13: mounting an arch that is already mounted answers with the same
+/// id and says so, rather than swapping the adapter underneath it. Over the
+/// real transport, because that answer is what a client acts on.
+#[tokio::test]
+async fn mounting_the_same_arch_twice_is_idempotent_and_says_so() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    let mount = || c.call("arch.mount_mock", json!({"name": "twice"}), None);
+    let first = mount().await.unwrap();
+    assert_eq!(
+        first["already_mounted"], false,
+        "the first mount mounts it: {first}"
+    );
+    let again = mount().await.unwrap();
+    assert_eq!(again["arch_id"], first["arch_id"], "{again}");
+    assert_eq!(
+        again["already_mounted"], true,
+        "the second is the same arch, not a new one: {again}"
+    );
+
+    // And the record says it happened once.
+    let mounted = c
+        .call("ledger.tail", json!({"n": 50}), None)
+        .await
+        .unwrap()
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|e| e["kind"] == "arch.mounted")
+        .count();
+    assert_eq!(mounted, 1, "an idempotent re-mount appends nothing");
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// An arch is either usable or it is not, and every list of them says which
+/// (Ruling 14). `arch.ls` carries the state beside the manifest, so a client
+/// never has to run a task to discover that the engine behind an arch is gone.
+#[tokio::test]
+async fn arch_ls_says_whether_each_arch_is_ready() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = vk_ipc::client::Client::connect(&endpoint).await.unwrap();
+    let arch = c
+        .call(
+            "arch.mount_mock",
+            json!({"name": "mock", "context_ceiling": 200}),
+            None,
+        )
+        .await
+        .unwrap()["arch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let listed = c.call("arch.ls", json!({}), None).await.unwrap();
+    let row = listed
+        .as_array()
+        .expect("arch.ls is a list")
+        .iter()
+        .find(|a| a["arch_id"] == json!(arch))
+        .unwrap_or_else(|| panic!("the mounted arch is missing from {listed}"));
+    assert_eq!(
+        row["state"], "ready",
+        "an arch that just mounted is ready: {listed}"
+    );
+    assert!(
+        row["reason"].is_null(),
+        "a ready arch has nothing to explain: {listed}"
+    );
+    assert!(row["manifest"]["name"] == json!("mock"), "{listed}");
+
+    // The same state reaches the namespace, which is the other surface an
+    // operator reads an arch off.
+    let entry = c
+        .call("ns.ls", json!({"path": format!("/arches/{arch}")}), None)
+        .await
+        .unwrap();
+    assert_eq!(entry["state"], "ready", "{entry}");
+
+    // And the boot report every client asks for names the states too.
+    let info = c.call("boot.info", json!({}), None).await.unwrap();
+    assert_eq!(info["arch_states"][0]["arch_id"], json!(arch), "{info}");
+    assert_eq!(info["arch_states"][0]["state"], "ready", "{info}");
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// Final review I-3: `arch.show` on an arch whose mount spec row does not
+/// parse is a store fault — not "no spec", the opposite of what `fsck` says.
+#[tokio::test]
+async fn arch_show_fails_loudly_on_a_spec_that_cannot_be_read() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    let arch = c
+        .call(
+            "arch.mount_mock",
+            json!({"name": "mock", "context_ceiling": 200}),
+            None,
+        )
+        .await
+        .unwrap()["arch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let shown = c
+        .call("arch.show", json!({"arch_id": arch}), None)
+        .await
+        .unwrap();
+    assert_eq!(shown["kind"], "mock", "{shown}");
+
+    k.lock()
+        .unwrap()
+        .store()
+        .db
+        .put_json("mounts", &arch, &json!("not a mount spec"))
+        .unwrap();
+    let err = c
+        .call("arch.show", json!({"arch_id": arch}), None)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_STORE, "{err}");
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// Ruling 20: the harness binary, model and budget are the daemon's
+/// configuration. A `harness.run` that names any of them is refused as a bad
+/// request — before anything is looked up, leased or launched. Ruling 22
+/// (M13): so is one that carries any key the method does not take.
+#[tokio::test]
+async fn harness_run_refuses_a_request_that_names_the_binary_model_timeout_or_any_unknown_key() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    for (field, value) in [
+        ("bin", json!("C:\\Windows\\System32\\whoami.exe")),
+        ("binary", json!("/usr/bin/id")),
+        ("model", json!("claude-opus-5")),
+        ("timeout_secs", json!(1)),
+    ] {
+        let mut params = json!({ "task_id": "task-x", "name": "claude-code" });
+        params[field] = value;
+        let err = c.call("harness.run", params, None).await.unwrap_err();
+        assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{field}: {err}");
+        assert!(
+            err.to_string().contains(field) && err.to_string().contains("--harness-bin"),
+            "{field}: the refusal names the field and the daemon flag: {err}"
+        );
+    }
+    // Any other key: the params are an allow-list of four, not a bag.
+    for (field, value) in [("foo", json!(1)), ("proof", json!({"x": 1}))] {
+        let mut params = json!({ "task_id": "task-x", "name": "claude-code" });
+        params[field] = value;
+        let err = c.call("harness.run", params, None).await.unwrap_err();
+        assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{field}: {err}");
+        assert!(
+            err.to_string().contains(field),
+            "{field}: the refusal names the key: {err}"
+        );
+    }
+    // Nothing was created or leased on the way.
+    let tasks = c.call("task.ls", json!({}), None).await.unwrap();
+    assert!(tasks.as_array().unwrap().is_empty(), "{tasks}");
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// A machine principal at the local endpoint's clearance, for a test that
+/// drives the kernel directly beside the transport.
+fn local_ctx() -> vk_contracts::syscalls::Ctx {
+    vk_contracts::syscalls::Ctx {
+        principal: Principal::Machine {
+            node_id: "n1".into(),
+            lease_id: "test".into(),
+        },
+        clearance: Clearance {
+            max_scope: Scope::Personal,
+            third_party_allowed: true,
+        },
+        partition: "local".into(),
+        now_ms: vk_kernel::now_ms(),
+    }
+}
+
+/// `key`'s approval of exactly `challenge`: the signature is over the
+/// challenge's digest, and the subject is what the challenge names.
+fn approval_of(key: &impl HumanKey, challenge: Challenge) -> Approval {
+    Approval {
+        subject_hash: challenge.action_digest.clone(),
+        kind: ApprovalKind::Human,
+        approver: Principal::Human {
+            device_id: key.device_id(),
+        },
+        signature_hex: Some(hex::encode(key.sign(&challenge.digest()))),
+        challenge: Some(challenge),
+    }
+}
+
+/// SP1b Task 5 (I1): the kernel mints every approval challenge. A challenge
+/// the client made up — however well signed — is refused; one the kernel
+/// minted is accepted exactly once; one it minted that has since expired, or
+/// that comes back altered, is refused. The node-key ceremony goes through
+/// the same verifier as the passkey one.
+#[tokio::test]
+async fn approve_accepts_only_a_challenge_the_kernel_minted_and_only_once() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let laptop = SoftwareHumanKey::generate("laptop");
+    {
+        use vk_contracts::testing::KernelTestHooks;
+        k.lock()
+            .unwrap()
+            .enroll_device("laptop", laptop.verifying_key_bytes());
+    }
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    let arch = c
+        .call("arch.mount_mock", json!({"name": "mock"}), None)
+        .await
+        .unwrap()["arch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id = c
+        .call(
+            "task.create",
+            json!({
+                "goal": "Draft a proposal",
+                "artefact_type": "proposal",
+                "steps": [
+                    {"kind": "draft", "arch_id": arch},
+                    {"kind": "approve"}
+                ]
+            }),
+            None,
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let step = || c.call("task.step", json!({"task_id": id}), None);
+    let approve = |a: Approval, proof: PresenceProof| {
+        c.call("approve", json!({ "approval": a }), Some(proof))
+    };
+
+    // Before the task waits there is nothing to mint a challenge for.
+    let err = c
+        .call("approval.challenge", json!({"task_id": id}), None)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(err.to_string().contains("not waiting"), "{err}");
+
+    step().await.unwrap();
+    assert_eq!(step().await.unwrap()["status"], "waiting_human");
+    let subject = c
+        .call("task.subject", json!({"task_id": id}), None)
+        .await
+        .unwrap()["subject_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // (a) A challenge the client made up, signed by the enrolled key over
+    // the right subject and presented with a valid presence proof: refused,
+    // because this node never minted it.
+    let proof = prove(&c, &laptop).await;
+    let err = approve(human_approval(&laptop, &subject), proof)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(
+        err.to_string().contains("I1") && err.to_string().contains("minted"),
+        "{err}"
+    );
+
+    // (b) A minted challenge that has expired: refused, and gone.
+    let stale = k
+        .lock()
+        .unwrap()
+        .mint_approval_challenge_with_ttl(&local_ctx(), &id, 1)
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let proof = prove(&c, &laptop).await;
+    let err = approve(approval_of(&laptop, stale.clone()), proof)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(err.to_string().contains("expired"), "{err}");
+
+    // (c) A minted challenge altered on the way back — the nonce is the
+    // kernel's, the rest is not — is not the challenge that was minted.
+    let minted: Challenge = serde_json::from_value(
+        c.call("approval.challenge", json!({"task_id": id}), None)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(minted.resource, format!("task:{id}"));
+    assert_eq!(minted.action_digest, subject);
+    assert!(minted.expires_at_ms > vk_kernel::now_ms());
+    let altered = Challenge {
+        expires_at_ms: minted.expires_at_ms + 3_600_000,
+        ..minted.clone()
+    };
+    let proof = prove(&c, &laptop).await;
+    let err = approve(approval_of(&laptop, altered), proof)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(err.to_string().contains("I1"), "{err}");
+    // The alteration burnt the nonce: the genuine challenge is spent too.
+    let proof = prove(&c, &laptop).await;
+    let err = approve(approval_of(&laptop, minted), proof)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+
+    // Nothing above was recorded: the task still waits.
+    assert_eq!(step().await.unwrap()["status"], "waiting_human");
+
+    // (d) A fresh minted challenge, signed and presented as minted: accepted.
+    let minted: Challenge = serde_json::from_value(
+        c.call("approval.challenge", json!({"task_id": id}), None)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let proof = prove(&c, &laptop).await;
+    let ok = approve(approval_of(&laptop, minted.clone()), proof)
+        .await
+        .unwrap();
+    assert_eq!(ok["ok"], true);
+
+    // (e) The same minted challenge a second time: spent on first use.
+    let proof = prove(&c, &laptop).await;
+    let err = approve(approval_of(&laptop, minted), proof)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(err.to_string().contains("I1"), "{err}");
+
+    // One approval on the record, and the waiting step completes on it.
+    {
+        use vk_contracts::testing::KernelTestHooks;
+        let kk = k.lock().unwrap();
+        assert_eq!(kk.approvals_for(&subject).len(), 1);
+    }
+    assert_eq!(step().await.unwrap()["status"], "done");
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// The pages' side of `web.link`, as a test sees it: links that name what
+/// they are for, minted by nothing but this stub.
+struct StubLinks;
+
+impl vk_ipc::server::WebLinks for StubLinks {
+    fn origin(&self) -> String {
+        "http://localhost:1".into()
+    }
+    fn enroll_link(&self, _now_ms: u64) -> String {
+        "http://localhost:1/enroll?t=stub".into()
+    }
+    fn approve_link(&self, task_id: &str, _now_ms: u64) -> String {
+        format!("http://localhost:1/approve/{task_id}?t=stub")
+    }
+}
+
+/// SP1b Task 5 fix round 1 (review Important 2): enrolling a passkey is a
+/// human act. `web.link {page: enroll}` is minted only under a presence proof
+/// by an enrolled device key — a process with the pipe and nothing else gets
+/// no link — while an approve link needs no proof, only a waiting task; and a
+/// daemon that serves no pages says so, proof or not.
+#[tokio::test]
+async fn web_link_enroll_requires_a_presence_proof() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let laptop = SoftwareHumanKey::generate("laptop");
+    {
+        use vk_contracts::testing::KernelTestHooks;
+        k.lock()
+            .unwrap()
+            .enroll_device("laptop", laptop.verifying_key_bytes());
+    }
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        web: Some(Arc::new(StubLinks)),
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    // No proof: the connection is a machine principal, and I1 refuses.
+    let err = c
+        .call("web.link", json!({"page": "enroll"}), None)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(
+        err.to_string().contains("I1") && err.to_string().contains("presence"),
+        "{err}"
+    );
+
+    // A forged proof (an unissued nonce) is refused the same way.
+    let forged = PresenceProof::sign(&laptop, "never-issued");
+    let err = c
+        .call("web.link", json!({"page": "enroll"}), Some(forged))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+
+    // The enrolled key's presence: a link.
+    let proof = prove(&c, &laptop).await;
+    let ok = c
+        .call("web.link", json!({"page": "enroll"}), Some(proof))
+        .await
+        .unwrap();
+    assert_eq!(ok["url"], "http://localhost:1/enroll?t=stub");
+
+    // An approve link needs no proof, only a task that is waiting.
+    let err = c
+        .call(
+            "web.link",
+            json!({"page": "approve", "task_id": "task-none"}),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_NOT_FOUND, "{err}");
+    let arch = c
+        .call("arch.mount_mock", json!({"name": "mock"}), None)
+        .await
+        .unwrap()["arch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id = c
+        .call(
+            "task.create",
+            json!({
+                "goal": "Draft a proposal",
+                "artefact_type": "proposal",
+                "steps": [
+                    {"kind": "draft", "arch_id": arch},
+                    {"kind": "approve"}
+                ]
+            }),
+            None,
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let err = c
+        .call("web.link", json!({"page": "approve", "task_id": id}), None)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(err.to_string().contains("not waiting"), "{err}");
+    c.call("task.step", json!({"task_id": id}), None)
+        .await
+        .unwrap();
+    c.call("task.step", json!({"task_id": id}), None)
+        .await
+        .unwrap();
+    let ok = c
+        .call("web.link", json!({"page": "approve", "task_id": id}), None)
+        .await
+        .unwrap();
+    assert_eq!(ok["url"], format!("http://localhost:1/approve/{id}?t=stub"));
+    assert!(ok["subject_hash"].as_str().unwrap().starts_with("sha256:"));
+    // Drain this server and its client before the next, so no connection task
+    // is left holding the kernel when the second one starts (Task 10 group F).
+    drop(c);
     server.abort();
+    let _ = server.await;
+
+    // A daemon without pages: `web.link` says so, whatever the proof.
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    let proof = prove(&c, &laptop).await;
+    let err = c
+        .call("web.link", json!({"page": "enroll"}), Some(proof))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_STORE, "{err}");
+    assert!(err.to_string().contains("--web-port"), "{err}");
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+// --------------------------------------------------- the API arches (Task 2b)
+
+/// A kernel whose factory is this build's real one, so a persisted arch comes
+/// back as the arch it was and not as a mock.
+fn kernel_with_arches(
+    dir: &std::path::Path,
+    keys: &vk_arch_anthropic::KeySource,
+) -> vk_kernel::RealKernel {
+    vk_contracts::testing::guard_state_dir(dir);
+    vk_kernel::RealKernel::open_with_factory(
+        dir,
+        vk_store::keys::KeySource::File(dir.join("m.key")),
+        "n1",
+        vk_ipc::server::adapter_factory(
+            dir.to_path_buf(),
+            keys.clone(),
+            vk_arch_anthropic::DEFAULT_BASE_URL.to_string(),
+            false,
+        ),
+    )
+    .unwrap()
+}
+
+/// A node with a device enrolled, because mounting a cloud arch is a human
+/// act and needs one (fix round 1, Critical 1).
+fn with_device(k: &Arc<Mutex<vk_kernel::RealKernel>>) -> SoftwareHumanKey {
+    let device = SoftwareHumanKey::generate("laptop");
+    {
+        use vk_contracts::testing::KernelTestHooks;
+        k.lock()
+            .unwrap()
+            .enroll_device("laptop", device.verifying_key_bytes());
+    }
+    device
+}
+
+/// The key a daemon under test holds. Shaped like a real one so that "it is
+/// not in the record" is a claim about a string that would be noticed.
+const FAKE_KEY: &str = "sk-ant-api03-ROUNDTRIPROUNDTRIPROUNDTRIP";
+
+/// Mounting an API arch: it is a **human** act, the key comes from the
+/// daemon's own key source and never from the request, the arch is a US cloud
+/// arch this kernel does not govern, and what is written down to re-create it
+/// carries the model and the numbers — and no credential.
+///
+/// The second half is the one that matters. A mount spec lives unencrypted in
+/// the metadata database, so an adapter that stashed its key there would put
+/// a live credential at rest in the clear for as long as the arch is mounted;
+/// the arch comes back at the next boot by reading the keyring again, which
+/// this proves by rebuilding it from the record alone.
+#[tokio::test]
+async fn an_anthropic_arch_mounts_from_the_daemons_own_key_and_the_spec_carries_none() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().to_path_buf();
+    let key_file = dir.join("anthropic.key");
+    std::fs::write(&key_file, format!("{FAKE_KEY}\n")).unwrap();
+    let keys = vk_arch_anthropic::KeySource::File(key_file);
+
+    let k = Arc::new(Mutex::new(kernel_with_arches(&dir, &keys)));
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        anthropic_keys: keys.clone(),
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    // Without a proof the connection is a machine principal, and mounting an
+    // arch that sends registers to a third party is not a machine's to do.
+    let err = c
+        .call(
+            "arch.mount",
+            json!({"kind": "anthropic", "config": {"model": "claude-sonnet-5"}}),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(err.to_string().contains("I1"), "{err}");
+    assert_eq!(
+        c.call("boot.info", json!({}), None).await.unwrap()["arches"],
+        0,
+        "nothing was mounted on the way past"
+    );
+
+    // With one, it mounts.
+    let proof = prove(&c, &device).await;
+    let mounted = c
+        .call(
+            "arch.mount",
+            json!({"kind": "anthropic", "config": {"model": "claude-sonnet-5"}}),
+            Some(proof),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mounted["name"], "anthropic/claude-sonnet-5");
+    assert_eq!(mounted["governed"], false);
+    let arch_id = mounted["arch_id"].as_str().unwrap().to_string();
+    let arches = c
+        .call("ns.ls", json!({"path": "/arches"}), None)
+        .await
+        .unwrap();
+    assert!(
+        serde_json::to_string(&arches).unwrap().contains(&arch_id),
+        "the arch is in the namespace: {arches}"
+    );
+
+    // Everything the daemon holds goes, in order, before the store's
+    // single-writer lock can be taken again.
+    drop(c);
+    server.abort();
+    let _ = server.await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // From here on this test handles an adapter that owns a blocking HTTP
+    // client, whose background runtime may not be dropped from inside an
+    // async context — which is exactly why `vkd` does every bit of this on
+    // the blocking pool, and why this test does too.
+    tokio::task::spawn_blocking(move || {
+        drop(k);
+        let k = kernel_with_arches(&dir, &keys);
+        let pending = k.pending_mounts();
+        assert_eq!(pending.len(), 1, "one arch to re-create");
+        let (id, spec) = &pending[0];
+        assert_eq!(id, &arch_id);
+        assert_eq!(spec.kind, "anthropic");
+        assert_eq!(spec.config["model"], "claude-sonnet-5");
+        let written = serde_json::to_string(&spec.config).unwrap();
+        assert!(
+            !written.contains(FAKE_KEY) && !written.contains("sk-ant"),
+            "a credential is at rest in the clear: {written}"
+        );
+        // Nor an endpoint: the origin is the daemon's, so nothing a client
+        // could have said about it survives into the record either.
+        assert!(
+            !written.contains("base_url") && !written.contains("http"),
+            "the record names an endpoint: {written}"
+        );
+        assert!(spec.validate().is_ok(), "{spec:?}");
+
+        // Re-created from the record plus the key source, it is the same arch.
+        let adapter = (k.adapter_factory())(spec).expect("re-created");
+        assert_eq!(adapter.manifest().arch_id(), arch_id);
+        assert_eq!(adapter.manifest().jurisdiction, "US");
+        assert_eq!(adapter.manifest().retention_days, Some(30));
+        assert!(!adapter.manifest().governed);
+    })
+    .await
+    .unwrap();
+}
+
+/// **Where the key goes is not the caller's to say.**
+///
+/// The daemon holds the key; a client that could name the origin could name a
+/// collector and have the daemon post the key to it — over plaintext, and
+/// again at every boot, since the spec is replayed. So the config for a cloud
+/// kind is a closed shape: `base_url`, `endpoint`, `host` or anything else
+/// nobody declared is a `-32602` that names the field, and the refusal is the
+/// same on a build with the AWS SDK and on one without (fix round 1,
+/// Critical 1).
+#[tokio::test]
+async fn a_cloud_mount_may_not_name_the_endpoint_its_key_is_sent_to() {
+    let d = tempfile::tempdir().unwrap();
+    let key_file = d.path().join("anthropic.key");
+    std::fs::write(&key_file, format!("{FAKE_KEY}\n")).unwrap();
+    let keys = vk_arch_anthropic::KeySource::File(key_file);
+    let k = Arc::new(Mutex::new(kernel_with_arches(d.path(), &keys)));
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        anthropic_keys: keys,
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    for (kind, field, value) in [
+        ("anthropic", "base_url", json!("http://collector.example")),
+        ("anthropic", "endpoint", json!("http://collector.example")),
+        ("anthropic", "host", json!("collector.example")),
+        ("bedrock", "base_url", json!("http://collector.example")),
+        ("bedrock", "endpoint_url", json!("http://collector.example")),
+    ] {
+        // A fresh proof per attempt: a nonce is spent by the request that
+        // shows it, and this must fail on the config and not on the nonce.
+        let proof = prove(&c, &device).await;
+        let err = c
+            .call(
+                "arch.mount",
+                json!({"kind": kind, "config": { field: value }}),
+                Some(proof),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            code_of(&err),
+            vk_ipc::E_BAD_PARAMS,
+            "{kind}/{field} was not refused as a bad parameter: {err}"
+        );
+        assert!(
+            err.to_string().contains(field),
+            "the refusal must name the field: {err}"
+        );
+    }
+    assert_eq!(
+        c.call("boot.info", json!({}), None).await.unwrap()["arches"],
+        0,
+        "nothing was mounted by any of them"
+    );
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// No key, no arch — and the refusal is the one sentence that fixes it.
+///
+/// Whether the keyring has no such entry, or this OS has no keyring at all,
+/// or the file the operator named is not there, the remedy is the same and
+/// the message says it. Nothing is mounted on the way past.
+#[tokio::test]
+async fn mounting_an_anthropic_arch_without_a_key_says_how_to_set_one() {
+    let d = tempfile::tempdir().unwrap();
+    let keys = vk_arch_anthropic::KeySource::File(d.path().join("not-there.key"));
+    let k = Arc::new(Mutex::new(kernel_with_arches(d.path(), &keys)));
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        anthropic_keys: keys,
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    let proof = prove(&c, &device).await;
+    let err = c
+        .call(
+            "arch.mount",
+            json!({"kind": "anthropic", "config": {}}),
+            Some(proof),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("vk secret set anthropic"),
+        "the refusal must name the remedy: {err}"
+    );
+    let info = c.call("boot.info", json!({}), None).await.unwrap();
+    assert_eq!(info["arches"], 0, "nothing was mounted on the way past");
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// A daemon built without the AWS SDK refuses `bedrock` by name and says how
+/// to get one that has it — rather than "no arch kind bedrock", which reads
+/// like a typo and is not one. This is the **default** build (Ruling 30), so
+/// this is the half of the feature gate that CI exercises.
+#[cfg(not(feature = "bedrock"))]
+#[tokio::test]
+async fn a_build_without_the_aws_sdk_refuses_a_bedrock_mount_by_name() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    let proof = prove(&c, &device).await;
+    let err = c
+        .call(
+            "arch.mount",
+            json!({"kind": "bedrock", "config": {"region": "eu-central-1"}}),
+            Some(proof),
+        )
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("bedrock` cargo feature"), "{text}");
+    assert!(text.contains("--features bedrock"), "{text}");
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// The same door with the SDK built in: the region is checked before the
+/// credentials are, so a mount outside the Union is refused for being outside
+/// the Union.
+#[cfg(feature = "bedrock")]
+#[tokio::test]
+async fn a_bedrock_mount_is_refused_for_a_region_outside_the_union() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    let proof = prove(&c, &device).await;
+    let err = c
+        .call(
+            "arch.mount",
+            json!({"kind": "bedrock", "config": {"region": "us-east-1"}}),
+            Some(proof),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not an EU region"), "{err}");
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// A **forged** proof must be refused before the daemon touches a secret.
+///
+/// The cheap "is a proof attached?" gate is not enough: a caller who sends a
+/// junk nonce and 64 bytes of junk signature would pass it, and on Linux the
+/// keyring read that follows is a D-Bus round trip that can raise an unlock
+/// prompt (fix round 2, Minor C). So the proof is verified in full — signature
+/// and nonce — before `load_key` runs.
+///
+/// The ordering is *observable* here rather than asserted by reading the code:
+/// the daemon's key source is a file that does not exist, so if the key were
+/// loaded first the refusal would name `vk secret set anthropic`. It names
+/// `I1` instead, which it can only do if nothing reached for the key.
+#[tokio::test]
+async fn a_forged_presence_proof_is_refused_before_the_keyring_is_touched() {
+    let d = tempfile::tempdir().unwrap();
+    let keys = vk_arch_anthropic::KeySource::File(d.path().join("not-there.key"));
+    let k = Arc::new(Mutex::new(kernel_with_arches(d.path(), &keys)));
+    let _enrolled = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        anthropic_keys: keys,
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    // A key nobody enrolled, over a nonce this server did issue: the
+    // signature verifies against the wrong device, so I1 refuses it.
+    let rogue = SoftwareHumanKey::generate("laptop");
+    let nonce = c.call("presence.challenge", json!({}), None).await.unwrap()["nonce"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for proof in [
+        PresenceProof::sign(&rogue, &nonce),
+        // And a nonce this server never issued, signed by the rogue too.
+        PresenceProof::sign(&rogue, "never-issued"),
+    ] {
+        let err = c
+            .call(
+                "arch.mount",
+                json!({"kind": "anthropic", "config": {"model": "claude-sonnet-5"}}),
+                Some(proof),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+        assert!(err.to_string().contains("I1"), "{err}");
+        assert!(
+            !err.to_string().contains("vk secret set"),
+            "the key was read before the proof was checked: {err}"
+        );
+    }
+    assert_eq!(
+        c.call("boot.info", json!({}), None).await.unwrap()["arches"],
+        0
+    );
+    drop(c);
+    shutdown(server, k, d).await;
 }

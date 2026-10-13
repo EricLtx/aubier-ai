@@ -24,9 +24,13 @@ use vk_ipc::client::Client;
 use vk_ipc::transport::{default_endpoint, Endpoint};
 use vk_ipc::PresenceProof;
 use vk_kernel::presence::{KeySource, NodeDevice};
+use zeroize::Zeroizing;
 
-/// How long an approval challenge stays answerable — the daemon's own window.
-const APPROVAL_TTL_MS: u64 = 60_000;
+/// `vkd --web-port`'s default, handed on by `vk boot`. A literal rather than
+/// `vk_web::DEFAULT_PORT` so this shell does not link the verifier.
+const DEFAULT_WEB_PORT: u16 = 7734;
+/// How often `vk approve --passkey` asks whether the approval has landed.
+const APPROVAL_POLL: Duration = Duration::from_millis(500);
 /// A `--all` run drives one step per call; this bounds it so a task that never
 /// settles is reported rather than looped on forever.
 const MAX_STEPS: usize = 256;
@@ -60,7 +64,12 @@ enum Cmd {
     /// Tasks and how far each has got.
     Ps,
     /// Per-arch calls and tokens, stopped scopes, liveness.
-    Top,
+    Top {
+        /// Also list every call behind those totals: which arch, which task's
+        /// which step, what came back and what it cost.
+        #[arg(long)]
+        calls: bool,
+    },
     /// Mount an arch.
     Mount {
         #[command(subcommand)]
@@ -68,10 +77,20 @@ enum Cmd {
     },
     /// Unmount an arch by id.
     Umount { arch_id: String },
+    /// One arch in full: its manifest, its identity tuple and its clearance.
+    Arch {
+        #[command(subcommand)]
+        what: ArchCmd,
+    },
     /// Submit, step and inspect tasks.
     Task {
         #[command(subcommand)]
         what: TaskCmd,
+    },
+    /// Run a confined agent harness (Claude Code) over a task.
+    Harness {
+        #[command(subcommand)]
+        what: HarnessCmd,
     },
     /// STOP a scope. Human: signed with this node's device key.
     Stop {
@@ -80,8 +99,31 @@ enum Cmd {
     },
     /// Lift a STOP by its id. Human.
     Resume { stop_id: String },
-    /// Approve a task's latest artefact. Human.
-    Approve { task_id: String },
+    /// Approve a task's latest artefact. Human: signed with this node's
+    /// device key, or — with --passkey — with a passkey in the browser.
+    Approve {
+        task_id: String,
+        /// Approve with an enrolled passkey (Windows Hello, a phone): prints
+        /// the approval page's link, then waits for the approval to land.
+        #[arg(long)]
+        passkey: bool,
+        /// Open the link in the default browser as well as printing it.
+        #[arg(long, requires = "passkey")]
+        open: bool,
+        /// How long to wait for the passkey approval, in seconds.
+        #[arg(long, default_value_t = 300, requires = "passkey")]
+        timeout: u64,
+    },
+    /// Secrets this node's daemon needs, in the OS keyring. Needs no daemon.
+    Secret {
+        #[command(subcommand)]
+        what: SecretCmd,
+    },
+    /// Passkeys: the human's own device, enrolled through the browser.
+    Passkey {
+        #[command(subcommand)]
+        what: PasskeyCmd,
+    },
     /// The ledger tail.
     Dmesg {
         #[arg(short = 'n', long = "lines", default_value_t = 20)]
@@ -91,6 +133,36 @@ enum Cmd {
     Ledger {
         #[command(subcommand)]
         what: LedgerCmd,
+    },
+    /// Verify the whole store: the chain, the recorded head, every blob
+    /// against its own address, every wrapped key, and the mounts.
+    ///
+    /// `vk ledger verify` answers one question — does the chain recompute.
+    /// This answers whether the state this node says it has is the state it
+    /// has. Exits non-zero if any tier fails, so a script can gate on it.
+    ///
+    /// A human act, like `stop` and `approve`: it reads every blob on the
+    /// node, so it is signed with this node's device key.
+    Fsck {
+        /// Re-record the ledger head from the record as it is on disk.
+        ///
+        /// **The recovery path after a legitimate restore**, and nothing
+        /// else. A restored backup is a shorter record than the one this
+        /// store last wrote, which is the same shape as a tail somebody cut
+        /// — the node cannot tell them apart and refuses to serve on either.
+        /// This is a human saying which it was, and it goes on the record:
+        /// the next `boot` event's report names both heads.
+        ///
+        /// Needs `--force` and the word `rebase` typed at the prompt.
+        #[arg(long, requires = "force")]
+        rebase_head: bool,
+        /// Required beside `--rebase-head`. On its own it does nothing.
+        #[arg(long)]
+        force: bool,
+        /// Take the typed confirmation as given, for scripts. The ceremony
+        /// is still a presence proof by this node's device key.
+        #[arg(long, requires = "rebase_head")]
+        yes: bool,
     },
     /// The contracts this kernel speaks: no name lists them, a name renders
     /// one. Needs no daemon — the schemas are in this binary.
@@ -118,6 +190,51 @@ struct BootArgs {
     /// Start the daemon even though the ledger chain does not verify.
     #[arg(long)]
     force: bool,
+    /// Loopback port for the passkey pages (`0`: one the OS picks).
+    #[arg(long, default_value_t = DEFAULT_WEB_PORT)]
+    web_port: u16,
+}
+
+#[derive(Subcommand)]
+enum SecretCmd {
+    /// Put a secret in this account's keyring, under service `vk`.
+    ///
+    /// `vk secret set anthropic` is the one an API arch needs: the daemon
+    /// reads it at `vk mount anthropic` and again whenever it re-creates that
+    /// arch at boot. The value is prompted for without echo and is never
+    /// printed, never logged and never written to a file — it does not go
+    /// into the mount spec either, which is stored in the clear and refuses
+    /// anything credential-shaped.
+    ///
+    /// The keyring is **this account's**. A daemon running under the Windows
+    /// service account (`vkd --as-service`) reads that account's keyring, not
+    /// this one, and is given its key with `vkd --anthropic-key-file` or by
+    /// running this verb as that account.
+    Set {
+        /// What it is called: `anthropic` for the first-party API arch.
+        name: String,
+        /// Read the value as one line on stdin instead of prompting, for
+        /// scripts. Still never echoed and never printed back.
+        #[arg(long)]
+        stdin: bool,
+        /// The keyring service. `vk` for everything this kernel reads; the
+        /// flag exists so a test can use a throwaway name.
+        #[arg(long, default_value = "vk")]
+        service: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PasskeyCmd {
+    /// Print the enrolment page's link (and open it with --open): the
+    /// browser asks Windows Hello, or a phone, to make the passkey.
+    Enroll {
+        /// Open the link in the default browser as well as printing it.
+        #[arg(long)]
+        open: bool,
+    },
+    /// The passkeys enrolled on this node.
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -129,11 +246,134 @@ enum MountCmd {
         #[arg(long, default_value_t = 4096)]
         ctx: u32,
     },
+    /// Claude, through the installed Claude Code and this machine's own
+    /// subscription: two arches, one to draft with and one to judge with.
+    ///
+    /// A cloud arch, so its clearance stops at Business and it refuses
+    /// third-party data; see `contracts/tcb.md`. Customer nodes use API arches
+    /// instead — a subscription is a person's, not a product's.
+    ClaudeCode {
+        #[arg(long, default_value = "claude-sonnet-5")]
+        draft_model: String,
+        #[arg(long, default_value = "claude-opus-5")]
+        judge_model: String,
+        /// The `claude` binary, if it is not on the daemon's PATH.
+        #[arg(long, default_value = "claude")]
+        bin: String,
+        /// How long one call may take, in seconds.
+        #[arg(long, default_value_t = 180)]
+        timeout: u32,
+    },
+    /// Claude through the **Anthropic API**, on a key in this account's
+    /// keyring (`vk secret set anthropic`). The arch a customer node mounts.
+    ///
+    /// A cloud arch in the United States: `jurisdiction: US`, 30-day
+    /// retention, clearance capped at Business with third-party data refused,
+    /// and metered — unlike `vk mount claude-code`, every call is billed, so
+    /// the manifest carries a per-token price and `vk top` shows what the
+    /// calls cost. For a register that may not leave the Union, mount
+    /// `bedrock` instead.
+    Anthropic {
+        /// The model, as the API names it (`claude-opus-5`,
+        /// `claude-sonnet-5`, `claude-haiku-4-5`).
+        #[arg(long, default_value = "claude-opus-5")]
+        model: String,
+        /// Context ceiling in tokens. `0` is the model's documented window,
+        /// which is what nearly every mount wants.
+        #[arg(long, default_value_t = 0)]
+        ctx: u32,
+        /// The longest answer one call may produce. Capped at 4096.
+        #[arg(long, default_value_t = 4096)]
+        max_tokens: u32,
+        /// How long one call may take, in seconds.
+        #[arg(long, default_value_t = 600)]
+        timeout: u32,
+    },
+    /// Claude **hosted in the EU**, through Amazon Bedrock's `Converse` API
+    /// in Frankfurt or Ireland, on this machine's AWS credentials.
+    ///
+    /// The EU jurisdiction: `jurisdiction: EU` and no retention window,
+    /// because AWS keeps neither the inputs nor the outputs. Needs a build
+    /// with the `bedrock` cargo feature; a daemon without it refuses the
+    /// mount and says so.
+    Bedrock {
+        /// Which European region. Only these two: the manifest's
+        /// `jurisdiction: EU` is the region, so a mount elsewhere is refused
+        /// rather than mislabelled.
+        #[arg(long, default_value = "eu-central-1",
+              value_parser = ["eu-central-1", "eu-west-1"])]
+        region: String,
+        /// A model name (`claude-opus-5`), which is resolved to the region's
+        /// cross-region inference profile, or a full Bedrock model id or
+        /// profile ARN, which is used exactly as given.
+        #[arg(long, default_value = "claude-opus-5")]
+        model: String,
+        /// Context ceiling in tokens. `0` is the model's documented window.
+        #[arg(long, default_value_t = 0)]
+        ctx: u32,
+        /// The longest answer one call may produce. Capped at 4096.
+        #[arg(long, default_value_t = 4096)]
+        max_tokens: u32,
+    },
+    /// A Gemma-class model on this machine, served by Ollama in a container
+    /// this kernel starts, caps and can stop.
+    ///
+    /// The governed arch: the inference is a process the kernel contains, on
+    /// loopback, under a memory and CPU cap, so nothing about the call leaves
+    /// this node. Its context ceiling is half the window asked for — Ollama
+    /// silently truncates past that (spike 1a) and this node refuses instead.
+    Ollama {
+        /// The model tag, as Ollama names it (`gemma4:e4b`, `gemma3:1b`).
+        #[arg(long)]
+        model: String,
+        /// Run it in a container this kernel starts and caps. The default.
+        #[arg(long, conflicts_with = "external")]
+        container: bool,
+        /// Use an Ollama already serving at this URL instead. Not governed:
+        /// this node did not start that process and cannot cap it, so this
+        /// takes a presence proof. Loopback only (127.0.0.1, ::1, localhost).
+        #[arg(long, value_name = "URL")]
+        external: Option<String>,
+        /// Context window asked of the server. Half of it is usable.
+        #[arg(long, default_value_t = 8192)]
+        ctx: u32,
+        /// The longest answer one call may produce. Always sent: a local model
+        /// with no bound runs until it decides to stop.
+        #[arg(long, default_value_t = 2048)]
+        max_tokens: u32,
+        /// Replace an existing container that is not the one asked for. Stops
+        /// it, removes it and makes it again under these caps; the volume, and
+        /// the models in it, are kept.
+        #[arg(long, conflicts_with = "external")]
+        recreate: bool,
+        // The three container flags are refused beside `--external`, rather
+        // than ignored: a cap named for a server this node does not start is
+        // a cap that would never be applied, and silently dropping it is how
+        // somebody ends up believing an ungoverned arch is capped.
+        /// Memory cap for the container: digits, then optionally k, m or g.
+        #[arg(long, default_value = "12g", conflicts_with = "external")]
+        memory: String,
+        /// CPU cap for the container: a whole or decimal number.
+        #[arg(long, default_value = "6", conflicts_with = "external")]
+        cpus: String,
+        /// The Ollama image. Pinned: the version is in the arch identity, and
+        /// the daemon refuses any other image (it may only be repeated).
+        #[arg(
+            long,
+            default_value = "ollama/ollama:0.33.3",
+            conflicts_with = "external"
+        )]
+        image: String,
+        /// Sampling seed. Part of the arch identity.
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+    },
 }
 
 #[derive(Subcommand)]
 enum TaskCmd {
-    /// Submit a task: plan, draft, then optionally wait for a human and release.
+    /// Submit a task: plan, then draft (or a harness), then optionally judge,
+    /// wait for a human and release.
     Submit {
         #[arg(long)]
         goal: String,
@@ -142,8 +382,20 @@ enum TaskCmd {
         artefact: String,
         #[arg(long, value_name = "ARCH")]
         plan: String,
+        /// The arch that drafts the artefact. Either this or `--harness`: a
+        /// task needs exactly one step that produces what is approved.
+        #[arg(long, value_name = "ARCH", required_unless_present = "harness")]
+        draft: Option<String>,
+        /// Draft with a confined agent harness instead of an arch, by name
+        /// (`claude-code`). The step is run by `vk harness run <TASK>`, not by
+        /// `vk task step`, which says so when it reaches one.
+        #[arg(long, value_name = "NAME", conflicts_with = "draft")]
+        harness: Option<String>,
+        /// Have this arch judge the draft. Its verdict is raised into the
+        /// register's open questions, where a later step — or a reader — sees
+        /// it beside the artefact it is about.
         #[arg(long, value_name = "ARCH")]
-        draft: String,
+        judge: Option<String>,
         /// Wait for a human approval of the drafted artefact.
         #[arg(long)]
         approve: bool,
@@ -159,6 +411,46 @@ enum TaskCmd {
     },
     /// One task in full, with where its release steps write.
     Show { task_id: String },
+}
+
+#[derive(Subcommand)]
+enum HarnessCmd {
+    /// Launch the confined harness over a task's harness step.
+    ///
+    /// Give an existing TASK whose next step is a harness step, or `--goal` to
+    /// create a task (harness step, then a human approval) and run it.
+    /// `--dry-run` prints the launch line, the `mcp.json` (token redacted) and
+    /// the permission fence, and runs nothing. Which binary, model and timeout
+    /// the harness runs with is the daemon's to set (`vkd --harness-bin`,
+    /// `--harness-model`, `--harness-timeout-secs`), never this verb's.
+    Run {
+        /// The task to run. Omit it and pass `--goal` to create one.
+        task: Option<String>,
+        /// Create a fresh task with this goal — a harness step then an
+        /// approval — and run its harness step.
+        #[arg(long)]
+        goal: Option<String>,
+        /// Which harness. Only `claude-code` in SP1b.
+        #[arg(long, default_value = "claude-code")]
+        name: String,
+        /// Print the launch line, `mcp.json` and `settings.json` and exit,
+        /// without running.
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep the workspace after the run instead of removing it (it is
+        /// swept a day later by the daemon's retention sweep, and at the
+        /// daemon's next boot, whichever comes first).
+        #[arg(long)]
+        keep: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ArchCmd {
+    /// One arch in full, by id: what it is, whether it would answer a prompt,
+    /// the identity tuple the arch id hashes, the clearance it may be handed,
+    /// and what the next boot would make it from.
+    Show { arch_id: String },
 }
 
 #[derive(Subcommand)]
@@ -184,6 +476,9 @@ fn run(cli: &Cli) -> Result<()> {
     match &cli.cmd {
         Cmd::Boot(args) => boot(cli, &rt, args),
         Cmd::Man { name } => man(cli, name.as_deref()),
+        // The keyring is this account's, not the daemon's to reach into: the
+        // shell writes it directly and no syscall is involved.
+        Cmd::Secret { what } => secret(cli, what),
         _ => rt.block_on(call(cli)),
     }
 }
@@ -216,6 +511,60 @@ fn endpoint(cli: &Cli) -> Endpoint {
         .unwrap_or_else(default_endpoint)
 }
 
+/// `vk secret set NAME` — the one verb that writes a credential, and the only
+/// place in this shell that handles one.
+///
+/// Three rules, all of them testable by reading this function: the value is
+/// never echoed (the terminal's echo is off while it is typed), never printed
+/// (what is reported back is the name, never the value) and never written
+/// anywhere but the keyring. An empty value is refused rather than stored,
+/// because an empty entry is worse than a missing one: `vk mount anthropic`
+/// would find something and fail at the far end instead of here.
+fn secret(cli: &Cli, what: &SecretCmd) -> Result<()> {
+    let SecretCmd::Set {
+        name,
+        stdin,
+        service,
+    } = what;
+    let name = name.trim();
+    if name.is_empty() || name.split_whitespace().count() != 1 {
+        return Err(anyhow!(
+            "a secret's name is one word with no spaces in it; `anthropic` is the one an \
+             API arch reads"
+        ));
+    }
+    // Wrapped the moment it exists and never copied out of the wrapper: this
+    // is the one process on this machine that sees the key as a human typed
+    // it, and a plain `String` would leave it in freed heap (fix round 1,
+    // Minor 5).
+    let value: Zeroizing<String> = Zeroizing::new(if *stdin {
+        let mut line = Zeroizing::new(String::new());
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("read the secret from stdin")?;
+        line.to_string()
+    } else {
+        rpassword::prompt_password(format!("{service}/{name}: "))
+            .context("read the secret from the terminal")?
+    });
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!(
+            "nothing was entered; the keyring was not touched. An empty entry is worse \
+             than a missing one: the mount would find it and fail at the far end"
+        ));
+    }
+    keyring::Entry::new(service, name)
+        .and_then(|e| e.set_password(value))
+        .with_context(|| format!("cannot write {service}/{name} to this account's keyring"))?;
+    // The name, never the value.
+    show(
+        cli,
+        json!({ "service": service, "name": name }),
+        render::secret_set,
+    )
+}
+
 fn show(cli: &Cli, v: Value, render: fn(&Value) -> String) -> Result<()> {
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&v)?);
@@ -240,7 +589,7 @@ async fn call(cli: &Cli) -> Result<()> {
     match &cli.cmd {
         // Dispatched before the client connects: one starts a daemon rather
         // than calling one, the other needs none at all.
-        Cmd::Boot(_) | Cmd::Man { .. } => unreachable!("not a syscall"),
+        Cmd::Boot(_) | Cmd::Man { .. } | Cmd::Secret { .. } => unreachable!("not a syscall"),
         Cmd::Status => show(
             cli,
             c.call("boot.info", json!({}), None).await?,
@@ -252,7 +601,11 @@ async fn call(cli: &Cli) -> Result<()> {
             render::ls,
         ),
         Cmd::Ps => show(cli, c.call("task.ls", json!({}), None).await?, render::ps),
-        Cmd::Top => show(cli, c.call("top", json!({}), None).await?, render::top),
+        Cmd::Top { calls } => show(
+            cli,
+            c.call("top", json!({ "calls": calls }), None).await?,
+            render::top,
+        ),
         Cmd::Mount {
             what: MountCmd::Mock { name, ctx },
         } => show(
@@ -265,13 +618,207 @@ async fn call(cli: &Cli) -> Result<()> {
             .await?,
             render::mounted,
         ),
+        // Two mounts, one verb: a role needs a model behind it, and one call
+        // that leaves the node with a draft arch and no judge arch would be a
+        // node whose tasks stall at their second step.
+        Cmd::Mount {
+            what:
+                MountCmd::ClaudeCode {
+                    draft_model,
+                    judge_model,
+                    bin,
+                    timeout,
+                },
+        } => {
+            // A proof per call: a nonce is spent by the request that shows
+            // it, so the second mount asks for one of its own (fix round 1,
+            // Critical 1 — a cloud arch is a human act).
+            // `&Client` rather than the client, so the closure stays `Copy`
+            // and can be called for each of the two roles.
+            let client = &c;
+            let mount = move |model: String| async move {
+                let proof = presence(client).await?;
+                client
+                    .call(
+                        "arch.mount",
+                        json!({
+                            "kind": "claude-code",
+                            "config": {
+                                "binary": bin,
+                                "model": model,
+                                "timeout_secs": timeout,
+                            },
+                        }),
+                        Some(proof),
+                    )
+                    .await
+            };
+            let draft = mount(draft_model.clone()).await?;
+            let judge = match mount(judge_model.clone()).await {
+                Ok(v) => v,
+                // All or nothing. A verb whose whole reason to exist is that a
+                // node needs both arches must not leave one behind when the
+                // second refuses — the unmount is best effort, and its own
+                // failure is reported beside the one that caused it.
+                Err(why) => {
+                    let id = draft["arch_id"].as_str().unwrap_or_default();
+                    let rolled_back = c
+                        .call("arch.unmount", json!({ "arch_id": id }), None)
+                        .await
+                        .is_ok();
+                    return Err(if rolled_back {
+                        why.context(format!(
+                            "mounting {judge_model} failed; unmounted {id} again"
+                        ))
+                    } else {
+                        why.context(format!(
+                            "mounting {judge_model} failed, and {id} could not be unmounted; \
+                             remove it with: vk umount {id}"
+                        ))
+                    });
+                }
+            };
+            show(
+                cli,
+                json!({ "draft": draft, "judge": judge }),
+                render::mounted_roles,
+            )
+        }
+        // One mount, one arch, and no key on the wire: the daemon reads it
+        // out of its own keyring, so what travels is the model and the
+        // numbers (Task 2b). It does travel with a **presence proof**, like
+        // `stop` and `approve` do: mounting a cloud arch authorises this
+        // node's registers to leave the machine for a third party, and it
+        // persists across every restart, so the daemon refuses it from a bare
+        // machine principal (fix round 1, Critical 1).
+        Cmd::Mount {
+            what:
+                MountCmd::Anthropic {
+                    model,
+                    ctx,
+                    max_tokens,
+                    timeout,
+                },
+        } => {
+            let proof = presence(&c).await?;
+            show(
+                cli,
+                c.call(
+                    "arch.mount",
+                    json!({
+                        "kind": "anthropic",
+                        "config": {
+                            "model": model,
+                            "context_ceiling": ctx,
+                            "max_tokens": max_tokens,
+                            "timeout_secs": timeout,
+                        },
+                    }),
+                    Some(proof),
+                )
+                .await?,
+                render::mounted_arch,
+            )
+        }
+        Cmd::Mount {
+            what:
+                MountCmd::Bedrock {
+                    region,
+                    model,
+                    ctx,
+                    max_tokens,
+                },
+        } => {
+            let proof = presence(&c).await?;
+            show(
+                cli,
+                c.call(
+                    "arch.mount",
+                    json!({
+                        "kind": "bedrock",
+                        "config": {
+                            "region": region,
+                            "model": model,
+                            "context_ceiling": ctx,
+                            "max_tokens": max_tokens,
+                        },
+                    }),
+                    Some(proof),
+                )
+                .await?,
+                render::mounted_arch,
+            )
+        }
+        // One mount, one arch: a local model is one engine, and which role it
+        // is given is the task's to say.
+        Cmd::Mount {
+            what:
+                MountCmd::Ollama {
+                    model,
+                    container: _,
+                    external,
+                    ctx,
+                    max_tokens,
+                    recreate,
+                    memory,
+                    cpus,
+                    image,
+                    seed,
+                },
+        } => {
+            // `--container` is the default, so it needs no branch of its own;
+            // naming a server is what switches the mode, and the daemon reads
+            // exactly that: a `base_url` means external, its absence means the
+            // container this node governs.
+            let mut config = json!({
+                "model": model,
+                "num_ctx": ctx,
+                "max_tokens": max_tokens,
+                "seed": seed,
+            });
+            // An engine this node did not start is one it cannot govern, so
+            // naming it is a human act and carries a presence proof (Ruling
+            // 42); the governed container takes none.
+            let proof = match external {
+                Some(_) => Some(presence(&c).await?),
+                None => None,
+            };
+            match external {
+                Some(url) => config["base_url"] = json!(url),
+                None => {
+                    config["image"] = json!(image);
+                    config["memory"] = json!(memory);
+                    config["cpus"] = json!(cpus);
+                    config["recreate"] = json!(recreate);
+                }
+            }
+            show(
+                cli,
+                c.call(
+                    "arch.mount",
+                    json!({ "kind": "ollama", "config": config }),
+                    proof,
+                )
+                .await?,
+                render::mounted_arch,
+            )
+        }
         Cmd::Umount { arch_id } => show(
             cli,
             c.call("arch.unmount", json!({ "arch_id": arch_id }), None)
                 .await?,
-            render::ok,
+            render::unmounted,
+        ),
+        Cmd::Arch {
+            what: ArchCmd::Show { arch_id },
+        } => show(
+            cli,
+            c.call("arch.show", json!({ "arch_id": arch_id }), None)
+                .await?,
+            render::arch_show,
         ),
         Cmd::Task { what } => task(cli, &c, what).await,
+        Cmd::Harness { what } => harness(cli, &c, what).await,
         Cmd::Stop { scope } => {
             let proof = presence(&c).await?;
             show(
@@ -290,7 +837,18 @@ async fn call(cli: &Cli) -> Result<()> {
                 render::ok,
             )
         }
-        Cmd::Approve { task_id } => approve(cli, &c, task_id).await,
+        Cmd::Approve {
+            task_id,
+            passkey: false,
+            ..
+        } => approve(cli, &c, task_id).await,
+        Cmd::Approve {
+            task_id,
+            passkey: true,
+            open,
+            timeout,
+        } => approve_with_passkey(cli, &c, task_id, *open, Duration::from_secs(*timeout)).await,
+        Cmd::Passkey { what } => passkey(cli, &c, what).await,
         Cmd::Dmesg { n } => show(
             cli,
             c.call("ledger.tail", json!({ "n": n }), None).await?,
@@ -303,7 +861,64 @@ async fn call(cli: &Cli) -> Result<()> {
             c.call("ledger.verify", json!({}), None).await?,
             render::verified,
         ),
+        Cmd::Fsck {
+            rebase_head,
+            force: _,
+            yes,
+        } => fsck(cli, &c, *rebase_head, *yes).await,
     }
+}
+
+/// `vk fsck`, and the one write in it.
+///
+/// Three things happen here and nowhere else. The **typed confirmation**: a
+/// rebase re-records where this node's record ends, and a flag is too easy to
+/// pass by accident for that — so the word is typed, on this end, before a
+/// syscall is made. The **presence proof**: reading every blob on the node,
+/// and overriding its store's own refusal, are human acts (invariant I1), so
+/// the call is signed with this node's device key like `stop` and `approve`.
+/// And the **exit code**: the report is printed either way — a person running
+/// `fsck` wants to see what failed — and then a store that does not verify
+/// leaves by the error path, so `vk fsck && deploy` does what it looks like.
+async fn fsck(cli: &Cli, c: &Client, rebase_head: bool, yes: bool) -> Result<()> {
+    if rebase_head && !yes {
+        confirm_rebase()?;
+    }
+    let proof = presence(c).await?;
+    let answer = c
+        .call(
+            "store.fsck",
+            json!({ "rebase_head": rebase_head }),
+            Some(proof),
+        )
+        .await?;
+    show(cli, answer.clone(), render::fsck)?;
+    anyhow::ensure!(
+        answer["ok"] == Value::Bool(true),
+        "this store does not verify; the tiers above say which part of it"
+    );
+    Ok(())
+}
+
+/// The word, typed out. Refused on anything else, including an empty line and
+/// a closed stdin — a confirmation nobody typed is not a confirmation.
+fn confirm_rebase() -> Result<()> {
+    // To stderr, so a `--json` run's stdout is still only the answer.
+    eprint!(
+        "This re-records where this node's record ends. Do it only if that record was \
+         restored from a backup on purpose.\nType `rebase` to confirm: "
+    );
+    use std::io::Write as _;
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("read the confirmation from stdin")?;
+    anyhow::ensure!(
+        line.trim() == "rebase",
+        "not confirmed: the ledger head was not touched"
+    );
+    Ok(())
 }
 
 async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
@@ -313,13 +928,23 @@ async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
             artefact,
             plan,
             draft,
+            harness,
+            judge,
             approve,
             release,
         } => {
-            let mut steps = vec![
-                json!({ "kind": "plan", "arch_id": plan }),
-                json!({ "kind": "draft", "arch_id": draft }),
-            ];
+            let mut steps = vec![json!({ "kind": "plan", "arch_id": plan })];
+            // Exactly one of the two produces what is approved. Clap already
+            // refuses both and refuses neither; this match is what turns the
+            // one that was given into its step.
+            match (draft, harness) {
+                (Some(arch), _) => steps.push(json!({ "kind": "draft", "arch_id": arch })),
+                (None, Some(name)) => steps.push(json!({ "kind": "harness", "name": name })),
+                (None, None) => return Err(anyhow!("give --draft <ARCH> or --harness <NAME>")),
+            }
+            if let Some(arch) = judge {
+                steps.push(json!({ "kind": "judge", "arch_id": arch }));
+            }
             if *approve {
                 steps.push(json!({ "kind": "approve" }));
             }
@@ -369,6 +994,62 @@ async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
     }
 }
 
+/// `vk harness run`: the confined Claude Code harness over a task's harness step.
+///
+/// The launch, the containment, the workspace projection and the egress telemetry
+/// all live in the daemon; this only names the task (or creates one from a goal),
+/// hands over the options and prints what came back.
+async fn harness(cli: &Cli, c: &Client, what: &HarnessCmd) -> Result<()> {
+    let HarnessCmd::Run {
+        task,
+        goal,
+        name,
+        dry_run,
+        keep,
+    } = what;
+
+    // An existing task, or a fresh one from a goal: a harness step, then the
+    // approval the harness's last instruction (`vk_request_approval`) asks for
+    // — so the request has a step to land on.
+    let task_id = match (task, goal) {
+        (Some(id), _) => id.clone(),
+        (None, Some(g)) => {
+            let created = c
+                .call(
+                    "task.create",
+                    json!({
+                        "goal": g,
+                        "artefact_type": "proposal",
+                        "steps": [ { "kind": "harness", "name": name }, { "kind": "approve" } ],
+                    }),
+                    None,
+                )
+                .await?;
+            field(&created, "id")?
+        }
+        (None, None) => {
+            return Err(anyhow!(
+                "give a task id to run, or --goal to create one: vk harness run <TASK> | --goal \"...\""
+            ))
+        }
+    };
+
+    // Only what the request may carry (Ruling 20): the binary, the model and
+    // the budget are the daemon's configuration.
+    let params = json!({
+        "task_id": task_id,
+        "name": name,
+        "dry_run": dry_run,
+        "keep": keep,
+    });
+    let answer = c.call("harness.run", params, None).await?;
+    if *dry_run {
+        show(cli, answer, render::harness_dry_run)
+    } else {
+        show(cli, answer, render::harness_run)
+    }
+}
+
 /// A task that will not move again without something else happening: a human,
 /// a fix, or a resume.
 fn settled(t: &Value) -> bool {
@@ -381,13 +1062,47 @@ fn settled(t: &Value) -> bool {
 /// This node's own device key, which in SP1a is the human's key: from
 /// `$VK_NODE_KEY_FILE` if it names one, else the OS keyring. The daemon says
 /// which node it is, so the key is the one enrolled as `node:<node_id>`.
+///
+/// **Loaded, never minted** (final review I-2). The key is created and
+/// enrolled by the daemon that serves the node — `vk boot`, which starts `vkd
+/// --auto-enroll-node` — and a key this shell made up would be one no node
+/// enrolled: every ceremony signed with it would be refused with nothing
+/// saying why. So an account with no key, or with one the node has not
+/// enrolled, is refused here, before anything is signed, with the remedy.
 async fn node_device(c: &Client) -> Result<NodeDevice> {
     let node_id = field(&c.call("boot.info", json!({}), None).await?, "node_id")?;
-    let source = match std::env::var_os("VK_NODE_KEY_FILE") {
-        Some(path) => KeySource::File(PathBuf::from(path)),
-        None => KeySource::Keyring,
+    let (source, place) = match std::env::var_os("VK_NODE_KEY_FILE") {
+        Some(path) => {
+            let place = format!("the file {}", PathBuf::from(&path).display());
+            (KeySource::File(PathBuf::from(path)), place)
+        }
+        None => (
+            KeySource::Keyring,
+            "this account's keyring (no VK_NODE_KEY_FILE)".to_string(),
+        ),
     };
-    NodeDevice::load_or_create(source, &node_id).context("this node's device key")
+    let device_id = format!("node:{node_id}");
+    let Some(device) = NodeDevice::load(source, &node_id).context("this node's device key")? else {
+        anyhow::bail!(
+            "this account has no device key for node {node_id} in {place}, and vk does not \
+             create one: a key this shell made would be one the node never enrolled. The \
+             daemon that serves the node creates and enrols it — `vk boot` does, for a daemon \
+             you start. Under the Windows service the node's key is the service account's, not \
+             yours: see README, \"Human ceremonies under the service\""
+        );
+    };
+    let enrolled = c.call("ns.ls", json!({ "path": "/devices" }), None).await?;
+    let listed = enrolled["entries"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(device_id.as_str())));
+    anyhow::ensure!(
+        listed,
+        "{device_id} is not enrolled on this node, so nothing signed with the key in {place} \
+         would be accepted. The daemon enrols the node's key when it starts with \
+         --auto-enroll-node (as `vk boot` starts it); under the Windows service, see README, \
+         \"Human ceremonies under the service\""
+    );
+    Ok(device)
 }
 
 /// A nonce this daemon issued: single use, and spent by the request that
@@ -405,28 +1120,24 @@ async fn presence(c: &Client) -> Result<PresenceProof> {
     Ok(PresenceProof::sign(&device, &challenge(c).await?))
 }
 
-/// The approval ceremony: learn what the scheduler is waiting to have
-/// approved, then sign it.
+/// The approval ceremony with this node's device key: ask the kernel for the
+/// challenge it minted for the task — the subject, the resource, the nonce
+/// and the expiry are all the kernel's, never this shell's (SP1b Task 5,
+/// invariant I1) — sign its digest, and present it with a presence proof.
 ///
-/// One challenge carries both signatures. They are in different domains — a
-/// presence proof signs `sha256("presence|<nonce>")`, an approval signs
-/// `H(resource|action|nonce|expiry)` — so neither can be replayed as the
-/// other, and the approval is bound to a nonce this daemon issued a moment
-/// ago rather than to one the client made up.
+/// Two signatures, two domains: the presence proof signs
+/// `sha256("presence|<nonce>")` over a nonce of its own, the approval signs
+/// `H(resource|action|nonce|expiry)` over the minted challenge, so neither
+/// can be replayed as the other, and `approve` accepts the approval only
+/// while the minted challenge is unspent and unexpired.
 async fn approve(cli: &Cli, c: &Client, task_id: &str) -> Result<()> {
     let device = node_device(c).await?;
-    let subject = field(
-        &c.call("task.subject", json!({ "task_id": task_id }), None)
+    let challenge: Challenge = serde_json::from_value(
+        c.call("approval.challenge", json!({ "task_id": task_id }), None)
             .await?,
-        "subject_hash",
-    )?;
-    let nonce = challenge(c).await?;
-    let challenge = Challenge {
-        resource: format!("task:{task_id}"),
-        action_digest: subject.clone(),
-        nonce: nonce.clone(),
-        expires_at_ms: vk_kernel::now_ms() + APPROVAL_TTL_MS,
-    };
+    )
+    .context("the daemon's approval challenge")?;
+    let subject = challenge.action_digest.clone();
     let approval = Approval {
         subject_hash: subject.clone(),
         kind: ApprovalKind::Human,
@@ -436,7 +1147,7 @@ async fn approve(cli: &Cli, c: &Client, task_id: &str) -> Result<()> {
         signature_hex: Some(hex::encode(device.sign(&challenge.digest()))),
         challenge: Some(challenge),
     };
-    let proof = PresenceProof::sign(&device, &nonce);
+    let proof = presence(c).await?;
     let mut answer = c
         .call("approve", json!({ "approval": approval }), Some(proof))
         .await?;
@@ -448,6 +1159,146 @@ async fn approve(cli: &Cli, c: &Client, task_id: &str) -> Result<()> {
         o.insert("subject_hash".into(), json!(subject));
     }
     show(cli, answer, render::approved)
+}
+
+/// The approval ceremony with a passkey: the daemon mints a link to the
+/// task's approval page, this shell prints it (and opens it with `--open`),
+/// and waits — polling `task.show` — for the task to leave `waiting_human`,
+/// which is what the page's `finish` does once the passkey has signed and
+/// the kernel has recorded. Nothing is signed here: the browser, the
+/// authenticator and the daemon do the whole ceremony between them.
+async fn approve_with_passkey(
+    cli: &Cli,
+    c: &Client,
+    task_id: &str,
+    open: bool,
+    timeout: Duration,
+) -> Result<()> {
+    let linked = c
+        .call(
+            "web.link",
+            json!({ "page": "approve", "task_id": task_id }),
+            None,
+        )
+        .await?;
+    let url = field(&linked, "url")?;
+    let subject = field(&linked, "subject_hash")?;
+    // The link goes to the person at once, before the wait: to stdout as the
+    // answer of the moment, or — under `--json`, where stdout is the final
+    // answer — to stderr, so a script capturing the answer still shows it.
+    if cli.json {
+        eprintln!("{url}");
+    } else {
+        println!("{}", render::link(&json!({ "url": url, "waiting": true })));
+    }
+    if open {
+        open_browser(&url)?;
+    }
+    let start = Instant::now();
+    let status = loop {
+        let t = c
+            .call("task.show", json!({ "task_id": task_id }), None)
+            .await?;
+        match t["status"].as_str() {
+            Some("waiting_human") | None => {}
+            // The approve step ran on the approval: the task finished, or
+            // went on to its next step.
+            Some(status @ ("done" | "running")) => break status.to_string(),
+            // It left `waiting_human` some other way — a STOP, a failure —
+            // and nothing says a passkey approved anything.
+            Some(other) => {
+                return Err(anyhow!(
+                    "task {task_id} is {other}; no passkey approval landed on it"
+                ))
+            }
+        }
+        if start.elapsed() > timeout {
+            return Err(anyhow!(
+                "no passkey approval of {task_id} arrived within {}s; the link stays open for \
+                 a few minutes: {url}",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(APPROVAL_POLL).await;
+    };
+    show(
+        cli,
+        json!({
+            "ok": true,
+            "task_id": task_id,
+            "subject_hash": subject,
+            "status": status,
+            "url": url,
+        }),
+        render::approved,
+    )
+}
+
+/// `vk passkey enroll | ls`.
+async fn passkey(cli: &Cli, c: &Client, what: &PasskeyCmd) -> Result<()> {
+    match what {
+        PasskeyCmd::Enroll { open } => {
+            // Enrolling a passkey is a human act: the link is minted only
+            // under a presence proof by this node's device key (review
+            // Important 2), so a process with the pipe and no key gets none.
+            let proof = presence(c).await?;
+            let linked = c
+                .call("web.link", json!({ "page": "enroll" }), Some(proof))
+                .await?;
+            let url = field(&linked, "url")?;
+            if *open {
+                open_browser(&url)?;
+            }
+            show(cli, json!({ "url": url, "opened": open }), render::link)
+        }
+        PasskeyCmd::Ls => {
+            let listed = c.call("passkey.ls", json!({}), None).await?;
+            // An enrolled passkey the daemon's verifier cannot read is an
+            // error (final review M-11): shown in the list, and the verb
+            // fails, because that passkey cannot approve anything.
+            let unreadable: Vec<String> = listed
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|p| p["unreadable"].is_string())
+                .map(|p| p["device_id"].as_str().unwrap_or("?").to_string())
+                .collect();
+            show(cli, listed, render::passkeys)?;
+            anyhow::ensure!(
+                unreadable.is_empty(),
+                "UNREADABLE passkey(s) {}: enrolled, but this daemon's verifier cannot read \
+                 them, so they cannot approve; enrol the authenticator again",
+                unreadable.join(", ")
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Hand `url` to the default browser: `start` on Windows, `open` on macOS,
+/// `xdg-open` elsewhere. Detached, and only its launch is checked — what
+/// the browser then does with the page is the person's, not this shell's.
+fn open_browser(url: &str) -> Result<()> {
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        // `start` treats its first quoted argument as a window title.
+        c.args(["/C", "start", "", url]);
+        c
+    } else if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    } else {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("open {url} in a browser"))?;
+    Ok(())
 }
 
 /// The `boot.info` of the daemon serving this endpoint, if one is. It carries
@@ -536,16 +1387,31 @@ fn detach(cmd: &mut Command, state_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // Its own process group: outside the terminal's foreground group.
-        cmd.process_group(0);
+        // Its own *session*, not only its own process group (SP1a review
+        // M7): `setsid` in the child leaves the terminal's session, so the
+        // `SIGHUP` the kernel sends to that session when the shell that ran
+        // `vk boot` closes never reaches the daemon. A new session is a new
+        // process group too.
+        // SAFETY: `setsid` is async-signal-safe and touches nothing of the
+        // parent's; it is the only call made between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     Ok(())
 }
 
 /// How a daemon this shell started stopped being a daemon it is waiting for.
 enum Started {
-    /// It answered on the endpoint.
-    Serving,
+    /// It answered on the endpoint, with the `boot.info` it answered with —
+    /// which says how many arches are still coming up behind it, so `vk boot`
+    /// can tell the person who ran it (Task 1b review, Important 1).
+    Serving(Box<Value>),
     /// It gave up before answering — a refused ledger, a key it could not
     /// read, an endpoint already taken.
     Exited(std::process::ExitStatus),
@@ -591,6 +1457,7 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
                 "endpoint": ep.0,
                 "state_dir": state_dir.display().to_string(),
                 "already_running": true,
+                "arches_starting": info["arches_starting"].as_u64().unwrap_or(0),
             }),
             render::booted,
         );
@@ -613,6 +1480,7 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
     if a.force {
         cmd.arg("--force");
     }
+    cmd.args(["--web-port", &a.web_port.to_string()]);
     if a.foreground {
         let status = cmd
             .status()
@@ -632,8 +1500,8 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
     let start = Instant::now();
     let outcome = rt.block_on(async {
         loop {
-            if serving(&ep).await.is_some() {
-                return Started::Serving;
+            if let Some(info) = serving(&ep).await {
+                return Started::Serving(Box::new(info));
             }
             match child.try_wait() {
                 Ok(Some(status)) => return Started::Exited(status),
@@ -647,8 +1515,8 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
         }
     });
     let log = state_dir.join("vkd.log");
-    match outcome {
-        Started::Serving => {}
+    let info = match outcome {
+        Started::Serving(info) => *info,
         // It said why on its way out. The log is where a detached daemon
         // speaks, so its last lines are the answer — naming a file to go and
         // read is not.
@@ -660,7 +1528,15 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
                 _ => format!("; see {}", log.display()),
             }
         ),
-        Started::Lost(e) => anyhow::bail!("lost track of vkd (pid {pid}): {e}"),
+        // The OS will not say whether it is still running, so assume it is:
+        // a daemon nobody knows the pid of would sit on the endpoint and make
+        // every later `vk boot` refuse, blaming a daemon the user never sees
+        // — the same reason `Silent` kills (SP1b Task 8, deferred minor).
+        Started::Lost(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("lost track of vkd (pid {pid}), and killed it: {e}")
+        }
         Started::Silent => {
             // It is ours and nobody else knows its pid, so it does not outlive
             // the call that started it: otherwise it would sit on the endpoint
@@ -674,14 +1550,80 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
                 log.display()
             );
         }
-    }
+    };
     show(
         cli,
         json!({
             "pid": pid,
             "endpoint": ep.0,
             "state_dir": state_dir.display().to_string(),
+            // The node is serving; some of its arches may still be coming up.
+            // Said here rather than left to be discovered by a task step that
+            // asks to be retried (Task 1b review, Important 1).
+            "arches_starting": info["arches_starting"].as_u64().unwrap_or(0),
         }),
         render::booted,
     )
+}
+
+#[cfg(all(test, unix))]
+mod detach_tests {
+    use super::detach;
+    use std::process::Command;
+
+    /// A detached daemon leads its own **session**, not only its own process
+    /// group (SP1a review M7): `setsid` in the child, so the terminal's
+    /// `SIGHUP` — sent to the session when the shell that ran `vk boot`
+    /// closes — never reaches it.
+    ///
+    /// On Linux the child reports its session id (`ps -o sess=` is numeric
+    /// there) and it must **differ** from this process's — exactly what tells
+    /// `setsid` (a new session) from a mere `process_group(0)` (a new group in
+    /// the same session). macOS's `ps` reports no session id at all (`sess`
+    /// prints `0` for every process), so there the test checks the portable,
+    /// necessary consequence of `setsid`: the child leads a process group of
+    /// its own (`pgid == pid`) that is not this process's.
+    #[test]
+    fn a_detached_daemon_leads_its_own_session() {
+        let d = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new("sh");
+        #[cfg(target_os = "linux")]
+        cmd.args(["-c", "ps -o sess= -p $$"]);
+        #[cfg(not(target_os = "linux"))]
+        cmd.args(["-c", "ps -o pgid= -p $$"]);
+        detach(&mut cmd, d.path()).unwrap();
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "{status}");
+        let reported = std::fs::read_to_string(d.path().join("vkd.log")).unwrap();
+        let reported = reported.trim().to_string();
+        assert!(!reported.is_empty(), "the child printed nothing");
+
+        #[cfg(target_os = "linux")]
+        {
+            // This process's own session, read the same way: the two differ.
+            let ours = Command::new("ps")
+                .args(["-o", "sess=", "-p", &std::process::id().to_string()])
+                .output()
+                .unwrap();
+            let ours = String::from_utf8_lossy(&ours.stdout);
+            assert_ne!(
+                reported,
+                ours.trim(),
+                "the child must be in a different session (setsid), not this one"
+            );
+            let _ = pid;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let pgid: i32 = reported
+                .parse()
+                .unwrap_or_else(|e| panic!("{e}: {reported:?}"));
+            assert_eq!(pgid, pid as i32, "the child leads its own process group");
+            // SAFETY: `getpgrp` reads this process's own process group id.
+            let ours = unsafe { libc::getpgrp() };
+            assert_ne!(pgid, ours, "and it is not this process's group");
+        }
+    }
 }

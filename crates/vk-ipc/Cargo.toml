@@ -6,9 +6,22 @@ license.workspace = true
 repository.workspace = true
 description = "VerticalAI IPC: local transport between vk CLI and vkd"
 
+[features]
+# The EU arch's transport, passed straight through to `vk-arch-anthropic`,
+# whose own default is off (Ruling 30 — see the reasoning there). The
+# dependency is taken with `default-features = false` as well, so enabling it
+# is always a deliberate act and never something a default carries in.
+default = []
+bedrock = ["vk-arch-anthropic/bedrock"]
+
 [dependencies]
 vk-contracts = { path = "../vk-contracts" }
 vk-kernel = { path = "../vk-kernel" }
+vk-harness = { path = "../vk-harness" }
+vk-arch-claude-code = { path = "../vk-arch-claude-code" }
+vk-arch-ollama = { path = "../vk-arch-ollama" }
+vk-arch-anthropic = { path = "../vk-arch-anthropic", default-features = false }
+vk-store = { path = "../vk-store" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +33,34 @@ rand.workspace = true
 hex.workspace = true
 uuid.workspace = true
 
+# `geteuid`, so the socket's directory is required to be this user's and not
+# only closed to others (SP1a review M6).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# The pipe's DACL (SP1b Task 6): turning the SDDL a caller hands `bind` into a
+# `SECURITY_ATTRIBUTES` for `CreateNamedPipe`, reading the token user's SID
+# back out for the service's own half of that DACL, and — in the tests — the
+# descriptor the object ended up with. Pinned to the same 0.62 line as
+# `vk-harness`, so one version of the Win32 bindings is built for the
+# workspace.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    # `GetNamedPipeServerProcessId`: who is on the other end of a pipe this
+    # client just opened, so a squatter on a well-known name is refused
+    # rather than served (fix round 1, Important 3).
+    "Win32_System_Pipes",
+    # `GetDriveTypeW`: under the service a Claude Code binary must be on a
+    # local fixed drive (final re-review N-2).
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 tempfile = "3"
+# The roundtrip test opens a kernel with this build's real adapter factory,
+# which needs the store's own key source.
 vk-store = { path = "../vk-store" }

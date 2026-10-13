@@ -7,7 +7,7 @@ use vk_contracts::labels::{Label, Scope};
 use vk_contracts::ledger::{ClockQuality, HlcClock, Ledger, RetentionClass};
 use vk_contracts::locks::{Lease, LockHome, LockTable};
 use vk_contracts::module::{GateKind, GateVerdict, ModuleManifest};
-use vk_contracts::principal::{Approval, ApprovalKind, DeviceRegistry};
+use vk_contracts::principal::{Approval, ApprovalKind, Challenge, DeviceRegistry};
 use vk_contracts::register::{Register, RegisterId};
 use vk_contracts::stop::{LivenessLease, ResumeEvent, StopEvent, StopSet};
 use vk_contracts::syscalls::{Ctx, InferOutcome, Kernel, KernelError};
@@ -24,6 +24,10 @@ pub struct StubKernel {
     home: LockHome,
     devices: DeviceRegistry,
     approvals: Vec<Approval>,
+    /// The challenges this stub has minted and no approval has spent, by
+    /// nonce — the real kernel's rule (SP1b Task 5): a human approval
+    /// answers a minted challenge or it is nothing.
+    challenges: BTreeMap<String, Challenge>,
     stops: StopSet,
     liveness: BTreeMap<String, LivenessLease>,
     hot: Vec<String>,
@@ -44,6 +48,7 @@ impl StubKernel {
             home: LockHome::default(),
             devices: DeviceRegistry::default(),
             approvals: vec![],
+            challenges: BTreeMap::new(),
             stops: StopSet::default(),
             liveness: BTreeMap::new(),
             hot: vec![],
@@ -114,7 +119,25 @@ impl Kernel for StubKernel {
         Ok(reg)
     }
 
-    fn write_register(&mut self, ctx: &Ctx, reg: Register) -> Result<(), KernelError> {
+    fn write_register(&mut self, ctx: &Ctx, mut reg: Register) -> Result<(), KernelError> {
+        // The real kernel's rule (SP1a review M1), so the two agree: no
+        // relabelling downward, no re-parenting, no overwriting a register
+        // the caller could not read.
+        if let Some(existing) = self.registers.get(&reg.id) {
+            if !existing.label.flows_to(&ctx.clearance) {
+                return Err(KernelError::I2(format!(
+                    "register {} exceeds caller clearance",
+                    reg.id.0
+                )));
+            }
+            if existing.task_id != reg.task_id {
+                return Err(KernelError::I3(format!(
+                    "register {} belongs to task {}; a write cannot move it to task {}",
+                    reg.id.0, existing.task_id, reg.task_id
+                )));
+            }
+            reg.label = existing.label.join(&reg.label);
+        }
         self.log("register.written", ctx.now_ms, &reg.id);
         self.registers.insert(reg.id.clone(), reg);
         Ok(())
@@ -167,6 +190,27 @@ impl Kernel for StubKernel {
     }
 
     fn approve(&mut self, ctx: &Ctx, approval: Approval) -> Result<(), KernelError> {
+        // The challenge first, as the real kernel does (SP1b Task 5): a human
+        // approval answers one this stub minted, unspent and unexpired, and
+        // the nonce is spent whatever follows.
+        if approval.kind == ApprovalKind::Human {
+            let presented = approval.challenge.as_ref().ok_or_else(|| {
+                KernelError::I1("a human approval answers a minted challenge".into())
+            })?;
+            let minted = self.challenges.remove(&presented.nonce).ok_or_else(|| {
+                KernelError::I1(
+                    "approval challenge was not minted by this node, or was already spent".into(),
+                )
+            })?;
+            if minted != *presented {
+                return Err(KernelError::I1(
+                    "approval challenge is not the one this node minted for that nonce".into(),
+                ));
+            }
+            if ctx.now_ms >= presented.expires_at_ms {
+                return Err(KernelError::I1("approval challenge expired".into()));
+            }
+        }
         interceptors::i1_approval(&ctx.principal, &approval, &self.devices, ctx.now_ms)?;
         self.log("approval.recorded", ctx.now_ms, &approval);
         self.approvals.push(approval);
@@ -319,6 +363,23 @@ impl KernelTestHooks for StubKernel {
     fn stops(&self) -> StopSet {
         self.stops.clone()
     }
+    fn mint_challenge(
+        &mut self,
+        ctx: &Ctx,
+        resource: &str,
+        action_digest: &str,
+        ttl_ms: u64,
+    ) -> Challenge {
+        let nonce = self.next_id("nonce");
+        let challenge = Challenge {
+            resource: resource.into(),
+            action_digest: action_digest.into(),
+            nonce: nonce.clone(),
+            expires_at_ms: ctx.now_ms.saturating_add(ttl_ms),
+        };
+        self.challenges.insert(nonce, challenge.clone());
+        challenge
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +389,66 @@ mod tests {
     use vk_contracts::labels::*;
     use vk_contracts::principal::*;
 
+    /// The stub applies the real kernel's write rule (SP1a review M1), so the
+    /// two kernels agree: no relabelling downward, no re-parenting, no
+    /// overwriting a register the caller could not read.
+    #[test]
+    fn a_register_write_cannot_relabel_reparent_or_overwrite_what_it_could_not_read() {
+        let mut k = StubKernel::new("n1");
+        let ctx = Ctx {
+            principal: Principal::Machine {
+                node_id: "n1".into(),
+                lease_id: "l".into(),
+            },
+            clearance: Clearance {
+                max_scope: Scope::Personal,
+                third_party_allowed: true,
+            },
+            partition: "p".into(),
+            now_ms: 1,
+        };
+        let business = Label {
+            scope: Scope::Business,
+            data_class: DataClass::Own,
+            origins: [Origin::OwnerAuthored].into(),
+        };
+        let id = k
+            .submit_task(&ctx, "a business register", business.clone())
+            .unwrap();
+        let stored = k.read_register(&ctx, &id).unwrap();
+
+        let mut lowered = stored.clone();
+        lowered.label = Label::bottom();
+        k.write_register(&ctx, lowered).unwrap();
+        assert_eq!(k.read_register(&ctx, &id).unwrap().label, business);
+
+        let mut moved = stored.clone();
+        moved.task_id = "task-somebody-elses".into();
+        assert!(matches!(
+            k.write_register(&ctx, moved).unwrap_err(),
+            KernelError::I3(_)
+        ));
+        assert_eq!(k.read_register(&ctx, &id).unwrap().task_id, stored.task_id);
+
+        let low = Ctx {
+            clearance: Clearance {
+                max_scope: Scope::Public,
+                third_party_allowed: false,
+            },
+            ..ctx.clone()
+        };
+        let mut overwrite = stored.clone();
+        overwrite.goal = "replaced".into();
+        assert!(matches!(
+            k.write_register(&low, overwrite).unwrap_err(),
+            KernelError::I2(_)
+        ));
+        assert_eq!(
+            k.read_register(&ctx, &id).unwrap().goal,
+            "a business register"
+        );
+    }
+
     fn gemma(clearance: Clearance) -> ArchManifest {
         ArchManifest {
             name: "gemma".into(),
@@ -335,7 +456,7 @@ mod tests {
             locality: Locality::Local,
             jurisdiction: "FR".into(),
             retention_days: None,
-            cost_per_1k_tokens_eur: 0.0,
+            cost_per_1k_tokens_eur: Some(0.0),
             latency_ms_p50: 1,
             context_ceiling: 100,
             determinism: Determinism::SeededDeterministic,
@@ -517,12 +638,9 @@ mod tests {
         ));
         let key = SoftwareHumanKey::generate("phone-1");
         k.enroll_device("phone-1", key.verifying_key_bytes());
-        let ch = Challenge {
-            resource: "module:quote-drafter".into(),
-            action_digest: "sha256:c".into(),
-            nonce: "n".into(),
-            expires_at_ms: 10,
-        };
+        // The challenge is the kernel's to mint now (SP1b Task 5, mirrored in
+        // the stub by group F): a human approval answers one this node minted.
+        let ch = k.mint_challenge(&human_ctx(2), "module:quote-drafter", "sha256:c", 60_000);
         let sig = key.sign(&ch.digest());
         let ap = Approval {
             subject_hash: "sha256:c".into(),

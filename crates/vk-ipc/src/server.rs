@@ -5,24 +5,142 @@
 use crate::transport::{self, AcceptError, Endpoint};
 use crate::{
     PresenceProof, Request, Response, RpcError, E_BAD_PARAMS, E_INTERNAL, E_INVARIANT, E_METHOD,
-    E_NOT_FOUND, E_STORE,
+    E_NOT_FOUND, E_RETRY, E_STORE,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use vk_contracts::arch::ArchManifest;
+use vk_arch_anthropic::{AnthropicAdapter, AnthropicConfig, SecretString};
+use vk_arch_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
+use vk_arch_ollama::{ContainerSpec, OllamaAdapter, OllamaConfig};
+use vk_contracts::arch::{ArchManifest, Locality};
 use vk_contracts::labels::{Clearance, Label, Scope};
 use vk_contracts::principal::{Approval, ApprovalKind, Principal};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
-use vk_kernel::arch::MockAdapter;
+use vk_harness::launch::{self, ExitReason, HarnessConfig, HarnessRun};
+use vk_kernel::arch::{ArchAdapter, MockAdapter, MountSpec};
 use vk_kernel::tasks::StepKind;
-use vk_kernel::{now_ms, RealKernel};
+use vk_kernel::{now_ms, RealKernel, Remount};
 
 type Shared = Arc<Mutex<RealKernel>>;
+
+/// What the daemon was started with, beyond the kernel: the endpoint it serves
+/// on (a harness's `vk-mcp` dials back on it) and the harness settings — the
+/// binary, the model and the run budget — which are the daemon's to set and
+/// never a request's (Ruling 20: a pipe client that could name the binary the
+/// daemon executes would be code execution as the daemon's account once Task 6
+/// puts it under one).
+#[derive(Clone)]
+pub struct ServerConfig {
+    pub endpoint: String,
+    pub harness: HarnessSettings,
+    /// The loopback web pages this daemon serves (SP1b Task 5), if it serves
+    /// any: what `web.link` mints an addressed link into. `None` on a daemon
+    /// started without them, and in every transport test.
+    pub web: Option<Arc<dyn WebLinks>>,
+    /// Where the Anthropic API key comes from when an `anthropic` arch is
+    /// mounted (Task 2b): this account's keyring in every ordinary run, and a
+    /// file only under `vkd --anthropic-key-file`, which exists for tests, CI
+    /// and a headless node whose OS has no credential store. Daemon
+    /// configuration, never a request field — a pipe client that could name
+    /// the file the daemon reads a credential out of would be reading the
+    /// daemon's files with the daemon's rights.
+    pub anthropic_keys: vk_arch_anthropic::KeySource,
+    /// Where an `anthropic` arch's calls go. `https://api.anthropic.com` on
+    /// every real node; `vkd --anthropic-base-url` moves it, for tests.
+    ///
+    /// **Never a request field** (fix round 1, Critical 1). A client that
+    /// could name the origin could name a collector, and this daemon would
+    /// put the key from its own keyring on the wire to it — persistently,
+    /// since the mount spec is replayed at every boot, and from a service
+    /// account whose keyring that client cannot otherwise read at all.
+    pub anthropic_base_url: String,
+    /// Whether this daemon runs as the Windows service (`vkd --as-service`,
+    /// set by `vkd` from its own flag — never a request field). Under the
+    /// service a Claude Code binary a request names may not resolve into a
+    /// synced folder or a user profile (Ruling 43); an interactive daemon is
+    /// the user's own process and may run the user's own binary.
+    pub as_service: bool,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("endpoint", &self.endpoint)
+            .field("harness", &self.harness)
+            .field("web", &self.web.as_ref().map(|w| w.origin()))
+            .field("anthropic_keys", &self.anthropic_keys)
+            .field("anthropic_base_url", &self.anthropic_base_url)
+            .field("as_service", &self.as_service)
+            .finish()
+    }
+}
+
+impl ServerConfig {
+    /// A config with the default harness settings and no web pages, for a
+    /// caller (a test) that has only an endpoint.
+    pub fn new(endpoint: String) -> ServerConfig {
+        ServerConfig {
+            endpoint,
+            harness: HarnessSettings::default(),
+            web: None,
+            anthropic_keys: vk_arch_anthropic::KeySource::Keyring,
+            anthropic_base_url: vk_arch_anthropic::DEFAULT_BASE_URL.to_string(),
+            as_service: false,
+        }
+    }
+}
+
+/// The web pages' side of `web.link` (SP1b Task 5): mint a link a person can
+/// open, carrying a token the pages check. The pages live in `vk-web`, which
+/// this crate does not depend on; `vkd` wires the two together. A link is the
+/// pipe's ACL carried over to loopback HTTP: only a process that could open
+/// this endpoint can obtain one, so only such a process — the interactive
+/// user's, in SP1b — can reach the enrolment and approval pages.
+pub trait WebLinks: Send + Sync {
+    /// `http://localhost:<port>`.
+    fn origin(&self) -> String;
+    /// A link to the enrolment page, good for a few minutes.
+    fn enroll_link(&self, now_ms: u64) -> String;
+    /// A link to the approval page of `task_id`, good for a few minutes.
+    fn approve_link(&self, task_id: &str, now_ms: u64) -> String;
+    /// Why the verifier behind the pages cannot read this enrolled passkey
+    /// credential, or `None` when it can (final review M-11): `passkey.ls`
+    /// reports such a row as unreadable rather than listing it as one that
+    /// could approve.
+    fn passkey_unreadable(&self, _credential: &Value) -> Option<String> {
+        None
+    }
+}
+
+/// How this daemon launches a harness: `vkd --harness-bin`, `--harness-model`,
+/// `--harness-timeout-secs`.
+#[derive(Debug, Clone)]
+pub struct HarnessSettings {
+    /// The Claude Code binary: `claude` by default, resolved on the daemon's
+    /// own `PATH` to `claude.exe` on Windows (never a `.cmd` shim); a test's
+    /// daemon is started with a stand-in.
+    pub binary: PathBuf,
+    /// The model the harness is pinned to.
+    pub model: Option<String>,
+    /// How long one run may take before its tree is killed.
+    pub timeout: Duration,
+}
+
+impl Default for HarnessSettings {
+    fn default() -> Self {
+        HarnessSettings {
+            binary: PathBuf::from("claude"),
+            model: Some("claude-sonnet-5".into()),
+            timeout: Duration::from_secs(300),
+        }
+    }
+}
 
 /// How long a presence challenge stays answerable.
 pub const CHALLENGE_TTL_MS: u64 = 60_000;
@@ -33,6 +151,14 @@ const MAX_CHALLENGES: usize = 1024;
 /// Longest request line accepted. Longer, and the connection is dropped
 /// rather than buffered without bound.
 const MAX_LINE: usize = 1 << 20;
+/// How many per-call usage rows `top --calls` carries: the newest this many.
+/// `usage.ls` is unbounded, because a caller that names a task or an arch has
+/// already said how much it wants.
+const MAX_TOP_CALLS: usize = 200;
+/// The longest a liveness lease may be renewed for in one call: thirty days.
+/// A lease is a recent human vouching for the business (I4); a year-long one
+/// would be a liveness check nobody makes.
+const MAX_LIVENESS_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// Pause after a connection that could not be accepted, so a condition that
 /// is not ours to fix (a burst past the descriptor limit, say) is not spun on.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
@@ -78,15 +204,22 @@ impl Challenges {
 
 pub async fn serve(kernel: Shared, endpoint: Endpoint) -> Result<()> {
     let listener = transport::os::bind(&endpoint).await?;
-    serve_on(kernel, listener).await
+    serve_on(kernel, listener, ServerConfig::new(endpoint.0)).await
 }
 
 /// Serve on an endpoint the caller has already bound. `vkd` binds before it
 /// boots the kernel, so a daemon refused its endpoint — another one is
 /// serving there — has not yet appended its `boot` event to a record it will
 /// never serve.
-pub async fn serve_on(kernel: Shared, mut listener: transport::os::Listener) -> Result<()> {
+pub async fn serve_on(
+    kernel: Shared,
+    mut listener: transport::os::Listener,
+    config: ServerConfig,
+) -> Result<()> {
     let challenges = Arc::new(Mutex::new(Challenges::default()));
+    // The endpoint the harness's `vk-mcp` must dial back on and the daemon's
+    // harness settings, threaded to every connection for `harness.run`.
+    let endpoint = Arc::new(config);
     loop {
         let stream = match listener.accept().await {
             Ok(s) => s,
@@ -102,12 +235,101 @@ pub async fn serve_on(kernel: Shared, mut listener: transport::os::Listener) -> 
             // The listener itself is gone: there is nothing left to serve with.
             Err(e @ AcceptError::Listener(_)) => return Err(e.into()),
         };
-        let (k, ch) = (kernel.clone(), challenges.clone());
+        let (k, ch, ep) = (kernel.clone(), challenges.clone(), endpoint.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, k, ch).await {
+            if let Err(e) = handle_connection(stream, k, ch, ep).await {
                 tracing::debug!(error = %e, "connection closed");
             }
         });
+    }
+}
+
+/// Build every arch this node had mounted, one at a time, while the node
+/// serves (Task 1b review, Important 1).
+///
+/// `vkd` spawns this once, after the endpoint is bound and `boot()` has run.
+/// Until an arch is installed its state is `Starting`: it is listed, and a
+/// step that names it is told to retry rather than failed. Re-creation used to
+/// happen inside `RealKernel::open`, before the bind, which left the node
+/// answering nothing for the sum of the adapters' mount timeouts — minutes,
+/// for a cold container — so `vk boot` timed out at 10 s and killed the daemon
+/// it had just started.
+///
+/// **The kernel mutex is never held across a factory call.** Each iteration
+/// takes the lock only to read the queue at the start and, inside the blocking
+/// task, for the length of an `install_arch`. The adapter an install did not
+/// want goes back out and is dropped here, with the lock released, because
+/// dropping one can `docker stop` a container.
+///
+/// One at a time, not all at once: two cold model loads racing each other help
+/// nobody, and the order is the id order an operator sees in `vk ls /arches`.
+pub async fn start_arches(kernel: Shared) {
+    let Ok((factory, pending)) = kernel
+        .lock()
+        .map(|k| (k.adapter_factory(), k.pending_mounts()))
+    else {
+        tracing::error!("kernel lock poisoned; no arch was re-created");
+        return;
+    };
+    if pending.is_empty() {
+        return;
+    }
+    tracing::info!(
+        arches = pending.len(),
+        "re-creating the arches this node had mounted; it is serving while they come up"
+    );
+    for (arch_id, spec) in pending {
+        let (kernel, factory) = (kernel.clone(), factory.clone());
+        // The blocking pool: building an adapter runs child processes and
+        // blocking HTTP, which must not sit on a runtime worker.
+        let built = tokio::task::spawn_blocking(move || {
+            // A factory that panics is an unavailable arch with the panic as
+            // its reason, never a startup task that died with the arch left
+            // `Starting` (Task 1b deferred minor).
+            let made = vk_kernel::build_adapter(&factory, &spec);
+            let stale = match kernel.lock() {
+                Ok(mut k) => k.install_arch(&arch_id, made),
+                Err(_) => None,
+            };
+            // Here, not in the match: the guard above is gone by now, so an
+            // Ollama adapter's `Drop` does its `docker stop` unlocked.
+            drop(stale);
+        })
+        .await;
+        if let Err(e) = built {
+            tracing::error!("an arch could not be re-created: {e}");
+        }
+    }
+    tracing::info!("every arch has been re-created; `vk ls /arches` says how each one came up");
+}
+
+/// The retention sweep on a schedule (Task 10 group C): every `every`, the
+/// kernel's `sweep_retention` runs under the lock for the length of a delete
+/// and a directory walk. `vkd` spawns this once, after `boot()` — which did
+/// the first sweep — with an hour; a test hands it milliseconds. The first
+/// tick of a tokio interval completes at once and is skipped for that reason.
+pub async fn sweep_retention_every(kernel: Shared, every: Duration) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let k = kernel.clone();
+        let swept = tokio::task::spawn_blocking(move || match k.lock() {
+            Ok(mut k) => k.sweep_retention(now_ms()).map_err(|e| e.to_string()),
+            Err(_) => Err("kernel lock poisoned".to_string()),
+        })
+        .await;
+        match swept {
+            Ok(Ok(s)) if s.usage_rows > 0 || s.workspaces > 0 => tracing::info!(
+                usage_rows = s.usage_rows,
+                workspaces = s.workspaces,
+                "retention sweep"
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "the retention sweep failed; next hour"),
+            Err(e) => tracing::error!(error = %e, "the retention sweep task did not run"),
+        }
     }
 }
 
@@ -115,6 +337,7 @@ async fn handle_connection(
     stream: Box<dyn transport::Stream>,
     kernel: Shared,
     challenges: Arc<Mutex<Challenges>>,
+    endpoint: Arc<ServerConfig>,
 ) -> Result<()> {
     let (r, mut w) = tokio::io::split(stream);
     let mut reader = BufReader::new(r);
@@ -126,8 +349,8 @@ async fn handle_connection(
                 // The kernel does its own disk IO, so a call runs on the
                 // blocking pool. `dispatch` is synchronous: the kernel lock is
                 // taken and released inside it, never held across an await.
-                let (k, ch) = (kernel.clone(), challenges.clone());
-                let outcome = tokio::task::spawn_blocking(move || dispatch(&k, &ch, req))
+                let (k, ch, ep) = (kernel.clone(), challenges.clone(), endpoint.clone());
+                let outcome = tokio::task::spawn_blocking(move || dispatch(&k, &ch, req, &ep))
                     .await
                     .unwrap_or_else(|e| Err(internal(&format!("dispatch aborted: {e}"))));
                 reply(id, outcome)
@@ -189,7 +412,16 @@ fn reply(id: u64, outcome: Result<Value, RpcError>) -> Response {
 fn kerr(e: KernelError) -> RpcError {
     let code = match e {
         KernelError::NotFound(_) => E_NOT_FOUND,
-        KernelError::Store(_) => E_STORE,
+        // Not `E_NOT_FOUND`: the arch is there and the client can see it in
+        // `arch.ls`. What failed is the machinery behind it, which is the
+        // store class — the same class an adapter's non-invariant failure
+        // already reports (SP1b review, Important 2).
+        KernelError::ArchUnavailable(_) | KernelError::Store(_) => E_STORE,
+        // Its own code, because it asks the caller for something no other
+        // code does: wait and send this again. A client that cannot tell it
+        // from `E_STORE` has to treat a four-second container start as a
+        // failure (Task 1b review, Important 1).
+        KernelError::ArchStarting(_) => E_RETRY,
         KernelError::I1(_)
         | KernelError::I2(_)
         | KernelError::I3(_)
@@ -260,7 +492,22 @@ struct Presented {
 fn takes_presence(method: &str) -> bool {
     matches!(
         method,
-        "task.create" | "task.step" | "stop" | "resume" | "approve"
+        "task.create"
+            | "task.step"
+            | "stop"
+            | "resume"
+            | "approve"
+            | "web.link"
+            // Renewing a liveness lease says a human vouched for the
+            // business (SP1a review M10).
+            | "liveness.renew"
+            // Mounting a cloud arch is a human act: see the refusal in
+            // `dispatch` (fix round 1, Critical 1). Local kinds take a proof
+            // and ignore it, as `task.step` does.
+            | "arch.mount"
+            // Reading every blob on the node, and overriding its store's own
+            // refusal, are human acts (SP1b Task 8).
+            | "store.fsck"
     )
 }
 
@@ -304,13 +551,14 @@ fn dispatch(
     kernel: &Shared,
     challenges: &Mutex<Challenges>,
     req: Request,
+    config: &ServerConfig,
 ) -> Result<Value, RpcError> {
     let now = now_ms();
     // A nonce presented is a nonce spent, whatever the method and whatever
     // happens next: it leaves the map here, before anything is dispatched, so
     // a proof sent to a method that would ignore it cannot be shown again to
     // one that would not.
-    let presence = match req.presence {
+    let mut presence = match req.presence {
         None => None,
         Some(proof) => {
             let nonce = lock(challenges)?.spend(&proof.nonce, now);
@@ -325,18 +573,136 @@ fn dispatch(
         let (nonce, exp) = lock(challenges)?.issue(now);
         return Ok(json!({ "nonce": nonce, "expires_at_ms": exp }));
     }
+    // **Mounting a cloud arch is a human act** (fix round 1, Critical 1).
+    // It authorises this node's registers to leave the machine for a third
+    // party, which is exactly what I2's third-party rule is about, and it is
+    // durable: the mount spec is replayed at every boot.
+    //
+    // Fully **verified here**, signature and nonce, not merely "a proof was
+    // attached" (fix round 2, Minor C): everything below this point reads a
+    // keyring, walks an AWS credential chain or executes `claude --version`,
+    // and a forged proof must not be able to make the daemon do any of those.
+    // The lock is taken for the verification alone and released again, because
+    // the slow work must not hold it; the `Ctx` it produces is what the mount
+    // arm uses, so the proof is verified exactly once and the nonce — already
+    // spent above — cannot be shown again.
+    let mount_kind = req.params["kind"].as_str().unwrap_or_default();
+    // An Ollama mount that names its own server is a human act too (Ruling 42
+    // (4)). The shape is parsed here, before any proof is asked for, so an
+    // unknown field is a bad request; and so is the image checked — the pinned
+    // one by tag, digest or both passes with no proof, any other is refused
+    // outright rather than asked for a proof it could never be mounted with
+    // (final re-review N-1).
+    let ollama_human = if req.method == "arch.mount" && mount_kind == "ollama" {
+        let asked = closed_config::<OllamaMountConfig>("ollama", &req.params["config"])
+            .map_err(|e| bad(&format!("{e:#}")))?;
+        checked_image(asked.image.as_deref()).map_err(|e| bad(&format!("{e:#}")))?;
+        asked.needs_a_human()
+    } else {
+        false
+    };
+    let cloud_ctx = if req.method == "arch.mount" && (is_cloud_kind(mount_kind) || ollama_human) {
+        let ctx = {
+            let k = lock(kernel)?;
+            ctx_for(&k, presence.take(), now)?
+        };
+        if !matches!(ctx.principal, Principal::Human { .. }) {
+            return Err(invariant(if ollama_human {
+                "I1: mounting an Ollama this node did not start (--external) points the \
+                 node at an engine it cannot govern, which is a human act; re-run it with a \
+                 presence proof"
+            } else {
+                "I1: mounting a cloud arch sends this node's registers to a third party, \
+                 which is a human act; re-run it with a presence proof"
+            }));
+        }
+        Some(ctx)
+    } else {
+        None
+    };
+    // Mounting a Claude Code arch means running the binary to ask its version,
+    // because the version is in the arch identity. That happens here, *before*
+    // the kernel lock, so a binary that is slow — or missing, and about to be
+    // waited out — delays this one mount rather than every other syscall on
+    // the node (SP1b review, Minor 8 / ruling 8).
+    // The config comes back with `binary` resolved: that is what is asked,
+    // persisted and run from here on (I-1 addendum).
+    let as_service = config.as_service;
+    let claude = (req.method == "arch.mount" && req.params["kind"] == "claude-code")
+        .then(|| -> anyhow::Result<(Value, String)> {
+            let resolved = resolved_claude_config(&req.params["config"], as_service)?;
+            let version = claude_code_version(&resolved, as_service)?;
+            Ok((resolved, version))
+        })
+        .transpose()
+        .map_err(|e| bad(&format!("{e:#}")))?;
+    // The same, and more so, for an Ollama arch: mounting one starts a
+    // container, waits for the server and may pull gigabytes of weights. None
+    // of that may happen with the kernel lock held.
+    let ollama = (req.method == "arch.mount" && req.params["kind"] == "ollama")
+        .then(|| ollama_adapter(&req.params["config"]))
+        .transpose()
+        .map_err(|e| bad(&format!("{e:#}")))?;
+    // And for the two API arches (Task 2b). Reading the key out of the OS
+    // keyring can block — on Linux it is a D-Bus round trip to a keyring that
+    // may still be locked — and resolving AWS credentials can reach the
+    // network for an instance role, so neither happens with the kernel lock
+    // held. The key is loaded here and moved into the adapter; it never goes
+    // near the mount spec, which is stored in the clear.
+    let anthropic_key = (req.method == "arch.mount" && req.params["kind"] == "anthropic")
+        .then(|| {
+            vk_arch_anthropic::load_key(&config.anthropic_keys, vk_arch_anthropic::KEYRING_USER)
+        })
+        .transpose()
+        .map_err(|e| bad(&format!("{e:#}")))?;
+    let bedrock = (req.method == "arch.mount" && req.params["kind"] == "bedrock")
+        .then(|| bedrock_adapter(&req.params["config"]))
+        .transpose()
+        .map_err(|e| bad(&format!("{e:#}")))?;
+    // Handled before the general lock, and taking the kernel lock only in short
+    // phases of its own: a harness run launches Claude Code and *waits* for it,
+    // and the harness calls back over MCP (`harness.*`) while it runs — so a lock
+    // held across the wait would deadlock the harness against its own syscalls
+    // (SP1b Task 4).
+    if req.method == "harness.run" {
+        return harness_run(kernel, config, req.params);
+    }
     let mut k = lock(kernel)?;
     let p = req.params;
     match req.method.as_str() {
         "boot.info" => Ok(json!({
             "node_id": k.node_id,
             "arches": k.arches().len(),
+            // Which of them came up usable (SP1b ruling 14). The count alone
+            // would let a node report two arches on a morning when neither
+            // can run, which is the morning somebody most needs to be told.
+            "arch_states": k.arch_states().into_iter().map(|(id, _, state)| json!({
+                "arch_id": id,
+                "state": state.name(),
+                "reason": state.reason(),
+            })).collect::<Vec<_>>(),
+            // How many are still being built. `vk boot` prints it, so the
+            // person who just started the node knows the arches are coming
+            // rather than wondering why a step says to retry.
+            "arches_starting": k.arches_starting(),
             "devices": k.devices().ids().len(),
             "ledger_len": k.ledger().events().len(),
             // The verdict boot reports, not a recomputation of the chain
             // alone: a chain shortened since the store last wrote it still
             // links, and only the kernel knows where its head was.
             "ledger_ok": k.ledger_holds(),
+            // Set for this run only, by `record_forced_boot`: this daemon
+            // decided to serve `--force` on a chain it just said does not
+            // verify. The event naming why is on the record; this is the
+            // live marker so `vk status` need not go read it.
+            "forced": k.forced_boot(),
+            // Every `vk fsck --rebase-head` this node has ever had, oldest
+            // first (SP1b Task 8 review, Important 2). Unlike `forced`, which
+            // is this run's, these are the node's for good: somebody
+            // overrode its store's refusal to say where its record ended,
+            // and `vk status` marks the node the way it marks a forced boot
+            // rather than leaving the only trace in a log file.
+            "fsck": k.rebase_history().map_err(kerr)?,
             // Fixed when this daemon opened its store: one event short of its
             // record is a thing every caller is told, not only the log line
             // nobody read.
@@ -348,13 +714,77 @@ fn dispatch(
             // There is no policy engine in SP1a, but a placeholder nothing can
             // read is a predecessor the first real policy set cannot migrate
             // from.
-            "policies_version": k.policies_version(),
+            "policies_version": k.policies_version().map_err(kerr)?,
             "state_dir": k.store().state_dir.display().to_string(),
             // Where a `release` step's `to_dir` is resolved: the client names a
             // subpath and prints the resolved path, so "where did my artefact
             // go?" is answerable without the client guessing the layout.
             "export_root": k.export_root().display().to_string(),
+            // The loopback origin of the passkey pages (SP1b Task 5), `null`
+            // on a daemon that serves none. The origin only: a link into the
+            // pages is minted by `web.link`, per person, per purpose.
+            "web": config.web.as_ref().map(|w| w.origin()),
         })),
+        // The link a person opens to enrol a passkey or to approve a task with
+        // one (SP1b Task 5). Minted here, over the endpoint, so only a process
+        // that could open this pipe gets one; the link is single-use, short
+        // and page-bound, and the pages themselves hold both loopback
+        // addresses and check the `Host` — see `contracts/tcb.md` for what
+        // that does and does not protect. The approve link is minted only for
+        // a task that is waiting at its approve step, for the same reason
+        // `task.subject` answers only then. The **enrol** link is a human act
+        // (review Important 2): a new passkey is admitted only under an
+        // existing ceremony — a presence proof by the node's device key
+        // today, so a same-user process with the pipe and nothing else cannot
+        // enrol a passkey of its own.
+        "web.link" => {
+            let web = config.web.as_ref().ok_or_else(|| RpcError {
+                code: E_STORE,
+                message: "this daemon serves no web pages: start vkd with --web-port".into(),
+            })?;
+            let ctx = ctx_for(&k, presence, now)?;
+            match p["page"].as_str().ok_or_else(|| bad("page"))? {
+                "enroll" => {
+                    if !ctx.principal.is_human() {
+                        return Err(invariant(
+                            "I1: enrolling a passkey requires a human ceremony: present a presence \
+                             proof by this node's device key (`vk passkey enroll` signs one)",
+                        ));
+                    }
+                    Ok(json!({ "url": web.enroll_link(now) }))
+                }
+                "approve" => {
+                    let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
+                    let subject = k.approval_subject(&ctx, id).map_err(kerr)?;
+                    Ok(json!({ "url": web.approve_link(id, now), "subject_hash": subject }))
+                }
+                other => Err(bad(&format!("no web page {other}"))),
+            }
+        }
+        // The enrolled passkeys, by id and enrolment time. Never the
+        // credential: a public key is a public value, but nothing outside the
+        // verifier needs it and a listing that carries one invites it into a
+        // log (SP1b Task 5).
+        // Each row says whether this daemon's verifier can read it (final
+        // review M-11): one it cannot is enrolled and cannot approve, and is
+        // reported as such rather than listed beside the good ones.
+        "passkey.ls" => to_value(
+            k.passkeys()
+                .map_err(kerr)?
+                .into_iter()
+                .map(|p| {
+                    let unreadable = config
+                        .web
+                        .as_ref()
+                        .and_then(|w| w.passkey_unreadable(&p.credential));
+                    json!({
+                        "device_id": p.device_id,
+                        "enrolled_ms": p.enrolled_ms,
+                        "unreadable": unreadable,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        ),
         // The read surfaces carry a `Ctx` too: a task shows its register's
         // goal, and what a caller may see of it is the register's label
         // against the caller's clearance (I2), as for `read_register`.
@@ -365,33 +795,284 @@ fn dispatch(
                 .map_err(kerr)
                 .and_then(to_value)
         }
+        // Every arch this node has mounted, with the state that says whether
+        // calling it would work (SP1b ruling 14). An unavailable arch is
+        // listed rather than hidden: it is the thing an operator has to go and
+        // fix, and leaving it out is how nobody ever does.
         "arch.ls" => to_value(
-            k.arches()
+            k.arch_states()
                 .into_iter()
-                .map(|(id, m)| json!({ "arch_id": id, "manifest": m }))
+                .map(|(id, m, state)| {
+                    json!({
+                        "arch_id": id,
+                        "manifest": m,
+                        "state": state.name(),
+                        "reason": state.reason(),
+                    })
+                })
                 .collect::<Vec<_>>(),
         ),
+        // The one door a *real* arch comes in by. `kind` picks the adapter and
+        // `config` is that adapter's own shape, because every engine is
+        // configured differently and the transport should not have to know
+        // how; what comes back is the same pair for all of them, so a client
+        // that mounts a new kind needs no new verb (SP1b ruling 4).
+        "arch.mount" => {
+            let kind = p["kind"].as_str().ok_or_else(|| bad("kind"))?;
+            // Who is asking. For a cloud kind this was settled above, before
+            // any secret was touched; for a local one it is settled here.
+            let ctx = match cloud_ctx {
+                Some(ctx) => ctx,
+                None => ctx_for(&k, presence, now)?,
+            };
+            // Recorded before anything is mounted, so a config this node could
+            // not make a spec out of — one carrying a credential — is refused
+            // rather than mounted into an arch no boot can bring back.
+            // A Claude Code config is the resolved one (I-1 addendum).
+            let mount_config = match &claude {
+                Some((resolved, _)) => resolved,
+                None => &p["config"],
+            };
+            let spec = mount_spec_of(kind, mount_config)?;
+            let adapter: Arc<dyn ArchAdapter> = match kind {
+                "claude-code" => {
+                    let (resolved, version) =
+                        claude.ok_or_else(|| internal("no claude version"))?;
+                    let state_dir = k.store().state_dir.clone();
+                    Arc::new(
+                        claude_code_adapter(&state_dir, &resolved, &version, config.as_service)
+                            .map_err(|e| bad(&format!("{e:#}")))?,
+                    )
+                }
+                // Already mounted, above, before the lock: all that is left
+                // here is to hand the kernel the adapter it produced.
+                "ollama" => Arc::new(ollama.ok_or_else(|| internal("no ollama adapter"))?),
+                // Claude through the API, on a key this daemon read out of
+                // its own keyring — never out of the request (Task 2b).
+                "anthropic" => {
+                    let key = anthropic_key.ok_or_else(|| internal("no anthropic key"))?;
+                    Arc::new(
+                        anthropic_adapter(key, &config.anthropic_base_url, &p["config"])
+                            .map_err(|e| bad(&format!("{e:#}")))?,
+                    )
+                }
+                // The EU one, already built above: its credentials were
+                // resolved before the lock.
+                "bedrock" => Arc::from(bedrock.ok_or_else(|| internal("no bedrock adapter"))?),
+                other => return Err(bad(&format!("no arch kind {other}"))),
+            };
+            // The list above is a list, and a list can be forgotten. The
+            // manifest is the thing that actually says where the register
+            // goes, so the refusal is repeated against it — a future cloud
+            // kind whose name nobody added to `is_cloud_kind` is caught here
+            // instead of shipping unguarded (fix round 1, Critical 1).
+            if adapter.manifest().locality == Locality::Cloud
+                && !matches!(ctx.principal, Principal::Human { .. })
+            {
+                return Err(invariant(
+                    "I1: mounting a cloud arch sends this node's registers to a third \
+                     party, which is a human act; re-run it with a presence proof",
+                ));
+            }
+            let name = adapter.manifest().name.clone();
+            // Said here rather than looked up afterwards: whether the kernel
+            // contains the process is the first thing a person mounting an
+            // arch needs to know, and it is the difference between the two
+            // kinds this node can mount.
+            let governed = adapter.manifest().governed;
+            // A repeat mount keeps the arch that is there (Ruling 13). The
+            // exception is a caller who has just re-made what is behind it:
+            // `--recreate` replaced the container, so the adapter holding the
+            // old one is stale however identical its manifest looks.
+            let remount = if kind == "ollama" && p["config"]["recreate"] == Value::Bool(true) {
+                Remount::Replace
+            } else {
+                Remount::Keep
+            };
+            let outcome = k
+                .mount_with(adapter, spec, remount)
+                .map_err(|e| bad(&e.to_string()))?;
+            let answer = json!({
+                "arch_id": outcome.arch_id,
+                "name": name,
+                "governed": governed,
+                "already_mounted": outcome.already_mounted,
+            });
+            // Out from under the kernel mutex before anything it replaced is
+            // dropped: an Ollama adapter's `Drop` is a `docker stop`.
+            drop(k);
+            drop(outcome.replaced);
+            Ok(answer)
+        }
         "arch.mount_mock" => {
             let name = p["name"].as_str().unwrap_or("mock");
             let ceiling = p["context_ceiling"]
                 .as_u64()
                 .map_or(Ok(4096), u32::try_from)
                 .map_err(|_| bad("context_ceiling"))?;
+            let manifest = mock_manifest(name, ceiling);
+            // The mock gets a spec like every other kind: a mock arch that
+            // vanished on restart would be a second, quieter version of the
+            // bug this task is about.
+            let spec = MountSpec::mock(&manifest, ceiling);
             let adapter = MockAdapter {
-                manifest: mock_manifest(name, ceiling),
+                manifest,
                 budget: ceiling,
             };
-            let id = k
-                .mount(Arc::new(adapter))
+            let outcome = k
+                .mount(Arc::new(adapter), spec)
                 .map_err(|e| bad(&e.to_string()))?;
-            Ok(json!({ "arch_id": id }))
+            Ok(json!({
+                "arch_id": outcome.arch_id,
+                "already_mounted": outcome.already_mounted,
+            }))
+        }
+        // One arch in full: the manifest `arch.ls` already carries, plus the
+        // two things a listing has no room for — the identity tuple that
+        // *is* the arch id, and the spec the next boot would make it from.
+        // No new information leaves the node: the manifest is public over
+        // `arch.ls`, and a mount spec is refused at the door if it carries
+        // anything credential-shaped (`MountSpec::new`).
+        "arch.show" => {
+            let id = p["arch_id"].as_str().ok_or_else(|| bad("arch_id"))?;
+            let (arch_id, manifest, state) = k
+                .arch_states()
+                .into_iter()
+                .find(|(a, _, _)| a == id)
+                .ok_or_else(|| not_found(id))?;
+            let spec = k.mount_spec(&arch_id).map_err(kerr)?;
+            Ok(json!({
+                "arch_id": arch_id,
+                "manifest": manifest,
+                "state": state.name(),
+                "reason": state.reason(),
+                "governed": manifest.governed,
+                "kind": spec.as_ref().map(|s| s.kind.clone()),
+                "config": spec.map(|s| s.config),
+            }))
+        }
+        // The per-call rows behind the counters (SP1b Task 8, ruling 8).
+        // Metadata only — ids, counts, a duration — and filtered by the
+        // caller's clearance through the task each row names, so a row about
+        // a register this caller may not read is not listed (I2).
+        "usage.ls" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            let filter = match (p["task_id"].as_str(), p["arch_id"].as_str()) {
+                (Some(_), Some(_)) => {
+                    return Err(bad("usage.ls takes task_id or arch_id, not both"))
+                }
+                (Some(t), None) => vk_kernel::UsageFilter::Task(t.into()),
+                (None, Some(a)) => vk_kernel::UsageFilter::Arch(a.into()),
+                (None, None) => vk_kernel::UsageFilter::All,
+            };
+            k.usage(&ctx, &filter).map_err(kerr).and_then(to_value)
+        }
+        // `vk fsck`: the whole store verified, tier by tier — and, with
+        // `rebase_head`, the one write in it.
+        //
+        // A **human act**, like `stop` and `approve`: this reads every blob
+        // on the node and, on the rebase path, overrides the store's own
+        // refusal to serve a record whose tail is gone. Neither is a thing a
+        // machine principal with the pipe may do (invariant I1), so the same
+        // presence proof those verbs carry is required here. The typed
+        // confirmation of the word `rebase` is the client's half of the
+        // ceremony; this end checks the proof.
+        "store.fsck" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            if !ctx.principal.is_human() {
+                return Err(invariant(
+                    "I1: fsck reads every blob this node holds, and --rebase-head overrides its \
+                     store's own refusal; both are human acts. Re-run with a presence proof",
+                ));
+            }
+            let rebased = if p["rebase_head"] == Value::Bool(true) {
+                Some(k.rebase_ledger_head(now).map_err(kerr)?)
+            } else {
+                None
+            };
+            // After the rebase, so the report is the store as it now is
+            // rather than the store the operator has just repaired.
+            let mut out = to_value(k.fsck())?;
+            if let Some(o) = out.as_object_mut() {
+                if let Some(r) = rebased {
+                    o.insert("rebased".into(), to_value(r)?);
+                }
+                // And every rebase this node has ever had, not only the one
+                // this call made (review Important 2): `vk fsck` is where an
+                // auditor looks at the store, so it is where the overrides
+                // of the store's own refusal belong.
+                o.insert(
+                    "rebases".into(),
+                    to_value(k.rebase_history().map_err(kerr)?)?,
+                );
+            }
+            Ok(out)
         }
         "arch.unmount" => {
             let id = p["arch_id"].as_str().ok_or_else(|| bad("arch_id"))?;
-            k.unmount(id).map_err(|e| RpcError {
+            let removed = k.unmount(id).map_err(|e| RpcError {
                 code: E_STORE,
                 message: e.to_string(),
             })?;
+            // Out from under the kernel mutex *before* the adapter is dropped.
+            // Dropping an Ollama arch stops the container it started, which is
+            // a `docker stop` of ten seconds or more, and the kernel lock is
+            // the one thing that must never be held across a slow external
+            // call (SP1b Task 1 review, Minor 10). The row and the ledger
+            // event are already durable at this point; what is left is the
+            // process, and every other syscall can proceed while it winds up.
+            drop(k);
+            drop(removed);
+            // The id, back to the caller: `vk umount` prints what it took
+            // away rather than a bare "ok" a reader has to match up with the
+            // argument they typed.
+            Ok(json!({ "ok": true, "arch_id": id }))
+        }
+        // The harness's own syscalls (SP1b Task 4). Each carries the lease token
+        // `vk-mcp` was launched with; the kernel maps it to the harness principal
+        // at the harness clearance. No presence proof is accepted (they are not
+        // in `takes_presence`), because a lease is a machine capability, not a
+        // human's presence; an unknown or expired token is an I1 refusal.
+        "harness.read_register" => {
+            let s = harness_session(&k, &p, now)?;
+            k.read_register(&s.ctx, &s.register)
+                .map_err(kerr)
+                .and_then(to_value)
+        }
+        "harness.write_decision" => {
+            let s = harness_session(&k, &p, now)?;
+            let text = p["text"].as_str().ok_or_else(|| bad("text"))?;
+            let mut reg = k.read_register(&s.ctx, &s.register).map_err(kerr)?;
+            reg.decisions.push(format!("harness: {text}"));
+            k.write_register(&s.ctx, reg).map_err(kerr)?;
+            Ok(json!({ "ok": true }))
+        }
+        "harness.attach_artefact" => {
+            let token = p["token"].as_str().ok_or_else(|| bad("token"))?;
+            let kind = p["kind"].as_str().ok_or_else(|| bad("kind"))?;
+            let path = p["path"].as_str().ok_or_else(|| bad("path"))?;
+            // The kernel resolves the token, confines the path to the
+            // workspace, holds the file to the per-file and per-run caps and
+            // attaches it at the harness clearance (Ruling 21.6).
+            let env = k
+                .harness_attach_file(token, now, kind, path)
+                .map_err(kerr)?;
+            Ok(json!({ "hash": env.hash }))
+        }
+        "harness.request_approval" => {
+            let s = harness_session(&k, &p, now)?;
+            let mut reg = k.read_register(&s.ctx, &s.register).map_err(kerr)?;
+            reg.open_questions
+                .push("approval requested by the harness".into());
+            k.write_register(&s.ctx, reg).map_err(kerr)?;
+            Ok(json!({ "ok": true, "requested": true }))
+        }
+        "harness.log" => {
+            // Validate the token even though the message only goes to the log:
+            // an unknown token is refused here rather than quietly accepted.
+            let s = harness_session(&k, &p, now)?;
+            let msg = p["message"].as_str().unwrap_or("");
+            tracing::info!(task = %s.task_id, harness = %msg, "harness log");
             Ok(json!({ "ok": true }))
         }
         "task.create" => {
@@ -420,20 +1101,101 @@ fn dispatch(
                 .map(|h| json!({ "subject_hash": h }))
                 .map_err(kerr)
         }
+        // The challenge a human approval of this task must answer (SP1b Task
+        // 5, invariant I1): minted by the kernel — the subject, the resource,
+        // a fresh nonce and a short expiry are all its — and never by the
+        // client, which used to build its own. `approve` accepts only a
+        // challenge that came out of here (or out of the passkey page's own
+        // mint), unspent and unexpired. Minting is not a human act, so no
+        // proof is asked for; answering it is, and `approve` is where that is
+        // proved. Not a `harness.*` method: a harness cannot mint one.
+        "approval.challenge" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
+            k.mint_approval_challenge(&ctx, id)
+                .map_err(kerr)
+                .and_then(to_value)
+        }
+        // A task, plus what each of its steps left in the register's
+        // `decisions` — a count, a length and a hash per step, never the text
+        // (Ruling 28). `decisions` is a field of `Register`, so this is the one
+        // place a caller with no lease learns that a step left the next one
+        // something to read; the summary is computed through `read_register`,
+        // under the same I2 check, so a register the caller is not cleared for
+        // yields no counts either. It rides on the task object rather than
+        // beside it because it is per step, and the steps are there.
         "task.show" => {
             let ctx = ctx_for(&k, presence, now)?;
             let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
-            k.task(&ctx, id)
-                .ok_or_else(|| not_found(id))
-                .and_then(to_value)
+            let task = k
+                .task(&ctx, id)
+                .map_err(kerr)?
+                .ok_or_else(|| not_found(id))?;
+            let decisions = k.task_decisions(&ctx, &task).map_err(kerr)?;
+            // And what each step spent (SP1b Task 8): the same rows
+            // `usage.ls` and `vk top --calls` serve, narrowed to this task,
+            // so the screen that shows a step's tokens also shows what came
+            // back and what it cost.
+            let usage = k
+                .usage(&ctx, &vk_kernel::UsageFilter::Task(id.into()))
+                .map_err(kerr)?;
+            let mut out = to_value(task)?;
+            if let Some(o) = out.as_object_mut() {
+                o.insert("decisions".into(), to_value(decisions)?);
+                o.insert("usage".into(), to_value(usage)?);
+            }
+            Ok(out)
         }
         "task.ls" => {
             let ctx = ctx_for(&k, presence, now)?;
-            to_value(k.tasks(&ctx))
+            k.tasks(&ctx).map_err(kerr).and_then(to_value)
         }
+        // The operator's screen. `calls: true` (`vk top --calls`) folds the
+        // per-call rows in beside the totals they add up to — one syscall,
+        // one answer, and the same I2 filter on both halves.
         "top" => {
             let ctx = ctx_for(&k, presence, now)?;
-            to_value(k.top(&ctx))
+            let mut view = k.top(&ctx).map_err(kerr)?;
+            if p["calls"] == Value::Bool(true) {
+                // The newest `MAX_TOP_CALLS`, bounded **in the query**: a
+                // node that has run for a week has more calls than a screen
+                // holds, and reading them all to print two hundred would make
+                // this verb slower every day (review Minor 2). `usage.ls` is
+                // the surface for a caller that wants every row.
+                let (rows, more) = k.usage_recent(&ctx, MAX_TOP_CALLS).map_err(kerr)?;
+                view.calls = rows;
+                view.calls_truncated = more;
+            }
+            to_value(view)
+        }
+        // Renew a business's liveness lease (I4): the admin syscall the plan
+        // promised and the one thing that populates `vk top`'s liveness
+        // column (SP1a review M10). A human act — the lease says a human
+        // vouched for the business recently — so it takes the presence proof
+        // `stop` takes, and the lease names the device that proved it.
+        "liveness.renew" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            let Principal::Human { device_id } = &ctx.principal else {
+                return Err(invariant(
+                    "I1: renewing a liveness lease is a human act; re-run it with a presence proof",
+                ));
+            };
+            let business = p["business"]
+                .as_str()
+                .filter(|b| !b.trim().is_empty())
+                .ok_or_else(|| bad("business"))?;
+            let ttl_ms = p["ttl_ms"]
+                .as_u64()
+                .filter(|t| (1..=MAX_LIVENESS_TTL_MS).contains(t))
+                .ok_or_else(|| bad("ttl_ms: between 1 and thirty days, in milliseconds"))?;
+            let expires_at_ms = now.saturating_add(ttl_ms);
+            k.renew_liveness_persisted(business, device_id, expires_at_ms)
+                .map_err(kerr)?;
+            Ok(json!({
+                "business": business,
+                "renewed_by_device": device_id,
+                "expires_at_ms": expires_at_ms,
+            }))
         }
         "stop" => {
             let ctx = ctx_for(&k, presence, now)?;
@@ -498,6 +1260,578 @@ fn dispatch(
     }
 }
 
+/// Everything `arch.mount { kind: "claude-code" }` may say, and — because of
+/// `deny_unknown_fields` — nothing else (Ruling 42).
+///
+/// `binary` is still a request field this wave: moving it to daemon
+/// configuration (`vkd --claude-bin`, as `--harness-bin` is) is a public
+/// surface change and the founder's call (Ruling 41). Until then every value
+/// goes through [`claude_binary`]'s refusals, at mount and again at every boot
+/// that re-creates the arch from its spec.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeCodeMountConfig {
+    binary: Option<String>,
+    model: Option<String>,
+    max_turns: Option<u32>,
+    timeout_secs: Option<u32>,
+    context_ceiling: Option<u32>,
+}
+
+/// The `claude` binary a config names, defaulted, resolved, and held to the
+/// rule `vkd-service install` applies to its own `ImagePath` (final review
+/// I-1, Rulings 41 and 43).
+///
+/// A bare name (`claude`, the default) is looked up on the **daemon's** own
+/// `PATH` when it is run, which is daemon configuration, not the request's.
+/// Anything with a separator is a path the request chose, and the daemon runs
+/// it at mount, at every boot and at every inference from the persisted spec.
+///
+/// Always, whatever the daemon: it must be absolute (a relative one resolves
+/// against whatever the daemon's working directory is), have no `..`
+/// component, and resolve — symlinks and junctions followed, a loop refused —
+/// to a file that is there. The **resolved** path is what is checked, stored
+/// and run; a link is not itself a reason to refuse (Ruling 43).
+///
+/// Under the Windows service (`as_service`), and only there, the resolved
+/// path must also not be in a synced folder or under a user profile: the
+/// service runs it as `NT SERVICE\vkd`, and a file the user's processes can
+/// replace would be code they choose run as that account. An interactive
+/// daemon is the user's own process, in the user's own trust domain, and may
+/// run the user's own profile-installed `claude`.
+fn claude_binary(
+    cfg: &ClaudeCodeMountConfig,
+    as_service: bool,
+) -> anyhow::Result<std::path::PathBuf> {
+    let Some(named) = cfg.binary.as_deref() else {
+        return Ok(ClaudeCodeConfig::default().binary);
+    };
+    let p = std::path::PathBuf::from(named);
+    if p.components().count() == 1 && !p.is_absolute() {
+        return Ok(p);
+    }
+    anyhow::ensure!(
+        p.is_absolute(),
+        "binary {named} is a relative path: give an absolute path, or a bare name the daemon \
+         finds on its own PATH"
+    );
+    anyhow::ensure!(
+        !p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "binary {named} has a `..` component: name the binary by its own path"
+    );
+    // Under the service, a share is refused before it is reached for: the
+    // service account does not go to the network on a request's behalf
+    // (final re-review N-2). The resolved path is held to it again below.
+    if as_service {
+        anyhow::ensure!(
+            on_a_local_fixed_drive(&p),
+            "binary {named} is not on a local fixed drive (a network share, a removable or \
+             mapped drive): the service would run whatever that drive holds at the next boot \
+             or call. Install Claude Code on a local disk"
+        );
+    }
+    let resolved = match resolved_path(&p) {
+        Ok(r) => r,
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            anyhow::bail!("binary {named} does not exist (or is not a file)")
+        }
+        // A link loop, a component that cannot be read: not a path this
+        // daemon can say where it goes.
+        Err(e) => anyhow::bail!("binary {named} cannot be resolved (a link loop?): {e:#}"),
+    };
+    anyhow::ensure!(
+        resolved.is_file(),
+        "binary {named} does not exist (or is not a file)"
+    );
+    if as_service {
+        anyhow::ensure!(
+            on_a_local_fixed_drive(&resolved),
+            "binary {named} resolves to {}, which is not on a local fixed drive: install \
+             Claude Code on a local disk",
+            resolved.display()
+        );
+        vk_store::paths::refuse_sync_folder(&resolved).map_err(|_| {
+            anyhow::anyhow!(
+                "binary {named} resolves to {}, inside a synced folder, which may replace the \
+                 file under the service; install Claude Code somewhere else",
+                resolved.display()
+            )
+        })?;
+        anyhow::ensure!(
+            !vk_store::paths::under_a_user_profile(&resolved),
+            "binary {named} resolves to {}, inside a user profile, and the service runs it as \
+             NT SERVICE\\vkd at every boot and call: anything running as that user could \
+             replace it. Name a binary somewhere only administrators may write, or put \
+             `claude` on the service's PATH and leave --bin at its default",
+            resolved.display()
+        );
+    }
+    Ok(resolved)
+}
+
+/// Is `p` on a local fixed drive (final re-review N-2)? A drive letter, plain
+/// or verbatim (`C:\…`, `\\?\C:\…`), whose root `GetDriveTypeW` reports as
+/// `DRIVE_FIXED`. A UNC share (`\\host\share\…`, `\\?\UNC\…`), a device
+/// namespace path, and a removable, network-mapped, CD or RAM drive are not.
+/// Answered from the spelling and the drive's type alone — nothing on a share
+/// is opened to decide.
+#[cfg(windows)]
+fn on_a_local_fixed_drive(p: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+    let letter = match p.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(l) | Prefix::VerbatimDisk(l) => l,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let root: Vec<u16> = format!("{}:\\", char::from(letter))
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    // `DRIVE_FIXED` is 3 (`fileapi.h`).
+    const DRIVE_FIXED: u32 = 3;
+    // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call.
+    unsafe {
+        windows::Win32::Storage::FileSystem::GetDriveTypeW(windows::core::PCWSTR(root.as_ptr()))
+            == DRIVE_FIXED
+    }
+}
+
+/// Elsewhere there is no service, no drive letter and no UNC: every absolute
+/// path is local in the sense this asks.
+#[cfg(not(windows))]
+fn on_a_local_fixed_drive(_: &std::path::Path) -> bool {
+    true
+}
+
+/// The canonical form of a path — every symlink and junction followed, the
+/// case the file system stores, an 8.3 name expanded — with
+/// Windows' verbatim `\\?\` prefix removed, so it can be printed, stored and
+/// compared with the profile and sync-folder spellings.
+fn resolved_path(p: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let canonical = std::fs::canonicalize(p)?;
+    #[cfg(windows)]
+    {
+        let s = canonical.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return Ok(std::path::PathBuf::from(format!(r"\\{rest}")));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return Ok(std::path::PathBuf::from(rest));
+        }
+    }
+    Ok(canonical)
+}
+
+/// The claude-code config as it is persisted: parsed into its closed shape,
+/// with `binary` replaced by the resolved path [`claude_binary`] will run, so
+/// the spec replayed at boot names what was checked rather than what was
+/// typed (I-1 addendum).
+fn resolved_claude_config(config: &Value, as_service: bool) -> anyhow::Result<Value> {
+    let asked: ClaudeCodeMountConfig = closed_config("claude-code", config)?;
+    let mut config = if config.is_null() {
+        json!({})
+    } else {
+        config.clone()
+    };
+    if asked.binary.is_some() {
+        let binary = claude_binary(&asked, as_service)?;
+        config["binary"] = json!(binary.to_string_lossy());
+    }
+    Ok(config)
+}
+
+/// Ask that binary its version, and refuse the mount if it cannot say.
+///
+/// The version is part of the arch identity: a mount without it would mint an
+/// arch id naming no particular Claude Code, and every call on it would fail
+/// anyway — so it is refused here, where the person mounting is still
+/// listening. Called before the kernel lock is taken, and again at boot by the
+/// factory, where a binary that is gone is what makes the arch unavailable.
+fn claude_code_version(config: &Value, as_service: bool) -> anyhow::Result<String> {
+    let binary = claude_binary(&closed_config("claude-code", config)?, as_service)?;
+    vk_arch_claude_code::probe_version(&binary).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot run `{} --version`: install Claude Code, or pass the binary's path",
+            binary.display()
+        )
+    })
+}
+
+/// How this node makes an adapter out of a persisted [`MountSpec`] — the three
+/// kinds it is compiled with (SP1b ruling 14).
+///
+/// `vkd` hands this to `RealKernel::open_with_factory`, and the kernel calls
+/// it once per persisted arch at boot. It is the *same* code `arch.mount`
+/// runs, reached by the same `kind` and the same `config`, which is the only
+/// way a re-created arch can be relied on to be the arch that was mounted:
+/// two construction paths would drift, and the drift would show up as an arch
+/// id that changed under an operator who did nothing.
+///
+/// `state_dir` is this node's, not a client's: it is where the Claude Code
+/// arch's working directory lives, and a spec does not get to name it.
+///
+/// Everything slow is inside the adapters and bounded by their own timeouts —
+/// `claude --version`, a `docker start`, waiting for the Ollama server — so a
+/// boot costs at worst one such timeout per arch. An error is an unavailable
+/// arch, never a boot that fails: an engine that is not running is not a
+/// reason for a node to stop serving everything else it has.
+pub fn adapter_factory(
+    state_dir: std::path::PathBuf,
+    anthropic_keys: vk_arch_anthropic::KeySource,
+    anthropic_base_url: String,
+    as_service: bool,
+) -> vk_kernel::AdapterFactory {
+    let mock = vk_kernel::mock_factory();
+    Arc::new(move |spec: &MountSpec| -> Result<Box<dyn ArchAdapter>> {
+        match spec.kind.as_str() {
+            "mock" => mock(spec),
+            "claude-code" => {
+                let version = claude_code_version(&spec.config, as_service)?;
+                Ok(Box::new(claude_code_adapter(
+                    &state_dir,
+                    &spec.config,
+                    &version,
+                    as_service,
+                )?))
+            }
+            "ollama" => Ok(Box::new(ollama_adapter(&spec.config)?)),
+            // The key is read again here rather than remembered from the
+            // mount: a spec is stored in the clear, so the keyring is the
+            // only place an API arch can come back from (Task 2b). A key
+            // rotated or removed since leaves this arch unavailable with a
+            // reason, which is the honest outcome and not a failed boot.
+            "anthropic" => {
+                let key =
+                    vk_arch_anthropic::load_key(&anthropic_keys, vk_arch_anthropic::KEYRING_USER)?;
+                Ok(Box::new(anthropic_adapter(
+                    key,
+                    &anthropic_base_url,
+                    &spec.config,
+                )?))
+            }
+            "bedrock" => bedrock_adapter(&spec.config),
+            other => anyhow::bail!("no arch kind {other}"),
+        }
+    })
+}
+
+/// The longest a mount may make one call wait, in seconds. A client that
+/// asked for a year would pin a kernel thread for a year (fix round 1,
+/// Critical 1's tail).
+const MAX_TIMEOUT_SECS: u32 = 3_600;
+
+/// Everything `arch.mount { kind: "anthropic" }` may say, and — because of
+/// `deny_unknown_fields` — nothing else.
+///
+/// A closed shape rather than a bag of optional lookups, so that `base_url`,
+/// `endpoint`, `host` or whatever a caller invents next is a `-32602` naming
+/// the field instead of a value this daemon quietly honours (fix round 1,
+/// Critical 1). What is *not* here is the whole point of it.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnthropicMountConfig {
+    model: Option<String>,
+    context_ceiling: Option<u32>,
+    max_tokens: Option<u32>,
+    timeout_secs: Option<u32>,
+}
+
+/// The same, for `arch.mount { kind: "bedrock" }`.
+///
+/// Parsed in every build, read only in one: without the `bedrock` feature the
+/// shape is still a validator — a config naming an endpoint must be refused
+/// for naming one, not for the feature — and its fields go nowhere.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(feature = "bedrock"), allow(dead_code))]
+struct BedrockMountConfig {
+    region: Option<String>,
+    model: Option<String>,
+    context_ceiling: Option<u32>,
+    max_tokens: Option<u32>,
+}
+
+/// Parse a cloud arch's mount config, refusing anything not in its shape.
+fn mount_config<T: serde::de::DeserializeOwned + Default>(
+    kind: &str,
+    config: &Value,
+) -> anyhow::Result<T> {
+    if config.is_null() {
+        return Ok(T::default());
+    }
+    serde_json::from_value(config.clone())
+        .map_err(|e| anyhow::anyhow!("{kind}: {e}; the endpoint is this daemon's to set"))
+}
+
+/// Parse a local arch's mount config into its closed shape (Ruling 42): a
+/// field the shape does not have is named and refused, never ignored.
+fn closed_config<T: serde::de::DeserializeOwned + Default>(
+    kind: &str,
+    config: &Value,
+) -> anyhow::Result<T> {
+    if config.is_null() {
+        return Ok(T::default());
+    }
+    serde_json::from_value(config.clone()).map_err(|e| anyhow::anyhow!("{kind}: {e}"))
+}
+
+/// Everything `arch.mount { kind: "ollama" }` may say, and nothing else
+/// (Ruling 42). `recreate` is an action, not a property, and never reaches the
+/// persisted spec ([`mount_spec_of`]).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaMountConfig {
+    base_url: Option<String>,
+    model: Option<String>,
+    num_ctx: Option<u32>,
+    max_tokens: Option<u32>,
+    seed: Option<u64>,
+    image: Option<String>,
+    memory: Option<String>,
+    cpus: Option<String>,
+    recreate: Option<bool>,
+}
+
+impl OllamaMountConfig {
+    /// Does this mount take a human (Ruling 42 (4))? An `--external` server is
+    /// one this node did not start and cannot cap, so pointing the node at it
+    /// is a human act like a cloud mount (Ruling 31). The image is not part of
+    /// this: [`checked_image`] runs before the proof gate and refuses any image
+    /// but the pinned one outright (final re-review N-1).
+    fn needs_a_human(&self) -> bool {
+        self.base_url.is_some()
+    }
+}
+
+/// Docker's memory cap in its plain form, `^[0-9]+[kmg]?$` (Ruling 42 (2)):
+/// the value lands in `docker run`'s argv, so nothing but digits and one
+/// lowercase unit gets there.
+fn checked_memory(v: &str) -> anyhow::Result<String> {
+    let digits = v.strip_suffix(['k', 'm', 'g']).unwrap_or(v);
+    anyhow::ensure!(
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        "memory {v:?} is not in the accepted format: digits, then optionally k, m or g \
+         (lowercase), e.g. 12g"
+    );
+    Ok(v.to_string())
+}
+
+/// The CPU cap in its plain form, `^[0-9]+(\.[0-9]+)?$` (Ruling 42 (2)).
+fn checked_cpus(v: &str) -> anyhow::Result<String> {
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let ok = match v.split_once('.') {
+        Some((whole, frac)) => all_digits(whole) && all_digits(frac),
+        None => all_digits(v),
+    };
+    anyhow::ensure!(
+        ok,
+        "cpus {v:?} is not in the accepted format: a whole or decimal number, e.g. 6 or 1.5"
+    );
+    Ok(v.to_string())
+}
+
+/// The image is the plan's, pinned (Ruling 42 (3)): a request may only repeat
+/// it — by tag, by digest, or both — and anything else is refused. The image
+/// is in the arch identity; choosing one is daemon configuration.
+fn checked_image(asked: Option<&str>) -> anyhow::Result<String> {
+    use vk_arch_ollama::{DEFAULT_IMAGE, PINNED_IMAGE_DIGEST};
+    let Some(image) = asked else {
+        return Ok(DEFAULT_IMAGE.to_string());
+    };
+    let repository = DEFAULT_IMAGE
+        .split_once(':')
+        .map_or(DEFAULT_IMAGE, |(r, _)| r);
+    let pinned = [
+        DEFAULT_IMAGE.to_string(),
+        format!("{repository}@{PINNED_IMAGE_DIGEST}"),
+        format!("{DEFAULT_IMAGE}@{PINNED_IMAGE_DIGEST}"),
+    ];
+    anyhow::ensure!(
+        pinned.iter().any(|p| p == image),
+        "image {image} is not the pinned image {DEFAULT_IMAGE} ({PINNED_IMAGE_DIGEST}): the \
+         image is this daemon's to choose, and a request may only repeat it"
+    );
+    Ok(image.to_string())
+}
+
+/// Build the first-party Anthropic adapter `arch.mount { kind: "anthropic" }`
+/// asks for.
+///
+/// Two things never come from `config`: the key, which is this function's own
+/// argument and which [`MountSpec::new`]'s guard would refuse in a spec
+/// anyway, and `base_url`, which is the daemon's (`vkd --anthropic-base-url`)
+/// because a client that chose it would be choosing where this node's key is
+/// sent. `context_ceiling` is clamped to the model's documented window — it
+/// is a manifest field outside `ArchIdentity`, so an unclamped one would let
+/// a client mount an arch claiming a four-billion-token context under an
+/// ordinary-looking arch id, and I4′ would then be bounding nothing.
+fn anthropic_adapter(
+    key: SecretString,
+    base_url: &str,
+    config: &Value,
+) -> anyhow::Result<AnthropicAdapter> {
+    let defaults = AnthropicConfig::default();
+    let asked: AnthropicMountConfig = mount_config("anthropic", config)?;
+    let model = asked.model.unwrap_or_else(|| defaults.model.clone());
+    let window = vk_arch_anthropic::context_window(&model);
+    let cfg = AnthropicConfig {
+        context_ceiling: asked.context_ceiling.unwrap_or(0).min(window),
+        model,
+        base_url: base_url.to_string(),
+        max_tokens: asked.max_tokens.unwrap_or(defaults.max_tokens),
+        timeout: Duration::from_secs(u64::from(
+            asked
+                .timeout_secs
+                .unwrap_or(u32::try_from(defaults.timeout.as_secs()).unwrap_or(MAX_TIMEOUT_SECS))
+                .clamp(1, MAX_TIMEOUT_SECS),
+        )),
+    };
+    Ok(AnthropicAdapter::with_config(key, cfg))
+}
+
+/// Build the EU adapter `arch.mount { kind: "bedrock" }` asks for. Slow: it
+/// resolves the AWS credential chain, which may reach the network for an
+/// instance role, so it is called before the kernel lock is taken.
+#[cfg(feature = "bedrock")]
+fn bedrock_adapter(config: &Value) -> anyhow::Result<Box<dyn ArchAdapter>> {
+    use vk_arch_anthropic::bedrock::{BedrockAdapter, BedrockConfig};
+    let defaults = BedrockConfig::default();
+    let asked: BedrockMountConfig = mount_config("bedrock", config)?;
+    let model = asked.model.unwrap_or_else(|| defaults.model.clone());
+    let window = vk_arch_anthropic::context_window(&model);
+    let cfg = BedrockConfig {
+        context_ceiling: asked.context_ceiling.unwrap_or(0).min(window),
+        model,
+        region: asked.region.unwrap_or_else(|| defaults.region.clone()),
+        max_tokens: asked.max_tokens.unwrap_or(defaults.max_tokens),
+    };
+    Ok(Box::new(BedrockAdapter::with_config(cfg)?))
+}
+
+/// The same door on a build without the AWS SDK: refused by name, saying how
+/// to get a build that has it, rather than "no arch kind bedrock", which
+/// reads like a typo and is not one.
+#[cfg(not(feature = "bedrock"))]
+fn bedrock_adapter(config: &Value) -> anyhow::Result<Box<dyn ArchAdapter>> {
+    // Parsed first, so that a config naming an endpoint is refused for naming
+    // one rather than for the feature — the answer must not depend on how the
+    // daemon was built.
+    let _: BedrockMountConfig = mount_config("bedrock", config)?;
+    anyhow::bail!(
+        "this build has no Bedrock support: the `bedrock` cargo feature, and the AWS SDK \
+         behind it, is off by default (Ruling 30). Rebuild with \
+         `--features bedrock`, or use `vk mount anthropic`, which needs no AWS SDK"
+    )
+}
+
+/// Which arch kinds mount a manifest that says `locality: Cloud`.
+///
+/// Named here rather than derived, because the refusal it drives has to
+/// happen *before* the adapter exists — before this daemon reads its keyring
+/// or walks an AWS credential chain on behalf of a caller who has shown no
+/// presence (fix round 1, Critical 1). The manifest is checked as well, once
+/// the adapter is built, so a kind missing from this list is caught rather
+/// than admitted.
+fn is_cloud_kind(kind: &str) -> bool {
+    matches!(kind, "anthropic" | "bedrock" | "claude-code")
+}
+
+/// The spec `arch.mount` records for what it just mounted.
+///
+/// `recreate` never survives into it: it destroys and rebuilds a container, so
+/// a spec carrying it would throw the container away on every boot (Ruling
+/// 10). It is an action a person asks for once, not a property of the arch.
+fn mount_spec_of(kind: &str, config: &Value) -> Result<MountSpec, RpcError> {
+    let mut config = config.clone();
+    if let Some(map) = config.as_object_mut() {
+        map.remove("recreate");
+    }
+    MountSpec::new(kind, config).map_err(|e| bad(&format!("{e:#}")))
+}
+
+/// Build the Claude Code adapter `arch.mount { kind: "claude-code" }` asks
+/// for. Everything in `config` is optional and falls back to the adapter's own
+/// defaults; the working directory does not, because it is this node's to
+/// choose and not a client's (SP1b ruling 4).
+fn claude_code_adapter(
+    state_dir: &std::path::Path,
+    config: &Value,
+    claude_version: &str,
+    as_service: bool,
+) -> anyhow::Result<ClaudeCodeAdapter> {
+    let defaults = ClaudeCodeConfig::default();
+    let asked: ClaudeCodeMountConfig = closed_config("claude-code", config)?;
+    // One fixed, empty directory under the state directory, not a temp
+    // directory per call: `claude` creates `~/.claude/projects/<mangled
+    // cwd>/memory/` for wherever it runs, so a new directory each time would
+    // leave a new one of those behind each time (spike 2a).
+    let cwd = state_dir.join("claude-code-cwd");
+    vk_store::paths::private_dir(&cwd).with_context(|| format!("create {}", cwd.display()))?;
+    let default_timeout = u32::try_from(defaults.timeout.as_secs()).unwrap_or(u32::MAX);
+    let cfg = ClaudeCodeConfig {
+        binary: claude_binary(&asked, as_service)?,
+        model: asked.model.clone().unwrap_or(defaults.model),
+        max_turns: asked.max_turns.unwrap_or(defaults.max_turns),
+        timeout: Duration::from_secs(u64::from(asked.timeout_secs.unwrap_or(default_timeout))),
+        context_ceiling: asked.context_ceiling.unwrap_or(defaults.context_ceiling),
+        cwd,
+    };
+    // `with_version`, not `new`: the binary was already asked, before the lock.
+    Ok(ClaudeCodeAdapter::with_version(cfg, claude_version))
+}
+
+/// Build and mount the Ollama adapter `arch.mount { kind: "ollama" }` asks
+/// for. Called before the kernel lock is taken, because this is the call that
+/// starts a container, waits up to a minute for the server and pulls the model
+/// if it is not there yet (SP1b ruling 4).
+///
+/// A `base_url` in the config is what asks for the ungoverned mode: naming a
+/// server that is already running says this node did not start it. Saying
+/// nothing gets the container, on loopback, under this node's caps — the
+/// ungoverned arch is one a person has to ask for by name.
+fn ollama_adapter(config: &Value) -> anyhow::Result<OllamaAdapter> {
+    let defaults = OllamaConfig::default();
+    let asked: OllamaMountConfig = closed_config("ollama", config)?;
+    // Ungoverned only when the client names the server it wants: no `base_url`
+    // means the container, on loopback, under this node's caps. The caps and
+    // the image are checked before anything reaches `docker run` (Ruling 42).
+    let container_defaults = ContainerSpec::default();
+    let container = match &asked.base_url {
+        Some(_) => None,
+        None => Some(ContainerSpec {
+            image: checked_image(asked.image.as_deref())?,
+            memory: match &asked.memory {
+                Some(m) => checked_memory(m)?,
+                None => container_defaults.memory.clone(),
+            },
+            cpus: match &asked.cpus {
+                Some(c) => checked_cpus(c)?,
+                None => container_defaults.cpus.clone(),
+            },
+            ..container_defaults
+        }),
+    };
+    let cfg = OllamaConfig {
+        base_url: asked.base_url.clone().unwrap_or(defaults.base_url),
+        model: asked.model.clone().unwrap_or(defaults.model),
+        num_ctx: asked.num_ctx.unwrap_or(defaults.num_ctx),
+        max_tokens: asked.max_tokens.unwrap_or(defaults.max_tokens),
+        seed: asked.seed.unwrap_or(defaults.seed),
+        temperature: defaults.temperature,
+        container,
+        // Only ever what the client said, and only in container mode: this
+        // one destroys a container, so it is never a default (Ruling 10).
+        recreate: asked.recreate == Some(true),
+    };
+    OllamaAdapter::mount(cfg)
+}
+
 fn mock_manifest(name: &str, ctx: u32) -> ArchManifest {
     use vk_contracts::arch::*;
     ArchManifest {
@@ -506,7 +1840,7 @@ fn mock_manifest(name: &str, ctx: u32) -> ArchManifest {
         locality: Locality::Local,
         jurisdiction: "FR".into(),
         retention_days: None,
-        cost_per_1k_tokens_eur: 0.0,
+        cost_per_1k_tokens_eur: Some(0.0),
         latency_ms_p50: 1,
         context_ceiling: ctx,
         determinism: Determinism::SeededDeterministic,
@@ -530,9 +1864,409 @@ fn mock_manifest(name: &str, ctx: u32) -> ArchManifest {
     }
 }
 
+/// Resolve the lease token in a `harness.*` request to the session it names.
+fn harness_session(
+    k: &RealKernel,
+    p: &Value,
+    now: u64,
+) -> Result<vk_kernel::HarnessSession, RpcError> {
+    let token = p["token"].as_str().ok_or_else(|| bad("token"))?;
+    k.harness_session(token, now).map_err(kerr)
+}
+
+/// The `vk-mcp` binary this daemon launches a harness's MCP server as: next to
+/// this executable, same target directory.
+fn mcp_server_path() -> PathBuf {
+    let name = format!("vk-mcp{}", std::env::consts::EXE_SUFFIX);
+    std::env::current_exe()
+        .ok()
+        .map(|p| p.with_file_name(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// The prompt a harness is launched with: the fixed instruction, plus — when
+/// the daemon's **own process environment** carries `VK_HARNESS_PROMPT_SUFFIX`
+/// — an operator's addendum. A diagnostic seam of the same class as `VK_DOCKER`:
+/// read from `vkd`'s environment, never from a request, so no pipe client can
+/// reach it. It exists so the fence can be proved from the operator's side of
+/// the prompt — a "try to read `C:\Windows\win.ini`" placed in a task's files is
+/// content the model rightly treats as an injection and refuses to act on,
+/// which proves the model's judgement and nothing about the fence.
+fn harness_prompt(base: &str) -> String {
+    match std::env::var("VK_HARNESS_PROMPT_SUFFIX") {
+        Ok(suffix) if !suffix.trim().is_empty() => format!("{base}\n\n{}", suffix.trim()),
+        _ => base.to_string(),
+    }
+}
+
+/// The operator's *system-prompt* addendum, from the daemon's own environment
+/// (`VK_HARNESS_SYSTEM_SUFFIX`), same class of seam as `harness_prompt`'s. The
+/// channel a confinement diagnostic has to use: in the two proof runs of the
+/// Task 4 fix round the model refused to act on the diagnostic when it came as
+/// task content and again when it came in the user turn — "not delivered
+/// through a trusted system channel" — so this is that channel. Empty in every
+/// ordinary run.
+fn harness_system_suffix() -> Option<String> {
+    std::env::var("VK_HARNESS_SYSTEM_SUFFIX")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// A run record for a launch that never started (the binary could not be
+/// spawned, or the launch panicked): nothing ran, so nothing was contained and
+/// nothing was reached.
+fn failed_run() -> HarnessRun {
+    HarnessRun {
+        exit_code: None,
+        exit_reason: ExitReason::NotStarted,
+        stdout_json: String::new(),
+        outcome: None,
+        connections: Vec::new(),
+        samples: 0,
+        duration_ms: 0,
+        governed: false,
+    }
+}
+
+/// `--harness-bin` as `vkd` settles it at start (Ruling 22, M14). A path is
+/// made absolute against the daemon's own working directory and must exist and
+/// be a file — refused at start, not at the first run, and never resolved
+/// against the workspace the child runs in. (Absolute, not canonical: the OS
+/// follows a symlink at exec, and Windows' canonical form carries a `\\?\`
+/// prefix the launch line should not print.) A bare name is looked up on the
+/// daemon's `PATH` now and pinned to what was found; one that is not there is a
+/// warning here and a refusal of each run until the daemon is restarted with a
+/// path — a node serves without its harness, it does not refuse to start.
+pub fn harness_binary_at_start(binary: &std::path::Path) -> Result<PathBuf> {
+    if binary.components().count() > 1 || binary.is_absolute() {
+        let abs = std::path::absolute(binary)
+            .with_context(|| format!("resolve --harness-bin {}", binary.display()))?;
+        anyhow::ensure!(
+            abs.is_file(),
+            "--harness-bin {} is not a file (resolved from {})",
+            abs.display(),
+            binary.display()
+        );
+        return resolve_harness_binary(&abs);
+    }
+    match resolve_harness_binary(binary) {
+        // Absolute even when found through a relative `PATH` entry.
+        Ok(found) => Ok(std::path::absolute(&found).unwrap_or(found)),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "no harness binary at start: every harness run will be refused until vkd is started with --harness-bin <path>");
+            Ok(binary.to_path_buf())
+        }
+    }
+}
+
+/// The harness binary as the daemon will execute it (Ruling 20).
+///
+/// An explicit path must be absolute — `vkd` makes it so at start
+/// ([`harness_binary_at_start`]), so a relative one here is a configuration no
+/// daemon produced — and must be a file. A bare name is looked up on the
+/// daemon's own `PATH`: on Windows as `<name>.exe` — never `<name>.cmd` or
+/// `<name>.bat`, a shim that would spawn the real binary as a grandchild before
+/// the governor can contain the tree — and elsewhere as `<name>`.
+pub fn resolve_harness_binary(binary: &std::path::Path) -> Result<PathBuf> {
+    if binary.components().count() > 1 || binary.is_absolute() {
+        anyhow::ensure!(
+            binary.is_absolute(),
+            "harness binary {} is a relative path: vkd resolves --harness-bin at start, so give an absolute path or a bare name",
+            binary.display()
+        );
+        anyhow::ensure!(
+            binary.is_file(),
+            "harness binary {} does not exist (vkd --harness-bin)",
+            binary.display()
+        );
+        if binary
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+        {
+            tracing::warn!(binary = %binary.display(), "the harness binary is a .cmd/.bat shim: its child may escape containment");
+        }
+        return Ok(binary.to_path_buf());
+    }
+    let name = binary.to_string_lossy().into_owned();
+    let candidates: Vec<String> = if cfg!(windows) {
+        if name.to_ascii_lowercase().ends_with(".exe") {
+            vec![name.clone()]
+        } else {
+            vec![format!("{name}.exe")]
+        }
+    } else {
+        vec![name.clone()]
+    };
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        for c in &candidates {
+            let p = dir.join(c);
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+    }
+    anyhow::bail!(
+        "harness binary `{name}` not found on the daemon's PATH{}; start vkd with --harness-bin <path>",
+        if cfg!(windows) { " (as an .exe)" } else { "" }
+    )
+}
+
+/// What `harness.run` takes, and nothing else (Rulings 20 and 22): an unknown
+/// key is a bad request, not a silently ignored one.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessRunParams {
+    task_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    keep: bool,
+}
+
+/// `harness.run`: the confined Claude Code harness, driven in three phases so the
+/// kernel lock is never held across the wait (SP1b Task 4).
+///
+/// The request carries `task_id`, `name`, `dry_run` and `keep` — nothing that
+/// chooses what executes: the binary, the model and the budget are the daemon's
+/// (Ruling 20), and a request that names them, or anything else, is refused
+/// (−32602). Everything that can be refused is refused *before* phase one, so a
+/// refusal leases nothing.
+///
+/// Phase one leases, mints the token and materialises under the lock; phase two
+/// launches and waits with the lock released, so the harness's own `harness.*`
+/// syscalls can be served; phase three settles under the lock — on every
+/// outcome, a panic in the launch included (Ruling 21.4). `--dry-run` returns
+/// the launch line, the `mcp.json` (token redacted) and the `settings.json`,
+/// and runs nothing.
+fn harness_run(kernel: &Shared, config: &ServerConfig, p: Value) -> Result<Value, RpcError> {
+    for forbidden in ["bin", "binary", "model", "timeout_secs", "timeout"] {
+        if p.get(forbidden).is_some() {
+            return Err(bad(&format!(
+                "harness.run does not take `{forbidden}`: the harness binary, model and timeout \
+                 are daemon configuration (vkd --harness-bin, --harness-model, --harness-timeout-secs)"
+            )));
+        }
+    }
+    let params: HarnessRunParams = serde_json::from_value(p).map_err(|e| {
+        bad(&format!(
+            "harness.run takes task_id, name, dry_run and keep, nothing else: {e}"
+        ))
+    })?;
+    let task_id = params.task_id;
+    let name = params.name.unwrap_or_else(|| "claude-code".to_string());
+    let dry_run = params.dry_run;
+    let keep = params.keep;
+    let settings = &config.harness;
+    let timeout = settings.timeout;
+
+    // Refused before anything is leased: a binary that is not there, a `vk-mcp`
+    // that is not there (a tool-less Claude that "succeeds" is not a run), or a
+    // governor the OS will not give.
+    let binary =
+        resolve_harness_binary(&settings.binary).map_err(|e| internal(&format!("{e:#}")))?;
+    let mcp_server = mcp_server_path();
+    if !dry_run && !mcp_server.is_file() {
+        return Err(internal(&format!(
+            "no vk-mcp next to this daemon at {}: the harness would run without its kernel channel",
+            mcp_server.display()
+        )));
+    }
+    let (state_dir, workspace, config_dir) = {
+        let k = lock(kernel)?;
+        (
+            k.store().state_dir.clone(),
+            k.harness_workspace_dir(&task_id),
+            k.harness_config_dir(&task_id),
+        )
+    };
+
+    if dry_run {
+        let cfg = HarnessConfig {
+            binary,
+            workspace: workspace.clone(),
+            config_dir: config_dir.clone(),
+            state_dir,
+            lease_token: launch::REDACTED_TOKEN.to_string(),
+            endpoint: config.endpoint.clone(),
+            mcp_server,
+            prompt: harness_prompt(vk_kernel::tasks::HARNESS_PROMPT),
+            model: settings.model.clone(),
+            timeout,
+            system_suffix: harness_system_suffix(),
+        };
+        return Ok(json!({
+            "dry_run": true,
+            "task_id": task_id,
+            "workspace": workspace.display().to_string(),
+            "config_dir": config_dir.display().to_string(),
+            "launch_line": launch::launch_line(&cfg),
+            "mcp_json": launch::mcp_json(&cfg, launch::REDACTED_TOKEN),
+            "settings_json": launch::settings_json(&cfg),
+        }));
+    }
+
+    // JobGovernor::new(2 GiB, None) on Windows; the Noop elsewhere. Made before
+    // the lease, so a refused governor leases nothing.
+    let governor = vk_harness::confine::for_this_platform(2 * 1024 * 1024 * 1024, None)
+        .map_err(|e| internal(&format!("governor: {e:#}")))?;
+
+    // Phase one: lease, token, workspace, under the lock.
+    let launch_plan = {
+        let mut k = lock(kernel)?;
+        let ctx = ctx_for(&k, None, now_ms())?;
+        k.harness_launch(&ctx, &task_id, &name, timeout.as_millis() as u64)
+            .map_err(kerr)?
+    };
+
+    // Phase two: launch and wait, lock released, so `harness.*` callbacks serve.
+    // A panic here is a run that did not start, not a step left `Running`.
+    let cfg = HarnessConfig {
+        binary,
+        workspace: launch_plan.workspace.clone(),
+        config_dir: launch_plan.config_dir.clone(),
+        state_dir,
+        lease_token: launch_plan.token.clone(),
+        endpoint: config.endpoint.clone(),
+        mcp_server,
+        prompt: harness_prompt(&launch_plan.prompt),
+        model: settings.model.clone(),
+        timeout,
+        system_suffix: harness_system_suffix(),
+    };
+    let stop_kernel = kernel.clone();
+    let should_stop = move || {
+        stop_kernel
+            .lock()
+            .map(|k| k.stopped_scopes().iter().any(|s| s == "node"))
+            .unwrap_or(false)
+    };
+    let launched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        launch::launch_claude_code(&cfg, governor, &should_stop)
+    }));
+    let (run, launch_error) = match launched {
+        Ok(Ok(run)) => (run, None),
+        Ok(Err(e)) => (failed_run(), Some(format!("{e:#}"))),
+        Err(_) => (
+            failed_run(),
+            Some("the harness launch panicked".to_string()),
+        ),
+    };
+
+    // Phase three: settle, under the lock — whatever the run was.
+    let mut k = lock(kernel)?;
+    let ctx = ctx_for(&k, None, now_ms())?;
+    let task = k
+        .harness_settle(&ctx, &task_id, &launch_plan, &run, keep)
+        .map_err(kerr)?;
+    let (artefact, artefacts) = k
+        .read_register(&ctx, &task.register)
+        .ok()
+        .map(|r| {
+            (
+                r.artefacts.last().map(|a| a.hash.clone()),
+                r.artefacts.len(),
+            )
+        })
+        .unwrap_or((None, 0));
+    let step_status = task
+        .steps
+        .get(launch_plan.step_index)
+        .map(|s| serde_json::to_value(&s.status).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
+    let outcome = run.outcome.as_ref();
+    // What the session spent, filed with every other call this node made
+    // (SP1b Task 8). A harness is not an arch, but its money is the node's:
+    // without this row, a node whose only real work goes through a harness
+    // reports having spent nothing. Best effort and after the settle — a run
+    // that printed no result object has nothing to record, and a bookkeeping
+    // failure must not undo a step that is already done.
+    if let Some(o) = outcome {
+        if let Err(e) = k.record_harness_usage(&vk_kernel::HarnessUsage {
+            name: &name,
+            task_id: &task_id,
+            step_index: launch_plan.step_index,
+            tokens_in: o.tokens_in,
+            tokens_out: o.tokens_out,
+            cost_list_usd: Some(o.total_cost_usd),
+            duration_ms: run.duration_ms,
+        }) {
+            tracing::warn!(task = %task_id, error = %e, "the harness run's usage was not recorded");
+        }
+    }
+    Ok(json!({
+        "task_id": task.id,
+        "status": serde_json::to_value(task.status).unwrap_or(Value::Null),
+        "step_status": step_status,
+        "exit": run.exit_reason.label(),
+        "governed": run.governed,
+        "connections": run.connections,
+        "samples": run.samples,
+        "duration_ms": run.duration_ms,
+        "artefact_hash": artefact,
+        "artefacts": artefacts,
+        "cost_list_usd": outcome.map(|o| o.total_cost_usd),
+        "num_turns": outcome.map(|o| o.num_turns),
+        "permission_denials": outcome.map(|o| o.permission_denials.clone()).unwrap_or_default(),
+        "kept": keep,
+        "error": launch_error,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Final re-review N-2: the system drive is a local fixed drive by either
+    /// spelling; a share, by either spelling, and a device path are not.
+    #[cfg(windows)]
+    #[test]
+    fn a_share_or_device_path_is_not_a_local_fixed_drive() {
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        for local in [
+            format!(r"{system}\x\claude.exe"),
+            format!(r"\\?\{system}\x\claude.exe"),
+        ] {
+            assert!(
+                on_a_local_fixed_drive(std::path::Path::new(&local)),
+                "{local}"
+            );
+        }
+        for remote in [
+            r"\\host\share\claude.exe",
+            r"\\?\UNC\host\share\claude.exe",
+            r"\\.\COM1",
+        ] {
+            assert!(
+                !on_a_local_fixed_drive(std::path::Path::new(remote)),
+                "{remote}"
+            );
+        }
+    }
+
+    /// Ruling 42: the plain values the CLI and the plan use pass; the pinned
+    /// image passes by tag, by digest and by both.
+    #[test]
+    fn the_plain_caps_and_the_pinned_image_pass() {
+        for m in ["12g", "512m", "1024k", "2147483648"] {
+            assert_eq!(checked_memory(m).unwrap(), m);
+        }
+        for c in ["6", "1.5", "0.25"] {
+            assert_eq!(checked_cpus(c).unwrap(), c);
+        }
+        let digest = vk_arch_ollama::PINNED_IMAGE_DIGEST;
+        for i in [
+            vk_arch_ollama::DEFAULT_IMAGE.to_string(),
+            format!("ollama/ollama@{digest}"),
+            format!("{}@{digest}", vk_arch_ollama::DEFAULT_IMAGE),
+        ] {
+            assert_eq!(checked_image(Some(&i)).unwrap(), i);
+        }
+        assert_eq!(checked_image(None).unwrap(), vk_arch_ollama::DEFAULT_IMAGE);
+    }
 
     #[test]
     fn a_challenge_expires_after_its_ttl_and_is_gone_once_spent() {

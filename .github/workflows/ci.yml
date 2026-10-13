@@ -3,6 +3,7 @@ on:
   push:
     branches: ['**']
   pull_request:
+  workflow_dispatch:
 jobs:
   test:
     strategy:
@@ -10,25 +11,298 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # No debug info and no incremental cache: the workspace test build with
+    # full debug info is ~29 GB on Windows, against 3.7 GB for the workspace
+    # *and* the `bedrock` build with both settings (measured locally), and
+    # much less for the linker to hold in memory. Panic messages keep their
+    # file and line — those are compiled in regardless — and a one-shot CI
+    # build has no use for an incremental cache. (Disk was suspected when the
+    # first feature-build step failed on Windows, and was not it: the runner
+    # this repository gets still has a D: drive with 217 GB free. That step
+    # has passed since, under these settings.)
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # vk-web builds OpenSSL from source (`openssl/vendored`), and on MSVC
+      # OpenSSL's `Configure` needs a Windows-native Perl — the README's own
+      # recipe for Windows builds. Under `shell: bash` the `perl` on PATH is
+      # Git's MSYS one (`$^O` is `cygwin`), which `Configure` refuses for
+      # VC-WIN64A; openssl-src then exits 1 with nothing but "failed to run
+      # custom build command for openssl-sys". Pinned here, for every step,
+      # to the Perl pwsh resolves (Strawberry, on the image), and refused by
+      # name if it is not a Windows Perl.
+      - name: A Windows-native Perl for the vendored OpenSSL
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $perl = (Get-Command perl.exe -ErrorAction Stop).Source
+          $os = & $perl -e 'print $^O'
+          if ($os -ne 'MSWin32') {
+            Write-Output "::error title=perl::$perl reports '$os'; OpenSSL's Configure needs an MSWin32 Perl"
+            exit 1
+          }
+          "OPENSSL_SRC_PERL=$perl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "OPENSSL_SRC_PERL=$perl ($os)"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # Ruling 37: a Windows suite that leaves a state directory behind leaves
+      # a `.tmp*` entry in `%TEMP%`, and the runner is alone on its `%TEMP%`,
+      # so the count before and after the suite attributes a leak to the
+      # suite (on a developer's machine it cannot — other processes and other
+      # sessions write there — which is why the in-process guard,
+      # `vk_contracts::testing::guard_state_dir`, registers directories
+      # per process instead). The path is the one `tempfile` uses: `TMP`,
+      # then `TEMP`, as `GetTempPath` reads them. The count is a `nullglob`
+      # array, not `ls | wc -l`: under the runner's `bash -e -o pipefail` an
+      # `ls` that matches nothing fails the step instead of counting 0.
+      - name: Count the temp directories before the suite
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          tmp=$(cygpath -u "${TMP:-${TEMP:-$RUNNER_TEMP}}")
+          dirs=("$tmp"/.tmp*)
+          before=${#dirs[@]}
+          echo "TMP_DIRS_BEFORE=$before" >> "$GITHUB_ENV"
+          echo "temp directories before the suite: $before (in $tmp)"
+      - name: cargo test --workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast 2>&1 | tee test.log
+      # Only when the count before was taken: a run that stopped earlier (fmt,
+      # clippy) ran no suite, and comparing against a missing count is noise.
+      - name: The suite left no temp directory behind
+        if: always() && runner.os == 'Windows' && env.TMP_DIRS_BEFORE != ''
+        shell: bash
+        run: |
+          shopt -s nullglob
+          tmp=$(cygpath -u "${TMP:-${TEMP:-$RUNNER_TEMP}}")
+          dirs=("$tmp"/.tmp*)
+          after=${#dirs[@]}
+          before="$TMP_DIRS_BEFORE"
+          echo "temp directories after the suite: $after (before: $before)"
+          if [ "$after" -gt "$before" ]; then
+            printf '::error title=temp leak::%s\n' "the suite left $((after - before)) .tmp* director(y/ies) in $tmp: a store was open when its TempDir dropped"
+            for d in "${dirs[@]}"; do
+              printf '::error title=temp leak::%s\n' "$d: $(ls -A "$d" 2>/dev/null | tr '\n' ' ' || true)"
+            done
+            exit 1
+          fi
+      # Raw job logs need a GitHub login; annotations and the step summary
+      # do not. On failure, surface every failing test by name so a public
+      # reader (and the API) can see what broke without the log.
+      - name: Name the failing tests
+        if: failure()
+        shell: bash
+        run: |
+          grep -E -A 6 "panicked at" test.log | head -80 | while IFS= read -r line; do
+            printf '::error title=panic::%s\n' "$line"
+          done
+          grep -E "^test .* FAILED$|^test .* \.\.\. FAILED|^---- .* stdout ----|^error(\[E[0-9]+\])?:" test.log | head -60 | while IFS= read -r line; do
+            printf '::error title=cargo test::%s\n' "$line"
+            printf -- '- `%s`\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+          done
+          grep -E "^test result:" test.log | grep -v " 0 failed" | while IFS= read -r line; do
+            printf '::error title=suite::%s\n' "$line"
+          done
+          # The in-process leak guard (Windows) names, on its way out, every
+          # state directory a test binary registered and left on disk.
+          grep -E -A 8 "^state-directory leak guard:" test.log | head -40 | while IFS= read -r line; do
+            printf '::error title=state-directory leak::%s\n' "$line"
+          done
+      # The other half of the `bedrock` feature gate. The default build has no
+      # AWS SDK in it (Ruling 30), so `cargo test --workspace` above exercises
+      # the refusal; this one *runs* the tests the feature turns on — the EU
+      # mount path included — rather than only compiling them, so neither half
+      # of the gate can rot unnoticed.
+      #
+      # Under bash and teed to a log, like the workspace step, so that a
+      # failure here is named in annotations too — the Windows job's first
+      # failure in these steps arrived as a bare "exit code 1" with nothing a
+      # public reader could see.
+      - name: The EU arch's transport builds and its mount path runs
+        shell: bash
+        run: |
+          set -o pipefail
+          df -h . | tail -1 | sed 's/^/disk before the feature builds: /' | tee feature-builds.log
+          cargo test -p vk-ipc -p vk-arch-anthropic --features vk-ipc/bedrock 2>&1 | tee -a feature-builds.log
+      - name: And the daemon with it
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check -p vkd --features bedrock --all-targets 2>&1 | tee -a feature-builds.log
+      # And that the crates stay buildable with every optional feature off,
+      # which is what a node that wants none of the AWS supply chain builds.
+      - name: The build without any optional feature
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check --no-default-features -p vkd -p vk-arch-anthropic 2>&1 | tee -a feature-builds.log
+      # GitHub shows at most ten error annotations per step, so this names the
+      # disk left and the first error with its context, then the log's tail.
+      - name: Name what broke in the feature builds
+        if: failure()
+        shell: bash
+        run: |
+          [ -f feature-builds.log ] || exit 0
+          printf '::error title=disk::%s\n' "$(df -h . | tail -1)"
+          # openssl-src says *why* on its own lines, well below cargo's
+          # "failed to run custom build command"; look for those first.
+          grep -E -m 3 "openssl-src:|Error (configuring|building|installing) OpenSSL|perl implementation" feature-builds.log | while IFS= read -r line; do
+            printf '::error title=openssl::%s\n' "$line"
+          done
+          grep -E -m 1 -A 3 "panicked at|^error(\[E[0-9]+\])?:|could not compile|failed to run custom build command|LNK[0-9]+|No space left|not enough space" feature-builds.log | head -4 | while IFS= read -r line; do
+            printf '::error title=feature build::%s\n' "$line"
+          done
+          tail -2 feature-builds.log | while IFS= read -r line; do
+            printf '::error title=feature build tail::%s\n' "$line"
+          done
+  arch-ollama:
+    # The Ollama adapter against a real container and a real model. Not on
+    # every branch push: it starts a container, pulls the 1B model and spends
+    # minutes of CPU, which is a cost worth paying on master and on request,
+    # not on every commit. The rest of the adapter's tests — the stand-in
+    # server, the refusals, the manifest — run in `test` above on all three
+    # operating systems, so a branch is still covered.
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/master') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Start Ollama under the caps the kernel imposes
+        run: docker run -d --name vk-ollama -p 127.0.0.1:11434:11434 -v vk-ollama:/root/.ollama --memory 12g --cpus 6 ollama/ollama:0.33.3
+      - name: Drive the real container
+        env:
+          VK_OLLAMA: '1'
+          # Never the demo model here: 9.6 GB a run.
+          VK_TEST_MODEL: gemma3:1b
+        run: cargo test -p vk-arch-ollama -- --ignored
+      - name: Stop the container
+        if: always()
+        run: docker rm -f vk-ollama
   sign:
-    # Scaffold only: signs release binaries when a certificate secret exists (SP1 gate).
-    if: ${{ github.event_name == 'push' }}
+    # Signs the four release binaries for the SP1 gate (item 1: signed
+    # binaries install without SmartScreen/Smart App Control prompts). Tries,
+    # in order, and never fails the workflow over a secret that is not there
+    # yet:
+    #   1. Azure Trusted Signing, when all six AZURE_* secrets are set.
+    #   2. An OV certificate through signtool, when SIGNING_CERT_B64 is set.
+    #   3. Neither: prints "unsigned: no signing secrets configured" and
+    #      uploads the same binaries under an `unsigned-` prefix, so a run
+    #      before either secret exists still succeeds and still leaves
+    #      something installable behind.
+    # The founder has not chosen between the two paths (README.md, "Signing
+    # release binaries"); both are wired up so whichever secret set is added
+    # first is the one that runs.
+    #
+    # Master pushes, tags and `workflow_dispatch` only — mirroring
+    # `arch-ollama` — so a real signing operation is never spent on a branch
+    # push (Task 10 group F): a branch is covered by `test` on three
+    # operating systems, and a signed artifact is for a release.
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))) || github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: windows-latest
     env:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+      AZURE_CODE_SIGNING_NAME: ${{ secrets.AZURE_CODE_SIGNING_NAME }}
+      AZURE_CERT_PROFILE_NAME: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
       SIGNING_CERT_B64: ${{ secrets.SIGNING_CERT_B64 }}
+      SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
-      - name: Check signing secret
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the four binaries release-mode
+        run: cargo build --release -p vk-cli -p vkd -p vk-mcp -p vk-service
+      - name: Stage them under one directory
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/vk.exe target/release/vkd.exe target/release/vk-mcp.exe target/release/vkd-service.exe dist/
+      - name: Decide which signing path applies
+        id: decide
+        shell: bash
+        run: |
+          if [ -n "$AZURE_TENANT_ID" ] && [ -n "$AZURE_CLIENT_ID" ] && [ -n "$AZURE_CLIENT_SECRET" ] && [ -n "$AZURE_ENDPOINT" ] && [ -n "$AZURE_CODE_SIGNING_NAME" ] && [ -n "$AZURE_CERT_PROFILE_NAME" ]; then
+            echo "path=azure" >> "$GITHUB_OUTPUT"
+          elif [ -n "$SIGNING_CERT_B64" ]; then
+            echo "path=ov-cert" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=unsigned" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Sign with Azure Trusted Signing
+        if: steps.decide.outputs.path == 'azure'
+        uses: azure/trusted-signing-action@v1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_CODE_SIGNING_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe
+          file-digest: SHA256
+      - name: Sign with an OV certificate
+        if: steps.decide.outputs.path == 'ov-cert'
         shell: pwsh
         run: |
-          if (-not $env:SIGNING_CERT_B64) { Write-Host "no SIGNING_CERT_B64 secret; skipping (expected in SP0)"; exit 0 }
-          Write-Host "signing pipeline would run here"
+          # $env:RUNNER_TEMP, not the checkout root: it is wiped with the runner
+          # regardless, but a failed sign must not be able to leave the decoded
+          # private key sitting beside the checkout for the rest of the job.
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_CERT_B64))
+          try {
+              $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                          Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+              if (-not $signtool) { $signtool = 'signtool.exe' }
+              $exes = Get-ChildItem -Path dist -Filter *.exe | ForEach-Object { $_.FullName }
+              $signArgs = @('sign', '/fd', 'SHA256', '/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', '/f', $pfx)
+              if ($env:SIGNING_CERT_PASSWORD) { $signArgs += @('/p', $env:SIGNING_CERT_PASSWORD) }
+              $signArgs += $exes
+              & $signtool @signArgs
+              if ($LASTEXITCODE -ne 0) { throw "signtool exited $LASTEXITCODE" }
+          } finally {
+              # Runs on the success path and on a thrown signtool failure alike
+              # (bad password, expired cert, timestamp-server hiccup) — the PFX
+              # never survives this step either way.
+              Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+      - name: No signing secrets configured
+        if: steps.decide.outputs.path == 'unsigned'
+        shell: bash
+        run: |
+          echo "unsigned: no signing secrets configured"
+          echo "::warning title=unsigned::unsigned: no signing secrets configured"
+      - name: Upload signed artifacts
+        if: steps.decide.outputs.path != 'unsigned'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vk-windows-signed
+          path: |
+            dist/vk.exe
+            dist/vkd.exe
+            dist/vk-mcp.exe
+            dist/vkd-service.exe
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload unsigned artifacts
+        if: steps.decide.outputs.path == 'unsigned'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-vk-windows
+          path: |
+            dist/vk.exe
+            dist/vkd.exe
+            dist/vk-mcp.exe
+            dist/vkd-service.exe
+          if-no-files-found: error
+          retention-days: 30

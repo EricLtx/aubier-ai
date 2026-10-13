@@ -4,18 +4,18 @@ pub mod ns;
 pub mod presence;
 pub mod tasks;
 
-use anyhow::Result;
-use std::collections::BTreeMap;
-use std::path::Path;
+use anyhow::{Context, Result};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vk_contracts::arch::{ArchManifest, Capability};
 use vk_contracts::hash_canonical;
 use vk_contracts::interceptors;
 use vk_contracts::labels::{Label, Scope};
-use vk_contracts::ledger::{ClockQuality, HlcClock, Ledger, RetentionClass};
+use vk_contracts::ledger::{is_allowed_kind, ClockQuality, HlcClock, Ledger, RetentionClass};
 use vk_contracts::locks::{Lease, LockHome, LockTable};
 use vk_contracts::module::{GateKind, GateVerdict, ModuleManifest};
-use vk_contracts::principal::{Approval, ApprovalKind, DeviceRegistry};
+use vk_contracts::principal::{Approval, ApprovalKind, Challenge, DeviceRegistry, Principal};
 use vk_contracts::register::{ArtefactRef, Register, RegisterId};
 use vk_contracts::stop::{LivenessLease, ResumeEvent, StopError, StopEvent, StopSet};
 use vk_contracts::storage::{BlobEnvelope, StorageError};
@@ -30,6 +30,19 @@ use vk_store::{HeadVerdict, Store};
 /// still true after one.
 fn store_failed(e: impl std::fmt::Display) -> KernelError {
     KernelError::Store(e.to_string())
+}
+
+/// A payload-tier read that failed. Absent or shredded (`StorageError`) is
+/// `NotFound`; anything else means the store has bytes at this address and
+/// cannot read them or they are not the ones the address names — a swapped,
+/// restored or altered blob, an unreadable file (final review I-3). That is a
+/// store that cannot be trusted for this artefact, not an artefact that is
+/// not there.
+pub(crate) fn blob_failed(e: anyhow::Error) -> KernelError {
+    match e.downcast_ref::<StorageError>() {
+        Some(missing) => KernelError::NotFound(missing.to_string()),
+        None => KernelError::Store(format!("{e:#}")),
+    }
 }
 
 /// An artefact's `kind` is not free-form text: a `Release` step turns it into a
@@ -57,10 +70,92 @@ fn validate_artefact_kind(kind: &str) -> Result<(), KernelError> {
 const POLICIES_VERSION: &str = "policies_version";
 
 /// An enrolled human device, as the `devices` table stores it.
+///
+/// Two kinds share the table (SP1b Task 5): a device *key* row carries the
+/// ed25519 verifying key that `DeviceRegistry` checks presence proofs and
+/// node-key approvals against; a *passkey* row (`trust_class: "passkey"`)
+/// carries the WebAuthn credential instead, opaque to the kernel — it is
+/// `vk-web`'s verifier that reads it — and an empty `vk_hex`, so `load`
+/// registers nothing for it. A row written before passkeys existed has
+/// neither new field and reads back exactly as it was.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DeviceRow {
     vk_hex: String,
     trust_class: String,
+    /// The serialised passkey of a `trust_class: "passkey"` row; absent on a
+    /// device-key row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    passkey: Option<serde_json::Value>,
+    #[serde(default)]
+    enrolled_ms: u64,
+}
+
+/// The trust class of a device row that holds a passkey rather than a key.
+pub const PASSKEY_TRUST_CLASS: &str = "passkey";
+/// Every passkey's device id starts with this; what follows is the
+/// credential id, base64url.
+pub const PASSKEY_DEVICE_PREFIX: &str = "passkey:";
+
+/// An enrolled passkey as `passkeys` hands it out: the device id, the
+/// credential as the enroller serialised it (the kernel never parses it),
+/// and when it was enrolled.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PasskeyRow {
+    pub device_id: String,
+    pub credential: serde_json::Value,
+    pub enrolled_ms: u64,
+}
+
+/// How long a minted approval challenge stays answerable (SP1b Task 5). Two
+/// minutes: a person has to get from the terminal to a browser and a Windows
+/// Hello prompt, and nothing more — the challenge is minted when the
+/// ceremony starts, not when the task starts waiting.
+pub const APPROVAL_CHALLENGE_TTL_MS: u64 = 120_000;
+/// Open approval challenges are bounded, as presence nonces are in the
+/// transport: past this many, the one closest to expiry is dropped. A caller
+/// that mints challenges it never spends cannot grow the map without limit.
+const MAX_APPROVAL_CHALLENGES: usize = 256;
+
+/// An approval challenge this kernel minted and no approval has spent yet
+/// (SP1b Task 5): the task it was minted for and the challenge itself. What
+/// [`RealKernel::pending_approvals`] lists.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PendingApproval {
+    pub task_id: String,
+    pub challenge: Challenge,
+}
+
+/// What a passkey assertion signed, as the record keeps it (SP1b Task 5 fix
+/// round 1, review Important 1). The authenticator signs
+/// `authenticator_data || SHA-256(client_data_json)`; `client_data_json`
+/// carries the challenge, which is the minted `Challenge`'s nonce, and the
+/// origin. With the enrolled passkey's public key (the `devices` row) and the
+/// approval's `signature_hex`, an auditor re-verifies the approval from the
+/// store and the ledger alone — the same standing a node-key approval has.
+/// Stored in the `assertions` table under the approval's own key, and hashed
+/// into the `approval.recorded` payload. Not a contract type.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AssertionRecord {
+    /// The credential id, base64url — the same value `passkey:<id>` names.
+    pub credential_id: String,
+    /// The authenticator data, base64url.
+    pub authenticator_data: String,
+    /// The client data JSON, base64url: `{type, challenge, origin, …}`.
+    pub client_data_json: String,
+}
+
+/// The `approval.recorded` payload (SP1b Task 5): the approval, which
+/// ceremony verified it — `device-key` for an ed25519 signature checked
+/// against the device registry, `webauthn` for a passkey assertion checked by
+/// `vk-web`'s verifier — and, for the latter, what the authenticator signed.
+/// Not a contract type; the ledger keeps its hash. The device-key payload
+/// has no `assertion` field at all, so its hash is unchanged.
+#[derive(serde::Serialize)]
+struct ApprovalRecord<'a> {
+    approval: &'a Approval,
+    proof: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assertion: Option<&'a AssertionRecord>,
 }
 
 /// What this node came up with: the verdict on its own record, what it had to
@@ -78,6 +173,20 @@ pub struct BootReport {
     /// dropped and truncated away. One event is missing from the record.
     pub recovered_partial_line: bool,
     pub arches: Vec<String>,
+    /// Which of `arches` came up unusable, and could not be re-created from
+    /// the spec their mount recorded (SP1b ruling 14). In the report, and so
+    /// in the `boot` event's payload hash, because "this node came up without
+    /// Gemma" is exactly the kind of thing an auditor should find in the
+    /// record rather than in a log line nobody kept. Empty on a node where
+    /// every arch came back, and absent from a report written before this
+    /// existed.
+    #[serde(default)]
+    pub unavailable_arches: Vec<String>,
+    /// Which of `arches` were still being built when the node started serving
+    /// (Task 1b review, Important 1). The node answers throughout; these are
+    /// the ones a step would be told to retry on for a few seconds more.
+    #[serde(default)]
+    pub starting_arches: Vec<String>,
     pub devices: Vec<String>,
     pub stopped_scopes: Vec<String>,
     /// Placeholder (spec §4.3): there is no policy engine in SP1a, so boot
@@ -85,14 +194,252 @@ pub struct BootReport {
     /// unchanged afterwards. It exists so that the first policy set has a
     /// predecessor to migrate from.
     pub policies_version: String,
+    /// Every `vk fsck --rebase-head` done since the last boot that reported
+    /// one (SP1b Task 8; review Important 1 made it a list — two rebases
+    /// between two boots are two overrides and both belong on the record).
+    ///
+    /// Empty on an ordinary boot, and skipped when empty, so the canonical
+    /// hash of an ordinary report is unchanged and an auditor's
+    /// recomputation of an old `boot` event still matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fsck: Vec<FsckRebase>,
 }
 
-/// Cumulative per-arch call counters, persisted under the `kv` key `stats:<arch_id>`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Cumulative per-arch call counters, persisted under the `kv` key
+/// `stats:<arch_id>`. What `vk top` reads, and — until per-call usage rows
+/// exist — the only place the numbers a real arch reported survive the call
+/// (SP1b rulings 7 and 8).
+///
+/// The new fields default to zero, so a stats row written before them reads
+/// back as an arch that has measured nothing, which is what it is.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ArchStats {
     pub calls: u64,
+    /// Prompt tokens, the best number available per call: what the arch
+    /// measured when it reported one, the adapter's estimate otherwise.
     pub tokens_in: u64,
+    /// How much of `tokens_in` was measured rather than estimated. Equal to
+    /// `tokens_in` when every call on this arch reported its own usage, zero
+    /// for an arch that never does — so a reader can tell a figure they can
+    /// bill against from a heuristic.
+    #[serde(default)]
+    pub tokens_in_measured: u64,
+    /// List-price equivalent of every call on this arch, in USD. Under a
+    /// subscription this is what the calls would have cost, not what they
+    /// did; the manifest's `cost_per_1k_tokens_eur` says which.
+    #[serde(default)]
+    pub cost_list_usd: f64,
     pub projected: u64,
+}
+
+/// The `boot.forced` event's payload (founder decision 2026-09-24): the
+/// verdict `boot` found, named rather than recomputed, so this event and the
+/// `boot` event it follows can never disagree about what was overridden.
+#[derive(serde::Serialize)]
+struct BootForcedRecord<'a> {
+    /// `BootReport::ledger_ok` — the chain and the recorded head combined.
+    ledger_ok: bool,
+    /// The recorded-head half of that verdict on its own: a chain that fails
+    /// to verify but still reaches the head this store last wrote is a
+    /// different failure from a tail that was cut or rewritten, and an
+    /// auditor reading `boot.forced` should not have to guess which.
+    head_ok: bool,
+    ledger_len: usize,
+    /// `hash_canonical` of the `BootReport` this event is about — the same
+    /// value already committed to as that report's own `boot` event's
+    /// `payload_hash`, so the two events verifiably name the same boot.
+    report_hash: &'a str,
+}
+
+/// The `infer` event's payload: which arch ran which register, and — when the
+/// arch measured its own call — what it cost and what it spent (SP1b ruling 3).
+///
+/// The optional halves are skipped when absent, so the mock's `infer` commits
+/// to exactly what it used to: which arch, which register, nothing invented.
+/// Nothing here is a contract type; the ledger stores only the hash of this
+/// object, and an auditor recomputes it from the same values.
+#[derive(serde::Serialize)]
+struct InferRecord<'a> {
+    arch_id: &'a str,
+    register: &'a str,
+    /// Which half of the call this record is: `requested` before the prompt is
+    /// handed to the adapter, `completed` once it has answered (SP1b review,
+    /// M2). Two events of one kind rather than two kinds, because they are one
+    /// thing — a call — and an auditor reading the chain wants them adjacent
+    /// and comparable. A `requested` with no `completed` after it is a call
+    /// that left this kernel and never came back.
+    phase: &'a str,
+    /// Prompt tokens: the arch's own count when it reported one, this node's
+    /// estimate otherwise. `measured` says which, so the record never leaves a
+    /// reader guessing whether a number is a fact or a heuristic.
+    tokens_in: u32,
+    measured: bool,
+    /// `Completion::cost_list_usd` — list price for a call the subscription
+    /// did not bill, so the record says what it would have cost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_list_usd: Option<f64>,
+    /// `Completion::details` — the arch's own measurements of the call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<&'a serde_json::Value>,
+}
+
+/// What a mount did, and what it left the caller holding (Ruling 13).
+///
+/// `replaced` is the whole point of the type: an adapter that was swapped out
+/// leaves the kernel by this field, so the daemon can release the kernel mutex
+/// before dropping it. Dropping an adapter can be slow and can reach outside
+/// the process — the Ollama arch stops the container it started — and the
+/// kernel lock is the one thing that must never be held across that.
+pub struct MountOutcome {
+    pub arch_id: String,
+    /// The adapter this mount took the place of, for the caller to drop
+    /// *after* releasing the lock. `None` on a first mount and on an
+    /// idempotent re-mount, which replaces nothing.
+    pub replaced: Option<Arc<dyn arch::ArchAdapter>>,
+    /// Was this arch already mounted? True both for the idempotent case and
+    /// for a deliberate replacement, so a client can say "already mounted"
+    /// rather than pretending something new happened.
+    pub already_mounted: bool,
+}
+
+/// What to do about an arch that is already mounted under the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remount {
+    /// Keep it: the arch that is there is the answer. The default, and what
+    /// makes a repeat mount idempotent.
+    Keep,
+    /// Replace it: the caller has re-made whatever is behind the arch, so the
+    /// adapter in the table is stale however identical its manifest looks.
+    Replace,
+}
+
+/// An arch's refusal, as the kernel must report it.
+///
+/// `I4Prime` is the kernel's own invariant raised by the adapter that knows
+/// the real limit, and it reaches the client as an invariant refusal, like
+/// every other I4′. Everything else is machinery that did not work — the
+/// engine would not start, the answer would not parse — which is a store-class
+/// failure, not "no such arch" (SP1b review, Important 2).
+fn adapter_failed(arch_id: &str, e: arch::AdapterError) -> KernelError {
+    match e {
+        arch::AdapterError::I4Prime { .. } => KernelError::I4Prime(format!("arch {arch_id}: {e}")),
+        arch::AdapterError::Other(e) => KernelError::Store(format!("arch {arch_id} failed: {e}")),
+    }
+}
+
+/// How this node makes an adapter out of a [`arch::MountSpec`] (SP1b ruling 14).
+///
+/// The kernel persists the spec and hands it back at boot; it has no idea what
+/// a `claude-code` or an `ollama` is, and should not — the arch kinds a build
+/// has are the daemon's, and a kernel that knew them would have to be rebuilt
+/// to gain one. `vkd` passes the real factory to
+/// [`RealKernel::open_with_factory`]; [`RealKernel::open`] uses one that knows
+/// only the mock, which is all a kernel test needs.
+/// `Arc`, not `Box`: the daemon calls the factory on a background task with
+/// the kernel mutex *not* held, so the same factory has to be reachable from
+/// outside the kernel as well as from `start_arches_now` inside it
+/// (Task 1b review, Important 1).
+pub type AdapterFactory =
+    Arc<dyn Fn(&arch::MountSpec) -> Result<Box<dyn arch::ArchAdapter>> + Send + Sync>;
+
+/// Is this arch usable, and if not, why not (SP1b ruling 14)?
+///
+/// The state exists because the alternative is worse. `load` used to build a
+/// `MockAdapter` for every persisted manifest, so an arch whose engine had
+/// gone away came back as the mock under the same id and answered prompts
+/// with an echo — the one failure a node must never have, because nothing
+/// downstream can tell it from an answer. An arch that cannot be made again is
+/// named, listed and refused instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchState {
+    /// The adapter is there: the factory made it and it is the arch the id says.
+    Ready,
+    /// The spec is known and the adapter is being built right now — a
+    /// `docker start`, a cold model load, a `claude --version` (Task 1b
+    /// review, Important 1). The node serves throughout; a step that names
+    /// this arch is told to retry rather than failed, because nothing is
+    /// wrong: the arch is seconds away.
+    Starting,
+    /// It is not, and this is what stopped it — the factory's own error, or
+    /// what differs between the manifest that was stored and the one the
+    /// factory just made.
+    Unavailable(String),
+}
+
+impl ArchState {
+    /// The word every read surface prints: `ready`, `starting` or `unavailable`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ArchState::Ready => "ready",
+            ArchState::Starting => "starting",
+            ArchState::Unavailable(_) => "unavailable",
+        }
+    }
+
+    /// Why it is not usable; `None` for one that is, and for one still coming
+    /// up — there is nothing wrong with it to explain.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            ArchState::Ready | ArchState::Starting => None,
+            ArchState::Unavailable(why) => Some(why),
+        }
+    }
+}
+
+/// An arch this node has mounted and cannot run: its manifest, so it can still
+/// be listed and so a re-mount can be checked against it, and the reason.
+struct UnavailableArch {
+    manifest: ArchManifest,
+    reason: String,
+}
+
+/// An arch whose adapter has not been built yet: the manifest it must come
+/// back as, and the spec to build it from.
+struct PendingMount {
+    manifest: ArchManifest,
+    spec: arch::MountSpec,
+}
+
+/// What differs between the manifest an arch was mounted with and the one the
+/// factory has just made — `None` when they are the same manifest (Task 1b
+/// review, Important 2).
+///
+/// The whole manifest, not the arch id. `arch_id` hashes `ArchIdentity` alone,
+/// so `clearance`, `capabilities`, `retention_days`, `governed` and the rest
+/// can all differ under an id that matches — and the adapter's manifest is the
+/// one `i2_flow` consults on the very next prompt. The mount path has always
+/// refused exactly this ("already mounted with a different manifest"); the
+/// boot path used to let it through.
+///
+/// The field names are read off the serialised manifests rather than listed
+/// here, so a field added to `ArchManifest` later is named by this without
+/// anybody having to remember to come back.
+fn manifest_difference(stored: &ArchManifest, made: &ArchManifest) -> Option<String> {
+    if hash_canonical(stored) == hash_canonical(made) {
+        return None;
+    }
+    let (stored_id, made_id) = (stored.arch_id(), made.arch_id());
+    if stored_id != made_id {
+        return Some(format!("identity {stored_id} → {made_id}"));
+    }
+    let (a, b) = (
+        serde_json::to_value(stored).unwrap_or_default(),
+        serde_json::to_value(made).unwrap_or_default(),
+    );
+    let named: Vec<&str> = a
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter(|(field, value)| b.get(field) != Some(*value))
+                .map(|(field, _)| field.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(if named.is_empty() {
+        "it is not the manifest that was stored".into()
+    } else {
+        named.join(", ")
+    })
 }
 
 pub struct RealKernel {
@@ -100,6 +447,18 @@ pub struct RealKernel {
     store: Store,
     clock: HlcClock,
     adapters: BTreeMap<String, Arc<dyn arch::ArchAdapter>>,
+    /// The arches whose adapter is still being built. Disjoint from
+    /// `adapters` and `unavailable`: an id is in exactly one of the three,
+    /// which is what makes `arch_state` a lookup rather than a question.
+    starting: BTreeMap<String, PendingMount>,
+    /// The arches that are mounted and not usable.
+    unavailable: BTreeMap<String, UnavailableArch>,
+    /// Makes an adapter out of a persisted spec. Never called with the kernel
+    /// mutex held — building an adapter starts containers and waits on
+    /// binaries. `vkd` clones this out and drives startup from a background
+    /// task; `start_arches_now` is the in-process version, for callers that
+    /// have no mutex.
+    factory: AdapterFactory,
     budgets: BTreeMap<String, u32>,
     locks: LockTable,
     home: LockHome,
@@ -107,23 +466,281 @@ pub struct RealKernel {
     stops: StopSet,
     infer_log: Vec<(String, Label)>,
     counter: u64,
+    /// Set by `record_forced_boot`. In memory only, for as long as this
+    /// process runs — the same lifetime `ledger_holds`'s doc comment already
+    /// promises for a `--force` verdict — never persisted, so it says
+    /// nothing about a previous or a future run.
+    forced_boot: bool,
+    /// The live harness runs, keyed by the **hash** of each run's lease token
+    /// (SP1b Task 4, Ruling 21.2). In memory only: a harness cannot outlive
+    /// this process (the Job Object kills it when the daemon's handle closes),
+    /// so a token that was live before a restart is rightly unknown after one.
+    /// The token itself is never stored, logged or put in a payload; the
+    /// ledger and every principal carry the lease id.
+    harness_tokens: BTreeMap<String, HarnessTokenState>,
+    /// The approval challenges this kernel has minted and no approval has
+    /// spent yet, keyed by nonce (SP1b Task 5, invariant I1). In memory only:
+    /// a challenge is a moment's thing, bound to a task that is waiting *now*,
+    /// and one that was open when this process stopped is rightly unknown to
+    /// the next — the person mints another.
+    approval_challenges: BTreeMap<String, PendingApproval>,
+    /// Which step of which task the call now in flight belongs to (SP1b Task
+    /// 8, ruling 8). Set by `run_task_step` around the one step it runs and
+    /// cleared again afterwards, so the usage row `infer` writes can name the
+    /// step that spent the money.
+    ///
+    /// A field rather than a parameter because `infer` is a **contract**
+    /// method (`vk_contracts::syscalls::Kernel`) and its signature is not
+    /// this task's to change. The scheduler runs one step at a time, in the
+    /// call that asked for it, so there is exactly one of these at a time;
+    /// an inference outside a task leaves it `None` and the row names no
+    /// task rather than the last one that happened to run.
+    usage_step: Option<(String, usize)>,
+}
+
+/// One completed call on an arch: which arch, which step of which task, what
+/// it spent and how long it took (SP1b Task 8, ruling 8's second half).
+///
+/// The per-arch counters in [`ArchStats`] are the sum of these rows, and a sum
+/// cannot answer the two questions an operator actually has — *which task cost
+/// that* and *is this call slower than the last one*. It is metadata
+/// throughout: ids, counts and a timestamp. Nothing of the register, of the
+/// prompt or of the completion is in here, which is why it can be read without
+/// the register's own label (invariant I2); what it does carry is a task id, so
+/// a row about a task the caller may not see is not listed at all.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UsageRow {
+    pub arch_id: String,
+    /// The task whose step made the call, or `None` for an inference made
+    /// outside one.
+    pub task_id: Option<String>,
+    pub step_index: Option<usize>,
+    /// Prompt tokens as accounted: the arch's own count where it reported
+    /// one, this node's estimate otherwise.
+    pub tokens_in: u64,
+    /// How much of `tokens_in` was measured rather than estimated — `0` for
+    /// an arch that reports no usage, so a reader can tell a figure they
+    /// could bill against from a heuristic.
+    pub tokens_in_measured: u64,
+    /// Completion tokens as the arch counted them; `0` where it counted none.
+    /// The kernel never estimates this: it does not see the answer being
+    /// produced.
+    pub tokens_out: u64,
+    /// List price of this one call in USD, where the arch reported one.
+    /// `None` is not zero — see `ArchManifest::cost_per_1k_tokens_eur`.
+    pub cost_list_usd: Option<f64>,
+    /// How long the arch was away, wall-clock, for this call alone.
+    pub duration_ms: u64,
+    /// When the call came back. Named `ts_ms` rather than `ts` like every
+    /// other instant in this kernel (`wall_ms`, `now_ms`, `enrolled_ms`).
+    pub ts_ms: u64,
+}
+
+/// Which usage rows a caller is asking for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum UsageFilter {
+    #[default]
+    All,
+    Task(String),
+    Arch(String),
+}
+
+/// The arch id a harness run's usage is filed under. A harness is not an arch
+/// — nothing mounts it, it has no manifest and no id of its own — but the
+/// money it spends is Claude's all the same, and an operator reading
+/// `vk top --calls` must see it beside the arches or the node's spend is
+/// simply wrong (SP1b Task 8; the Task 4 deferred minor).
+pub fn harness_arch_id(name: &str) -> String {
+    format!("harness:{name}")
+}
+
+/// What a `--rebase-head` did, as the next `boot` event's report names it
+/// (SP1b Task 8). `boot.forced`'s style and `boot.forced`'s reason: an
+/// operator overrode a refusal of this node's own store, and an auditor must
+/// find it in the record without having to be told to look.
+///
+/// No new ledger kind: it rides the `boot` report, whose canonical hash is
+/// already the `boot` event's payload — so the event that says this node
+/// started is the same event that says what it started over.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FsckRebase {
+    /// The head that was on record before, `None` if none was.
+    pub rebased_from: Option<vk_store::LedgerHead>,
+    pub rebased_to: vk_store::LedgerHead,
+    /// When the rebase was done, in wall-clock milliseconds.
+    pub at: u64,
+}
+
+/// The `kv` prefix every head rebase is recorded under, one row per rebase,
+/// keyed by when it happened. **Append-only**: nothing overwrites a row and
+/// nothing deletes one, so the history of a node's overrides is the history
+/// (review Important 1).
+const REBASE_PREFIX: &str = "ledger.head.rebase.";
+/// The key of the newest rebase row a `boot` event has already named. A
+/// watermark, because the rows are the record and must not be cleared to
+/// mark them read. It shares the rows' prefix, so `rebase_rows` excludes it
+/// by name.
+const REBASE_REPORTED_THROUGH: &str = "ledger.head.rebase.reported-through";
+
+/// How long a per-call usage row is kept: the ledger's operational class,
+/// `Operational90d`, and no longer (Task 8 deferred minor, Task 10 group
+/// C). A row is metadata about a call — ids, counts, a duration — and the
+/// counters it adds up to (`ArchStats`) are kept for good; the rows behind
+/// them are what `vk top --calls` and `vk task show` read, and ninety days
+/// is as far back as either has any business showing.
+pub const USAGE_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
+/// How long a `--keep` harness workspace stays after its run: a day. It
+/// holds label-projected plaintext, kept for the operator to look at after
+/// the run, and "after the run" is not a fortnight. Swept by the daemon's
+/// scheduled sweep, and — as before — whole at the next boot.
+pub const KEPT_WORKSPACE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// What one retention sweep removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RetentionSweep {
+    /// Usage rows older than [`USAGE_RETENTION_MS`].
+    pub usage_rows: u64,
+    /// Kept harness workspaces older than [`KEPT_WORKSPACE_TTL_MS`], and
+    /// directories under `harness/` that no task accounts for.
+    pub workspaces: u64,
+}
+
+/// What a harness run's Claude Code session spent, for
+/// [`RealKernel::record_harness_usage`]. A struct rather than seven
+/// parameters, because six of them are numbers and a caller that swapped two
+/// would be reporting somebody else's spend with no compiler to say so.
+#[derive(Debug, Clone)]
+pub struct HarnessUsage<'a> {
+    /// Which harness: the name `vk harness run --name` was given.
+    pub name: &'a str,
+    pub task_id: &'a str,
+    pub step_index: usize,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_list_usd: Option<f64>,
+    pub duration_ms: u64,
+}
+
+/// One live harness run, as the token map holds it: which lease and task the
+/// token stands for, and how much the run has attached so far (the 16 MiB
+/// per-run cap, Ruling 21.6). `oversize` remembers a file the run tried to
+/// attach past a cap, so settle can fail the step naming it.
+struct HarnessTokenState {
+    lease_id: String,
+    task_id: String,
+    bytes_attached: u64,
+    oversize: Option<String>,
+}
+
+/// Build an adapter with `factory`, turning a panic inside it into the error
+/// it should have been (Task 1b deferred minor). A factory that panicked used
+/// to take the daemon's startup task down with it and leave the arch
+/// `Starting` for ever — the one state a step waits on rather than fails on.
+pub fn build_adapter(
+    factory: &AdapterFactory,
+    spec: &arch::MountSpec,
+) -> Result<Box<dyn arch::ArchAdapter>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory(spec))).unwrap_or_else(
+        |panic| {
+            let what = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".into());
+            Err(anyhow::anyhow!(
+                "the adapter factory panicked while building this arch: {what}"
+            ))
+        },
+    )
+}
+
+/// The factory [`RealKernel::open`] uses: the mock and nothing else.
+///
+/// A kernel opened without a daemon around it can still bring its mock arches
+/// back, and every other kind is honestly unavailable — which is the point of
+/// the state. The mock's spec carries the whole manifest, because the arch id
+/// is a hash of it and re-deriving it from a name and a ceiling would mint a
+/// different arch.
+pub fn mock_factory() -> AdapterFactory {
+    Arc::new(|spec: &arch::MountSpec| {
+        anyhow::ensure!(
+            spec.kind == "mock",
+            "this kernel was opened without a factory for arch kind {}; \
+             open it with `open_with_factory` to mount one",
+            spec.kind
+        );
+        let manifest: ArchManifest = serde_json::from_value(spec.config["manifest"].clone())
+            .context("a mock mount spec carries the manifest it was mounted with")?;
+        let budget = spec.config["budget"]
+            .as_u64()
+            .and_then(|b| u32::try_from(b).ok())
+            .unwrap_or(manifest.context_ceiling);
+        Ok(Box::new(arch::MockAdapter { manifest, budget }) as Box<dyn arch::ArchAdapter>)
+    })
 }
 
 impl RealKernel {
+    /// Open the store, bring this node's state back, and build every mounted
+    /// arch before returning, with a factory that knows only the mock.
+    ///
+    /// What every kernel test uses. The building is synchronous here because
+    /// the mock is instantaneous and there is no mutex in the way; `vkd` uses
+    /// [`RealKernel::open_with_factory`] and drives startup itself, because
+    /// real engines are not instantaneous and its kernel is behind a mutex.
     pub fn open(state_dir: &Path, key_source: KeySource, node_id: &str) -> Result<RealKernel> {
+        let mut k = RealKernel::open_with_factory(state_dir, key_source, node_id, mock_factory())?;
+        k.start_arches_now();
+        Ok(k)
+    }
+
+    /// The same, with the factory that re-creates every kind this node can
+    /// mount (SP1b ruling 14) — and **without building anything**.
+    ///
+    /// Every persisted arch comes back `Starting`, and the caller brings them
+    /// up afterwards through [`RealKernel::pending_mounts`] and
+    /// [`RealKernel::install_arch`]. That split is the whole point: building
+    /// an adapter runs `claude --version`, a `docker start`, a cold model
+    /// load — up to minutes of it — and doing that inside `open` left the
+    /// node unreachable for the whole time, so `vk boot` timed out after 10 s
+    /// and *killed* the daemon it had just started (Task 1b review,
+    /// Important 1). The store lock is still taken here, before anything
+    /// else, so a second daemon is refused before a single container is
+    /// touched.
+    pub fn open_with_factory(
+        state_dir: &Path,
+        key_source: KeySource,
+        node_id: &str,
+        factory: AdapterFactory,
+    ) -> Result<RealKernel> {
         let store = Store::open(state_dir, key_source)?;
+        // The clock continues from the record's newest stamp (SP1a review
+        // M3): a restart on a wall clock that went backwards must still stamp
+        // its events after everything already appended, or the HLC would be
+        // monotonic within a process and not across the record.
+        let clock = match store.ledger.events().last() {
+            Some(tail) => HlcClock::resume(node_id, &tail.hlc),
+            None => HlcClock::new(node_id),
+        };
         let mut k = RealKernel {
             node_id: node_id.into(),
             store,
-            clock: HlcClock::new(node_id),
+            clock,
             adapters: BTreeMap::new(),
+            starting: BTreeMap::new(),
+            unavailable: BTreeMap::new(),
+            factory,
             budgets: BTreeMap::new(),
             locks: LockTable::default(),
             home: LockHome::default(),
             devices: DeviceRegistry::default(),
             stops: StopSet::default(),
+            forced_boot: false,
             infer_log: vec![],
             counter: 0,
+            harness_tokens: BTreeMap::new(),
+            approval_challenges: BTreeMap::new(),
+            usage_step: None,
         };
         k.load()?;
         Ok(k)
@@ -143,17 +760,7 @@ impl RealKernel {
                 }
             }
         }
-        for (id, m) in self.store.db.list_json::<ArchManifest>("arches")? {
-            let budget = m.context_ceiling;
-            self.adapters.insert(
-                id.clone(),
-                Arc::new(arch::MockAdapter {
-                    manifest: m,
-                    budget,
-                }),
-            );
-            self.budgets.insert(id, budget);
-        }
+        self.load_arches()?;
         // Fences first, and from `kv` rather than from the lease rows: a fence
         // must stay monotonic for the life of the resource, including after the
         // last lease that carried it has expired and been swept away below.
@@ -211,6 +818,165 @@ impl RealKernel {
         Ok(())
     }
 
+    /// Read every mounted arch back off disk (SP1b ruling 14). Builds nothing.
+    ///
+    /// An arch with a spec becomes `Starting` — the caller builds it, after
+    /// the endpoint is answering. An arch with no spec (one mounted before
+    /// Task 1b existed) has nothing to build from, so it is `Unavailable` at
+    /// once and says to mount it again; there is no point in making the
+    /// operator wait for a startup pass to tell them that.
+    fn load_arches(&mut self) -> Result<()> {
+        let specs: BTreeMap<String, arch::MountSpec> =
+            self.store.db.list_json("mounts")?.into_iter().collect();
+        let manifests: Vec<(String, ArchManifest)> = self.store.db.list_json("arches")?;
+        for (id, manifest) in &manifests {
+            match specs.get(id) {
+                None => self.mark_unavailable(
+                    id,
+                    manifest,
+                    "no mount spec was recorded for this arch, so there is nothing to make it \
+                     from; mount it again"
+                        .into(),
+                ),
+                Some(spec) => {
+                    self.starting.insert(
+                        id.clone(),
+                        PendingMount {
+                            manifest: manifest.clone(),
+                            spec: spec.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        // A spec whose arch is gone is a leftover of a failed write, never a
+        // mount: `unmount` deletes both rows and `mount` writes both together.
+        // Swept rather than kept, so it cannot come back as an arch nobody
+        // mounted if that id is ever minted again.
+        for id in specs.keys() {
+            if !manifests.iter().any(|(m, _)| m == id) {
+                self.store.db.delete("mounts", id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every arch still waiting for its adapter, with the spec to build it
+    /// from. What the daemon's startup task iterates (Task 1b review,
+    /// Important 1).
+    ///
+    /// A snapshot, taken under the kernel lock and then let go of: the caller
+    /// builds each adapter with the lock **released** and hands the result to
+    /// [`RealKernel::install_arch`], which takes the lock again for as long as
+    /// a map insert. The mutex is never held across a `docker start`.
+    pub fn pending_mounts(&self) -> Vec<(String, arch::MountSpec)> {
+        self.starting
+            .iter()
+            .map(|(id, p)| (id.clone(), p.spec.clone()))
+            .collect()
+    }
+
+    /// This node's adapter factory, for a caller that will use it outside the
+    /// kernel lock.
+    pub fn adapter_factory(&self) -> AdapterFactory {
+        self.factory.clone()
+    }
+
+    /// How many arches are still coming up. `boot.info`'s `arches_starting`,
+    /// and what `vk boot` reports to the person who just started the node.
+    pub fn arches_starting(&self) -> usize {
+        self.starting.len()
+    }
+
+    /// Install what the factory made for a `Starting` arch — or record why it
+    /// could not be made (SP1b ruling 14, Task 1b review Importants 1 and 2).
+    ///
+    /// Returns an adapter the **caller** must drop, once it has released the
+    /// kernel lock: dropping one can `docker stop` a container, which is the
+    /// one thing that must never happen under the mutex. `None` when there is
+    /// nothing to throw away.
+    ///
+    /// Three ways this ends with nothing installed, and each of them is a case
+    /// the daemon actually meets:
+    /// - the arch left `Starting` while its adapter was being built — an
+    ///   operator ran `vk mount` or `vk umount` in those seconds — so what was
+    ///   built is stale and goes back to the caller to drop;
+    /// - the factory failed → `Unavailable` with its error;
+    /// - what came back is not the manifest that was stored → `Unavailable`
+    ///   naming what differs and how to retire the old id. Never installed:
+    ///   the adapter's manifest is what `i2_flow` reads, so adopting a
+    ///   manifest whose clearance is not the one on disk would widen what an
+    ///   arch may see, on the first prompt after a restart, with nothing
+    ///   anywhere recording that it had changed.
+    pub fn install_arch(
+        &mut self,
+        arch_id: &str,
+        made: Result<Box<dyn arch::ArchAdapter>>,
+    ) -> Option<Box<dyn arch::ArchAdapter>> {
+        let Some(pending) = self.starting.remove(arch_id) else {
+            tracing::debug!(
+                arch_id = %arch_id,
+                "this arch stopped waiting while its adapter was being built; discarding it"
+            );
+            return made.ok();
+        };
+        match made {
+            Err(e) => {
+                self.mark_unavailable(arch_id, &pending.manifest, format!("{e:#}"));
+                None
+            }
+            Ok(adapter) => match manifest_difference(&pending.manifest, adapter.manifest()) {
+                Some(what) => {
+                    self.mark_unavailable(
+                        arch_id,
+                        &pending.manifest,
+                        format!(
+                            "manifest changed: {what} — run `vk umount {arch_id}` to retire it"
+                        ),
+                    );
+                    Some(adapter)
+                }
+                None => {
+                    self.budgets
+                        .insert(arch_id.into(), adapter.context_budget());
+                    self.adapters.insert(arch_id.into(), Arc::from(adapter));
+                    tracing::info!(arch_id = %arch_id, name = %pending.manifest.name, "arch ready");
+                    None
+                }
+            },
+        }
+    }
+
+    /// Build and install every `Starting` arch on this thread, now.
+    ///
+    /// For a caller that holds no mutex: [`RealKernel::open`], and tests. The
+    /// daemon must **not** use it — its kernel is behind a mutex it would have
+    /// to hold for the whole pass — and uses `pending_mounts` +
+    /// `install_arch` around its own lock instead.
+    pub fn start_arches_now(&mut self) {
+        let factory = self.adapter_factory();
+        for (id, spec) in self.pending_mounts() {
+            // The adapter this did not install, dropped here rather than left
+            // to fall inside `install_arch`: same rule, no lock is held.
+            drop(self.install_arch(&id, build_adapter(&factory, &spec)));
+        }
+    }
+
+    fn mark_unavailable(&mut self, id: &str, manifest: &ArchManifest, reason: String) {
+        tracing::warn!(
+            arch_id = %id,
+            name = %manifest.name,
+            "this arch could not be brought up and is unavailable: {reason}"
+        );
+        self.unavailable.insert(
+            id.into(),
+            UnavailableArch {
+                manifest: manifest.clone(),
+                reason,
+            },
+        );
+    }
+
     /// The boot sequence: verify the ledger chain, load the policies version,
     /// enumerate what this node has, and record that it started.
     ///
@@ -230,26 +996,87 @@ impl RealKernel {
     /// the tail cut off the newest segment would still "verify" — and the
     /// tail is where the latest STOP, approval or release lives.
     pub fn boot(&mut self) -> Result<BootReport, KernelError> {
-        if let HeadVerdict::Diverged { recorded, found } = &self.store.ledger_head {
-            tracing::warn!(
+        match &self.store.ledger_head {
+            HeadVerdict::Diverged { recorded, found } => tracing::warn!(
                 recorded_seq = recorded.seq,
                 recorded_hash = %recorded.hash,
                 found_seq = found.as_ref().map(|h| h.seq),
                 "the ledger on disk no longer contains the head this node last recorded: \
                  its tail was cut or rewritten"
-            );
+            ),
+            // The head is written on every append, so a record with no head
+            // recorded for it is a row somebody removed — the quiet half of
+            // cutting a tail (review Critical 1).
+            HeadVerdict::Missing { found } => tracing::warn!(
+                found_seq = found.seq,
+                "this node has a record and nothing saying where it ended: the recorded head \
+                 is gone. `vk fsck` says so; `vk fsck --rebase-head --force` re-records it"
+            ),
+            HeadVerdict::Unrecorded | HeadVerdict::Intact => {}
         }
+        let unreported = self.unreported_rebases()?;
         let report = BootReport {
             ledger_ok: self.ledger_holds(),
             ledger_len: self.store.ledger.len(),
             recovered_partial_line: self.recovered_partial_line(),
             arches: self.arches().into_iter().map(|(id, _)| id).collect(),
-            devices: self.devices.ids(),
+            unavailable_arches: self.unavailable.keys().cloned().collect(),
+            starting_arches: self.starting.keys().cloned().collect(),
+            devices: self.device_ids()?,
             stopped_scopes: self.stops.stopped_scopes(),
             policies_version: self.load_policies_version()?,
+            // Every rebase since the last boot that named one. Read here so
+            // the event commits to them; the watermark moves below, once
+            // that event is durable — ledger before the row, as everywhere
+            // else, so a failed append leaves them still to be reported.
+            fsck: unreported.iter().map(|(_, r)| r.clone()).collect(),
         };
         self.log("boot", now_ms(), &report)?;
+        if let Some((newest, _)) = unreported.last() {
+            self.store
+                .db
+                .kv_set(REBASE_REPORTED_THROUGH, newest)
+                .map_err(store_failed)?;
+        }
+        // After the `boot` event, so the record reads in the order things
+        // happened: this node came up, and then it found what the last one
+        // left half-done (SP1b review, M11).
+        self.recover_interrupted_steps(now_ms())?;
+        // No harness survives a restart (the Job Object dies with the daemon's
+        // handle), so every harness lease and workspace on disk is a leftover:
+        // swept here, so no stale token resolves and no projected plaintext
+        // lingers (SP1b Task 4 review, I4).
+        self.sweep_harness_state()?;
+        // And the rows past their retention (Task 10 group C). The daemon
+        // repeats this on its schedule for as long as it runs.
+        let swept = self.sweep_retention(now_ms())?;
+        if swept.usage_rows > 0 {
+            tracing::info!(
+                usage_rows = swept.usage_rows,
+                "swept usage rows older than the operational retention"
+            );
+        }
         Ok(report)
+    }
+
+    /// Remove what has outlived its retention (Task 10 group C): usage rows
+    /// older than [`USAGE_RETENTION_MS`], `--keep` harness workspaces older
+    /// than [`KEPT_WORKSPACE_TTL_MS`], and any directory under `harness/`
+    /// that no task accounts for. Never a live run's workspace or
+    /// configuration. Run at boot and, by the daemon, on a schedule; a
+    /// second sweep of the same moment removes nothing.
+    pub fn sweep_retention(&mut self, now_ms: u64) -> Result<RetentionSweep, KernelError> {
+        let cutoff = now_ms.saturating_sub(USAGE_RETENTION_MS);
+        let usage_rows = self
+            .store
+            .db
+            .delete_keys_below("usage", &format!("{cutoff:013}-"))
+            .map_err(store_failed)?;
+        let workspaces = self.sweep_kept_workspaces(now_ms)?;
+        Ok(RetentionSweep {
+            usage_rows,
+            workspaces,
+        })
     }
 
     /// Does the record hold? Both halves of the verdict `boot` reports, for
@@ -261,14 +1088,381 @@ impl RealKernel {
     /// long as it runs.
     pub fn ledger_holds(&self) -> bool {
         self.store.ledger.verify()
-            && !matches!(self.store.ledger_head, HeadVerdict::Diverged { .. })
+            && !matches!(
+                self.store.ledger_head,
+                HeadVerdict::Diverged { .. } | HeadVerdict::Missing { .. }
+            )
+    }
+
+    /// Ledger event for a daemon that decided to serve `report` anyway
+    /// (founder decision 2026-09-24). Kept separate from `boot` so `vk
+    /// dmesg` and an auditor can find, without replaying the whole chain,
+    /// every time this node's operator overrode a verdict that said not to
+    /// serve. `report` must be the value `boot` just returned — its own
+    /// `boot` event already committed to `report`'s hash, so naming that
+    /// same hash here lets the two events be tied together without either
+    /// trusting the other.
+    ///
+    /// Ledger before the in-memory flag, as `boot` itself: an append that
+    /// fails must leave nothing for `boot.info` or `vk status` to show.
+    ///
+    /// Callers: `vkd`, exactly on the path where it has already decided to
+    /// serve under `--force`; never when `report.ledger_ok` is true.
+    pub fn record_forced_boot(&mut self, report: &BootReport) -> Result<(), KernelError> {
+        let head_ok = !matches!(
+            self.store.ledger_head,
+            HeadVerdict::Diverged { .. } | HeadVerdict::Missing { .. }
+        );
+        let report_hash = hash_canonical(report);
+        self.log(
+            "boot.forced",
+            now_ms(),
+            &BootForcedRecord {
+                ledger_ok: report.ledger_ok,
+                head_ok,
+                ledger_len: report.ledger_len,
+                report_hash: &report_hash,
+            },
+        )?;
+        self.forced_boot = true;
+        Ok(())
+    }
+
+    /// Did this run serve under `--force`? Set only by `record_forced_boot`,
+    /// and only for as long as this process runs: `boot.info` and `vk
+    /// status` surface it as `forced`/`forced boot`.
+    pub fn forced_boot(&self) -> bool {
+        self.forced_boot
+    }
+
+    /// The whole store, verified: the four storage tiers
+    /// ([`vk_store::Store::fsck`]) plus the one only the kernel can check.
+    ///
+    /// `vk ledger verify` answers "does the chain recompute". This answers
+    /// "is this node's state the state it says it has": the chain, the
+    /// recorded head, every blob against its own address, every wrapped DEK
+    /// — and the **mounts**, because an arch whose spec has gone is an arch
+    /// the next boot cannot make again, and being told that at the restart
+    /// is being told it too late.
+    ///
+    /// Read-only, and it takes only `&self`: an operator can run it on a
+    /// store they are afraid of, with the node still serving.
+    pub fn fsck(&self) -> vk_store::FsckReport {
+        self.store.fsck().with([self.fsck_mounts()])
+    }
+
+    /// The kernel's own tier: every mounted arch can be made again.
+    ///
+    /// Two failures, both of them a node that will come up differently from
+    /// how it is now — an arch with a manifest and no spec (nothing to build
+    /// it from; `load_arches` marks it unavailable), and a spec whose
+    /// manifest has gone (a mount half-written, which `load_arches` sweeps).
+    fn fsck_mounts(&self) -> vk_store::FsckTier {
+        // A table that cannot be read fails the tier (final review I-3):
+        // swallowed into an empty list it read as a green `checked 0`.
+        //
+        // Either table unreadable and the tier reports the table, not a guess
+        // per row: without the specs "no mount spec" would be said of every
+        // arch, and without the manifests "half-written" of every spec (final
+        // re-review N-3).
+        let mut problems = Vec::new();
+        let manifests = self
+            .store
+            .db
+            .list_json::<ArchManifest>("arches")
+            .map_err(|e| problems.push(format!("the arches table cannot be read: {e:#}")))
+            .ok();
+        let specs = self
+            .store
+            .db
+            .list_json::<arch::MountSpec>("mounts")
+            .map_err(|e| problems.push(format!("the mounts table cannot be read: {e:#}")))
+            .ok();
+        let (Some(manifests), Some(specs)) = (manifests, specs) else {
+            return vk_store::FsckTier::new("mounts", 0, 0, problems);
+        };
+        let specs: BTreeMap<String, arch::MountSpec> = specs.into_iter().collect();
+        for (id, m) in &manifests {
+            match specs.get(id) {
+                None => problems.push(format!(
+                    "{id} ({}): no mount spec, so the next boot cannot make this arch again; \
+                     mount it again",
+                    m.name
+                )),
+                Some(spec) => {
+                    if let Err(e) = spec.validate() {
+                        problems.push(format!("{id} ({}): its mount spec is bad: {e:#}", m.name));
+                    }
+                }
+            }
+        }
+        let mut orphans = 0u64;
+        for id in specs.keys() {
+            if !manifests.iter().any(|(m, _)| m == id) {
+                orphans += 1;
+                problems.push(format!(
+                    "{id}: a mount spec with no arch beside it, left by a half-written mount"
+                ));
+            }
+        }
+        // Manifests **and** orphan specs: a store with two orphan specs and
+        // no manifests reported `checked 0 / failed 2`, which reads like a
+        // tier that did not run (review Minor 4). Everything this tier looked
+        // at is counted.
+        vk_store::FsckTier::new("mounts", manifests.len() as u64 + orphans, 0, problems)
+    }
+
+    /// Re-record the ledger head from the chain as it is on disk — the
+    /// recovery path after a **legitimate** restore (SP1b Task 8).
+    ///
+    /// The store refuses to tell a restored-from-backup record from a tail
+    /// somebody cut, and rightly: they are the same bytes. This is the human
+    /// saying which it was. The ceremony belongs to the caller — `vk fsck
+    /// --rebase-head --force`, a presence proof and the word `rebase` typed
+    /// out — and what this adds is the record of it: the operation is parked
+    /// for the next `boot` event's report, in `boot.forced`'s style and with
+    /// no new event kind, so an auditor reading the chain finds the override
+    /// without being told to look for it.
+    ///
+    /// Written rather than appended to the chain, because an append *now*
+    /// would land on the very chain whose head is in question, in the middle
+    /// of the one operation that is about to redefine where that chain ends.
+    ///
+    /// **Append-only** (review Important 1). Each rebase is its own row under
+    /// `ledger.head.rebase.<ts>`; nothing here overwrites a row and nothing
+    /// anywhere deletes one, so a second rebase cannot erase the first —
+    /// which was the whole gap, since the person who did the first one
+    /// already holds the presence the second one needs. The rows are the
+    /// history `boot.info`, `vk status` and `vk fsck` all read.
+    pub fn rebase_ledger_head(&mut self, at: u64) -> Result<FsckRebase, KernelError> {
+        let done = self.store.rebase_head().map_err(store_failed)?;
+        let rebase = FsckRebase {
+            rebased_from: done.from,
+            rebased_to: done.to,
+            at,
+        };
+        // `<ts>` zero-padded so the rows sort in the order they happened, and
+        // the kernel's own id counter behind it so two rebases in one
+        // millisecond are two rows rather than one overwriting the other.
+        self.counter += 1;
+        self.store
+            .db
+            .kv_set("counter", &self.counter.to_string())
+            .map_err(store_failed)?;
+        let key = format!("{REBASE_PREFIX}{at:013}-{:012}", self.counter);
+        self.store
+            .db
+            .kv_set(&key, &serde_json::to_string(&rebase).map_err(store_failed)?)
+            .map_err(store_failed)?;
+        tracing::warn!(
+            from_seq = rebase.rebased_from.as_ref().map(|h| h.seq),
+            to_seq = rebase.rebased_to.seq,
+            "the ledger head was re-recorded by hand; the next boot event names it, and \
+             `vk status` names it from now on"
+        );
+        Ok(rebase)
+    }
+
+    /// Every head rebase this node has ever had, oldest first.
+    ///
+    /// The readable surface the review asked for (Important 2): `boot.info`
+    /// carries it, so `vk status` marks a rebased node the way it marks a
+    /// forced one, and `vk fsck` prints it. Nothing clears it — an override
+    /// of the store's own refusal is not a thing that stops being true.
+    pub fn rebase_history(&self) -> Result<Vec<FsckRebase>, KernelError> {
+        Ok(self.rebase_rows()?.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// The rows, with their keys, so `boot` can say which it has reported.
+    /// The watermark lives under the same prefix and is not a row: excluded
+    /// by name, not left to a parse that happens to fail. Any other row under
+    /// the prefix that does not parse is damage to append-only evidence
+    /// (Ruling 34) and is reported as a Store error, never dropped (Task 10
+    /// review, Minor 9).
+    fn rebase_rows(&self) -> Result<Vec<(String, FsckRebase)>, KernelError> {
+        self.store
+            .db
+            .kv_list_prefix(REBASE_PREFIX)
+            .map_err(store_failed)?
+            .into_iter()
+            .filter(|(k, _)| k != REBASE_REPORTED_THROUGH)
+            .map(|(k, v)| {
+                serde_json::from_str::<FsckRebase>(&v)
+                    .map_err(|e| {
+                        store_failed(format!(
+                            "rebase evidence row {k} cannot be read: {e}. It is append-only \
+                             evidence of a head rebase: nothing repairs, skips or deletes it, \
+                             and --force does not help (boot reads it before it serves). \
+                             Keep this state directory as it is, and restore one copied \
+                             before the damage (README: \"A damaged rebase evidence row\")"
+                        ))
+                    })
+                    .map(|r| (k, r))
+            })
+            .collect()
+    }
+
+    /// The rebases no `boot` event has named yet — every one since the last
+    /// boot that reported any. A watermark rather than a delete: the rows
+    /// themselves are the history and are never removed.
+    fn unreported_rebases(&self) -> Result<Vec<(String, FsckRebase)>, KernelError> {
+        let through = self
+            .store
+            .db
+            .kv_get(REBASE_REPORTED_THROUGH)
+            .map_err(store_failed)?
+            .unwrap_or_default();
+        Ok(self
+            .rebase_rows()?
+            .into_iter()
+            .filter(|(k, _)| k.as_str() > through.as_str())
+            .collect())
+    }
+
+    /// The per-call usage rows this node has, as `ctx` may see them (SP1b
+    /// Task 8, ruling 8).
+    ///
+    /// **I2 in one rule**: a row naming a task is shown only to a caller who
+    /// could see that task, because "there is a task that spent 40 000 tokens
+    /// on the cloud arch" is a fact about a register, and the register's
+    /// label is what decides who may learn facts about it. A row naming no
+    /// task — an inference made outside one — carries nothing labelled and is
+    /// shown to everyone. Nothing here is register content: ids, counts, a
+    /// duration and a timestamp.
+    pub fn usage(&self, ctx: &Ctx, filter: &UsageFilter) -> Result<Vec<UsageRow>, KernelError> {
+        // A named task is resolved through the same read the rest of the
+        // kernel uses, so a task above this caller's clearance is "not found"
+        // rather than "no rows" — which would say it exists and was idle.
+        if let UsageFilter::Task(id) = filter {
+            self.task(ctx, id)?
+                .ok_or_else(|| KernelError::NotFound(id.clone()))?;
+        }
+        let visible: BTreeSet<String> = self.tasks(ctx)?.into_iter().map(|t| t.id).collect();
+        Ok(self
+            .store
+            .db
+            .list_json::<UsageRow>("usage")
+            .map_err(store_failed)?
+            .into_iter()
+            .map(|(_, row)| row)
+            .filter(|row| match &row.task_id {
+                None => true,
+                Some(id) => visible.contains(id),
+            })
+            .filter(|row| match filter {
+                UsageFilter::All => true,
+                UsageFilter::Task(id) => row.task_id.as_deref() == Some(id.as_str()),
+                UsageFilter::Arch(id) => &row.arch_id == id,
+            })
+            .collect())
+    }
+
+    /// The newest calls, as `ctx` may see them, and whether there are older
+    /// ones behind them.
+    ///
+    /// What `vk top --calls` reads. The bound is in the query (`LIMIT`), not
+    /// a truncation of the answer: the `usage` table grows for the life of a
+    /// node, and a screen must not get slower every day to print the same
+    /// two hundred lines (review Minor 2). `usage` — unbounded, and filtered
+    /// by task or arch — is the surface for a caller that wants them all.
+    ///
+    /// The same I2 filter as [`RealKernel::usage`], applied after the read:
+    /// a row naming a task this caller may not see is not a row it may read,
+    /// so the answer can come back shorter than `limit` even when there are
+    /// older rows.
+    pub fn usage_recent(
+        &self,
+        ctx: &Ctx,
+        limit: usize,
+    ) -> Result<(Vec<UsageRow>, bool), KernelError> {
+        let newest = self
+            .store
+            .db
+            .list_json_last::<UsageRow>("usage", limit)
+            .map_err(store_failed)?;
+        // Exactly `limit` back means the table may well hold more.
+        let more = newest.len() == limit;
+        let visible: BTreeSet<String> = self.tasks(ctx)?.into_iter().map(|t| t.id).collect();
+        Ok((
+            newest
+                .into_iter()
+                .map(|(_, row)| row)
+                .filter(|row| match &row.task_id {
+                    None => true,
+                    Some(id) => visible.contains(id),
+                })
+                .collect(),
+            more,
+        ))
+    }
+
+    /// One completed call, written down. Keyed `<ts>-<seq>`, both zero-padded,
+    /// so the table's own key order is the order the calls came back in and a
+    /// reader never has to sort.
+    ///
+    /// `seq` is this kernel's own id counter, the one `next_id` mints from:
+    /// one counter means one source of uniqueness, and two rows written in
+    /// the same millisecond still order and still do not collide. Ids skip
+    /// numbers as a result, which nothing depends on — an id has to be
+    /// unique, not consecutive.
+    fn record_usage(&mut self, row: &UsageRow) -> Result<(), KernelError> {
+        self.counter += 1;
+        self.store
+            .db
+            .kv_set("counter", &self.counter.to_string())
+            .map_err(store_failed)?;
+        let key = format!("{:013}-{:012}", row.ts_ms, self.counter);
+        self.store
+            .db
+            .put_json("usage", &key, row)
+            .map_err(store_failed)
+    }
+
+    /// Record what a harness run's Claude Code session spent (SP1b Task 8).
+    ///
+    /// A harness is not an arch — nothing mounts it and it has no manifest —
+    /// but its calls are Claude's and its money is the node's, so the spend
+    /// goes in the same place every other call's does, under
+    /// [`harness_arch_id`]. Without this, `vk top` would show a node whose
+    /// only real work went through a harness as having spent nothing.
+    pub fn record_harness_usage(&mut self, u: &HarnessUsage) -> Result<(), KernelError> {
+        let arch_id = harness_arch_id(u.name);
+        let measured = u32::try_from(u.tokens_in).unwrap_or(u32::MAX);
+        // The same counters an arch's calls bump, so `vk top`'s arch table
+        // has a row for the harness rather than a hole where its spend was.
+        // Measured throughout: these are the CLI's own counts, not an
+        // estimate this node made.
+        self.bump_stats(&arch_id, measured, Some(measured), u.cost_list_usd, false)?;
+        self.record_usage(&UsageRow {
+            arch_id,
+            task_id: Some(u.task_id.into()),
+            step_index: Some(u.step_index),
+            tokens_in: u.tokens_in,
+            tokens_in_measured: u.tokens_in,
+            tokens_out: u.tokens_out,
+            cost_list_usd: u.cost_list_usd.filter(|c| c.is_finite()),
+            duration_ms: u.duration_ms,
+            ts_ms: now_ms(),
+        })
+    }
+
+    /// The mount spec an arch was made from, for `arch.show`. `None` for an
+    /// arch this node has never mounted, and for one mounted before specs
+    /// were recorded; a row that cannot be read is a Store error, never "no
+    /// spec" (final review I-3).
+    pub fn mount_spec(&self, arch_id: &str) -> Result<Option<arch::MountSpec>, KernelError> {
+        self.store
+            .db
+            .get_json("mounts", arch_id)
+            .map_err(|e| store_failed(format!("the mount spec of {arch_id} cannot be read: {e:#}")))
     }
 
     /// The policy set this node runs under, as the store has it — `None` on a
     /// node that has never booted. Read-only, so a status call can report the
-    /// version without being the thing that decides it.
-    pub fn policies_version(&self) -> Option<String> {
-        self.store.db.kv_get(POLICIES_VERSION).ok().flatten()
+    /// version without being the thing that decides it. A store that cannot
+    /// answer is a Store error, not "never booted" (Ruling 43).
+    pub fn policies_version(&self) -> Result<Option<String>, KernelError> {
+        self.store.db.kv_get(POLICIES_VERSION).map_err(store_failed)
     }
 
     /// The boot step that loads it. SP1a has no policy engine, so the key is
@@ -303,48 +1497,233 @@ impl RealKernel {
         self.stops.stopped_scopes()
     }
 
-    /// Mount an adapter for its manifest's arch id, replacing the mock that
-    /// `load` built from the `arches` table.
+    /// Mount an adapter for its manifest's arch id (Ruling 13).
+    ///
+    /// Mounting the same arch twice is **idempotent**: the adapter already in
+    /// the table stays, nothing is written, nothing is appended, and the
+    /// outcome says `already_mounted`. That is not an optimisation. An adapter
+    /// can own something outside this process — the Ollama arch owns the
+    /// container it started — and dropping it is how that thing gets stopped,
+    /// so a plain `vk mount ollama` run twice used to stop the container out
+    /// from under the arch it had just re-mounted, under the kernel lock (SP1b
+    /// Task 1 re-review, Important). An arch that is already there and usable
+    /// is the answer to "mount this".
     ///
     /// The arch id hashes only `ArchIdentity`, so two manifests can agree on it
     /// and still disagree about clearance — the very field `i2_flow` consults.
     /// Letting the second silently win would relabel a mounted arch, so a
-    /// conflicting manifest is refused; re-mounting an identical one only swaps
-    /// the adapter (a real engine taking over from the mock) and is otherwise a
-    /// no-op.
-    pub fn mount(&mut self, adapter: Arc<dyn arch::ArchAdapter>) -> Result<String> {
+    /// conflicting manifest is refused.
+    ///
+    /// The spec is not optional (Task 1b review, Minor 4): a mount that
+    /// recorded nothing would come back `Unavailable` at the next restart,
+    /// which is the bug this whole task is about, one layer down.
+    pub fn mount(
+        &mut self,
+        adapter: Arc<dyn arch::ArchAdapter>,
+        spec: arch::MountSpec,
+    ) -> Result<MountOutcome> {
+        self.mount_with(adapter, spec, Remount::Keep)
+    }
+
+    /// The same with the spec the next boot re-creates this arch from, and for
+    /// a caller that knows the thing behind the arch has been re-made and that
+    /// the adapter in the table is therefore stale — `vk mount ollama
+    /// --recreate`, which replaces the container itself.
+    ///
+    /// An arch that is mounted but `Unavailable` — or still `Starting` — is
+    /// re-attached here: the placeholder is replaced by the adapter the caller
+    /// just built, and the outcome says `already_mounted: false`, because what
+    /// was there was not an arch anybody could use (Ruling 13 for the
+    /// unavailable case). A startup pass that finishes building that arch
+    /// afterwards finds it gone from `starting` and throws its result away.
+    pub fn mount_with(
+        &mut self,
+        adapter: Arc<dyn arch::ArchAdapter>,
+        spec: arch::MountSpec,
+        remount: Remount,
+    ) -> Result<MountOutcome> {
         let m = adapter.manifest().clone();
         m.validate()?;
+        spec.validate()?;
         let id = m.arch_id();
+        // The manifest an arch that is down or still coming up was mounted
+        // with is still the manifest of that id, and it is checked exactly as
+        // a live one is: an id whose clearance quietly widened is the same
+        // danger whether the engine behind it happens to be up.
+        let recorded = self
+            .unavailable
+            .get(&id)
+            .map(|down| &down.manifest)
+            .or_else(|| self.starting.get(&id).map(|p| &p.manifest));
+        if let Some(recorded) = recorded {
+            anyhow::ensure!(
+                *recorded == m,
+                "arch {id} is already mounted with a different manifest; unmount first"
+            );
+        }
         if let Some(mounted) = self.adapters.get(&id) {
             anyhow::ensure!(
                 *mounted.manifest() == m,
                 "arch {id} is already mounted with a different manifest; unmount first"
             );
+            // Keep what is there unless the caller says it is stale, or the
+            // entry itself is no longer usable. The spec is not rewritten
+            // either: the adapter that is mounted is the one the *stored* spec
+            // describes, and replacing the spec without replacing the adapter
+            // would make the next boot build something this one never ran.
+            if remount == Remount::Keep && self.mounted_arch_is_ready(&id) {
+                return Ok(MountOutcome {
+                    arch_id: id,
+                    replaced: None,
+                    already_mounted: true,
+                });
+            }
+            self.persist_mount(&id, &m, &spec)?;
             self.budgets.insert(id.clone(), adapter.context_budget());
-            self.adapters.insert(id.clone(), adapter);
-            return Ok(id);
+            // The replaced adapter leaves by the return value, never by a
+            // dropped temporary: dropping it here would run its `Drop` — a
+            // `docker stop` for the Ollama arch — with the kernel mutex held.
+            let replaced = self.adapters.insert(id.clone(), adapter);
+            return Ok(MountOutcome {
+                arch_id: id,
+                replaced,
+                already_mounted: true,
+            });
         }
-        self.store.db.put_json("arches", &id, &m)?;
+        self.persist_mount(&id, &m, &spec)?;
+        // A placeholder is not an adapter, so there is nothing to hand back
+        // and nothing to drop: an `Unavailable` entry, or one still waiting
+        // for its adapter, is a manifest and a spec, and it goes out here.
+        self.unavailable.remove(&id);
+        self.starting.remove(&id);
         self.budgets.insert(id.clone(), adapter.context_budget());
         self.adapters.insert(id.clone(), adapter);
         self.log("arch.mounted", now_ms(), &id)?;
-        Ok(id)
+        Ok(MountOutcome {
+            arch_id: id,
+            replaced: None,
+            already_mounted: false,
+        })
     }
 
-    pub fn unmount(&mut self, arch_id: &str) -> Result<()> {
-        self.adapters.remove(arch_id);
+    /// The manifest and the spec, together or not at all.
+    ///
+    /// One transaction because they are two halves of one fact: a manifest
+    /// whose spec did not land is an arch the next boot lists as unavailable
+    /// although its mount succeeded, and a spec whose manifest did not land is
+    /// a row for an arch that is not there.
+    fn persist_mount(
+        &self,
+        id: &str,
+        manifest: &ArchManifest,
+        spec: &arch::MountSpec,
+    ) -> Result<()> {
+        self.store.db.transaction(|| {
+            self.store.db.put_json("arches", id, manifest)?;
+            self.store.db.put_json("mounts", id, spec)
+        })
+    }
+
+    /// Is the adapter already mounted under `arch_id` still usable?
+    ///
+    /// The Ready half of the state (Ruling 14): an arch whose engine has gone
+    /// away is held in `unavailable` and never in `adapters`, so an adapter in
+    /// the table is one the factory made and checked. A re-mount of an
+    /// unavailable arch therefore never takes the idempotent branch — there is
+    /// no adapter there to keep.
+    fn mounted_arch_is_ready(&self, arch_id: &str) -> bool {
+        self.adapters.contains_key(arch_id)
+    }
+
+    /// Unmount an arch, and hand the caller the adapter that was removed.
+    ///
+    /// The adapter comes back rather than being dropped here because dropping
+    /// one can be slow: the Ollama arch stops the container it started, which
+    /// is a `docker stop` of ten seconds or more. This runs under the kernel
+    /// mutex, which is the one thing that must never be held across a slow
+    /// external call, so the daemon releases the lock and *then* drops what
+    /// this returned (SP1b Task 1 review, Minor 10). A caller that lets the
+    /// value fall here gets the old behaviour, which is why it is
+    /// `#[must_use]`-shaped: `Option` already is.
+    ///
+    /// Unmounting an `Unavailable` arch is how an operator clears one whose
+    /// runtime has changed for good: the placeholder, the manifest and the
+    /// mount spec all go, so the next boot has nothing to try to re-create.
+    ///
+    /// The durable delete happens **before** the in-memory tables are touched
+    /// (Task 1b review, Minor 6): a delete that fails used to leave the arch
+    /// gone from this process and still on disk, with no `arch.unmounted`
+    /// event — so it came back at the next boot and the operator was never
+    /// told the unmount had not taken.
+    pub fn unmount(&mut self, arch_id: &str) -> Result<Option<Arc<dyn arch::ArchAdapter>>> {
+        self.store.db.transaction(|| {
+            self.store.db.delete("arches", arch_id)?;
+            self.store.db.delete("mounts", arch_id)
+        })?;
+        let removed = self.adapters.remove(arch_id);
+        self.unavailable.remove(arch_id);
+        self.starting.remove(arch_id);
         self.budgets.remove(arch_id);
-        self.store.db.delete("arches", arch_id)?;
         self.log("arch.unmounted", now_ms(), &arch_id)?;
-        Ok(())
+        Ok(removed)
     }
 
+    /// Every arch this node has mounted, usable or not.
+    ///
+    /// Unavailable ones are in here on purpose (Ruling 14): an arch left out
+    /// of the listing is one nobody goes and fixes, and the id is still
+    /// mounted — a task may name it, and `vk umount` is how it goes away. Ask
+    /// [`RealKernel::arch_states`] which is which.
     pub fn arches(&self) -> Vec<(String, ArchManifest)> {
-        self.adapters
-            .iter()
-            .map(|(k, a)| (k.clone(), a.manifest().clone()))
+        self.arch_states()
+            .into_iter()
+            .map(|(id, m, _)| (id, m))
             .collect()
+    }
+
+    /// The same, each with its state: what `arch.ls`, `/arches`, `top` and the
+    /// boot report all print.
+    pub fn arch_states(&self) -> Vec<(String, ArchManifest, ArchState)> {
+        let ready = self
+            .adapters
+            .iter()
+            .map(|(id, a)| (id.clone(), (a.manifest().clone(), ArchState::Ready)));
+        // The manifest of an arch still coming up is the stored one, which is
+        // the one it must come back as — so a listing during startup shows
+        // what the operator mounted, not a guess.
+        let coming = self
+            .starting
+            .iter()
+            .map(|(id, p)| (id.clone(), (p.manifest.clone(), ArchState::Starting)));
+        let down = self.unavailable.iter().map(|(id, u)| {
+            (
+                id.clone(),
+                (u.manifest.clone(), ArchState::Unavailable(u.reason.clone())),
+            )
+        });
+        // Through a `BTreeMap` rather than chained: sorted sequences
+        // concatenated are not one sorted sequence, and every caller of this
+        // prints it in order.
+        ready
+            .chain(coming)
+            .chain(down)
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(id, (m, state))| (id, m, state))
+            .collect()
+    }
+
+    /// One arch's state; `None` for an id this node has never mounted.
+    pub fn arch_state(&self, arch_id: &str) -> Option<ArchState> {
+        if self.adapters.contains_key(arch_id) {
+            return Some(ArchState::Ready);
+        }
+        if self.starting.contains_key(arch_id) {
+            return Some(ArchState::Starting);
+        }
+        self.unavailable
+            .get(arch_id)
+            .map(|u| ArchState::Unavailable(u.reason.clone()))
     }
 
     pub fn store(&self) -> &Store {
@@ -353,6 +1732,20 @@ impl RealKernel {
 
     pub fn devices(&self) -> &DeviceRegistry {
         &self.devices
+    }
+
+    /// Every enrolled device, sorted: the device keys the registry holds and
+    /// the passkeys beside them. What the boot report and `boot.info` count —
+    /// a passkey is a device that speaks for a human, whatever verifies it.
+    ///
+    /// A `devices` row that cannot be read is a Store error, not a device
+    /// quietly left out of the count (final review I-3).
+    pub fn device_ids(&self) -> Result<Vec<String>, KernelError> {
+        let mut ids = self.devices.ids();
+        ids.extend(self.passkeys()?.into_iter().map(|p| p.device_id));
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 
     /// Enrol a human device. The `KernelTestHooks` hook of the same name cannot
@@ -371,12 +1764,366 @@ impl RealKernel {
                 &DeviceRow {
                     vk_hex: hex::encode(vk),
                     trust_class: "full".into(),
+                    passkey: None,
+                    enrolled_ms: now_ms(),
                 },
             )
             .map_err(store_failed)?;
         self.devices.register(device_id.into(), vk);
         self.log("device.enrolled", now_ms(), &device_id)?;
         Ok(())
+    }
+
+    /// Enrol a passkey as device `passkey:<credential id>` (SP1b Task 5).
+    ///
+    /// In-process only, never a syscall: the enrolment ceremony is `vk-web`'s
+    /// registration flow, whose `finish` verified the attestation with
+    /// `webauthn-rs` before it calls this. `credential` is that verifier's
+    /// `Passkey`, serialised, and the kernel never looks inside it — it holds
+    /// it for the verifier the way it holds a verifying key for the registry.
+    /// A second enrolment under an id already there is refused as an I1
+    /// matter, exactly as a different key for the node device is: a device id
+    /// names one credential for good.
+    pub fn enroll_passkey(
+        &mut self,
+        device_id: &str,
+        credential: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<(), KernelError> {
+        if !device_id.starts_with(PASSKEY_DEVICE_PREFIX)
+            || device_id.len() == PASSKEY_DEVICE_PREFIX.len()
+        {
+            return Err(KernelError::I1(format!(
+                "a passkey's device id is `{PASSKEY_DEVICE_PREFIX}<credential id>`, not {device_id:?}"
+            )));
+        }
+        let existing: Option<DeviceRow> = self
+            .store
+            .db
+            .get_json("devices", device_id)
+            .map_err(store_failed)?;
+        if existing.is_some() {
+            return Err(KernelError::I1(format!(
+                "device {device_id} is already enrolled"
+            )));
+        }
+        self.store
+            .db
+            .put_json(
+                "devices",
+                device_id,
+                &DeviceRow {
+                    vk_hex: String::new(),
+                    trust_class: PASSKEY_TRUST_CLASS.into(),
+                    passkey: Some(credential),
+                    enrolled_ms: now_ms,
+                },
+            )
+            .map_err(store_failed)?;
+        self.log("device.enrolled", now_ms, &device_id)
+    }
+
+    /// Replace an enrolled passkey's credential with what the verifier holds
+    /// after an assertion — its signature counter moved. The device id, its
+    /// trust class and its enrolment time stay; nothing is appended, because
+    /// nothing was enrolled. An id that is not an enrolled passkey is refused.
+    pub fn update_passkey(
+        &mut self,
+        device_id: &str,
+        credential: serde_json::Value,
+    ) -> Result<(), KernelError> {
+        let row: DeviceRow = self
+            .store
+            .db
+            .get_json("devices", device_id)
+            .map_err(store_failed)?
+            .filter(|r: &DeviceRow| r.trust_class == PASSKEY_TRUST_CLASS)
+            .ok_or_else(|| KernelError::NotFound(format!("passkey {device_id}")))?;
+        self.store
+            .db
+            .put_json(
+                "devices",
+                device_id,
+                &DeviceRow {
+                    passkey: Some(credential),
+                    ..row
+                },
+            )
+            .map_err(store_failed)
+    }
+
+    /// Every enrolled passkey, sorted by device id: what `vk-web`'s verifier
+    /// loads before an authentication and what `vk passkey ls` prints.
+    pub fn passkeys(&self) -> Result<Vec<PasskeyRow>, KernelError> {
+        Ok(self
+            .store
+            .db
+            .list_json::<DeviceRow>("devices")
+            .map_err(store_failed)?
+            .into_iter()
+            .filter(|(_, row)| row.trust_class == PASSKEY_TRUST_CLASS)
+            .filter_map(|(device_id, row)| {
+                row.passkey.map(|credential| PasskeyRow {
+                    device_id,
+                    credential,
+                    enrolled_ms: row.enrolled_ms,
+                })
+            })
+            .collect())
+    }
+
+    /// Mint the challenge a human approval of `task_id` must answer (SP1b
+    /// Task 5, invariant I1): the task's current approval subject as the
+    /// action digest, `task:<id>` as the resource, a random nonce and a short
+    /// expiry. The only way a `Challenge` a human signs comes into being. A
+    /// task that is not waiting at its `Approve` step gets no challenge
+    /// (`approval_subject` refuses), so nothing can be signed for a subject
+    /// the scheduler would not ask about.
+    pub fn mint_approval_challenge(
+        &mut self,
+        ctx: &Ctx,
+        task_id: &str,
+    ) -> Result<Challenge, KernelError> {
+        self.mint_approval_challenge_with_ttl(ctx, task_id, APPROVAL_CHALLENGE_TTL_MS)
+    }
+
+    /// The same with an explicit lifetime — the default for every caller but a
+    /// test that needs a challenge to expire while it watches.
+    pub fn mint_approval_challenge_with_ttl(
+        &mut self,
+        ctx: &Ctx,
+        task_id: &str,
+        ttl_ms: u64,
+    ) -> Result<Challenge, KernelError> {
+        let nonce = {
+            use base64::Engine;
+            let bytes: [u8; 32] = rand::random();
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        };
+        self.mint(ctx, task_id, nonce, ttl_ms)
+    }
+
+    /// Mint with a nonce the caller made — the passkey path (SP1b Task 5 fix
+    /// round 1, review Important 1). In-process only, never a syscall: the
+    /// caller is `vk-web`, and the nonce is the WebAuthn challenge its
+    /// verifier just generated (32 random bytes, base64url), so the value the
+    /// authenticator signs inside `clientDataJSON` **is** the minted
+    /// challenge's nonce — one value, made by the verifier, bound here to the
+    /// task's subject, resource and expiry, spent here on first use. A nonce
+    /// that is short, or already open, is refused: the map is keyed by it.
+    pub fn mint_approval_challenge_with_nonce(
+        &mut self,
+        ctx: &Ctx,
+        task_id: &str,
+        nonce: String,
+    ) -> Result<Challenge, KernelError> {
+        if nonce.len() < 32 {
+            return Err(KernelError::I1(
+                "an approval nonce is at least 32 characters of base64url".into(),
+            ));
+        }
+        if self.approval_challenges.contains_key(&nonce) {
+            return Err(KernelError::I1(
+                "an approval challenge with this nonce is already open".into(),
+            ));
+        }
+        self.mint(ctx, task_id, nonce, APPROVAL_CHALLENGE_TTL_MS)
+    }
+
+    /// Both mints: the subject from the scheduler's rule (a task that is not
+    /// waiting gets nothing), the resource, the expiry, the bounded map.
+    fn mint(
+        &mut self,
+        ctx: &Ctx,
+        task_id: &str,
+        nonce: String,
+        ttl_ms: u64,
+    ) -> Result<Challenge, KernelError> {
+        let subject = self.approval_subject(ctx, task_id)?;
+        let now = ctx.now_ms;
+        self.approval_challenges
+            .retain(|_, p| p.challenge.expires_at_ms > now);
+        if self.approval_challenges.len() >= MAX_APPROVAL_CHALLENGES {
+            if let Some(soonest) = self
+                .approval_challenges
+                .iter()
+                .min_by_key(|(_, p)| p.challenge.expires_at_ms)
+                .map(|(nonce, _)| nonce.clone())
+            {
+                self.approval_challenges.remove(&soonest);
+            }
+        }
+        let challenge = Challenge {
+            resource: format!("task:{task_id}"),
+            action_digest: subject,
+            nonce: nonce.clone(),
+            expires_at_ms: now.saturating_add(ttl_ms),
+        };
+        self.approval_challenges.insert(
+            nonce,
+            PendingApproval {
+                task_id: task_id.into(),
+                challenge: challenge.clone(),
+            },
+        );
+        Ok(challenge)
+    }
+
+    /// The challenges minted and not yet spent or expired, oldest expiry
+    /// first. A read surface for a client that wants to know whether a
+    /// ceremony is under way; it hands out nothing a client could not have
+    /// asked to be minted.
+    pub fn pending_approvals(&self, now_ms: u64) -> Vec<PendingApproval> {
+        let mut open: Vec<PendingApproval> = self
+            .approval_challenges
+            .values()
+            .filter(|p| p.challenge.expires_at_ms > now_ms)
+            .cloned()
+            .collect();
+        open.sort_by_key(|p| p.challenge.expires_at_ms);
+        open
+    }
+
+    /// Spend a minted challenge: the one presented must be, field for field,
+    /// one this kernel minted, not yet spent and not yet expired. It leaves
+    /// the map here, before anything else about the approval is looked at,
+    /// whatever the verdict — a nonce presented is a nonce spent, as for
+    /// presence nonces in the transport, so a challenge that fails a check
+    /// cannot be shown again to a check it would pass. Both ceremonies go
+    /// through this: the node-key path from `approve`, the passkey path from
+    /// `record_verified_human_approval`. Returns the task the challenge was
+    /// minted for.
+    fn spend_approval_challenge(
+        &mut self,
+        presented: &Challenge,
+        now_ms: u64,
+    ) -> Result<String, KernelError> {
+        let minted = self
+            .approval_challenges
+            .remove(&presented.nonce)
+            .ok_or_else(|| {
+                KernelError::I1(
+                    "approval challenge was not minted by this node, or was already spent".into(),
+                )
+            })?;
+        if minted.challenge != *presented {
+            return Err(KernelError::I1(
+                "approval challenge is not the one this node minted for that nonce".into(),
+            ));
+        }
+        if now_ms >= presented.expires_at_ms {
+            return Err(KernelError::I1("approval challenge expired".into()));
+        }
+        Ok(minted.task_id)
+    }
+
+    /// Record a human approval whose ceremony has already been verified by
+    /// this process — the passkey path (SP1b Task 5).
+    ///
+    /// **I1 argument.** A human approval reaches the record by exactly two
+    /// doors. One is the `approve` syscall, where the approver must be the
+    /// human principal the transport derived from an enrolled ed25519 device
+    /// key's presence proof, and the signature must verify against that key.
+    /// The other is this method, which no syscall reaches: it is called only
+    /// in-process, by `vk-web`'s `POST /approve/<task>/finish`, after
+    /// `webauthn-rs` has verified the assertion against a passkey that was
+    /// enrolled under an existing human ceremony — so the *approver* here is the passkey
+    /// the verifier identified, never a principal a client asserted, and the
+    /// *challenge* is checked here to be one this kernel minted, unspent and
+    /// unexpired, never one a client supplied. What a client sends over the
+    /// loopback page is an assertion; what becomes an approval is decided on
+    /// this side of it. `proof` names the ceremony on the ledger, and
+    /// `assertion` is what the authenticator signed — kept beside the
+    /// approval so the recorded signature can be checked again by anyone
+    /// with the record and the enrolled public key (review Important 1).
+    pub fn record_verified_human_approval(
+        &mut self,
+        now_ms: u64,
+        approval: Approval,
+        proof: &str,
+        assertion: Option<AssertionRecord>,
+    ) -> Result<(), KernelError> {
+        if approval.kind != ApprovalKind::Human {
+            return Err(KernelError::I1(
+                "a verified human approval is of kind human".into(),
+            ));
+        }
+        if !approval.approver.is_human() {
+            return Err(KernelError::I1(
+                "a verified human approval names a human device".into(),
+            ));
+        }
+        let challenge = approval
+            .challenge
+            .as_ref()
+            .ok_or_else(|| KernelError::I1("a human approval answers a challenge".into()))?;
+        if approval
+            .signature_hex
+            .as_deref()
+            .is_none_or(|s| s.is_empty())
+        {
+            return Err(KernelError::I1(
+                "a human approval carries the assertion's signature".into(),
+            ));
+        }
+        if challenge.action_digest != approval.subject_hash {
+            return Err(KernelError::I1(
+                "approval subject does not match the challenge's action".into(),
+            ));
+        }
+        self.spend_approval_challenge(challenge, now_ms)?;
+        self.record_approval(now_ms, &approval, proof, assertion.as_ref())
+    }
+
+    /// The row key an approval and its assertion share.
+    fn approval_key(approval: &Approval) -> String {
+        format!("{}:{}", approval.subject_hash, hash_canonical(approval))
+    }
+
+    /// The approval onto the record, ledger first: an approval that is stored
+    /// but reported as failed would still satisfy a later promote's
+    /// human-approval gate and the scheduler's waiting step. The approval row
+    /// and its assertion row land together or not at all.
+    fn record_approval(
+        &mut self,
+        now_ms: u64,
+        approval: &Approval,
+        proof: &str,
+        assertion: Option<&AssertionRecord>,
+    ) -> Result<(), KernelError> {
+        let key = Self::approval_key(approval);
+        self.log(
+            "approval.recorded",
+            now_ms,
+            &ApprovalRecord {
+                approval,
+                proof,
+                assertion,
+            },
+        )?;
+        self.store
+            .db
+            .transaction(|| {
+                self.store.db.put_json("approvals", &key, approval)?;
+                if let Some(a) = assertion {
+                    self.store.db.put_json("assertions", &key, a)?;
+                }
+                Ok(())
+            })
+            .map_err(store_failed)
+    }
+
+    /// What the authenticator signed for `approval`, if it was a passkey
+    /// approval: what `vk`'s auditor, or a test, re-verifies the recorded
+    /// signature against.
+    pub fn assertion_for(
+        &self,
+        approval: &Approval,
+    ) -> Result<Option<AssertionRecord>, KernelError> {
+        self.store
+            .db
+            .get_json("assertions", &Self::approval_key(approval))
+            .map_err(store_failed)
     }
 
     /// Enrol the node's own device key as `node:<node_id>`, trust class `full`.
@@ -460,27 +2207,126 @@ impl RealKernel {
     }
 
     pub fn read_artefact(&self, ctx: &Ctx, hash: &str) -> Result<Vec<u8>, KernelError> {
-        let env = self
-            .store
-            .blobs
-            .envelope(hash)
-            .map_err(|e| KernelError::NotFound(e.to_string()))?;
+        let env = self.store.blobs.envelope(hash).map_err(blob_failed)?;
         if !env.label.flows_to(&ctx.clearance) {
             return Err(KernelError::I2(format!(
                 "artefact {hash} exceeds caller clearance"
             )));
         }
+        self.store.blobs.get(hash).map_err(blob_failed)
+    }
+
+    /// The label an artefact carries, or `None` when it is not there. Read for
+    /// the workspace projection's record (`vk_harness::ProjectionRecord`), which
+    /// names the class of data admitted to a harness. An envelope that is there
+    /// and cannot be read is a Store error, not an absent artefact (Ruling 43).
+    pub fn artefact_label(&self, hash: &str) -> Result<Option<Label>, KernelError> {
+        match self.store.blobs.envelope(hash).map_err(blob_failed) {
+            Ok(env) => Ok(Some(env.label)),
+            Err(KernelError::NotFound(_)) => Ok(None),
+            Err(damaged) => Err(damaged),
+        }
+    }
+
+    /// Where a task's harness workspace lives: `<state_dir>/harness/<task_id>`,
+    /// the label-projected directory the harness is launched in (`0700` on Unix).
+    pub fn harness_workspace_dir(&self, task_id: &str) -> PathBuf {
+        self.store.state_dir.join("harness").join(task_id)
+    }
+
+    /// Where a run's `mcp.json` (with the lease token) and `settings.json` (the
+    /// permission fence) are written: `<state_dir>/harness/<task_id>.mcp`,
+    /// **outside** the workspace, so no allow rule reaches them and the fence
+    /// denies them by name (Ruling 19).
+    pub fn harness_config_dir(&self, task_id: &str) -> PathBuf {
         self.store
-            .blobs
-            .get(hash)
-            .map_err(|e| match e.downcast_ref::<StorageError>() {
-                Some(missing) => KernelError::NotFound(missing.to_string()),
-                // The store has bytes at this address and they are not the
-                // ones the address names: a swapped, restored or altered
-                // blob. That is a store that cannot be trusted for this
-                // artefact, not an artefact that is not there.
-                None => KernelError::Store(e.to_string()),
-            })
+            .state_dir
+            .join("harness")
+            .join(format!("{task_id}.mcp"))
+    }
+
+    /// The map key a token is looked up by: its SHA-256, so the token itself
+    /// is never held anywhere but in the run's `mcp.json`.
+    fn harness_token_key(token: &str) -> String {
+        vk_contracts::hash_bytes(token.as_bytes())
+    }
+
+    /// Mint a run's lease token: 32 random bytes, base64url (Ruling 21.2). A
+    /// secret, returned once to the launcher and hashed into the token map.
+    fn mint_harness_token(&mut self, lease_id: &str, task_id: &str) -> String {
+        use base64::Engine;
+        let bytes: [u8; 32] = rand::random();
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        self.harness_tokens.insert(
+            Self::harness_token_key(&token),
+            HarnessTokenState {
+                lease_id: lease_id.into(),
+                task_id: task_id.into(),
+                bytes_attached: 0,
+                oversize: None,
+            },
+        );
+        token
+    }
+
+    /// Forget a run's token, so it stops resolving at once (Ruling 21.4).
+    fn revoke_harness_token(&mut self, token: &str) {
+        self.harness_tokens.remove(&Self::harness_token_key(token));
+    }
+
+    /// Is a harness run live for this task right now?
+    pub fn harness_running(&self, task_id: &str) -> bool {
+        self.harness_tokens.values().any(|s| s.task_id == task_id)
+    }
+
+    /// The harness session a lease token names (SP1b Task 4).
+    ///
+    /// The token is the secret a run was launched with; possessing it is the
+    /// capability that lets `vk-mcp` act as the harness. This resolves it — by
+    /// its hash, through the token map — to the machine principal it stands for
+    /// (`lease_id` = the lease id, never the token) at the harness clearance
+    /// (Business, no third-party), never the caller's own, and to the task and
+    /// register it may touch. An unknown, revoked or expired token is refused as
+    /// an I1 violation (the transport maps that to `E_INVARIANT`); no presence
+    /// proof is ever accepted for a `harness.*` call, because a lease is a
+    /// machine capability, not a human's presence.
+    pub fn harness_session(&self, token: &str, now_ms: u64) -> Result<HarnessSession, KernelError> {
+        let state = self
+            .harness_tokens
+            .get(&Self::harness_token_key(token))
+            .ok_or_else(|| KernelError::I1("unknown harness token".into()))?;
+        let lease: Lease = self
+            .store
+            .db
+            .get_json("leases", &state.lease_id)
+            .map_err(store_failed)?
+            .ok_or_else(|| KernelError::I1("harness token's lease is gone".into()))?;
+        if lease.expired(now_ms) {
+            return Err(KernelError::I1("expired harness token".into()));
+        }
+        if lease.resource != format!("harness:{}", state.task_id) {
+            return Err(KernelError::I1("token is not a harness lease".into()));
+        }
+        let task: crate::tasks::Task = self
+            .store
+            .db
+            .get_json("tasks", &state.task_id)
+            .map_err(store_failed)?
+            .ok_or_else(|| KernelError::NotFound(state.task_id.clone()))?;
+        let ctx = Ctx {
+            principal: Principal::Machine {
+                node_id: self.node_id.clone(),
+                lease_id: state.lease_id.clone(),
+            },
+            clearance: vk_harness::harness_clearance(),
+            partition: lease.partition.clone(),
+            now_ms,
+        };
+        Ok(HarnessSession {
+            ctx,
+            task_id: state.task_id.clone(),
+            register: task.register,
+        })
     }
 
     fn log(
@@ -489,6 +2335,19 @@ impl RealKernel {
         wall_ms: u64,
         payload: &impl serde::Serialize,
     ) -> Result<(), KernelError> {
+        // The sole choke point every kernel-originated event passes through
+        // (review finding, Task 0 fix-wave): a kind outside the contract's
+        // list is refused here, before the clock advances or anything is
+        // appended, rather than being silently hashed into the permanent
+        // record. `Ledger::append` itself stays free-form — it is shared
+        // with the stub and a node must still be able to *read* a kind a
+        // newer version minted — this gate is only on what this kernel
+        // itself will originate.
+        if !is_allowed_kind(kind) {
+            return Err(KernelError::Store(format!(
+                "ledger kind not allowed: {kind}"
+            )));
+        }
         let hlc = self.clock.now(wall_ms);
         // Through the store, not the ledger tier alone: the store records the
         // new head beside the event, which is what lets the next boot tell a
@@ -523,11 +2382,20 @@ impl RealKernel {
             .map_err(store_failed)
     }
 
-    /// Accumulate the per-arch counters a later cost/quota task reads back.
+    /// Accumulate the per-arch counters `vk top` reads back — and, for an arch
+    /// that measures its own calls, the only place those measurements outlive
+    /// the call until per-call usage rows exist (SP1b rulings 7 and 8).
+    ///
+    /// `measured` is `None` for an arch that reports no usage; `tokens_in` is
+    /// then the estimate and only the total moves. When it is `Some`, the
+    /// measurement is what both totals take, so `tokens_in_measured` is the
+    /// part of `tokens_in` that is a fact rather than a heuristic.
     fn bump_stats(
         &self,
         arch_id: &str,
         tokens_in: u32,
+        measured: Option<u32>,
+        cost_list_usd: Option<f64>,
         projected: bool,
     ) -> Result<(), KernelError> {
         let key = format!("stats:{arch_id}");
@@ -537,9 +2405,51 @@ impl RealKernel {
         };
         stats.calls += 1;
         stats.tokens_in += u64::from(tokens_in);
+        stats.tokens_in_measured += u64::from(measured.unwrap_or(0));
+        // A cost that is not a finite number is not a cost: adding it would
+        // turn the arch's running total into a NaN nothing can read back.
+        if let Some(cost) = cost_list_usd.filter(|c| c.is_finite()) {
+            stats.cost_list_usd += cost;
+        }
         stats.projected += u64::from(projected);
         let json = serde_json::to_string(&stats).map_err(store_failed)?;
         self.store.db.kv_set(&key, &json).map_err(store_failed)
+    }
+}
+
+/// Who a harness lease token is, and what it may act on: the machine principal
+/// at the harness clearance, plus the task and register the lease is for. What
+/// [`RealKernel::harness_session`] hands the transport for every `harness.*`
+/// call.
+pub struct HarnessSession {
+    pub ctx: Ctx,
+    pub task_id: String,
+    pub register: RegisterId,
+}
+
+/// The kernel as the workspace projection sees it (SP1b Task 4). `vk-harness`
+/// defines this trait so it need not depend on the kernel; the kernel's own
+/// read paths back it, and the projection's log rides `infer.projected` — the
+/// existing "an object was projected" kind, no new event kind.
+impl vk_harness::Host for RealKernel {
+    fn read_register(&mut self, ctx: &Ctx, reg: &RegisterId) -> Result<Register, KernelError> {
+        <Self as vk_contracts::syscalls::Kernel>::read_register(self, ctx, reg)
+    }
+
+    fn read_artefact(&self, ctx: &Ctx, hash: &str) -> Result<Vec<u8>, KernelError> {
+        RealKernel::read_artefact(self, ctx, hash)
+    }
+
+    fn artefact_label(&self, hash: &str) -> std::result::Result<Option<Label>, KernelError> {
+        RealKernel::artefact_label(self, hash)
+    }
+
+    fn log_projection(
+        &mut self,
+        now_ms: u64,
+        rec: &vk_harness::ProjectionRecord,
+    ) -> Result<(), KernelError> {
+        self.log("infer.projected", now_ms, rec)
     }
 }
 
@@ -594,7 +2504,34 @@ impl Kernel for RealKernel {
         Ok(reg)
     }
 
-    fn write_register(&mut self, ctx: &Ctx, reg: Register) -> Result<(), KernelError> {
+    fn write_register(&mut self, ctx: &Ctx, mut reg: Register) -> Result<(), KernelError> {
+        // An in-process caller is held to the rule a syscall would be (SP1a
+        // review M1): the stored label joins the written one, so a write
+        // never lowers a label; the register stays its task's; and a
+        // register the caller could not read is not one it may overwrite.
+        // Over the pipe no method writes a register wholesale — the harness
+        // verbs read it first and change one field — so this is the whole of
+        // the rule, in the one place a register is written.
+        if let Some(existing) = self
+            .store
+            .db
+            .get_json::<Register>("registers", &reg.id.0)
+            .map_err(store_failed)?
+        {
+            if !existing.label.flows_to(&ctx.clearance) {
+                return Err(KernelError::I2(format!(
+                    "register {} exceeds caller clearance",
+                    reg.id.0
+                )));
+            }
+            if existing.task_id != reg.task_id {
+                return Err(KernelError::I3(format!(
+                    "register {} belongs to task {}; a write cannot move it to task {}",
+                    reg.id.0, existing.task_id, reg.task_id
+                )));
+            }
+            reg.label = existing.label.join(&reg.label);
+        }
         self.store
             .db
             .put_json("registers", &reg.id.0, &reg)
@@ -609,11 +2546,23 @@ impl Kernel for RealKernel {
         capability: Capability,
         reg_id: &RegisterId,
     ) -> Result<InferOutcome, KernelError> {
-        let adapter = self
-            .adapters
-            .get(arch_id)
-            .cloned()
-            .ok_or_else(|| KernelError::NotFound(arch_id.into()))?;
+        // Before the register is read and before anything is appended: an arch
+        // that cannot run is refused by name, with the reason `load` recorded,
+        // and no `infer` event is written — an inference that never left this
+        // node must leave no trace of having been attempted (Ruling 14). It is
+        // never quietly served by a mock, which is what this used to be.
+        let adapter = match self.adapters.get(arch_id).cloned() {
+            Some(adapter) => adapter,
+            None if self.starting.contains_key(arch_id) => {
+                return Err(KernelError::ArchStarting(arch_id.into()))
+            }
+            None => {
+                return Err(match self.unavailable.get(arch_id) {
+                    Some(down) => KernelError::ArchUnavailable(down.reason.clone()),
+                    None => KernelError::NotFound(arch_id.into()),
+                })
+            }
+        };
         let mut reg = self.read_register(ctx, reg_id)?;
         interceptors::i2_flow(&reg.label, adapter.manifest())?;
         let role = match capability {
@@ -646,16 +2595,98 @@ impl Kernel for RealKernel {
             prompt
         };
         // What the arch is actually handed, not a clamp of what we wished for.
-        let tokens_in = count(&prompt);
-        let output = adapter
+        let estimated = count(&prompt);
+        // The prompt is about to leave this kernel. Record the attempt before
+        // it does: an engine can hang, be killed, or take the machine down
+        // with it, and an inference that happened with nothing in the record
+        // saying so is the one gap an auditor cannot close afterwards (SP1b
+        // review, M2). This half knows only the estimate — the measurement is
+        // what comes back — so it says `measured: false` and claims nothing.
+        self.log(
+            "infer",
+            ctx.now_ms,
+            &InferRecord {
+                arch_id,
+                register: &reg_id.0,
+                phase: "requested",
+                tokens_in: estimated,
+                measured: false,
+                cost_list_usd: None,
+                details: None,
+            },
+        )?;
+        // Timed here and nowhere else: this is the only span in the kernel
+        // that is the arch's own, and it is what the per-call usage row
+        // reports as `duration_ms` (ruling 8).
+        let called_at = std::time::Instant::now();
+        let completion = adapter
             .complete(&prompt, budget.min(1024))
-            .map_err(|e| KernelError::NotFound(format!("arch error: {e}")))?;
-        // The call has left the kernel: record it before doing anything that
-        // could fail, or a real send to a real arch could leave no trace.
-        self.log("infer", ctx.now_ms, &(arch_id, reg_id))?;
+            .map_err(|e| adapter_failed(arch_id, e))?;
+        let duration_ms = u64::try_from(called_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // An arch that counted the prompt itself has the number; the estimate
+        // was only ever a stand-in for it (ruling 7).
+        let tokens_in = completion.tokens_in_measured.unwrap_or(estimated);
+        // The call has come back: record it before doing anything that could
+        // fail, so the answer is never acted on before it is written down.
+        //
+        // `now_ms()`, not `ctx.now_ms`: the call took as long as it took, and
+        // two records of one inference stamped with the same instant tell a
+        // ledger reader nothing about how long the arch was away (SP1b Task 1
+        // review, Minor 7). The HLC keeps the order whatever the wall clock
+        // does.
+        self.log(
+            "infer",
+            now_ms(),
+            &InferRecord {
+                arch_id,
+                register: &reg_id.0,
+                phase: "completed",
+                tokens_in,
+                measured: completion.tokens_in_measured.is_some(),
+                cost_list_usd: completion.cost_list_usd,
+                details: completion.details.as_ref(),
+            },
+        )?;
         self.infer_log.push((arch_id.into(), reg.label.clone()));
-        self.bump_stats(arch_id, tokens_in, projected)?;
-        arch::raise(&mut reg, role, &output);
+        self.bump_stats(
+            arch_id,
+            tokens_in,
+            completion.tokens_in_measured,
+            completion.cost_list_usd,
+            projected,
+        )?;
+        // And the call itself, beside the total it just moved (ruling 8's
+        // second half). Only a call that came back: an attempt that never
+        // did is the `infer`/`requested` event, which is already on the
+        // record, and a usage row for it would be a charge nobody incurred.
+        //
+        // **This runs after the `infer`/`completed` append, and the order is
+        // load-bearing** (review Minor 1, and the ruling that kept the `?`).
+        // A failure here is a `KernelError` and fails the call — Ruling 8's
+        // discipline: a node that cannot write down what it spent must not
+        // go on spending. What makes that safe rather than lossy is that the
+        // completion is *already on the ledger* by this line: the two `infer`
+        // events, `requested` and `completed`, are appended above, so an
+        // auditor can see exactly what was paid for even when the row that
+        // would have accounted for it could not be written. The register is
+        // not raised, so nothing acts on an answer the node could not
+        // account for — which is the whole of the discipline.
+        let (task_id, step_index) = match &self.usage_step {
+            Some((task, step)) => (Some(task.clone()), Some(*step)),
+            None => (None, None),
+        };
+        self.record_usage(&UsageRow {
+            arch_id: arch_id.into(),
+            task_id,
+            step_index,
+            tokens_in: u64::from(tokens_in),
+            tokens_in_measured: u64::from(completion.tokens_in_measured.unwrap_or(0)),
+            tokens_out: u64::from(completion.tokens_out.unwrap_or(0)),
+            cost_list_usd: completion.cost_list_usd.filter(|c| c.is_finite()),
+            duration_ms,
+            ts_ms: now_ms(),
+        })?;
+        arch::raise(&mut reg, role, &completion.text);
         self.write_register(ctx, reg)?;
         Ok(InferOutcome {
             arch_id: arch_id.into(),
@@ -705,15 +2736,20 @@ impl Kernel for RealKernel {
     }
 
     fn approve(&mut self, ctx: &Ctx, approval: Approval) -> Result<(), KernelError> {
+        // The challenge first, before the principal or the signature is
+        // looked at (SP1b Task 5): a human approval answers a challenge this
+        // node minted for the task, unspent and unexpired, or it is nothing —
+        // a client that builds its own `Challenge`, however well it signs it,
+        // is signing a subject and an expiry of its own choosing. Spent here
+        // whatever follows, so a failed signature burns the nonce too.
+        if approval.kind == ApprovalKind::Human {
+            let challenge = approval.challenge.as_ref().ok_or_else(|| {
+                KernelError::I1("a human approval answers a minted challenge".into())
+            })?;
+            self.spend_approval_challenge(challenge, ctx.now_ms)?;
+        }
         interceptors::i1_approval(&ctx.principal, &approval, &self.devices, ctx.now_ms)?;
-        let key = format!("{}:{}", approval.subject_hash, hash_canonical(&approval));
-        // Ledger first: an approval that is stored but reported as failed would
-        // still satisfy a later promote's human-approval gate.
-        self.log("approval.recorded", ctx.now_ms, &approval)?;
-        self.store
-            .db
-            .put_json("approvals", &key, &approval)
-            .map_err(store_failed)
+        self.record_approval(ctx.now_ms, &approval, "device-key", None)
     }
 
     fn stop(&mut self, ctx: &Ctx, scope: &str) -> Result<String, KernelError> {
@@ -845,11 +2881,18 @@ impl Kernel for RealKernel {
 impl KernelTestHooks for RealKernel {
     fn register_arch(&mut self, m: ArchManifest) -> String {
         let budget = m.context_ceiling;
-        self.mount(Arc::new(arch::MockAdapter {
-            manifest: m,
-            budget,
-        }))
+        // With the spec that makes it again, so a mock arch survives a restart
+        // the way a real one does — `open`'s own factory knows this kind.
+        let spec = arch::MountSpec::mock(&m, budget);
+        self.mount(
+            Arc::new(arch::MockAdapter {
+                manifest: m,
+                budget,
+            }),
+            spec,
+        )
         .expect("mount")
+        .arch_id
     }
 
     fn enroll_device(&mut self, device_id: &str, vk: [u8; 32]) {
@@ -860,6 +2903,38 @@ impl KernelTestHooks for RealKernel {
     fn renew_liveness(&mut self, business: &str, device_id: &str, expires_at_ms: u64) {
         self.renew_liveness_persisted(business, device_id, expires_at_ms)
             .expect("store write");
+    }
+
+    /// The I1 property's mint (SP1a review M16): a challenge over a subject
+    /// of the test's own, through the same map `approve` spends from, with
+    /// no task behind it. A hook of the same standing as `enroll_device` —
+    /// in-process, for tests — and no syscall reaches it.
+    fn mint_challenge(
+        &mut self,
+        ctx: &Ctx,
+        resource: &str,
+        action_digest: &str,
+        ttl_ms: u64,
+    ) -> Challenge {
+        let nonce = {
+            use base64::Engine;
+            let bytes: [u8; 32] = rand::random();
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        };
+        let challenge = Challenge {
+            resource: resource.into(),
+            action_digest: action_digest.into(),
+            nonce: nonce.clone(),
+            expires_at_ms: ctx.now_ms.saturating_add(ttl_ms),
+        };
+        self.approval_challenges.insert(
+            nonce,
+            PendingApproval {
+                task_id: resource.into(),
+                challenge: challenge.clone(),
+            },
+        );
+        challenge
     }
 
     fn set_context_budget(&mut self, arch_id: &str, tokens: u32) {
@@ -910,6 +2985,7 @@ mod tests {
     use vk_store::keys::KeySource;
 
     fn open(dir: &std::path::Path) -> RealKernel {
+        vk_contracts::testing::guard_state_dir(dir);
         RealKernel::open(dir, KeySource::File(dir.join("master.key")), "n1").unwrap()
     }
 
@@ -923,7 +2999,7 @@ mod tests {
             locality: Locality::Local,
             jurisdiction: "FR".into(),
             retention_days: None,
-            cost_per_1k_tokens_eur: 0.0,
+            cost_per_1k_tokens_eur: Some(0.0),
             latency_ms_p50: 1,
             context_ceiling: 100,
             determinism: Determinism::SeededDeterministic,
@@ -976,6 +3052,467 @@ mod tests {
         }
     }
 
+    /// An in-process `write_register` cannot relabel a register downward,
+    /// re-parent it to another task, or overwrite one the caller could not
+    /// read (SP1a review M1): the stored label joins the written one, a
+    /// changed `task_id` is an I3 refusal, and a register above the caller's
+    /// clearance is an I2 refusal — the same rule the stub kernel applies.
+    #[test]
+    fn a_register_write_cannot_relabel_reparent_or_overwrite_what_it_could_not_read() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let business = Label {
+            scope: Scope::Business,
+            data_class: DataClass::Own,
+            origins: [Origin::OwnerAuthored].into(),
+        };
+        let id = k
+            .submit_task(&machine(1), "a business register", business.clone())
+            .unwrap();
+        let stored = k.read_register(&machine(1), &id).unwrap();
+
+        // Written back with a lower label: the stored one is kept (joined).
+        let mut lowered = stored.clone();
+        lowered.label = Label::bottom();
+        lowered.decisions.push("a decision".into());
+        k.write_register(&machine(2), lowered).unwrap();
+        let after = k.read_register(&machine(2), &id).unwrap();
+        assert_eq!(after.label, business, "a write never lowers a label");
+        assert_eq!(after.decisions, vec!["a decision".to_string()]);
+
+        // Written back with a higher label: the join takes it.
+        let mut raised = after.clone();
+        raised.label = Label {
+            scope: Scope::Personal,
+            data_class: DataClass::Unknown,
+            origins: [Origin::Web].into(),
+        };
+        k.write_register(&machine(3), raised.clone()).unwrap();
+        assert_eq!(
+            k.read_register(&machine(3), &id).unwrap().label,
+            business.join(&raised.label)
+        );
+
+        // Re-parented: refused, and the row untouched.
+        let mut moved = k.read_register(&machine(4), &id).unwrap();
+        moved.task_id = "task-somebody-elses".into();
+        let err = k.write_register(&machine(4), moved).unwrap_err();
+        assert!(matches!(err, KernelError::I3(_)), "{err}");
+        assert_eq!(
+            k.read_register(&machine(4), &id).unwrap().task_id,
+            stored.task_id
+        );
+
+        // A caller who could not read it cannot overwrite it either.
+        let low = Ctx {
+            clearance: Clearance {
+                max_scope: Scope::Public,
+                third_party_allowed: false,
+            },
+            ..machine(5)
+        };
+        let mut overwrite = stored.clone();
+        overwrite.goal = "replaced".into();
+        let err = k.write_register(&low, overwrite).unwrap_err();
+        assert!(matches!(err, KernelError::I2(_)), "{err}");
+        assert_eq!(
+            k.read_register(&machine(5), &id).unwrap().goal,
+            "a business register"
+        );
+    }
+
+    /// A factory that panics while building an arch leaves it `Unavailable`
+    /// with the panic as its reason — never `Starting` for ever, and never a
+    /// kernel that panicked with it (Task 1b deferred minor).
+    #[test]
+    fn a_factory_that_panics_leaves_the_arch_unavailable_not_starting() {
+        let d = tempfile::tempdir().unwrap();
+        let spec = {
+            let mut k = open(d.path());
+            let m = local(personal());
+            let spec = arch::MountSpec::mock(&m, 100);
+            k.mount(
+                Arc::new(arch::MockAdapter {
+                    manifest: m,
+                    budget: 100,
+                }),
+                spec.clone(),
+            )
+            .unwrap();
+            spec
+        };
+        let panicking: AdapterFactory = Arc::new(
+            |_: &arch::MountSpec| -> Result<Box<dyn arch::ArchAdapter>> {
+                panic!("the engine behind this arch blew up")
+            },
+        );
+        let mut k = RealKernel::open_with_factory(
+            d.path(),
+            KeySource::File(d.path().join("master.key")),
+            "n1",
+            panicking,
+        )
+        .unwrap();
+        k.start_arches_now();
+        let states = k.arch_states();
+        assert_eq!(states.len(), 1, "{states:?}");
+        let (_, _, state) = &states[0];
+        assert_eq!(state.name(), "unavailable", "{state:?}");
+        let why = state.reason().unwrap_or_default();
+        assert!(why.contains("panicked"), "{why}");
+        assert!(why.contains("blew up"), "the panic's own words: {why}");
+        assert_eq!(k.arches_starting(), 0);
+        let _ = spec;
+    }
+
+    /// `authorization`, `oauth`, `x_auth_token`: credential-shaped names the
+    /// guard's needles did not cover (Task 1b deferred minor).
+    #[test]
+    fn a_credential_under_an_auth_shaped_name_is_refused() {
+        for named in [
+            "authorization",
+            "Authorization",
+            "oauth",
+            "auth",
+            "basic_auth",
+        ] {
+            assert!(
+                arch::MountSpec::new("x", serde_json::json!({ named: "Bearer sk-live-1" }))
+                    .is_err(),
+                "{named} must be refused"
+            );
+        }
+        // A number under such a name is still not a credential.
+        arch::MountSpec::new("x", serde_json::json!({ "auth_retries": 3 })).unwrap();
+    }
+
+    /// A register row that cannot be read fails `task`, `tasks` and `top` as
+    /// a store fault (Ruling 8, review N3) rather than hiding the task; a
+    /// register that is simply not there still hides it.
+    #[test]
+    fn a_register_that_cannot_be_read_is_a_store_fault_not_a_hidden_task() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let t = k
+            .create_task(&machine(1), "g", "note", Label::bottom(), vec![])
+            .unwrap();
+        assert!(k.task(&machine(2), &t.id).unwrap().is_some());
+
+        k.store()
+            .db
+            .put_json(
+                "registers",
+                &t.register.0,
+                &serde_json::json!("not a register"),
+            )
+            .unwrap();
+        assert!(matches!(
+            k.task(&machine(2), &t.id),
+            Err(KernelError::Store(_))
+        ));
+        assert!(matches!(k.tasks(&machine(2)), Err(KernelError::Store(_))));
+        assert!(matches!(k.top(&machine(2)), Err(KernelError::Store(_))));
+
+        // Gone rather than unreadable: hidden, as before.
+        k.store().db.delete("registers", &t.register.0).unwrap();
+        assert_eq!(k.task(&machine(2), &t.id).unwrap(), None);
+        assert!(k.tasks(&machine(2)).unwrap().is_empty());
+        assert!(k.top(&machine(2)).unwrap().tasks.is_empty());
+    }
+
+    /// An unreadable row under the rebase prefix is damage to append-only
+    /// evidence (Ruling 34) and is reported as a Store error — not dropped out
+    /// of `rebase_history` and `vk status` (Task 10 review, Minor 9). The
+    /// watermark is excluded by name and never parsed.
+    #[test]
+    fn an_unreadable_rebase_row_is_a_store_error_not_a_missing_entry() {
+        let d = tempfile::tempdir().unwrap();
+        let k = open(d.path());
+        k.store()
+            .db
+            .kv_set(&format!("{REBASE_PREFIX}0000000000000099"), "{not json")
+            .unwrap();
+        let err = k
+            .rebase_history()
+            .expect_err("damaged evidence is reported, not dropped");
+        assert!(matches!(err, KernelError::Store(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("ledger.head.rebase.0000000000000099"), "{msg}");
+        assert!(msg.contains("cannot be read"), "{msg}");
+        // The error carries the remedy (re-review N5): there is no repair
+        // command, `--force` does not get past it, and the README says what to do.
+        assert!(msg.contains("--force does not help"), "{msg}");
+        assert!(msg.contains("A damaged rebase evidence row"), "{msg}");
+        // And boot itself refuses, with the same words: the README's claim.
+        let mut k = k;
+        let boot = k.boot().expect_err("boot reads the rows before it serves");
+        assert!(matches!(boot, KernelError::Store(_)), "{boot:?}");
+        assert!(boot.to_string().contains("--force does not help"), "{boot}");
+    }
+
+    /// Final review I-3: a `mounts` or `arches` table that cannot be read
+    /// fails the mounts tier. Swallowed into an empty list it read as a green
+    /// tier with `checked 0` — on `vk fsck`, the one surface that exists to
+    /// say the store is damaged.
+    #[test]
+    fn an_unreadable_mounts_or_arches_row_fails_the_mounts_tier() {
+        for table in ["mounts", "arches"] {
+            let d = tempfile::tempdir().unwrap();
+            let k = open(d.path());
+            k.store()
+                .db
+                .put_json(
+                    table,
+                    "broken",
+                    &serde_json::json!("not a row of this table"),
+                )
+                .unwrap();
+            let report = k.fsck();
+            let mounts = report
+                .tiers
+                .iter()
+                .find(|t| t.tier == "mounts")
+                .expect("a mounts tier");
+            assert!(!mounts.ok, "{table}: {mounts:?}");
+            assert!(!report.ok, "{table}: {report:?}");
+            assert!(
+                mounts
+                    .problems
+                    .iter()
+                    .any(|p| p.contains(table) && p.contains("cannot be read")),
+                "{table}: {mounts:?}"
+            );
+        }
+    }
+
+    /// Final re-review N-3: with the `arches` table unreadable, a spec that is
+    /// there is not reported as "half-written" — without the manifests there is
+    /// nothing to say it has no arch beside it. The tier reports the table.
+    #[test]
+    fn an_unreadable_arches_table_does_not_call_every_spec_half_written() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(local(personal()));
+        k.store()
+            .db
+            .put_json("arches", "broken", &serde_json::json!("not a manifest"))
+            .unwrap();
+        let mounts = k
+            .fsck()
+            .tiers
+            .into_iter()
+            .find(|t| t.tier == "mounts")
+            .expect("a mounts tier");
+        assert!(!mounts.ok, "{mounts:?}");
+        assert!(
+            !mounts.problems.iter().any(|p| p.contains("half-written")),
+            "{arch}'s spec is not half-written: {mounts:?}"
+        );
+        assert_eq!(mounts.failed, 1, "the table, once: {mounts:?}");
+    }
+
+    /// Drop `table` from the store's database under a running kernel: the
+    /// shape a database fault takes, for the read surfaces that must say so.
+    fn drop_table(dir: &std::path::Path, table: &str) {
+        rusqlite::Connection::open(dir.join("vk.sqlite"))
+            .unwrap()
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .unwrap();
+    }
+
+    /// Ruling 43: the policy version, read from a store that cannot answer, is
+    /// a Store error — not "this node has never booted".
+    #[test]
+    fn an_unreadable_policies_version_is_a_store_error_not_none() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        k.boot().unwrap();
+        drop_table(d.path(), "kv");
+        let got = format!("{:?}", k.policies_version());
+        assert!(got.contains("Err(Store("), "{got}");
+    }
+
+    /// Ruling 43: `/devices` and `/devices/<id>` on a store that cannot be
+    /// read are Store errors — not an empty list, not "no such device".
+    #[test]
+    fn the_devices_namespace_fails_loudly_on_a_store_that_cannot_be_read() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        k.enroll_device_persisted("phone-1", [7u8; 32]).unwrap();
+        drop_table(d.path(), "devices");
+        let ctx = machine(2);
+        for path in ["/devices", "/devices/phone-1"] {
+            let got = ns::resolve(&k, &ctx, path);
+            assert!(matches!(got, Err(KernelError::Store(_))), "{path}: {got:?}");
+        }
+    }
+
+    /// Ruling 43: the label of an artefact whose envelope is there and cannot
+    /// be read is a Store error, not "no such artefact".
+    #[test]
+    fn an_unreadable_envelope_fails_artefact_label() {
+        let d = tempfile::tempdir().unwrap();
+        let k = open(d.path());
+        let env = k
+            .store()
+            .blobs
+            .put("subject-1", Label::bottom(), b"hello")
+            .unwrap();
+        let file = d
+            .path()
+            .join("blobs")
+            .join(format!("{}.json", env.hash.trim_start_matches("sha256:")));
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let got = format!("{:?}", k.artefact_label(&env.hash));
+        assert!(got.contains("Err(Store("), "{got}");
+    }
+
+    /// Final review I-3: a `devices` row that does not parse is a store
+    /// fault, not a device quietly left out of the boot report's count.
+    #[test]
+    fn an_unreadable_device_row_fails_the_device_count_instead_of_undercounting() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        k.store()
+            .db
+            .put_json("devices", "broken", &serde_json::json!("not a device row"))
+            .unwrap();
+        let err = k
+            .boot()
+            .expect_err("a boot report that cannot count its devices is not written");
+        assert!(matches!(err, KernelError::Store(_)), "{err:?}");
+    }
+
+    /// An unreadable `stats:` row fails `top` as a Store error instead of
+    /// showing that arch with zeros (Task 10 review, Minor 9; Ruling 8).
+    #[test]
+    fn an_unreadable_stats_row_fails_top_instead_of_showing_zeros() {
+        let d = tempfile::tempdir().unwrap();
+        let k = open(d.path());
+        k.store()
+            .db
+            .kv_set("stats:broken-arch", "{not json")
+            .unwrap();
+        let err = k
+            .top(&machine(2))
+            .expect_err("a store that cannot answer fails the screen");
+        assert!(matches!(err, KernelError::Store(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("stats:broken-arch"), "{msg}");
+    }
+
+    /// A stats row written before `tokens_in_measured` and `cost_list_usd`
+    /// existed reads back with them at zero (Task 2 deferred minor).
+    #[test]
+    fn an_old_stats_row_reads_back_with_the_new_counters_at_zero() {
+        let old: ArchStats =
+            serde_json::from_str(r#"{"calls":3,"tokens_in":120,"projected":1}"#).unwrap();
+        assert_eq!(old.calls, 3);
+        assert_eq!(old.tokens_in, 120);
+        assert_eq!(old.projected, 1);
+        assert_eq!(old.tokens_in_measured, 0);
+        assert_eq!(old.cost_list_usd, 0.0);
+    }
+
+    /// The HLC is seeded from the ledger tail on open (review M3): an event
+    /// appended after a restart on a wall clock that went backwards still
+    /// sorts after everything already on the record — same wall, next
+    /// counter — instead of restarting the clock at zero.
+    #[test]
+    fn the_clock_resumes_from_the_ledger_tail_across_a_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let far_ahead = 4_000_000_000_000u64;
+        let before = {
+            let mut k = open(d.path());
+            k.submit_task(&machine(far_ahead), "before the restart", Label::bottom())
+                .unwrap();
+            k.ledger().events().last().unwrap().hlc.clone()
+        };
+        let mut k = open(d.path());
+        k.submit_task(
+            &machine(1),
+            "after the restart, clock set back",
+            Label::bottom(),
+        )
+        .unwrap();
+        let after = k.ledger().events().last().unwrap().hlc.clone();
+        assert!(after > before, "{after:?} must sort after {before:?}");
+        assert_eq!(after.wall_ms, before.wall_ms);
+        assert_eq!(after.counter, before.counter + 1);
+        assert_eq!(after.node, "n1");
+    }
+
+    /// The watermark `boot` keeps under the rebase prefix is never reported
+    /// as a rebase of its own (Task 8 deferred minor): excluded by key, not
+    /// by a parse that happens to fail.
+    #[test]
+    fn the_reported_through_watermark_is_never_a_rebase_row() {
+        let d = tempfile::tempdir().unwrap();
+        let k = open(d.path());
+        let looks_like_one = serde_json::to_string(&FsckRebase {
+            rebased_from: None,
+            rebased_to: vk_store::LedgerHead {
+                seq: 0,
+                hash: "sha256:x".into(),
+            },
+            at: 1,
+        })
+        .unwrap();
+        k.store()
+            .db
+            .kv_set(REBASE_REPORTED_THROUGH, &looks_like_one)
+            .unwrap();
+        assert!(
+            k.rebase_history().unwrap().is_empty(),
+            "the watermark is not a rebase"
+        );
+    }
+
+    /// Usage rows are operational metadata, kept for the operational
+    /// retention class — ninety days — and no longer (Task 8 deferred
+    /// minor): swept at boot and by the daemon's scheduled sweep; a row still
+    /// inside the window stays.
+    #[test]
+    fn usage_rows_past_their_retention_are_swept_and_fresh_ones_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let row = |ts_ms: u64| UsageRow {
+            arch_id: "a".into(),
+            task_id: None,
+            step_index: None,
+            tokens_in: 1,
+            tokens_in_measured: 1,
+            tokens_out: 1,
+            cost_list_usd: None,
+            duration_ms: 1,
+            ts_ms,
+        };
+        let now = now_ms();
+        let stale = now - USAGE_RETENTION_MS - 1;
+        let fresh = now - USAGE_RETENTION_MS + 60_000;
+        for ts in [stale, fresh] {
+            k.store()
+                .db
+                .put_json("usage", &format!("{ts:013}-{:012}", 1), &row(ts))
+                .unwrap();
+        }
+        let swept = k.sweep_retention(now).unwrap();
+        assert_eq!(swept.usage_rows, 1, "{swept:?}");
+        let left = k.usage(&machine(now), &UsageFilter::All).unwrap();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].ts_ms, fresh);
+        assert_eq!(k.sweep_retention(now).unwrap().usage_rows, 0);
+
+        // Boot sweeps the same way.
+        k.store()
+            .db
+            .put_json("usage", &format!("{:013}-{:012}", 1u64, 2u64), &row(1))
+            .unwrap();
+        k.boot().unwrap();
+        assert_eq!(k.usage(&machine(now), &UsageFilter::All).unwrap().len(), 1);
+    }
+
     #[test]
     fn boot_verifies_the_chain_and_records_that_the_node_started() {
         let d = tempfile::tempdir().unwrap();
@@ -1021,12 +3558,18 @@ mod tests {
     fn boot_reports_what_this_node_came_up_with() {
         let d = tempfile::tempdir().unwrap();
         let mut k = open(d.path());
+        let manifest = local(personal());
+        let spec = arch::MountSpec::mock(&manifest, 100);
         let arch = k
-            .mount(Arc::new(arch::MockAdapter {
-                manifest: local(personal()),
-                budget: 100,
-            }))
-            .unwrap();
+            .mount(
+                Arc::new(arch::MockAdapter {
+                    manifest,
+                    budget: 100,
+                }),
+                spec,
+            )
+            .unwrap()
+            .arch_id;
         k.enroll_device_persisted("phone-1", [7u8; 32]).unwrap();
         let stop = k.stop(&human(1), "business:acme").unwrap();
 
@@ -1145,6 +3688,356 @@ mod tests {
         assert!(!k.boot().unwrap().recovered_partial_line);
     }
 
+    /// A healthy `boot` never marks the node forced: `record_forced_boot` is
+    /// the only thing that does, and only `vkd`'s `--force` path calls it.
+    #[test]
+    fn boot_alone_never_marks_the_node_forced() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        assert!(!k.forced_boot());
+        k.boot().unwrap();
+        assert!(!k.forced_boot(), "a healthy boot must not look forced");
+    }
+
+    /// `vkd` calls this on the serve-under-force path, with the very report
+    /// `boot` returned. The ledger gains a `boot.forced` event naming exactly
+    /// that verdict — not a fresh recomputation, which could disagree with
+    /// what `boot` already committed to — so `vk dmesg` shows an auditor
+    /// when and why an operator overrode a chain that said not to serve.
+    #[test]
+    fn record_forced_boot_appends_the_event_boot_reported() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut k = open(d.path());
+            k.boot().unwrap();
+            assert!(k.boot().unwrap().ledger_ok);
+        }
+        // Tamper the first of the two boot events: `verify_chain` fails, but
+        // the recorded head — the second boot's `{seq, hash}` — is untouched,
+        // so only the chain half of the verdict breaks.
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        first["payload_hash"] = serde_json::json!("sha256:tampered");
+        lines[0] = serde_json::to_string(&first).unwrap();
+        std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let mut k = open(d.path());
+        let report = k.boot().unwrap();
+        assert!(!report.ledger_ok, "the tampered chain must not verify");
+        assert!(!k.forced_boot());
+
+        k.record_forced_boot(&report).unwrap();
+        assert!(k.forced_boot());
+
+        let last = k.ledger().events().last().unwrap().clone();
+        assert_eq!(last.kind, "boot.forced");
+        let report_hash = hash_canonical(&report);
+        assert_eq!(
+            last.payload_hash,
+            hash_canonical(&BootForcedRecord {
+                ledger_ok: false,
+                head_ok: true,
+                ledger_len: report.ledger_len,
+                report_hash: &report_hash,
+            }),
+            "the payload must name the verdict `boot` found"
+        );
+    }
+
+    /// An adapter that answers however a test needs it to, so the kernel's
+    /// side of the `ArchAdapter` contract can be exercised without an engine.
+    struct Scripted {
+        manifest: ArchManifest,
+        answer: Box<dyn Fn() -> Result<arch::Completion, arch::AdapterError> + Send + Sync>,
+    }
+
+    impl arch::ArchAdapter for Scripted {
+        fn manifest(&self) -> &ArchManifest {
+            &self.manifest
+        }
+        fn context_budget(&self) -> u32 {
+            self.manifest.context_ceiling
+        }
+        fn count_tokens(&self, text: &str) -> u32 {
+            (text.len() / 4) as u32 + 1
+        }
+        fn complete(&self, _: &str, _: u32) -> Result<arch::Completion, arch::AdapterError> {
+            (self.answer)()
+        }
+    }
+
+    /// An adapter that says which instance it is and counts its own drops, so
+    /// a re-mount can be shown to have *kept* the one already there rather
+    /// than swapped it — and so that a swap can be shown to hand the old one
+    /// back instead of dropping it in place (Ruling 13).
+    struct Counted {
+        manifest: ArchManifest,
+        tag: u32,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl arch::ArchAdapter for Counted {
+        fn manifest(&self) -> &ArchManifest {
+            &self.manifest
+        }
+        fn context_budget(&self) -> u32 {
+            self.manifest.context_ceiling
+        }
+        fn count_tokens(&self, text: &str) -> u32 {
+            (text.len() / 4) as u32 + 1
+        }
+        fn complete(&self, _: &str, _: u32) -> Result<arch::Completion, arch::AdapterError> {
+            Ok(arch::Completion::text(format!("adapter {}", self.tag)))
+        }
+    }
+
+    /// Ruling 13: mounting an arch that is already there keeps what is there.
+    ///
+    /// The adapter in the table can own something outside this process — the
+    /// Ollama arch owns the container it started — so silently swapping it and
+    /// dropping the old one is how a plain repeat `vk mount ollama` stopped
+    /// the container it had just re-mounted, with the kernel lock held. A
+    /// deliberate replacement is still possible, and hands the old adapter
+    /// back for the caller to drop after it has let the lock go.
+    #[test]
+    fn an_identical_re_mount_keeps_the_adapter_that_is_already_there() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = |tag: u32| {
+            Arc::new(Counted {
+                manifest: local_named("counted", personal()),
+                tag,
+                dropped: dropped.clone(),
+            })
+        };
+        let fallen = || dropped.load(std::sync::atomic::Ordering::SeqCst);
+
+        let spec = || arch::MountSpec::mock(&local_named("counted", personal()), 100);
+        let first = k.mount(counted(1), spec()).expect("the first mount");
+        assert!(!first.already_mounted);
+        assert!(first.replaced.is_none());
+        let events = k.ledger().events().len();
+
+        let again = k.mount(counted(2), spec()).expect("the same arch again");
+        assert_eq!(again.arch_id, first.arch_id, "the same arch is the same id");
+        assert!(again.already_mounted);
+        assert!(
+            again.replaced.is_none(),
+            "an idempotent re-mount replaces nothing"
+        );
+        assert_eq!(
+            k.ledger().events().len(),
+            events,
+            "and appends nothing to the record"
+        );
+        assert_eq!(fallen(), 1, "the newcomer was dropped, not the incumbent");
+
+        // Which one is actually mounted: the answer comes out of the arch.
+        let reg = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        k.infer(&machine(2), &again.arch_id, Capability::Plan, &reg)
+            .unwrap();
+        let after = k.read_register(&machine(3), &reg).unwrap();
+        assert!(
+            after.decisions.iter().any(|d| d.contains("adapter 1")),
+            "the first adapter is still the one mounted: {:?}",
+            after.decisions
+        );
+
+        // The deliberate replacement: it swaps, and the old adapter leaves by
+        // the return value rather than being dropped here.
+        let swapped = k
+            .mount_with(counted(3), spec(), Remount::Replace)
+            .expect("a replacement");
+        assert_eq!(swapped.arch_id, first.arch_id);
+        assert!(swapped.already_mounted);
+        let old = swapped.replaced.expect("the adapter it took the place of");
+        assert_eq!(
+            fallen(),
+            1,
+            "the replaced adapter is still alive, in the caller's hand"
+        );
+        drop(old);
+        assert_eq!(fallen(), 2, "and dies when the caller drops it");
+        k.infer(&machine(4), &first.arch_id, Capability::Plan, &reg)
+            .unwrap();
+        let after = k.read_register(&machine(5), &reg).unwrap();
+        assert!(
+            after.decisions.iter().any(|d| d.contains("adapter 3")),
+            "the replacement is the one mounted now: {:?}",
+            after.decisions
+        );
+    }
+
+    fn scripted(
+        k: &mut RealKernel,
+        name: &str,
+        answer: impl Fn() -> Result<arch::Completion, arch::AdapterError> + Send + Sync + 'static,
+    ) -> String {
+        let manifest = local_named(name, personal());
+        let spec = arch::MountSpec::mock(&manifest, manifest.context_ceiling);
+        k.mount(
+            Arc::new(Scripted {
+                manifest,
+                answer: Box::new(answer),
+            }),
+            spec,
+        )
+        .expect("mount")
+        .arch_id
+    }
+
+    /// Ruling 7: an arch that counted the prompt itself has the number, and the
+    /// estimate was only ever a stand-in for it. What the kernel accounts and
+    /// reports is the measurement — and ruling 8's counters say how much of the
+    /// total is measurement rather than heuristic, so nobody has to guess
+    /// whether a figure could be billed against.
+    #[test]
+    fn a_measured_call_is_accounted_by_its_measurement_not_by_the_estimate() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let measured = scripted(&mut k, "measured", || {
+            Ok(arch::Completion {
+                text: "ok".into(),
+                tokens_in_measured: Some(14_435),
+                tokens_out: Some(812),
+                cost_list_usd: Some(0.0148193),
+                details: Some(serde_json::json!({ "session_id": "s-1" })),
+            })
+        });
+        let guessing = scripted(&mut k, "guessing", || Ok(arch::Completion::text("ok")));
+
+        let reg = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        let out = k
+            .infer(&machine(2), &measured, Capability::Plan, &reg)
+            .unwrap();
+        assert_eq!(
+            out.tokens_in, 14_435,
+            "the arch counted the prompt; the estimate is not the number to keep"
+        );
+        let guessed = k
+            .infer(&machine(3), &guessing, Capability::Plan, &reg)
+            .unwrap();
+        assert!(
+            guessed.tokens_in > 0 && guessed.tokens_in < 1_000,
+            "an arch that measures nothing still gets the estimate: {}",
+            guessed.tokens_in
+        );
+
+        let stats = k.top(&machine(4)).unwrap().arches;
+        let m = &stats[&measured];
+        assert_eq!(m.calls, 1);
+        assert_eq!(m.tokens_in, 14_435);
+        assert_eq!(m.tokens_in_measured, 14_435, "all of it was measured");
+        assert!((m.cost_list_usd - 0.0148193).abs() < 1e-9, "{m:?}");
+        let g = &stats[&guessing];
+        assert_eq!(g.tokens_in, u64::from(guessed.tokens_in));
+        assert_eq!(g.tokens_in_measured, 0, "nothing here was measured");
+        assert_eq!(g.cost_list_usd, 0.0);
+
+        // And it is on disk, not in this process: `vk top` after a restart.
+        drop(k);
+        let k = open(d.path());
+        let after = k.top(&machine(5)).unwrap().arches;
+        assert_eq!(after[&measured].tokens_in_measured, 14_435);
+        assert!((after[&measured].cost_list_usd - 0.0148193).abs() < 1e-9);
+    }
+
+    /// Review finding (SP1b, Important 2): an adapter refusing a prompt its
+    /// context cannot hold is raising the kernel's own I4′, and it must reach
+    /// the caller as an invariant refusal — not as `NotFound`, which the
+    /// transport sends as "no such arch". Everything else an adapter can fail
+    /// at is machinery, which is a store-class failure.
+    #[test]
+    fn an_adapters_i4_prime_stays_an_invariant_and_its_other_failures_do_not() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let too_big = scripted(&mut k, "too-big", || {
+            Err(arch::AdapterError::I4Prime {
+                needed: 190_000,
+                ceiling: 180_000,
+            })
+        });
+        let broken = scripted(&mut k, "broken", || {
+            Err(arch::AdapterError::Other(anyhow::anyhow!(
+                "claude exited 1: nothing on stderr"
+            )))
+        });
+        let reg = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+
+        let err = k
+            .infer(&machine(2), &too_big, Capability::Plan, &reg)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I4Prime(m) if m.contains("190000") && m.contains("180000")),
+            "{err:?}"
+        );
+        let err = k
+            .infer(&machine(3), &broken, Capability::Plan, &reg)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::Store(m) if m.contains("claude exited 1")),
+            "{err:?}"
+        );
+
+        // A refused call is not a call. Both arches are on the screen — they
+        // are mounted, and `top` says so (Ruling 9d) — with nothing counted
+        // against either of them.
+        let top = k.top(&machine(4)).unwrap();
+        assert_eq!(top.arches.len(), 2, "both mounted arches are listed");
+        assert!(
+            top.arches
+                .values()
+                .all(|s| s.calls == 0 && s.tokens_in == 0),
+            "a refusal must not bump the counters: {:?}",
+            top.arches
+        );
+    }
+
+    /// Review finding (Task 0 fix-wave, Ruling 2): `ALLOWED_KINDS` must be
+    /// load-bearing, not decorative. `log` is the sole choke point every
+    /// kernel-originated event passes through, so an unlisted or misspelled
+    /// kind is refused there, before the append — nothing lands in the
+    /// permanent record, and the chain that was already there is untouched.
+    #[test]
+    fn log_refuses_a_kind_outside_the_allowed_list() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        k.boot().unwrap();
+        let before = k.ledger().events().len();
+
+        let err = k.log("not.a.real.kind", now_ms(), &"payload").unwrap_err();
+        assert!(
+            matches!(&err, KernelError::Store(msg) if msg.contains("not.a.real.kind")),
+            "{err}"
+        );
+
+        assert_eq!(
+            k.ledger().events().len(),
+            before,
+            "an unlisted kind must not be appended"
+        );
+        assert!(
+            k.ledger().verify_chain(),
+            "the existing chain must still verify"
+        );
+    }
+
     #[test]
     fn state_survives_reopen() {
         let d = tempfile::tempdir().unwrap();
@@ -1261,6 +4154,66 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == "infer" || e.kind == "infer.projected"),
             "a refused inference must not claim a projection it never made"
+        );
+    }
+
+    /// Review M2: a call that leaves the kernel has to be in the record
+    /// *before* it leaves. An adapter can hang, be killed, or take the machine
+    /// down with it, and an inference that happened with nothing saying so is
+    /// the one kind of gap an auditor cannot close afterwards. So `infer` is
+    /// appended twice — the same kind, with `phase` saying which half — and
+    /// the second one still carries everything the record carried before.
+    #[test]
+    fn a_send_is_recorded_before_it_leaves_and_again_when_it_comes_back() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let answers = scripted(&mut k, "answers", || {
+            Ok(arch::Completion {
+                text: "ok".into(),
+                tokens_in_measured: Some(12),
+                tokens_out: None,
+                cost_list_usd: None,
+                details: None,
+            })
+        });
+        let dies = scripted(&mut k, "dies", || {
+            Err(arch::AdapterError::Other(anyhow::anyhow!(
+                "the engine went away"
+            )))
+        });
+        let r = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+
+        k.infer(&machine(2), &answers, Capability::Plan, &r)
+            .unwrap();
+        let events = k.ledger().events().to_vec();
+        let infers: Vec<_> = events.iter().filter(|e| e.kind == "infer").collect();
+        assert_eq!(
+            infers.len(),
+            2,
+            "one record for the send, one for the answer"
+        );
+        assert_ne!(
+            infers[0].payload_hash, infers[1].payload_hash,
+            "the two halves must not hash alike, or `phase` is not in the payload"
+        );
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        let requested = kinds.iter().position(|x| *x == "infer").unwrap();
+        let written = kinds.iter().position(|x| *x == "register.written").unwrap();
+        assert!(requested < written, "{kinds:?}");
+
+        // A send that never comes back leaves the first record and no second.
+        let before = k.ledger().events().len();
+        assert!(k.infer(&machine(3), &dies, Capability::Plan, &r).is_err());
+        let after: Vec<&str> = k.ledger().events()[before..]
+            .iter()
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert_eq!(
+            after,
+            ["infer"],
+            "the attempt belongs in the record even though no answer came: {after:?}"
         );
     }
 
@@ -1420,11 +4373,16 @@ mod tests {
             ..mounted.clone()
         };
         let budget = widened.context_ceiling;
+        let spec = arch::MountSpec::mock(&widened, budget);
         let err = k
-            .mount(Arc::new(arch::MockAdapter {
-                manifest: widened,
-                budget,
-            }))
+            .mount(
+                Arc::new(arch::MockAdapter {
+                    manifest: widened,
+                    budget,
+                }),
+                spec,
+            )
+            .map(|o| o.arch_id)
             .unwrap_err();
         assert!(
             err.to_string().contains("already mounted with a different"),
@@ -1453,17 +4411,16 @@ mod tests {
         let mut k = open(d.path());
         let key = SoftwareHumanKey::generate("phone-1");
         k.enroll_device("phone-1", key.verifying_key_bytes());
-        let ch = Challenge {
-            resource: "module:quote-drafter".into(),
-            action_digest: "sha256:c".into(),
-            nonce: "n".into(),
-            expires_at_ms: 10,
-        };
+        // A task waiting at its approve step, so a challenge can be minted
+        // for it (SP1b Task 5): the subject is the drafted artefact's hash.
+        let (task, subject) = waiting_task(&mut k);
+        let ch = k.mint_approval_challenge(&machine(2), &task).unwrap();
+        assert_eq!(ch.action_digest, subject);
         let sig = key.sign(&ch.digest());
         k.approve(
             &human(2),
             Approval {
-                subject_hash: "sha256:c".into(),
+                subject_hash: subject.clone(),
                 kind: ApprovalKind::Human,
                 approver: Principal::Human {
                     device_id: "phone-1".into(),
@@ -1474,7 +4431,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(k.approvals_for("sha256:c").len(), 1);
+        assert_eq!(k.approvals_for(&subject).len(), 1);
         // The row's key is "<subject>:<hash_canonical>" and hash_canonical is
         // itself "sha256:…", so a key-prefix match would let a module whose
         // content hash is the bare string "sha256" inherit this approval.
@@ -1510,6 +4467,466 @@ mod tests {
             Err(KernelError::I1(_))
         ));
         assert!(k.hot_modules().is_empty());
+    }
+
+    /// A task drafted through a mock arch and now waiting at its approve
+    /// step, with the subject a human approval of it must name.
+    fn waiting_task(k: &mut RealKernel) -> (String, String) {
+        use crate::tasks::{StepKind, TaskStatus};
+        let arch = k.register_arch(local(personal()));
+        let task = k
+            .create_task(
+                &machine(1),
+                "draft a proposal",
+                "proposal",
+                Label::bottom(),
+                vec![StepKind::Draft { arch_id: arch }, StepKind::Approve],
+            )
+            .unwrap()
+            .id;
+        k.run_task_step(&machine(1), &task).unwrap();
+        let t = k.run_task_step(&machine(1), &task).unwrap();
+        assert_eq!(t.status, TaskStatus::WaitingHuman);
+        let subject = k.approval_subject(&machine(1), &task).unwrap();
+        (task, subject)
+    }
+
+    /// `key`'s approval of exactly `ch`.
+    fn signed(key: &SoftwareHumanKey, ch: &Challenge) -> Approval {
+        Approval {
+            subject_hash: ch.action_digest.clone(),
+            kind: ApprovalKind::Human,
+            approver: Principal::Human {
+                device_id: key.device_id(),
+            },
+            challenge: Some(ch.clone()),
+            signature_hex: Some(hex::encode(key.sign(&ch.digest()))),
+        }
+    }
+
+    /// SP1b Task 5, invariant I1: the kernel mints every approval challenge,
+    /// bound to the task's subject and resource with a fresh nonce and a
+    /// short expiry; a task that is not waiting gets none; the map of open
+    /// challenges is bounded and drops the expired.
+    #[test]
+    fn mint_approval_challenge_binds_the_waiting_task_and_is_bounded() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(local(personal()));
+        let queued = k
+            .create_task(
+                &machine(1),
+                "later",
+                "note",
+                Label::bottom(),
+                vec![
+                    crate::tasks::StepKind::Draft { arch_id: arch },
+                    crate::tasks::StepKind::Approve,
+                ],
+            )
+            .unwrap()
+            .id;
+        // Not waiting yet: no challenge, and nothing left open.
+        let err = k.mint_approval_challenge(&machine(1), &queued).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::Gate(m) if m.contains("not waiting")),
+            "{err}"
+        );
+        assert!(k.pending_approvals(1).is_empty());
+
+        let (task, subject) = waiting_task(&mut k);
+        let a = k.mint_approval_challenge(&machine(10), &task).unwrap();
+        let b = k.mint_approval_challenge(&machine(10), &task).unwrap();
+        assert_eq!(a.resource, format!("task:{task}"));
+        assert_eq!(a.action_digest, subject);
+        assert_eq!(a.expires_at_ms, 10 + APPROVAL_CHALLENGE_TTL_MS);
+        assert_ne!(a.nonce, b.nonce, "every mint is a fresh nonce");
+        assert!(
+            a.nonce.len() >= 40,
+            "32 random bytes, base64url: {}",
+            a.nonce
+        );
+        // Both open, both for this task; equal expiries, so the order between
+        // them is the nonces', which is random.
+        let mut open: Vec<(String, Challenge)> = k
+            .pending_approvals(10)
+            .into_iter()
+            .map(|p| (p.task_id, p.challenge))
+            .collect();
+        open.sort_by(|x, y| x.1.nonce.cmp(&y.1.nonce));
+        let mut expected = vec![(task.clone(), a.clone()), (task.clone(), b.clone())];
+        expected.sort_by(|x, y| x.1.nonce.cmp(&y.1.nonce));
+        assert_eq!(open, expected);
+        // Expired ones are not pending, and are swept by the next mint.
+        assert!(k.pending_approvals(a.expires_at_ms).is_empty());
+        let c = k
+            .mint_approval_challenge(&machine(a.expires_at_ms), &task)
+            .unwrap();
+        assert_eq!(k.approval_challenges.len(), 1);
+        assert_eq!(k.pending_approvals(a.expires_at_ms)[0].challenge, c);
+        // Bounded: past the cap the one closest to expiry goes.
+        for _ in 0..(MAX_APPROVAL_CHALLENGES + 5) {
+            k.mint_approval_challenge(&machine(a.expires_at_ms + 1), &task)
+                .unwrap();
+        }
+        assert_eq!(k.approval_challenges.len(), MAX_APPROVAL_CHALLENGES);
+        assert!(
+            !k.approval_challenges.contains_key(&c.nonce),
+            "the earliest expiry was the one dropped"
+        );
+    }
+
+    /// The node-key path through the shared verifier: a challenge nobody
+    /// minted is refused before the signature is looked at, an altered one is
+    /// refused and burns the nonce, an expired one is refused, and a minted
+    /// one is accepted exactly once — after which the waiting step completes.
+    #[test]
+    fn approve_spends_a_minted_challenge_once_and_refuses_every_other() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let key = SoftwareHumanKey::generate("phone-1");
+        k.enroll_device("phone-1", key.verifying_key_bytes());
+        let (task, subject) = waiting_task(&mut k);
+        let events = |k: &RealKernel| k.ledger().events().len();
+
+        // Unminted, well signed, right subject.
+        let forged = Challenge {
+            resource: format!("task:{task}"),
+            action_digest: subject.clone(),
+            nonce: "made-up".into(),
+            expires_at_ms: 1_000_000,
+        };
+        let before = events(&k);
+        let err = k.approve(&human(5), signed(&key, &forged)).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+        assert_eq!(events(&k), before, "nothing appended");
+
+        // Minted, then altered: refused, and the nonce is gone with it.
+        let minted = k.mint_approval_challenge(&machine(5), &task).unwrap();
+        let altered = Challenge {
+            action_digest: "sha256:other".into(),
+            ..minted.clone()
+        };
+        let mut wrong_subject = signed(&key, &altered);
+        wrong_subject.subject_hash = "sha256:other".into();
+        let err = k.approve(&human(6), wrong_subject).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("not the one")),
+            "{err}"
+        );
+        let err = k.approve(&human(6), signed(&key, &minted)).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+
+        // Minted and expired.
+        let stale = k
+            .mint_approval_challenge_with_ttl(&machine(7), &task, 3)
+            .unwrap();
+        let err = k.approve(&human(10), signed(&key, &stale)).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("expired")),
+            "{err}"
+        );
+
+        // Minted, and signed by a key that is not the device's: the nonce is
+        // spent by the failed signature, so the real key cannot use it after.
+        let minted = k.mint_approval_challenge(&machine(8), &task).unwrap();
+        let impostor = SoftwareHumanKey::generate("phone-1");
+        let err = k
+            .approve(&human(9), signed(&impostor, &minted))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::Principal(_)), "{err}");
+        let err = k.approve(&human(9), signed(&key, &minted)).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+        assert!(k.approvals_for(&subject).is_empty());
+        assert_eq!(events(&k), before);
+
+        // Minted, signed, presented once: recorded, with the ceremony named.
+        let minted = k.mint_approval_challenge(&machine(11), &task).unwrap();
+        k.approve(&human(12), signed(&key, &minted)).unwrap();
+        assert_eq!(k.approvals_for(&subject).len(), 1);
+        // A device-key approval has no assertion row, and its payload has no
+        // `assertion` field at all.
+        assert_eq!(k.assertion_for(&signed(&key, &minted)).unwrap(), None);
+        let last = k.ledger().events().last().unwrap();
+        assert_eq!(last.kind, "approval.recorded");
+        assert_eq!(
+            last.payload_hash,
+            hash_canonical(&ApprovalRecord {
+                approval: &signed(&key, &minted),
+                proof: "device-key",
+                assertion: None,
+            })
+        );
+        // Presented again: spent.
+        let err = k.approve(&human(13), signed(&key, &minted)).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+        assert_eq!(k.approvals_for(&subject).len(), 1);
+        assert!(k.pending_approvals(13).is_empty());
+        let t = k.run_task_step(&machine(14), &task).unwrap();
+        assert_eq!(t.status, crate::tasks::TaskStatus::Done);
+    }
+
+    /// The passkey path (SP1b Task 5): an approval the web verifier already
+    /// checked is recorded in-process against a minted challenge, once, with
+    /// `proof: webauthn` on the ledger; one that names no minted challenge,
+    /// a machine approver, or a subject other than the challenge's is refused
+    /// with nothing recorded.
+    #[test]
+    fn record_verified_human_approval_takes_a_minted_challenge_once() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let (task, subject) = waiting_task(&mut k);
+        let passkey = || Principal::Human {
+            device_id: "passkey:abc".into(),
+        };
+        let approval = |ch: &Challenge| Approval {
+            subject_hash: ch.action_digest.clone(),
+            kind: ApprovalKind::Human,
+            approver: passkey(),
+            challenge: Some(ch.clone()),
+            signature_hex: Some("3045".into()),
+        };
+        let before = k.ledger().events().len();
+
+        // No minted challenge behind it.
+        let unminted = Challenge {
+            resource: format!("task:{task}"),
+            action_digest: subject.clone(),
+            nonce: "n".into(),
+            expires_at_ms: 1_000_000,
+        };
+        let err = k
+            .record_verified_human_approval(5, approval(&unminted), "webauthn", None)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+
+        // A machine approver, a missing signature, a subject that is not the
+        // challenge's: each refused before the challenge is spent.
+        let minted = k.mint_approval_challenge(&machine(5), &task).unwrap();
+        let mut machine_made = approval(&minted);
+        machine_made.approver = Principal::Machine {
+            node_id: "n1".into(),
+            lease_id: "web".into(),
+        };
+        assert!(matches!(
+            k.record_verified_human_approval(6, machine_made, "webauthn", None),
+            Err(KernelError::I1(_))
+        ));
+        let mut unsigned = approval(&minted);
+        unsigned.signature_hex = None;
+        assert!(matches!(
+            k.record_verified_human_approval(6, unsigned, "webauthn", None),
+            Err(KernelError::I1(_))
+        ));
+        let mut other = approval(&minted);
+        other.subject_hash = "sha256:other".into();
+        assert!(matches!(
+            k.record_verified_human_approval(6, other, "webauthn", None),
+            Err(KernelError::I1(_))
+        ));
+        assert_eq!(k.pending_approvals(6).len(), 1, "still unspent");
+        assert!(k.approvals_for(&subject).is_empty());
+        assert_eq!(k.ledger().events().len(), before);
+
+        // The genuine one: recorded, named, spent.
+        let assertion = AssertionRecord {
+            credential_id: "abc".into(),
+            authenticator_data: "YXV0aA".into(),
+            client_data_json: "eyJjaGFsbGVuZ2UiOiJuIn0".into(),
+        };
+        k.record_verified_human_approval(7, approval(&minted), "webauthn", Some(assertion.clone()))
+            .unwrap();
+        assert_eq!(k.approvals_for(&subject), vec![approval(&minted)]);
+        // The assertion is stored beside the approval, under its key.
+        assert_eq!(
+            k.assertion_for(&approval(&minted)).unwrap(),
+            Some(assertion.clone())
+        );
+        let last = k.ledger().events().last().unwrap();
+        assert_eq!(last.kind, "approval.recorded");
+        assert_eq!(
+            last.payload_hash,
+            hash_canonical(&ApprovalRecord {
+                approval: &approval(&minted),
+                proof: "webauthn",
+                assertion: Some(&assertion),
+            })
+        );
+        assert!(k.pending_approvals(7).is_empty());
+        let err = k
+            .record_verified_human_approval(8, approval(&minted), "webauthn", None)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+        assert_eq!(k.approvals_for(&subject).len(), 1);
+        assert_eq!(
+            k.run_task_step(&machine(9), &task).unwrap().status,
+            crate::tasks::TaskStatus::Done
+        );
+    }
+
+    /// SP1b Task 5 fix round 1 (review Important 1): the passkey path mints
+    /// with the verifier's own challenge as the nonce, so one value is
+    /// signed by the authenticator and spent by the kernel. The kernel still
+    /// binds the task, the subject, the resource and the expiry, refuses a
+    /// short nonce and one already open, and spends it exactly once.
+    #[test]
+    fn a_challenge_minted_with_a_given_nonce_is_bound_and_spent_like_any_other() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let (task, subject) = waiting_task(&mut k);
+        let webauthn_challenge = "c".repeat(43);
+        let ch = k
+            .mint_approval_challenge_with_nonce(&machine(5), &task, webauthn_challenge.clone())
+            .unwrap();
+        assert_eq!(ch.nonce, webauthn_challenge);
+        assert_eq!(ch.resource, format!("task:{task}"));
+        assert_eq!(ch.action_digest, subject);
+        assert_eq!(ch.expires_at_ms, 5 + APPROVAL_CHALLENGE_TTL_MS);
+        assert_eq!(k.pending_approvals(5)[0].challenge, ch);
+
+        // Too short, already open, or for a task that is not there: refused,
+        // and nothing is minted for any of them.
+        let err = k
+            .mint_approval_challenge_with_nonce(&machine(5), &task, "short".into())
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("32")),
+            "{err}"
+        );
+        let err = k
+            .mint_approval_challenge_with_nonce(&machine(5), &task, webauthn_challenge.clone())
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("already open")),
+            "{err}"
+        );
+        let err = k
+            .mint_approval_challenge_with_nonce(&machine(5), "task-none", "d".repeat(43))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::NotFound(_)), "{err}");
+        assert_eq!(k.pending_approvals(5).len(), 1);
+
+        // Spent once by the passkey path, then gone.
+        let approval = Approval {
+            subject_hash: subject.clone(),
+            kind: ApprovalKind::Human,
+            approver: Principal::Human {
+                device_id: "passkey:abc".into(),
+            },
+            challenge: Some(ch.clone()),
+            signature_hex: Some("3045".into()),
+        };
+        k.record_verified_human_approval(6, approval.clone(), "webauthn", None)
+            .unwrap();
+        assert!(k.pending_approvals(6).is_empty());
+        let err = k
+            .record_verified_human_approval(7, approval, "webauthn", None)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+        // The task is done with its approval now, so nothing more is minted
+        // for it — with that nonce or any other.
+        assert_eq!(
+            k.run_task_step(&machine(8), &task).unwrap().status,
+            crate::tasks::TaskStatus::Done
+        );
+        assert!(k
+            .mint_approval_challenge_with_nonce(&machine(9), &task, webauthn_challenge)
+            .is_err());
+    }
+
+    /// A passkey is a device row of its own class: listed with its credential
+    /// and enrolment time, counted among the devices, absent from the key
+    /// registry (it has no ed25519 key), refused a second time under the same
+    /// id, updatable in place without a second `device.enrolled`, and there
+    /// again after a reopen.
+    #[test]
+    fn a_passkey_is_enrolled_once_listed_counted_and_survives_reopen() {
+        let d = tempfile::tempdir().unwrap();
+        let cred = serde_json::json!({ "cred": { "id": "abc", "counter": 0 } });
+        {
+            let mut k = open(d.path());
+            let enrolled = |k: &RealKernel| {
+                k.ledger()
+                    .events()
+                    .iter()
+                    .filter(|e| e.kind == "device.enrolled")
+                    .count()
+            };
+            let err = k.enroll_passkey("laptop", cred.clone(), 1).unwrap_err();
+            assert!(matches!(err, KernelError::I1(_)), "{err}");
+            let err = k
+                .enroll_passkey(PASSKEY_DEVICE_PREFIX, cred.clone(), 1)
+                .unwrap_err();
+            assert!(matches!(err, KernelError::I1(_)), "{err}");
+            k.enroll_passkey("passkey:abc", cred.clone(), 1).unwrap();
+            assert_eq!(enrolled(&k), 1);
+            let err = k
+                .enroll_passkey("passkey:abc", cred.clone(), 2)
+                .unwrap_err();
+            assert!(
+                matches!(&err, KernelError::I1(m) if m.contains("already")),
+                "{err}"
+            );
+            assert_eq!(enrolled(&k), 1);
+
+            assert_eq!(
+                k.passkeys().unwrap(),
+                vec![PasskeyRow {
+                    device_id: "passkey:abc".into(),
+                    credential: cred.clone(),
+                    enrolled_ms: 1,
+                }]
+            );
+            assert!(k.devices().ids().is_empty(), "no key in the registry");
+            k.enroll_device_persisted("phone-1", [7u8; 32]).unwrap();
+            assert_eq!(
+                k.device_ids().unwrap(),
+                vec!["passkey:abc".to_string(), "phone-1".to_string()]
+            );
+            assert_eq!(k.boot().unwrap().devices, k.device_ids().unwrap());
+
+            // A counter moved: the row is replaced, nothing is appended.
+            let moved = serde_json::json!({ "cred": { "id": "abc", "counter": 3 } });
+            k.update_passkey("passkey:abc", moved.clone()).unwrap();
+            assert_eq!(k.passkeys().unwrap()[0].credential, moved);
+            assert_eq!(enrolled(&k), 2, "phone-1's, and nothing for the update");
+            assert!(matches!(
+                k.update_passkey("phone-1", moved.clone()),
+                Err(KernelError::NotFound(_))
+            ));
+            assert!(matches!(
+                k.update_passkey("passkey:nope", moved),
+                Err(KernelError::NotFound(_))
+            ));
+        }
+        let k = open(d.path());
+        let rows = k.passkeys().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].device_id, "passkey:abc");
+        assert_eq!(rows[0].credential["cred"]["counter"], 3);
+        assert_eq!(rows[0].enrolled_ms, 1);
+        assert_eq!(k.devices().ids(), vec!["phone-1".to_string()]);
     }
 
     #[test]
@@ -1601,5 +5018,883 @@ mod tests {
             .filter(|e| e.path().extension().map(|x| x == "bin").unwrap_or(false))
             .count();
         assert_eq!(blobs, 0, "a refused kind must store no blob");
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 1b (Ruling 14): an arch is re-created at boot from the spec its
+    // mount recorded. What cannot be re-created is listed as unavailable —
+    // never quietly replaced by the mock, which is what `load` used to do.
+    // ---------------------------------------------------------------------
+
+    /// A stand-in for a real adapter: not a `MockAdapter`, and it says so in
+    /// every completion, so a test can tell which of the two answered.
+    struct StandIn {
+        manifest: ArchManifest,
+        budget: u32,
+    }
+
+    impl arch::ArchAdapter for StandIn {
+        fn manifest(&self) -> &ArchManifest {
+            &self.manifest
+        }
+        fn context_budget(&self) -> u32 {
+            self.budget
+        }
+        fn count_tokens(&self, text: &str) -> u32 {
+            (text.len() / 4) as u32 + 1
+        }
+        fn complete(
+            &self,
+            _prompt: &str,
+            _max: u32,
+        ) -> Result<arch::Completion, arch::AdapterError> {
+            Ok(arch::Completion::text("the stand-in answered"))
+        }
+    }
+
+    /// The spec `arch.mount` would record for one of those.
+    fn standin_spec(name: &str) -> arch::MountSpec {
+        arch::MountSpec::new("standin", serde_json::json!({ "name": name })).unwrap()
+    }
+
+    /// One stand-in adapter, and the mount that records how to make it again.
+    fn mount_standin(k: &mut RealKernel, name: &str) -> String {
+        mount_standin_outcome(k, name).arch_id
+    }
+
+    fn mount_standin_outcome(k: &mut RealKernel, name: &str) -> MountOutcome {
+        let manifest = local_named(name, personal());
+        let budget = manifest.context_ceiling;
+        k.mount_with(
+            Arc::new(StandIn { manifest, budget }),
+            standin_spec(name),
+            Remount::Keep,
+        )
+        .expect("mount")
+    }
+
+    /// A factory that makes the stand-in `standin_spec` names — the daemon's
+    /// job, here in miniature. `weights` renames the weights the re-created
+    /// arch claims, which is how a runtime that changed under a node is
+    /// simulated: different weights, different `ArchIdentity`, different id.
+    fn standin_factory(weights: Option<&'static str>) -> AdapterFactory {
+        Arc::new(move |spec: &arch::MountSpec| {
+            anyhow::ensure!(spec.kind == "standin", "no arch kind {}", spec.kind);
+            let name = spec.config["name"].as_str().unwrap_or("standin");
+            let mut manifest = local_named(name, personal());
+            if let Some(w) = weights {
+                manifest.identity.weights_sha256 = w.into();
+            }
+            let budget = manifest.context_ceiling;
+            Ok(Box::new(StandIn { manifest, budget }) as Box<dyn arch::ArchAdapter>)
+        })
+    }
+
+    /// A factory that cannot make anything: the engine is gone, Docker is not
+    /// running, the binary was uninstalled.
+    fn broken_factory() -> AdapterFactory {
+        Arc::new(|spec: &arch::MountSpec| anyhow::bail!("no engine for {} here", spec.kind))
+    }
+
+    /// Open the store and let the arches come up, as a node does — the two
+    /// phases the daemon runs, back to back, because a test has no mutex to
+    /// keep them apart. `open_starting` is the same without the second phase,
+    /// for the tests that are about the window between them.
+    fn open_with(dir: &std::path::Path, factory: AdapterFactory) -> RealKernel {
+        let mut k = open_starting(dir, factory);
+        k.start_arches_now();
+        k
+    }
+
+    fn open_starting(dir: &std::path::Path, factory: AdapterFactory) -> RealKernel {
+        RealKernel::open_with_factory(dir, KeySource::File(dir.join("master.key")), "n1", factory)
+            .unwrap()
+    }
+
+    /// Mount the stand-in, drop the kernel, open it again over the same store:
+    /// the arch is Ready and the completion comes back from the stand-in. The
+    /// bug this pins down is the one Task 2 found — `load` fabricated a
+    /// `MockAdapter` for every persisted manifest, so a restart turned every
+    /// real arch into the mock without a word to anybody.
+    #[test]
+    fn a_persisted_arch_is_re_created_at_boot_and_never_replaced_by_a_mock() {
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+
+        let mut k = open_with(d.path(), standin_factory(None));
+        assert_eq!(
+            k.arch_state(&id),
+            Some(ArchState::Ready),
+            "re-created at boot"
+        );
+        let reg = k
+            .submit_task(&machine(1), "say something", Label::bottom())
+            .unwrap();
+        k.infer(&machine(2), &id, Capability::Plan, &reg).unwrap();
+        let decisions = k.read_register(&machine(3), &reg).unwrap().decisions;
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.contains("the stand-in answered")),
+            "the arch that answered after the restart must be the real one: {decisions:?}"
+        );
+    }
+
+    /// The factory cannot make it: the arch is listed, with its reason, and
+    /// every step that names it fails saying so. Nothing is mocked, and no
+    /// `infer` event is written for a call that never left this node.
+    #[test]
+    fn an_arch_the_factory_cannot_re_create_is_unavailable_and_the_scheduler_refuses_it() {
+        use crate::tasks::{StepKind, StepStatus, TaskStatus};
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+
+        let mut k = open_with(d.path(), broken_factory());
+        match k.arch_state(&id) {
+            Some(ArchState::Unavailable(why)) => assert!(why.contains("no engine"), "{why}"),
+            other => panic!("an arch that could not be re-created is unavailable, got {other:?}"),
+        }
+        assert!(
+            k.arches().iter().any(|(i, _)| *i == id),
+            "an unavailable arch is still listed: it is what an operator has to go and fix"
+        );
+
+        let infers = |k: &RealKernel| {
+            k.ledger()
+                .events()
+                .iter()
+                .filter(|e| e.kind == "infer")
+                .count()
+        };
+        let before = infers(&k);
+        let t = k
+            .create_task(
+                &machine(1),
+                "say something",
+                "note",
+                Label::bottom(),
+                vec![StepKind::Plan {
+                    arch_id: id.clone(),
+                }],
+            )
+            .unwrap();
+        let err = k.run_task_step(&machine(2), &t.id).unwrap_err();
+        assert!(
+            err.to_string().starts_with("arch unavailable: "),
+            "the scheduler names the state, not a mock's answer: {err}"
+        );
+        let row = k.task(&machine(3), &t.id).unwrap().unwrap();
+        assert!(matches!(row.status, TaskStatus::Failed));
+        match &row.steps[0].status {
+            StepStatus::Failed(why) => assert!(why.starts_with("arch unavailable: "), "{why}"),
+            other => panic!("the step must be Failed, got {other:?}"),
+        }
+        assert_eq!(
+            infers(&k),
+            before,
+            "nothing was inferred, so nothing may be recorded as having been"
+        );
+    }
+
+    /// The runtime under the node changed — a new image, new weights — so the
+    /// arch the factory makes is a *different* arch. The stored id becomes
+    /// unavailable saying exactly that, and the new one is not mounted in its
+    /// place: substituting one model for another behind an id is the thing an
+    /// arch id exists to prevent.
+    #[test]
+    fn an_arch_whose_re_created_manifest_changed_is_unavailable_and_nothing_takes_its_place() {
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+
+        let k = open_with(d.path(), standin_factory(Some("sha256:new-weights")));
+        match k.arch_state(&id) {
+            Some(ArchState::Unavailable(why)) => {
+                assert!(why.starts_with("manifest changed: "), "{why}");
+                assert!(why.contains(&id), "the id that was stored: {why}");
+            }
+            other => panic!("a changed manifest is unavailable, got {other:?}"),
+        }
+        assert_eq!(
+            k.arches().len(),
+            1,
+            "the arch the factory made is not mounted behind the operator's back: {:?}",
+            k.arches().iter().map(|(i, _)| i).collect::<Vec<_>>()
+        );
+    }
+
+    /// Ruling 13 for the unavailable case: mounting the same manifest again is
+    /// how an operator repairs one. It replaces the placeholder and says it
+    /// mounted something, because it did — the arch was not usable before.
+    #[test]
+    fn mounting_an_unavailable_arch_again_re_attaches_it() {
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+        let mut k = open_with(d.path(), broken_factory());
+        assert!(matches!(k.arch_state(&id), Some(ArchState::Unavailable(_))));
+
+        let outcome = {
+            let manifest = local_named("standin", personal());
+            let budget = manifest.context_ceiling;
+            k.mount_with(
+                Arc::new(StandIn { manifest, budget }),
+                standin_spec("standin"),
+                Remount::Keep,
+            )
+            .unwrap()
+        };
+        assert_eq!(outcome.arch_id, id);
+        assert!(
+            !outcome.already_mounted,
+            "what was there was a placeholder, not an arch: this mount mounted one"
+        );
+        assert!(
+            outcome.replaced.is_none(),
+            "a placeholder holds no adapter to drop"
+        );
+        assert_eq!(k.arch_state(&id), Some(ArchState::Ready));
+        assert_eq!(k.arches().len(), 1);
+    }
+
+    /// A mount spec is durable, and a durable file is the last place a
+    /// credential belongs. Neither adapter this node has takes one today; the
+    /// guard is here for the kind that will (Ruling 14).
+    #[test]
+    fn a_mount_spec_refuses_to_carry_anything_shaped_like_a_secret() {
+        for named in ["api_key", "token", "secret", "AuthToken", "password"] {
+            let err = arch::MountSpec::new("x", serde_json::json!({ named: "sk-live-1" }))
+                .expect_err("a spec carrying a credential must be refused");
+            assert!(err.to_string().contains(named), "{err}");
+        }
+        // Nested, too: a config is a tree and a credential can sit anywhere in it.
+        assert!(
+            arch::MountSpec::new("x", serde_json::json!({ "auth": { "key": "sk-1" } })).is_err()
+        );
+        // Including through a list, and through an object with innocent keys
+        // of its own (Task 1b review, Minor 1): the name over the collection
+        // is what makes everything inside it a credential. A list of secrets
+        // is a secret.
+        assert!(
+            arch::MountSpec::new("x", serde_json::json!({ "api_keys": ["sk-live-1"] })).is_err(),
+            "a list under a credential-shaped name is a list of credentials"
+        );
+        assert!(arch::MountSpec::new(
+            "x",
+            serde_json::json!({ "credentials": { "user": "eric", "value": "sk-1" } })
+        )
+        .is_err());
+        assert!(
+            arch::MountSpec::new("x", serde_json::json!({ "outer": [{ "token": "sk-1" }] }))
+                .is_err()
+        );
+        // And the counts every adapter here does carry are not credentials:
+        // `max_tokens` is a number, and a number is not a secret.
+        arch::MountSpec::new(
+            "ollama",
+            serde_json::json!({ "model": "gemma3:1b", "max_tokens": 2048, "num_ctx": 8192 }),
+        )
+        .expect("a spec of plain configuration is not a secret");
+    }
+
+    /// An arch whose adapter has not been built yet is `Starting`, and a step
+    /// that names one is told to **retry** — not failed (Task 1b review,
+    /// Important 1). A container that takes four seconds to start must not
+    /// cost a task a human re-submission, so nothing is written down as a
+    /// failure and nothing is inferred; the step goes back to Pending and the
+    /// task to Queued, and the next `vk task step` runs it.
+    #[test]
+    fn a_step_that_names_an_arch_still_starting_is_retryable_and_then_runs() {
+        use crate::tasks::{StepKind, StepStatus, TaskStatus};
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+
+        // Opened, not yet started: this is the window the daemon serves in.
+        let mut k = open_starting(d.path(), standin_factory(None));
+        assert_eq!(k.arch_state(&id), Some(ArchState::Starting));
+        assert_eq!(k.arches_starting(), 1);
+        assert!(
+            k.arches().iter().any(|(i, _)| *i == id),
+            "an arch coming up is listed while it does"
+        );
+
+        let infers = |k: &RealKernel| {
+            k.ledger()
+                .events()
+                .iter()
+                .filter(|e| e.kind == "infer")
+                .count()
+        };
+        let before = infers(&k);
+        let t = k
+            .create_task(
+                &machine(1),
+                "say something",
+                "note",
+                Label::bottom(),
+                vec![StepKind::Plan {
+                    arch_id: id.clone(),
+                }],
+            )
+            .unwrap();
+        let err = k.run_task_step(&machine(2), &t.id).unwrap_err();
+        assert!(
+            matches!(err, KernelError::ArchStarting(ref named) if *named == id),
+            "{err}"
+        );
+        assert_eq!(err.to_string(), format!("arch {id} is starting; retry"));
+        let row = k.task(&machine(3), &t.id).unwrap().unwrap();
+        assert!(
+            matches!(row.status, TaskStatus::Queued),
+            "a task waiting on an arch that is coming up is queued, not failed: {:?}",
+            row.status
+        );
+        assert!(
+            matches!(row.steps[0].status, StepStatus::Pending),
+            "the step is still to run: {:?}",
+            row.steps[0].status
+        );
+        assert_eq!(row.steps[0].started_ms, None);
+        assert_eq!(
+            infers(&k),
+            before,
+            "nothing was inferred, so nothing is recorded"
+        );
+
+        // The arch comes up, and the very same task runs — no re-submission.
+        k.start_arches_now();
+        assert_eq!(k.arch_state(&id), Some(ArchState::Ready));
+        assert_eq!(k.arches_starting(), 0);
+        let done = k.run_task_step(&machine(4), &t.id).unwrap();
+        assert!(matches!(done.status, TaskStatus::Done), "{:?}", done.status);
+        let decisions = k.read_register(&machine(5), &t.register).unwrap().decisions;
+        assert!(
+            decisions
+                .iter()
+                .any(|x| x.contains("the stand-in answered")),
+            "{decisions:?}"
+        );
+    }
+
+    /// Opening a store builds nothing (Task 1b review, Important 1). The whole
+    /// reason is timing: a factory that takes seconds must not run before the
+    /// daemon's endpoint answers, or `vk boot` times out and kills the node.
+    #[test]
+    fn opening_a_store_builds_no_adapter() {
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = {
+            let calls = calls.clone();
+            let inner = standin_factory(None);
+            Arc::new(move |spec: &arch::MountSpec| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                inner(spec)
+            }) as AdapterFactory
+        };
+        let mut k = open_starting(d.path(), counted);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "open must not have built anything: the node is not reachable yet"
+        );
+        assert_eq!(k.pending_mounts().len(), 1);
+        k.start_arches_now();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(k.arch_state(&id), Some(ArchState::Ready));
+    }
+
+    /// Important 2: the boot path compares the **whole** manifest, not the
+    /// arch id. `arch_id` hashes `ArchIdentity` alone, so an adapter can come
+    /// back under the right id carrying a clearance that is not the one on
+    /// disk — and the adapter's manifest is what `i2_flow` reads on the very
+    /// next prompt. The mount path has always refused this; so does boot now.
+    #[test]
+    fn an_arch_re_created_with_the_same_identity_but_a_different_manifest_is_unavailable() {
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+
+        // Same `ArchIdentity` — so the same arch id — and a clearance that
+        // would quietly widen what this arch may be shown.
+        let widening: AdapterFactory = Arc::new(|spec: &arch::MountSpec| {
+            let name = spec.config["name"].as_str().unwrap_or("standin");
+            let manifest = local_named(
+                name,
+                Clearance {
+                    max_scope: Scope::Holdout,
+                    third_party_allowed: true,
+                },
+            );
+            let budget = manifest.context_ceiling;
+            Ok(Box::new(StandIn { manifest, budget }) as Box<dyn arch::ArchAdapter>)
+        });
+        let mut k = open_with(d.path(), widening);
+
+        match k.arch_state(&id) {
+            Some(ArchState::Unavailable(why)) => {
+                assert!(why.starts_with("manifest changed: "), "{why}");
+                assert!(why.contains("clearance"), "it names what differs: {why}");
+                assert!(
+                    why.contains(&format!("vk umount {id}")),
+                    "and how to retire it: {why}"
+                );
+            }
+            other => panic!("a widened clearance must not be adopted, got {other:?}"),
+        }
+        // The listing still shows the clearance that was stored, never the one
+        // that came back.
+        assert_eq!(
+            k.arch_states()[0].1.clearance,
+            personal(),
+            "the stored manifest is the one this node still answers with"
+        );
+        // And `i2_flow` never sees the new clearance, because the arch cannot
+        // be called at all.
+        let reg = k
+            .submit_task(&machine(1), "say something", Label::bottom())
+            .unwrap();
+        assert!(matches!(
+            k.infer(&machine(2), &id, Capability::Plan, &reg),
+            Err(KernelError::ArchUnavailable(_))
+        ));
+    }
+
+    /// Mounting an arch while its adapter is still being built is the operator
+    /// getting there first: their adapter is installed, and the one the
+    /// startup pass finishes building afterwards is handed back to be thrown
+    /// away rather than installed over the top of it.
+    #[test]
+    fn an_arch_mounted_while_it_was_starting_keeps_the_adapter_the_operator_mounted() {
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+        let mut k = open_starting(d.path(), standin_factory(None));
+        assert_eq!(k.arch_state(&id), Some(ArchState::Starting));
+
+        // The operator mounts it before the startup pass reaches it.
+        let pending = k.pending_mounts();
+        assert_eq!(pending.len(), 1);
+        let outcome = mount_standin_outcome(&mut k, "standin");
+        assert!(!outcome.already_mounted, "a placeholder is not an arch");
+        assert_eq!(k.arch_state(&id), Some(ArchState::Ready));
+        assert_eq!(k.arches_starting(), 0);
+
+        // The pass finishes and finds it gone from the queue: what it built is
+        // handed back, and nothing is installed over the operator's adapter.
+        let factory = k.adapter_factory();
+        let stale = k.install_arch(&pending[0].0, factory(&pending[0].1));
+        assert!(
+            stale.is_some(),
+            "the adapter nobody wanted comes back to be dropped outside the lock"
+        );
+        assert_eq!(k.arch_state(&id), Some(ArchState::Ready));
+        assert_eq!(k.arches().len(), 1);
+    }
+
+    /// Unmounting an arch that is still coming up clears it everywhere, and
+    /// what the startup pass built afterwards is not resurrected.
+    #[test]
+    fn an_arch_unmounted_while_it_was_starting_does_not_come_back() {
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+        let mut k = open_starting(d.path(), standin_factory(None));
+        let pending = k.pending_mounts();
+        assert!(
+            k.unmount(&id).unwrap().is_none(),
+            "a placeholder holds no adapter"
+        );
+        assert_eq!(k.arch_state(&id), None);
+
+        let factory = k.adapter_factory();
+        drop(k.install_arch(&pending[0].0, factory(&pending[0].1)));
+        assert_eq!(k.arch_state(&id), None, "an unmounted arch stays unmounted");
+        assert!(k.arches().is_empty());
+        // And the store agrees: nothing is left for the next boot to re-create.
+        assert!(k
+            .store()
+            .db
+            .list_json::<arch::MountSpec>("mounts")
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Ruling 8's second half: the counters say what an arch has spent in
+    /// total, and a per-call row says what each call was. A total cannot be
+    /// attributed to a task, compared with the next call or read after the
+    /// fact; the row can, and it is the only place `tokens_out` and the
+    /// duration of one call survive at all.
+    #[test]
+    fn every_completed_infer_leaves_one_usage_row() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = scripted(&mut k, "measured", || {
+            Ok(arch::Completion {
+                text: "ok".into(),
+                tokens_in_measured: Some(1_400),
+                tokens_out: Some(37),
+                cost_list_usd: Some(0.002),
+                details: None,
+            })
+        });
+        let reg = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        k.infer(&machine(2), &arch, Capability::Plan, &reg).unwrap();
+
+        let rows = k.usage(&machine(3), &UsageFilter::All).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let r = &rows[0];
+        assert_eq!(r.arch_id, arch);
+        assert_eq!(r.tokens_in, 1_400);
+        assert_eq!(r.tokens_in_measured, 1_400);
+        assert_eq!(r.tokens_out, 37);
+        assert_eq!(r.cost_list_usd, Some(0.002));
+        assert!(r.ts_ms > 0, "{r:?}");
+        // An inference outside a task names no task and no step, rather than
+        // inventing one.
+        assert_eq!(r.task_id, None, "{r:?}");
+        assert_eq!(r.step_index, None, "{r:?}");
+
+        // A failed call leaves no row: `usage` is what was spent and came
+        // back, and the `infer`/`requested` event is where an attempt lives.
+        let dies = scripted(&mut k, "dies", || {
+            Err(arch::AdapterError::Other(anyhow::anyhow!("engine gone")))
+        });
+        assert!(k.infer(&machine(4), &dies, Capability::Plan, &reg).is_err());
+        assert_eq!(k.usage(&machine(5), &UsageFilter::All).unwrap().len(), 1);
+
+        // On disk, like the counters beside them.
+        drop(k);
+        let k = open(d.path());
+        assert_eq!(k.usage(&machine(6), &UsageFilter::All).unwrap().len(), 1);
+        assert_eq!(
+            k.usage(&machine(6), &UsageFilter::Arch(arch.clone()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(k
+            .usage(&machine(6), &UsageFilter::Arch("sha256:nope".into()))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A usage row says which step of which task spent the money, which is
+    /// the whole reason it is not just another counter.
+    #[test]
+    fn a_task_step_names_itself_on_the_call_it_made() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(local(personal()));
+        let t = k
+            .create_task(
+                &machine(1),
+                "draft a proposal",
+                "note",
+                Label::bottom(),
+                vec![
+                    tasks::StepKind::Plan {
+                        arch_id: arch.clone(),
+                    },
+                    tasks::StepKind::Draft {
+                        arch_id: arch.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        k.run_task_step(&machine(2), &t.id).unwrap();
+        k.run_task_step(&machine(3), &t.id).unwrap();
+
+        let rows = k
+            .usage(&machine(4), &UsageFilter::Task(t.id.clone()))
+            .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(
+            rows.iter().map(|r| r.step_index).collect::<Vec<_>>(),
+            [Some(0), Some(1)],
+            "in the order the steps ran: {rows:?}"
+        );
+        for r in &rows {
+            assert_eq!(r.task_id.as_deref(), Some(t.id.as_str()), "{r:?}");
+            assert_eq!(r.arch_id, arch);
+        }
+        // A task nobody has heard of is not an empty answer.
+        assert!(k
+            .usage(&machine(5), &UsageFilter::Task("task-nope".into()))
+            .is_err());
+    }
+
+    /// I2: a usage row is metadata about a task, and a caller who may not see
+    /// the task may not see what it spent either — a row naming a register
+    /// above the caller's clearance would leak that it exists and how big it
+    /// was.
+    #[test]
+    fn usage_rows_of_a_task_the_caller_cannot_see_are_not_listed() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(local(personal()));
+        let secret = Label {
+            scope: Scope::Personal,
+            data_class: DataClass::Own,
+            origins: Default::default(),
+        };
+        let t = k
+            .create_task(
+                &machine(1),
+                "a private goal",
+                "note",
+                secret,
+                vec![tasks::StepKind::Plan {
+                    arch_id: arch.clone(),
+                }],
+            )
+            .unwrap();
+        k.run_task_step(&machine(2), &t.id).unwrap();
+        assert_eq!(k.usage(&machine(3), &UsageFilter::All).unwrap().len(), 1);
+
+        let outsider = Ctx {
+            clearance: Clearance {
+                max_scope: Scope::Vertical,
+                third_party_allowed: true,
+            },
+            ..machine(4)
+        };
+        assert!(
+            k.usage(&outsider, &UsageFilter::All).unwrap().is_empty(),
+            "a row about a task this caller cannot see is not a row it may read"
+        );
+        assert!(k.usage(&outsider, &UsageFilter::Task(t.id)).is_err());
+    }
+
+    /// `fsck` is the whole store, and the kernel's own tier is the one the
+    /// store cannot check: an arch whose mount spec has gone is an arch the
+    /// next boot cannot make again, which is exactly the thing an operator
+    /// wants told before the restart rather than after it.
+    #[test]
+    fn fsck_adds_the_kernels_own_tier_and_finds_an_arch_with_no_spec() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(local(personal()));
+        let report = k.fsck();
+        assert!(report.ok, "{report:?}");
+        let mounts = report
+            .tiers
+            .iter()
+            .find(|t| t.tier == "mounts")
+            .expect("a mounts tier");
+        assert_eq!(mounts.checked, 1, "{mounts:?}");
+
+        k.store().db.delete("mounts", &arch).unwrap();
+        let report = k.fsck();
+        assert!(!report.ok, "{report:?}");
+        let mounts = report
+            .tiers
+            .iter()
+            .find(|t| t.tier == "mounts")
+            .expect("a mounts tier");
+        assert_eq!(mounts.failed, 1, "{mounts:?}");
+        assert!(
+            mounts.problems.iter().any(|p| p.contains(&arch)),
+            "{mounts:?}"
+        );
+    }
+
+    /// The rebase is a human overriding the store's own refusal, so it goes on
+    /// the record — on the next `boot` event's report, in `boot.forced`'s
+    /// style, rather than as a new event kind. Once: the boot after it is an
+    /// ordinary boot and must not keep restating an override that happened
+    /// two restarts ago.
+    #[test]
+    fn a_rebase_is_named_in_the_next_boot_report_and_only_that_one() {
+        let d = tempfile::tempdir().unwrap();
+        // A record worth cutting, then the cut, as a restore of an older copy
+        // of the segment leaves it.
+        {
+            let mut k = open(d.path());
+            k.boot().unwrap();
+            k.register_arch(local(personal()));
+        }
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        assert!(lines.len() >= 2, "{}", lines.len());
+        lines.truncate(lines.len() - 1);
+        std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let rebase = {
+            let mut k = open(d.path());
+            assert!(!k.ledger_holds(), "a cut record does not hold");
+            let rebase = k.rebase_ledger_head(now_ms()).expect("rebase");
+            assert!(k.ledger_holds(), "and holds once the head is re-recorded");
+            rebase
+        };
+
+        // The next boot says so, and its `boot` event commits to a report
+        // that carries it.
+        let mut k = open(d.path());
+        let report = k.boot().unwrap();
+        assert_eq!(report.fsck.len(), 1, "{report:?}");
+        let named = &report.fsck[0];
+        assert_eq!(named.rebased_to, rebase.rebased_to, "{named:?}");
+        assert_eq!(named.rebased_from, rebase.rebased_from, "{named:?}");
+        let last = k
+            .ledger()
+            .events()
+            .iter()
+            .rev()
+            .find(|e| e.kind == "boot")
+            .expect("a boot event");
+        assert_eq!(last.payload_hash, hash_canonical(&report));
+
+        // And the boot after it is an ordinary boot — the *event* names a
+        // rebase once, when it happened.
+        drop(k);
+        let mut k = open(d.path());
+        assert!(k.boot().unwrap().fsck.is_empty());
+        // But the node does not stop having been rebased: the rows are the
+        // history, and `boot.info`/`vk status`/`vk fsck` read them for as
+        // long as the node exists (review Important 2).
+        assert_eq!(k.rebase_history().unwrap().len(), 1);
+    }
+
+    /// Review Important 1: a second rebase before the reporting boot must
+    /// not erase the first one's evidence — the person who did the first
+    /// already holds the presence the second needs, and the mechanism exists
+    /// to stop exactly them from being able to deny it.
+    #[test]
+    fn a_second_rebase_adds_a_row_rather_than_replacing_the_first() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut k = open(d.path());
+            k.boot().unwrap();
+            k.register_arch(local(personal()));
+            k.register_arch(local_named("second", personal()));
+        }
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        assert!(lines.len() >= 3, "{}", lines.len());
+        lines.truncate(lines.len() - 2);
+        std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let mut k = open(d.path());
+        // The real one: it discards the two events the cut removed.
+        let first = k.rebase_ledger_head(1_000).expect("the first rebase");
+        assert!(first.rebased_from.is_some(), "{first:?}");
+        // And a second, on a now-healthy store, which is a no-op. It used to
+        // overwrite the row above, so the boot afterwards reported the no-op
+        // and the real override was gone.
+        let second = k.rebase_ledger_head(2_000).expect("the second rebase");
+        assert_eq!(second.rebased_from.as_ref(), Some(&second.rebased_to));
+
+        let history = k.rebase_history().unwrap();
+        assert_eq!(history.len(), 2, "both rebases are on record: {history:?}");
+        assert_eq!(history[0], first, "the first is unchanged: {history:?}");
+        assert_eq!(history[1], second, "{history:?}");
+        drop(k);
+
+        // And the reporting boot names both, in order.
+        let mut k = open(d.path());
+        let report = k.boot().unwrap();
+        assert_eq!(report.fsck, vec![first, second], "{report:?}");
+        // Reported once; still history for ever.
+        drop(k);
+        let mut k = open(d.path());
+        assert!(k.boot().unwrap().fsck.is_empty());
+        assert_eq!(k.rebase_history().unwrap().len(), 2);
+    }
+
+    /// Review Critical 1. Cutting the tail is caught by the recorded head;
+    /// cutting the tail *and deleting the head row* used to be caught by
+    /// nothing — the node served without `--force` and `vk fsck` printed
+    /// "the store verifies". A head is written on every append, so a record
+    /// with no head recorded for it is a row somebody removed.
+    #[test]
+    fn a_record_with_no_recorded_head_does_not_hold_and_fails_the_head_tier() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut k = open(d.path());
+            k.boot().unwrap();
+            k.register_arch(local(personal()));
+        }
+        // The cut, and then the row that would have caught it.
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.truncate(lines.len() - 1);
+        std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+        {
+            let s = vk_store::Store::open(d.path(), KeySource::File(d.path().join("master.key")))
+                .unwrap();
+            // Exactly the reviewer's reproduction: one `DELETE` of one row.
+            s.db.kv_delete(vk_store::LEDGER_HEAD).unwrap();
+            assert!(s.db.kv_get(vk_store::LEDGER_HEAD).unwrap().is_none());
+        }
+        let mut k = open(d.path());
+        assert!(
+            !k.ledger_holds(),
+            "a record with no head recorded for it does not hold"
+        );
+        let report = k.fsck();
+        assert!(!report.ok, "{report:?}");
+        let head = report
+            .tiers
+            .iter()
+            .find(|t| t.tier == "head")
+            .expect("a head tier");
+        assert!(!head.ok, "{head:?}");
+        assert!(
+            head.problems
+                .iter()
+                .any(|p| p.contains("no recorded head for a non-empty chain")),
+            "{head:?}"
+        );
+        // And appending does not quietly record one over it: only a human's
+        // rebase does, so the state survives until somebody says so.
+        k.boot().unwrap();
+        assert!(!k.ledger_holds(), "an append must not paper over it");
+        assert!(!k.fsck().ok);
+
+        // The rebase is the way out, and it names no previous head because
+        // there was none on record.
+        let done = k.rebase_ledger_head(now_ms()).expect("rebase");
+        assert_eq!(done.rebased_from, None, "{done:?}");
+        assert!(k.ledger_holds());
+        assert!(k.fsck().ok, "{:?}", k.fsck());
+    }
+
+    /// And the innocent case stays innocent: a store nothing has been
+    /// appended to has no head and no record, and that is not damage.
+    #[test]
+    fn a_fresh_store_with_no_record_and_no_head_verifies() {
+        let d = tempfile::tempdir().unwrap();
+        let k = open(d.path());
+        assert!(k.ledger_holds(), "a fresh store holds");
+        let report = k.fsck();
+        assert!(report.ok, "{report:?}");
     }
 }

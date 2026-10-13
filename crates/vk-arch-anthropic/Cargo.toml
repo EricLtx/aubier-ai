@@ -1,0 +1,50 @@
+[package]
+name = "vk-arch-anthropic"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VerticalAI arch adapters: the Anthropic API first-party (US) and EU-hosted through Amazon Bedrock"
+
+[features]
+# `bedrock` is **off by default** (Ruling 30). Not for the build time — that
+# was measured at 83 extra crates and about a minute on a clean Windows build,
+# 15 s to 1 m 15 s, which is affordable — but for the supply chain: this is a
+# kernel with a `contracts/tcb.md` that enumerates its trusted base, and 83
+# transitive dependencies (`aws-lc-sys` among them, which wants a C toolchain)
+# do not belong in every node's build for an arch most nodes will never mount.
+# A node that wants the EU arch asks for it: `cargo build --features bedrock`.
+# Without it, `arch.mount { kind: "bedrock" }` is refused by name and says how
+# to get a build that has it — and *that* refusal is what the default build
+# now exercises.
+#
+# Nothing outside `src/bedrock.rs`'s `client` module is gated, so the EU
+# manifest, the model table and `converse_input` are compiled and tested in
+# every build either way.
+default = []
+bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:tokio"]
+
+[dependencies]
+vk-contracts = { path = "../vk-contracts" }
+vk-kernel = { path = "../vk-kernel" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# The API key's only home: service `vk`, user `anthropic`. Never a file in the
+# ordinary path, never the mount spec, never a manifest.
+keyring.workspace = true
+# The key is wiped when the adapter is dropped. A loop that writes zeroes can
+# be optimised away; this one cannot.
+zeroize = "1"
+
+# The EU half. Optional, and nothing else in the crate depends on it.
+aws-config = { version = "1", optional = true }
+aws-sdk-bedrockruntime = { version = "1", optional = true }
+# Bedrock's SDK is async and `ArchAdapter::complete` is not: one runtime,
+# owned by the adapter, driven from a thread of its own (see `bedrock.rs`).
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

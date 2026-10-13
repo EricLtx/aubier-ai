@@ -5,6 +5,8 @@
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long the daemon is given to answer its first request.
@@ -16,9 +18,32 @@ struct Daemon(Child);
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        kill_tree(self.0.id());
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Kill a daemon and everything it spawned. `Child::kill` reaches only the
+/// daemon itself; an infer's `cmd.exe` or a harness's `vk-mcp` is a
+/// grandchild, and an orphaned one keeps a handle to the state directory that
+/// would outlive the test's `TempDir` (Task 10 group F). On Windows
+/// `taskkill /T` walks the tree. On Unix there is no Job Object: a killed
+/// daemon's children are re-parented to `init` and run on until they finish
+/// of their own accord — but Unix removes a directory whose files are still
+/// open, and these tests' daemons spawn only short-lived children, so the
+/// direct kill is enough there.
+fn kill_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    let _ = pid;
 }
 
 fn vk_exe() -> PathBuf {
@@ -43,13 +68,16 @@ fn vkd_exe() -> PathBuf {
     BUILT.call_once(|| {
         // Captured, not inherited: a no-op build has nothing to say, and the
         // one time it does have something the message is in the failure.
+        // `vk-mcp` too: the daemon refuses to launch a harness without it
+        // beside itself (a tool-less Claude is not a run), so the harness
+        // tests need it built even when only this crate is under test.
         let out = Command::new(env!("CARGO"))
-            .args(["build", "-p", "vkd"])
+            .args(["build", "-p", "vkd", "-p", "vk-mcp"])
             .output()
             .expect("run cargo");
         assert!(
             out.status.success(),
-            "cargo build -p vkd failed:\n{}",
+            "cargo build -p vkd -p vk-mcp failed:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
     });
@@ -72,6 +100,29 @@ impl Shell {
             .env("VK_NODE_KEY_FILE", &self.node_key)
             .output()
             .expect("run vk")
+    }
+
+    /// The same, with something on stdin: `vk fsck --rebase-head` reads the
+    /// typed confirmation from there, and a test types it the way a person
+    /// would.
+    fn run_with_stdin(&self, args: &[&str], input: &str) -> Output {
+        let mut child = Command::new(vk_exe())
+            .args(args)
+            .env("VK_ENDPOINT", &self.endpoint)
+            .env("VK_NODE_KEY_FILE", &self.node_key)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run vk");
+        use std::io::Write as _;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(input.as_bytes())
+            .expect("write the confirmation");
+        child.wait_with_output().expect("vk")
     }
 
     fn ok(&self, args: &[&str]) -> String {
@@ -98,6 +149,15 @@ fn str_of<'a>(v: &'a Value, field: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no string field {field} in {v}"))
 }
 
+/// The `kind` of every event a `vk dmesg --json` tail carries, in order.
+fn dmesg_kinds(tail: &Value) -> Vec<&str> {
+    tail.as_array()
+        .unwrap_or_else(|| panic!("dmesg --json is not an array: {tail}"))
+        .iter()
+        .map(|e| str_of(e, "kind"))
+        .collect()
+}
+
 /// One `vk status --json`: the answer when a daemon is serving this shell's
 /// endpoint, nothing when none is.
 fn serving(sh: &Shell) -> Option<Value> {
@@ -107,6 +167,28 @@ fn serving(sh: &Shell) -> Option<Value> {
         .then(|| serde_json::from_slice(&o.stdout).expect("status JSON"))
 }
 
+/// Whether a process with this id is still running.
+fn process_alive(pid: u64) -> bool {
+    #[cfg(windows)]
+    {
+        // `tasklist` filtered to the pid prints the image line only when it is
+        // still there; otherwise "No tasks are running…".
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: `kill(pid, 0)` sends no signal and only asks whether the
+        // process exists and is signallable.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+}
+
 /// A daemon this test knows only by pid — which is all `vk boot --json` gives
 /// a caller, and so exactly what it must be enough to stop it with.
 struct Detached(u64);
@@ -114,9 +196,11 @@ struct Detached(u64);
 impl Detached {
     fn kill(&self) {
         let pid = self.0.to_string();
+        // Tree-kill (Task 10 group F): a detached `vk boot` daemon may have
+        // spawned children of its own, and an orphan keeps the state dir open.
         let mut cmd = if cfg!(windows) {
             let mut c = Command::new("taskkill");
-            c.args(["/F", "/PID", &pid]);
+            c.args(["/F", "/T", "/PID", &pid]);
             c
         } else {
             let mut c = Command::new("kill");
@@ -124,6 +208,12 @@ impl Detached {
             c
         };
         let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
+        // Wait for it to be gone, so its handles are released before the
+        // TempDir is removed.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && process_alive(self.0) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -136,6 +226,7 @@ impl Drop for Detached {
 #[test]
 fn the_vk_shell_drives_a_task_from_mount_to_release() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
     let mut daemon = Daemon(
@@ -175,11 +266,11 @@ fn the_vk_shell_drives_a_task_from_mount_to_release() {
     .to_string();
     let ls = sh.json(&["ls", "/arches", "--json"]);
     assert!(
-        ls["entries"]
+        ls["arches"]
             .as_array()
-            .expect("entries")
+            .expect("arches")
             .iter()
-            .any(|e| e.as_str().is_some_and(|s| s.contains(&arch))),
+            .any(|a| a["arch_id"].as_str() == Some(arch.as_str())),
         "mounted arch missing from /arches: {ls}"
     );
 
@@ -241,6 +332,1065 @@ fn the_vk_shell_drives_a_task_from_mount_to_release() {
     assert_eq!(tail.as_array().expect("events").len(), 5, "{tail}");
 }
 
+/// The shell verbs an operator uses on the arches themselves and on the store
+/// under them: mount one, read it in full, take it away again, and verify
+/// everything the node holds.
+///
+/// `vk fsck` is the point of this test. `vk ledger verify` answers one
+/// question — does the chain recompute — and a node can pass it with every
+/// blob on disk unreadable; this is the whole store, tier by tier, and a
+/// healthy one must come back green with counts that say what was looked at.
+#[test]
+fn vk_arch_show_umount_and_fsck_cover_the_arches_and_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let arch = str_of(
+        &sh.json(&["mount", "mock", "m1", "--ctx", "4096", "--json"]),
+        "arch_id",
+    )
+    .to_string();
+
+    // `vk arch show`: the manifest, the state, and the two things a listing
+    // has no room for — the identity tuple the arch id hashes, and the
+    // clearance the arch may be handed.
+    let shown = sh.json(&["arch", "show", &arch, "--json"]);
+    assert_eq!(str_of(&shown, "arch_id"), arch, "{shown}");
+    assert_eq!(str_of(&shown, "state"), "ready", "{shown}");
+    assert_eq!(str_of(&shown, "kind"), "mock", "{shown}");
+    assert!(
+        shown["manifest"]["identity"]["engine"].is_string(),
+        "the identity tuple is on the answer: {shown}"
+    );
+    assert!(
+        shown["manifest"]["clearance"]["max_scope"].is_string(),
+        "{shown}"
+    );
+    let page = sh.ok(&["arch", "show", &arch]);
+    for named in [arch.as_str(), "identity", "clearance", "ready"] {
+        assert!(page.contains(named), "{named} missing from:\n{page}");
+    }
+    // An id nobody mounted is not found, rather than an empty page.
+    assert!(!sh.run(&["arch", "show", "sha256:nope"]).status.success());
+
+    // A task, so the store has a blob, a register and a task row to verify.
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Draft a note",
+            "--plan",
+            &arch,
+            "--draft",
+            &arch,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    assert_eq!(
+        sh.json(&["task", "step", &task, "--all", "--json"])["status"],
+        "done"
+    );
+
+    // The whole store, green, with the tiers named and counted.
+    let report = sh.json(&["fsck", "--json"]);
+    assert_eq!(report["ok"], true, "{report}");
+    let tiers: std::collections::BTreeMap<String, Value> = report["tiers"]
+        .as_array()
+        .expect("tiers")
+        .iter()
+        .map(|t| (str_of(t, "tier").to_string(), t.clone()))
+        .collect();
+    for named in ["ledger", "head", "blobs", "keys", "mounts"] {
+        let t = tiers
+            .get(named)
+            .unwrap_or_else(|| panic!("no {named} tier in {report}"));
+        assert_eq!(t["ok"], true, "{named}: {t}");
+    }
+    assert!(
+        tiers["ledger"]["checked"].as_u64().unwrap_or(0) > 0,
+        "the chain was actually walked: {report}"
+    );
+    assert!(
+        tiers["blobs"]["checked"].as_u64().unwrap_or(0) > 0,
+        "the task left a blob and it was actually opened: {report}"
+    );
+    assert_eq!(tiers["mounts"]["checked"], 1, "{report}");
+    let screen = sh.ok(&["fsck"]);
+    assert!(screen.contains("the store verifies"), "{screen}");
+    assert!(screen.contains("TIER"), "{screen}");
+
+    // And `vk umount` says what it took away, after which the arch is gone
+    // from every listing and `fsck` counts one mount fewer.
+    let gone = sh.ok(&["umount", &arch]);
+    assert!(gone.contains(&arch), "{gone}");
+    assert!(!sh.ok(&["ls", "/arches"]).contains(&arch));
+    let report = sh.json(&["fsck", "--json"]);
+    assert_eq!(report["ok"], true, "{report}");
+}
+
+/// A record whose tail was cut — what a restore of an older copy of the
+/// segment leaves, and what a tail somebody deleted leaves: the same bytes.
+/// `vk fsck` says which tier failed and exits non-zero; `--rebase-head
+/// --force`, with the word typed out, is the documented way back, and it is
+/// on the record afterwards.
+#[test]
+fn vk_fsck_reports_a_cut_record_and_the_typed_rebase_is_the_way_back() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        sh.ok(&["mount", "mock", "m1", "--ctx", "4096"]);
+        sh.ok(&["stop"]);
+    }
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+    cut_ledger_tail(dir.path());
+
+    // The node will not serve a cut record, so `fsck` is reached the way an
+    // operator reaches it: under --force, which is what --force is for.
+    let _forced = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &["--force"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    wait_until(&sh, true, "--force did not start a daemon").expect("status");
+
+    let refused = sh.run(&["fsck"]);
+    assert!(
+        !refused.status.success(),
+        "a store that does not verify must exit non-zero"
+    );
+    let screen = String::from_utf8_lossy(&refused.stdout).to_string();
+    assert!(screen.contains("FAILED"), "{screen}");
+    assert!(
+        screen.contains("head: the record no longer contains"),
+        "the failing tier and its reason belong on the screen:\n{screen}"
+    );
+    assert!(
+        screen.contains("--rebase-head"),
+        "and the way back:\n{screen}"
+    );
+    // The chain that is left still links: this is a head failure, not a
+    // rewritten record, and the two must not read the same.
+    let report: Value = serde_json::from_slice(&sh.run(&["fsck", "--json"]).stdout).expect("json");
+    let tier = |name: &str| {
+        report["tiers"]
+            .as_array()
+            .expect("tiers")
+            .iter()
+            .find(|t| t["tier"] == name)
+            .unwrap_or_else(|| panic!("no {name} tier in {report}"))
+            .clone()
+    };
+    assert_eq!(report["ok"], false, "{report}");
+    assert_eq!(tier("ledger")["ok"], true, "{report}");
+    assert_eq!(tier("head")["ok"], false, "{report}");
+
+    // A flag is not a confirmation: the word has to be typed, and anything
+    // else leaves the head exactly where it was.
+    let mistyped = sh.run_with_stdin(&["fsck", "--rebase-head", "--force"], "yes\n");
+    assert!(!mistyped.status.success(), "a mistyped word must refuse");
+    let why = String::from_utf8_lossy(&mistyped.stderr);
+    assert!(why.contains("not confirmed"), "{why}");
+    let report: Value = serde_json::from_slice(&sh.run(&["fsck", "--json"]).stdout).expect("json");
+    assert_eq!(report["ok"], false, "the head was not touched: {report}");
+
+    // Typed out: the head moves, both ends are named, and the store verifies.
+    let done = sh.run_with_stdin(&["fsck", "--rebase-head", "--force"], "rebase\n");
+    let screen = String::from_utf8_lossy(&done.stdout).to_string();
+    assert!(
+        done.status.success(),
+        "{screen}{}",
+        String::from_utf8_lossy(&done.stderr)
+    );
+    assert!(screen.contains("the store verifies"), "{screen}");
+    assert!(
+        screen.contains("the recorded ledger head was moved"),
+        "{screen}"
+    );
+
+    // A second rebase — a no-op on a store that is now healthy — must
+    // **add** to the record, not replace the real one (review Important 1).
+    // The person who did the first already holds the presence the second
+    // needs; the mechanism exists to stop exactly them from denying it.
+    let again = sh.run_with_stdin(&["fsck", "--rebase-head", "--force"], "rebase\n");
+    assert!(again.status.success(), "{:?}", again.status);
+    let report: Value = serde_json::from_slice(&sh.run(&["fsck", "--json"]).stdout).expect("json");
+    let history = report["rebases"].as_array().expect("a rebase history");
+    assert_eq!(history.len(), 2, "both are on record: {report}");
+    // The first one really moved the head — off the event the cut record
+    // used to end at, onto the one it ends at now (the same seq, since the
+    // forced boot appended two events of its own, but not the same event).
+    assert_ne!(
+        history[0]["rebased_from"]["hash"], history[0]["rebased_to"]["hash"],
+        "the first rebase is unchanged and is the real one: {report}"
+    );
+    // And the second is the no-op that used to overwrite it.
+    assert_eq!(
+        history[1]["rebased_from"]["hash"], history[1]["rebased_to"]["hash"],
+        "{report}"
+    );
+    drop(_forced);
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+
+    // And the node serves again without --force, because the record and the
+    // head now agree. The override is in what that boot said, beside the
+    // `boot` event whose payload commits to it.
+    let log_path = dir.path().join("boot.log");
+    let log_file = std::fs::File::create(&log_path).expect("a log to read back");
+    let _again = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            // The daemon's own log goes to stdout (`vkd::init_tracing`), and
+            // `vk boot` is what usually redirects it into `vkd.log`; here the
+            // test does the redirecting, because the daemon was spawned
+            // directly.
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let status = wait_until(&sh, true, "the rebased node did not serve").expect("status");
+    assert_eq!(status["ledger_ok"], true, "{status}");
+    assert_eq!(status["forced"], false, "{status}");
+    let log = std::fs::read_to_string(&log_path).expect("the boot log");
+    assert!(
+        log.contains("rebased by hand"),
+        "the boot that followed the rebase says so:\n{log}"
+    );
+    assert_eq!(sh.json(&["fsck", "--json"])["ok"], true);
+
+    // And it is on a surface a live operator reads, not only in whatever
+    // file the daemon's stdout went to (review Important 2). Both rebases,
+    // for as long as the node exists — a boot does not clear them.
+    assert_eq!(
+        status["fsck"].as_array().map(Vec::len),
+        Some(2),
+        "`boot.info` carries the history: {status}"
+    );
+    let screen = sh.ok(&["status"]);
+    assert!(screen.contains("head rebased"), "{screen}");
+    assert_eq!(
+        sh.json(&["fsck", "--json"])["rebases"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "and so does `vk fsck --json`"
+    );
+}
+
+/// The review's Critical 1, end to end: cutting the tail **and** deleting the
+/// one SQLite row that says where the record ended.
+///
+/// Cutting alone is caught by the recorded head. Cutting and removing the head
+/// row used to be caught by nothing at all: the node served with no `--force`,
+/// `vk status` said `chain verified`, and the whole-store verifier printed
+/// "the store verifies" and exited 0 — one `DELETE` turning a detectable
+/// tamper into an attested-clean node. The head is written on every append, so
+/// a record with no head recorded for it is a row somebody removed.
+#[test]
+fn vk_fsck_refuses_a_record_whose_head_row_was_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        sh.ok(&["mount", "mock", "m1", "--ctx", "4096"]);
+        sh.ok(&["stop"]);
+    }
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+
+    cut_ledger_tail(dir.path());
+    delete_recorded_head(dir.path());
+
+    // The node must refuse to serve on it, exactly as it refuses a cut tail
+    // whose head row is still there.
+    let refused = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let (exit, why) = exit_of(refused, "vkd is serving a record with no recorded head");
+    assert!(!exit.success(), "{exit:?}: {why}");
+    assert!(why.contains("ledger") && why.contains("--force"), "{why}");
+    assert!(serving(&sh).is_none(), "nothing is serving that store");
+
+    // Forced, so `vk fsck` can be reached at all — and it names the tier.
+    let _forced = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &["--force"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let status = wait_until(&sh, true, "--force did not start a daemon").expect("status");
+    assert_eq!(status["ledger_ok"], false, "{status}");
+    assert_eq!(status["forced"], true, "{status}");
+
+    let out = sh.run(&["fsck"]);
+    assert!(!out.status.success(), "a deleted head row must exit 1");
+    let screen = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        screen.contains("head: no recorded head for a non-empty chain"),
+        "the tier and the reason belong on the screen:\n{screen}"
+    );
+    assert!(screen.contains("the store DOES NOT verify"), "{screen}");
+    let report: Value = serde_json::from_slice(&sh.run(&["fsck", "--json"]).stdout).expect("json");
+    assert_eq!(report["ok"], false, "{report}");
+    for t in report["tiers"].as_array().expect("tiers") {
+        let expected = t["tier"] != "head";
+        assert_eq!(t["ok"], expected, "only the head tier fails: {report}");
+    }
+
+    // And the rebase is the way back here too, naming no previous head
+    // because there was none on record.
+    let done = sh.run_with_stdin(&["fsck", "--rebase-head", "--force"], "rebase\n");
+    let screen = String::from_utf8_lossy(&done.stdout).to_string();
+    assert!(done.status.success(), "{screen}");
+    assert!(screen.contains("nothing recorded"), "{screen}");
+    // On the record for good, and on the screen a live operator reads.
+    assert!(
+        screen.contains("re-recorded by hand"),
+        "the history is in the report:\n{screen}"
+    );
+    drop(_forced);
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+    let _again = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let status = wait_until(&sh, true, "the rebased node did not serve").expect("status");
+    assert_eq!(status["ledger_ok"], true, "{status}");
+    assert_eq!(
+        status["fsck"].as_array().map(Vec::len),
+        Some(1),
+        "the rebase is on `boot.info` for good, not only in a log line: {status}"
+    );
+    assert!(
+        sh.ok(&["status"]).contains("head rebased"),
+        "and `vk status` marks it: {}",
+        sh.ok(&["status"])
+    );
+}
+
+/// A blob whose bytes are not what its address says — a `.bin` restored from
+/// the wrong backup, a flipped byte on a failing disk. Nothing else on the
+/// node notices until somebody reads that one artefact; `fsck` reads all of
+/// them.
+#[test]
+fn vk_fsck_finds_a_tampered_blob_and_exits_non_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        let arch = str_of(
+            &sh.json(&["mount", "mock", "m1", "--ctx", "4096", "--json"]),
+            "arch_id",
+        )
+        .to_string();
+        let task = str_of(
+            &sh.json(&[
+                "task",
+                "submit",
+                "--goal",
+                "Draft a note",
+                "--plan",
+                &arch,
+                "--draft",
+                &arch,
+                "--json",
+            ]),
+            "id",
+        )
+        .to_string();
+        assert_eq!(
+            sh.json(&["task", "step", &task, "--all", "--json"])["status"],
+            "done"
+        );
+        assert_eq!(sh.json(&["fsck", "--json"])["ok"], true);
+    }
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+
+    // One ciphertext byte flipped, with the node gone — as a bad restore or
+    // a failing disk would leave it.
+    let blobs = dir.path().join("blobs");
+    let bin = std::fs::read_dir(&blobs)
+        .expect("a blob directory")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|e| e == "bin"))
+        .expect("the task left a blob");
+    let mut bytes = std::fs::read(&bin).expect("read the blob");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&bin, bytes).expect("write the blob");
+
+    // The node still boots — a damaged blob is not a damaged chain — and
+    // that is exactly why `fsck` has to be the thing that finds it.
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let status = wait_until(&sh, true, "vkd did not answer").expect("status");
+    assert_eq!(
+        status["ledger_ok"], true,
+        "the record is untouched; the payload tier is not: {status}"
+    );
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+
+    let refused = sh.run(&["fsck"]);
+    assert!(!refused.status.success(), "a damaged blob must exit 1");
+    let screen = String::from_utf8_lossy(&refused.stdout).to_string();
+    assert!(screen.contains("FAILED"), "{screen}");
+    assert!(
+        screen.contains("blobs: sha256:") && screen.contains("integrity"),
+        "the failing blob is named, by address:\n{screen}"
+    );
+    let report: Value = serde_json::from_slice(&sh.run(&["fsck", "--json"]).stdout).expect("json");
+    assert_eq!(report["ok"], false, "{report}");
+    for t in report["tiers"].as_array().expect("tiers") {
+        let expected = t["tier"] != "blobs";
+        assert_eq!(
+            t["ok"], expected,
+            "only the payload tier is damaged: {report}"
+        );
+    }
+}
+
+/// A scripted stand-in for `claude` at `dir/fake-claude.{cmd,sh}`: it answers
+/// `--version`, swallows the prompt on stdin and prints one canned result
+/// object. Enough for `vk mount claude-code --bin` to mount a real adapter and
+/// for a task to run through it, without a subscription, a network or a cost.
+fn fake_claude(dir: &std::path::Path) -> PathBuf {
+    let reply = dir.join("reply.json");
+    std::fs::write(
+        &reply,
+        r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":120,
+            "duration_api_ms":90,"num_turns":1,"result":"a stand-in completion",
+            "session_id":"smoke-1","total_cost_usd":0.002,
+            "usage":{"input_tokens":7,"cache_creation_input_tokens":11,
+                     "cache_read_input_tokens":23,"output_tokens":5}}"#,
+    )
+    .expect("write the canned reply");
+    let bin = dir.join(if cfg!(windows) {
+        "fake-claude.cmd"
+    } else {
+        "fake-claude.sh"
+    });
+    let (r, script) = (
+        path_of(&reply),
+        if cfg!(windows) {
+            "@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo 0.0.0-smoke\r\n  exit /b 0\r\n)\r\n\
+         findstr \"^\" >nul\r\ntype \"{R}\"\r\nexit /b 0\r\n"
+        } else {
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.0.0-smoke; exit 0; fi\n\
+         cat >/dev/null\ncat '{R}'\n"
+        },
+    );
+    std::fs::write(&bin, script.replace("{R}", &r)).expect("write the stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).expect("chmod +x");
+    }
+    bin
+}
+
+/// Final review I-2: `vk` never mints a node key as a side effect of signing.
+/// A shell whose account has no key for this node — the interactive user
+/// beside a Windows service, whose key is the service account's — is refused
+/// before anything is signed, told what to do, and left with no key.
+#[test]
+fn vk_does_not_mint_a_device_key_it_was_never_enrolled_with() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    // The daemon enrolled `node.key`; this shell's account has none at all.
+    let absent = dir.path().join("absent.key");
+    let sh = Shell {
+        endpoint,
+        node_key: absent.clone(),
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    for verb in [
+        vec!["approve", "task-none"],
+        vec!["stop"],
+        vec!["resume", "stop-none"],
+    ] {
+        let out = sh.run(&verb);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "vk {verb:?} must be refused: {err}");
+        assert!(
+            err.contains("vk does not create one"),
+            "vk {verb:?} names the remedy: {err}"
+        );
+        assert!(
+            !absent.exists(),
+            "vk {verb:?} minted a key: the file is there"
+        );
+    }
+}
+
+/// The other half of I-2: a key this account does have, for a node that
+/// never enrolled it, is refused by `vk` with the remedy rather than signed
+/// with and refused by the daemon with none.
+#[test]
+fn vk_refuses_to_sign_with_a_key_the_node_never_enrolled() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    // A daemon that enrols nothing (no `--auto-enroll-node`).
+    let mut cmd = Command::new(vkd_exe());
+    cmd.arg("--state-dir")
+        .arg(dir.path())
+        .args(["--endpoint", &endpoint])
+        .arg("--master-key-file")
+        .arg(dir.path().join("master.key"))
+        .args(["--web-port", "0"]);
+    let _daemon = Daemon(
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    // A well-formed key of this account's own (32 zero bytes), never enrolled.
+    let key = dir.path().join("mine.key");
+    std::fs::write(&key, format!("{}=", "A".repeat(43))).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let before = std::fs::read(&key).unwrap();
+    let sh = Shell {
+        endpoint,
+        node_key: key.clone(),
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let out = sh.run(&["stop"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("is not enrolled on this node"), "{err}");
+    assert_eq!(std::fs::read(&key).unwrap(), before, "the key is untouched");
+}
+
+/// Final review M-11: an enrolled passkey this daemon's verifier cannot read
+/// cannot approve, so `vk passkey ls` reports it as an error instead of
+/// listing it beside the good ones as if it could.
+#[test]
+fn vk_passkey_ls_reports_an_unreadable_passkey_as_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    // A passkey row no verifier can read, written while no daemon holds the store.
+    {
+        let mut k = vk_kernel::RealKernel::open(
+            dir.path(),
+            vk_store::keys::KeySource::File(dir.path().join("master.key")),
+            "n1",
+        )
+        .expect("open the store");
+        k.enroll_passkey("passkey:broken", serde_json::json!({"not": "a passkey"}), 1)
+            .expect("enrol the row");
+    }
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &["--node-id", "n1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell {
+        endpoint,
+        node_key: dir.path().join("node.key"),
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let out = sh.run(&["passkey", "ls"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "an unreadable passkey is an error: {text}"
+    );
+    assert!(text.contains("passkey:broken"), "{text}");
+    assert!(text.contains("UNREADABLE"), "{text}");
+}
+
+/// How `--bin` names the stand-in: by its absolute path, which an
+/// interactive daemon accepts even under the user profile — where `%TEMP%`
+/// is on Windows (Ruling 43; the service refuses it, see
+/// `vk-ipc/tests/mount_config.rs`).
+fn bin_arg(fake: &std::path::Path) -> String {
+    path_of(fake)
+}
+
+/// `vk mount claude-code` is the first verb that mounts a *real* adapter: two
+/// arches in one call, a draft and a judge, each named for its model and each
+/// with its own content-addressed id. Driven against the stand-in via `--bin`,
+/// so this test needs no subscription and spends nothing.
+#[test]
+fn vk_mounts_two_claude_code_arches_and_a_task_runs_through_one() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let claude = bin_arg(&fake_claude(dir.path()));
+    let mounted = sh.json(&[
+        "mount",
+        "claude-code",
+        "--bin",
+        &claude,
+        "--draft-model",
+        "claude-sonnet-5",
+        "--judge-model",
+        "claude-opus-5",
+        "--json",
+    ]);
+    let draft = str_of(&mounted["draft"], "arch_id").to_string();
+    let judge = str_of(&mounted["judge"], "arch_id").to_string();
+    assert_eq!(
+        str_of(&mounted["draft"], "name"),
+        "claude-code/claude-sonnet-5"
+    );
+    assert_eq!(
+        str_of(&mounted["judge"], "name"),
+        "claude-code/claude-opus-5"
+    );
+    assert_ne!(draft, judge, "two models are two arches: {mounted}");
+
+    // Both are in the namespace, and the human rendering names both.
+    let ls = sh.ok(&["ls", "/arches"]);
+    for id in [&draft, &judge] {
+        assert!(ls.contains(id.as_str()), "{id} missing from /arches:\n{ls}");
+    }
+    let plain = sh.ok(&[
+        "mount",
+        "claude-code",
+        "--bin",
+        &claude,
+        "--draft-model",
+        "claude-sonnet-5",
+        "--judge-model",
+        "claude-opus-5",
+    ]);
+    assert!(
+        plain.contains("draft") && plain.contains("judge"),
+        "{plain}"
+    );
+    assert!(plain.contains("claude-code/claude-opus-5"), "{plain}");
+
+    // And the adapter really drives the child: a task runs to completion on it.
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Say something",
+            "--plan",
+            &draft,
+            "--draft",
+            &draft,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let done = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(done["status"], "done", "{done}");
+    // Both steps went out through the adapter and came back, so the arch has
+    // two calls on its counters — and, because this arch measures its own
+    // usage, what it measured rather than what the kernel estimated: the
+    // stand-in reports 7 + 11 + 23 prompt tokens and 0.002 USD a call.
+    let top = sh.json(&["top", "--json"]);
+    let stats = &top["arches"][&draft];
+    assert_eq!(stats["calls"], 2, "{top}");
+    assert_eq!(stats["tokens_in"], 2 * (7 + 11 + 23), "{top}");
+    assert_eq!(
+        stats["tokens_in_measured"], stats["tokens_in"],
+        "every call on this arch was measured, so none of the total is a guess: {top}"
+    );
+    let cost = stats["cost_list_usd"].as_f64().unwrap_or_default();
+    assert!((cost - 0.004).abs() < 1e-9, "{top}");
+
+    // A cloud arch says so, and says under whose law it answered, on the
+    // same row as what it cost (SP1b Task 8).
+    assert_eq!(top["locality"][&draft], "cloud", "{top}");
+    assert_eq!(top["jurisdiction"][&draft], "US", "{top}");
+    // The judge arch was never called, and is on the screen all the same:
+    // an operator must not have to run an arch to find out it is mounted.
+    assert_eq!(top["arches"][&judge]["calls"], 0, "{top}");
+
+    // And a person reading `vk top` sees both, not only the hash of them.
+    let screen = sh.ok(&["top"]);
+    assert!(
+        screen.contains("MEASURED") && screen.contains("COST"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("LOCALITY") && screen.contains("JURISDICTION"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("0.00400"),
+        "the cost belongs on the screen:\n{screen}"
+    );
+    assert!(
+        screen.lines().any(|l| l.starts_with(&judge)),
+        "the never-called arch has a row of its own:\n{screen}"
+    );
+
+    // `--calls`: the rows behind the totals, each naming the step that spent
+    // it — which the totals alone can never say (ruling 8).
+    let calls = sh.json(&["top", "--calls", "--json"]);
+    let rows = calls["calls"].as_array().expect("calls");
+    assert_eq!(rows.len(), 2, "one row per completed call: {calls}");
+    for r in rows {
+        assert_eq!(str_of(r, "arch_id"), draft, "{r}");
+        assert_eq!(str_of(r, "task_id"), task, "{r}");
+        assert_eq!(r["tokens_in_measured"], 7 + 11 + 23, "{r}");
+        assert_eq!(r["tokens_out"], 5, "{r}");
+    }
+    assert_eq!(
+        rows.iter().map(|r| &r["step_index"]).collect::<Vec<_>>(),
+        [&serde_json::json!(0), &serde_json::json!(1)],
+        "in the order the steps ran: {calls}"
+    );
+    let screen = sh.ok(&["top", "--calls"]);
+    assert!(
+        screen.contains("CALL") && screen.contains(&task),
+        "{screen}"
+    );
+
+    // And the task's own screen carries what each of its steps returned and
+    // cost, beside the tokens it sent.
+    let shown = sh.json(&["task", "show", &task, "--json"]);
+    assert_eq!(
+        shown["usage"].as_array().expect("usage").len(),
+        2,
+        "{shown}"
+    );
+    let page = sh.ok(&["task", "show", &task]);
+    assert!(page.contains("OUT") && page.contains("COST"), "{page}");
+    assert!(page.contains("0.00200"), "{page}");
+
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
+/// A stand-in Ollama on loopback: `/api/version`, `/api/tags`, `/api/show`, a
+/// 404 on `/api/tokenize` exactly as 0.33.3 gives, and one canned completion.
+/// Enough for `vk mount ollama --external` to mount a *real* adapter and for a
+/// task to run through it, without Docker, a model or nine gigabytes.
+///
+/// It serves from a thread of this test process, so the daemon — a separate
+/// process — reaches it over a loopback socket, which is the same path a real
+/// Ollama is reached by.
+struct FakeOllama {
+    url: String,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for FakeOllama {
+    fn drop(&mut self) {
+        // The thread is blocked in `accept`; one connection wakes it so it can
+        // see the flag. Nothing is joined: a failing test must not also hang.
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.url.trim_start_matches("http://"));
+    }
+}
+
+impl FakeOllama {
+    fn start(model: &str) -> FakeOllama {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (model, flag) = (model.to_string(), stop.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(mut stream) = stream else { continue };
+                let Some(path) = ollama_request_path(&stream) else {
+                    continue;
+                };
+                let (status, kind, body) = ollama_answer(&path, &model);
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n",
+                    body.len()
+                );
+                use std::io::Write;
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        FakeOllama { url, stop }
+    }
+}
+
+/// The five answers spike 1a measured, canned.
+fn ollama_answer(path: &str, model: &str) -> (&'static str, &'static str, String) {
+    const JSON: &str = "application/json";
+    match path {
+        "/api/version" => ("200 OK", JSON, r#"{"version":"0.33.3"}"#.into()),
+        "/api/tags" => (
+            "200 OK",
+            JSON,
+            format!(
+                r#"{{"models":[{{"name":"{model}","digest":"8648f39daa8fbf5b18c7b4e6a8fb4990c692751d49917417b8842ca5758e7ffc"}}]}}"#
+            ),
+        ),
+        "/api/show" => (
+            "200 OK",
+            JSON,
+            r#"{"details":{"family":"gemma3","parameter_size":"999.89M","quantization_level":"Q4_K_M"},
+                "model_info":{"gemma3.context_length":32768}}"#
+                .into(),
+        ),
+        // 0.33.3 has no tokenizer endpoint, and says so in plain text.
+        "/api/tokenize" => ("404 Not Found", "text/plain", "404 page not found".into()),
+        "/api/chat" => (
+            "200 OK",
+            JSON,
+            r#"{"message":{"role":"assistant","content":"a stand-in completion"},
+                "done":true,"done_reason":"stop","prompt_eval_count":42,"eval_count":5,
+                "eval_duration":900000000,"load_duration":250000000}"#
+                .into(),
+        ),
+        _ => ("404 Not Found", JSON, r#"{"error":"no such route"}"#.into()),
+    }
+}
+
+/// The path off the request line, with the body drained so the client is never
+/// left writing into a socket nobody is reading.
+fn ollama_request_path(stream: &std::net::TcpStream) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let mut reader = std::io::BufReader::new(stream.try_clone().ok()?);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let path = line.split_whitespace().nth(1)?.to_string();
+    let mut length = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).ok()? == 0 || header.trim_end().is_empty() {
+            break;
+        }
+        if let Some(v) = header
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .map(str::trim)
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            length = v;
+        }
+    }
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body).ok()?;
+    Some(path)
+}
+
+/// `vk mount ollama` is the verb that mounts the *governed* kind of arch — and
+/// the one that has to be honest when it is not governed. Driven against the
+/// stand-in with `--external`, which is exactly the ungoverned case: the
+/// daemon did not start that server and cannot cap it, so the mount says so,
+/// and `vk top` keeps saying so for every call made on it.
+#[test]
+fn vk_mounts_an_external_ollama_as_ungoverned_and_a_task_runs_through_it() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let ollama = FakeOllama::start("gemma3:1b");
+    let mounted = sh.json(&[
+        "mount",
+        "ollama",
+        "--model",
+        "gemma3:1b",
+        "--external",
+        &ollama.url,
+        "--ctx",
+        "8192",
+        "--json",
+    ]);
+    let arch = str_of(&mounted, "arch_id").to_string();
+    assert_eq!(str_of(&mounted, "name"), "ollama/gemma3:1b");
+    assert_eq!(
+        mounted["governed"], false,
+        "a server this node did not start is not one it governs: {mounted}"
+    );
+    assert_eq!(
+        mounted["already_mounted"], false,
+        "the first mount mounts it: {mounted}"
+    );
+
+    // Mounting it again is the same arch, said so, and nothing swapped
+    // underneath it (Ruling 13).
+    let again = sh.json(&[
+        "mount",
+        "ollama",
+        "--model",
+        "gemma3:1b",
+        "--external",
+        &ollama.url,
+        "--ctx",
+        "8192",
+        "--json",
+    ]);
+    assert_eq!(str_of(&again, "arch_id"), arch, "{again}");
+    assert_eq!(
+        again["already_mounted"], true,
+        "the second mount is the arch that is already there: {again}"
+    );
+    assert!(
+        sh.ok(&["ls", "/arches"]).contains(arch.as_str()),
+        "the mounted arch belongs in the namespace"
+    );
+
+    // The same mount, rendered for a person: the id, and the one thing about
+    // it that matters before a prompt is sent.
+    let plain = sh.ok(&[
+        "mount",
+        "ollama",
+        "--model",
+        "gemma3:1b",
+        "--external",
+        &ollama.url,
+    ]);
+    assert!(
+        plain.contains("GOVERNED") && plain.contains("no"),
+        "{plain}"
+    );
+    assert!(plain.contains("ollama/gemma3:1b"), "{plain}");
+    assert!(
+        plain.contains("already mounted"),
+        "a person mounting it again is told so, and the verb still exits 0:
+{plain}"
+    );
+
+    // And the adapter really drives the server: a task runs through it, and
+    // what `vk top` reports is the server's own count of the prompt.
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Say something",
+            "--plan",
+            &arch,
+            "--draft",
+            &arch,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let done = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(done["status"], "done", "{done}");
+
+    let top = sh.json(&["top", "--json"]);
+    let stats = &top["arches"][&arch];
+    assert_eq!(stats["calls"], 2, "{top}");
+    assert_eq!(
+        stats["tokens_in"], 84,
+        "the server counted the prompt twice over; we did not guess it: {top}"
+    );
+    assert_eq!(stats["tokens_in_measured"], stats["tokens_in"], "{top}");
+    assert_eq!(top["governed"][&arch], false, "{top}");
+    let screen = sh.ok(&["top"]);
+    assert!(
+        screen.contains("GOVERNED"),
+        "the operator's screen says which arches this kernel contains:\n{screen}"
+    );
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
 /// `vk boot` is the verb with real logic of its own — find the daemon, refuse
 /// to double it, hand it its state and keys, detach it, wait for it to answer.
 /// It runs here with file-backed keys, so CI never touches a keyring.
@@ -254,6 +1404,7 @@ fn vk_boot_detaches_a_daemon_it_can_be_asked_to_stop_and_will_not_serve_two_stat
     // `cargo test -p vk-cli`.
     let vkd = vkd_exe();
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let other = tempfile::tempdir().unwrap();
     let node_key = dir.path().join("node.key");
     let sh = Shell {
@@ -271,6 +1422,8 @@ fn vk_boot_detaches_a_daemon_it_can_be_asked_to_stop_and_will_not_serve_two_stat
         &master,
         "--node-key-file",
         &key,
+        "--web-port",
+        "0",
         "--json",
     ];
     let boot_elsewhere = [
@@ -281,6 +1434,8 @@ fn vk_boot_detaches_a_daemon_it_can_be_asked_to_stop_and_will_not_serve_two_stat
         &master,
         "--node-key-file",
         &key,
+        "--web-port",
+        "0",
         "--json",
     ];
     assert!(vkd.exists());
@@ -341,6 +1496,367 @@ fn vk_boot_detaches_a_daemon_it_can_be_asked_to_stop_and_will_not_serve_two_stat
     }
 }
 
+/// A stand-in `claude` *harness*: unlike `fake_claude` (a pure-completion arch),
+/// this ignores its arguments, writes a proposal into the workspace's `OUT/`
+/// (its working directory is the workspace) and exits 0. Enough for `vk harness
+/// run` to drive a whole confined run without a subscription, a network or MCP.
+fn harness_standin(dir: &std::path::Path) -> PathBuf {
+    let bin = dir.join(if cfg!(windows) {
+        "harness-standin.cmd"
+    } else {
+        "harness-standin.sh"
+    });
+    let script = if cfg!(windows) {
+        "@echo off\r\n\
+         >OUT\\proposal.md echo # Proposal drafted by the confined harness\r\n\
+         echo {\"type\":\"result\",\"is_error\":false,\"num_turns\":2,\"total_cost_usd\":0,\"result\":\"ok\",\"permission_denials\":[]}\r\n\
+         exit /b 0\r\n"
+    } else {
+        "#!/bin/sh\n\
+         printf '# Proposal drafted by the confined harness\\n' > OUT/proposal.md\n\
+         printf '{\"type\":\"result\",\"is_error\":false,\"num_turns\":2,\"total_cost_usd\":0,\"result\":\"ok\",\"permission_denials\":[]}\\n'\n\
+         exit 0\n"
+    };
+    std::fs::write(&bin, script).expect("write harness stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).expect("chmod +x");
+    }
+    bin
+}
+
+/// `vk harness run --dry-run` prints the exact launch line, the `mcp.json` it
+/// would write (token redacted) and the permission fence — and runs nothing.
+/// This is the verb an operator reads before ever spending a real Claude Code
+/// call. The binary is the daemon's (`vkd --harness-bin`), never the verb's.
+#[test]
+fn vk_harness_run_dry_run_prints_the_launch_line_the_fence_and_a_redacted_mcp_config() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let standin = path_of(&harness_standin(dir.path()));
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &["--harness-bin", &standin])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let dry = sh.json(&[
+        "harness",
+        "run",
+        "task-demo",
+        "--name",
+        "claude-code",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(dry["dry_run"], true, "{dry}");
+    let line: Vec<String> = dry["launch_line"]
+        .as_array()
+        .expect("a launch line")
+        .iter()
+        .map(|x| x.as_str().unwrap_or("").to_string())
+        .collect();
+    // The binary is the one the daemon was started with.
+    assert_eq!(line[0], standin, "{line:?}");
+    // The flags the confinement rests on are all there, and the bare-name
+    // allow-everything flags of the first cut are not.
+    for flag in [
+        "-p",
+        "--restricted",
+        "--mcp-config",
+        "--strict-mcp-config",
+        "--settings",
+        "--setting-sources",
+        "--permission-mode",
+        "dontAsk",
+        "--permission-prompts",
+        "none",
+        "--output-format",
+        "json",
+    ] {
+        assert!(
+            line.iter().any(|a| a == flag),
+            "{flag} missing from {line:?}"
+        );
+    }
+    assert!(!line.iter().any(|a| a == "--allowedTools"), "{line:?}");
+    assert!(!line.iter().any(|a| a == "acceptEdits"), "{line:?}");
+    // The MCP config and the fence live outside the workspace.
+    let workspace = dry["workspace"].as_str().unwrap();
+    let config_dir = dry["config_dir"].as_str().unwrap();
+    // Component-wise, not as text: `task-demo.mcp` is a sibling of
+    // `task-demo`, and as a string it starts with it.
+    assert!(
+        !std::path::Path::new(config_dir).starts_with(workspace),
+        "the config dir must not be inside the workspace: {dry}"
+    );
+    assert!(
+        line.iter()
+            .any(|a| a.starts_with(config_dir) && a.ends_with("mcp.json")),
+        "{line:?}"
+    );
+    // The mcp.json names the vk server and redacts the token — a dry run never
+    // prints a live capability.
+    let mcp = dry["mcp_json"].as_str().expect("mcp_json");
+    assert!(mcp.contains("vk-mcp"), "{mcp}");
+    assert!(
+        mcp.contains("<redacted>"),
+        "the token must be redacted: {mcp}"
+    );
+    assert!(!mcp.contains("lease-"), "{mcp}");
+    // The fence: the workspace and the kernel tools allowed, the shell, the
+    // web and the claude.ai-reaching tools denied, reads outside the working
+    // directories blocked in every mode, the config dir denied by its real
+    // path.
+    let fence = dry["settings_json"].as_str().expect("settings_json");
+    for rule in [
+        "Read(./**)",
+        "Edit(./**)",
+        "mcp__vk__*",
+        "\"Bash\"",
+        "\"WebFetch\"",
+        "\"RemoteTrigger\"",
+        "\"SendUserFile\"",
+        "\"LSP\"",
+        "\"blockReadsOutsideWorkingDirectories\": true",
+    ] {
+        assert!(
+            fence.contains(rule),
+            "{rule} missing from the fence:\n{fence}"
+        );
+    }
+    assert!(
+        !fence.contains("Write(") && !fence.contains("Glob("),
+        "no rule Claude Code would ignore: {fence}"
+    );
+}
+
+/// `vk harness run` drives the confined harness to a finished, attached proposal
+/// and records its egress. Against a stand-in the daemon was started with
+/// (`vkd --harness-bin`), so it needs no subscription and reaches no network —
+/// the point being the daemon orchestration: lease, materialise, launch under
+/// the governor, collect the declared output, one `harness.connections` event,
+/// settle, and nothing of the run left behind.
+#[test]
+fn vk_harness_run_drives_a_stand_in_to_an_attached_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let standin = path_of(&harness_standin(dir.path()));
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &["--harness-bin", &standin])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let run = sh.json(&[
+        "harness",
+        "run",
+        "--goal",
+        "Draft a proposal for Acme",
+        "--name",
+        "claude-code",
+        "--json",
+    ]);
+    // The harness step is done; the approval `--goal` put after it is next.
+    assert_eq!(
+        run["step_status"], "done",
+        "the harness step finished: {run}"
+    );
+    assert_eq!(
+        run["status"], "running",
+        "the approve step is pending: {run}"
+    );
+    assert_eq!(
+        run["governed"],
+        cfg!(windows),
+        "contained on Windows, ungoverned elsewhere: {run}"
+    );
+    assert_eq!(run["exit"], "code 0", "{run}");
+    let hash = run["artefact_hash"].as_str().unwrap_or("");
+    assert!(
+        hash.starts_with("sha256:"),
+        "the proposal was attached: {run}"
+    );
+    assert_eq!(run["artefacts"], 1, "attached once: {run}");
+    assert_eq!(
+        run["num_turns"], 2,
+        "read off the stand-in's result object: {run}"
+    );
+    assert!(run["error"].is_null(), "{run}");
+
+    // Nothing of the run is left on disk: no workspace, no config directory
+    // (it held the token).
+    let task_id = run["task_id"].as_str().unwrap().to_string();
+    assert!(!dir.path().join("harness").join(&task_id).exists());
+    assert!(!dir
+        .path()
+        .join("harness")
+        .join(format!("{task_id}.mcp"))
+        .exists());
+
+    // A person reading `vk task show` sees the step done and the task waiting
+    // on its approval.
+    let shown = sh.json(&["task", "show", &task_id, "--json"]);
+    assert_eq!(shown["status"], "running", "{shown}");
+    assert_eq!(shown["steps"][0]["status"], "done", "{shown}");
+    assert_eq!(shown["steps"][1]["status"], "pending", "{shown}");
+
+    // Exactly one harness.connections event is on the record for the run.
+    let tail = sh.json(&["dmesg", "-n", "20", "--json"]);
+    let conns = dmesg_kinds(&tail)
+        .iter()
+        .filter(|k| **k == "harness.connections")
+        .count();
+    assert_eq!(conns, 1, "one harness.connections event per run: {tail:?}");
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
+/// `vk task submit --judge` and `--harness`: the two step kinds the kernel has
+/// always run but the shell could not ask for (found writing the SP1 demo,
+/// which needs `[Plan, Draft, Judge, Approve, Release]` and, in harness mode,
+/// `[Plan, Harness, Judge, Approve, Release]`).
+///
+/// One daemon, two tasks: the judge step runs on a mock arch and the harness
+/// step is only *reached*, because running it is `vk harness run`'s job — and
+/// that refusal, naming the verb that does run it, is the thing a script
+/// driving `--all` has to be able to rely on.
+#[test]
+fn vk_task_submit_builds_judge_and_harness_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+
+    // Plan, draft, judge, approve, release — the demo's shape.
+    let judged = sh.json(&[
+        "task",
+        "submit",
+        "--goal",
+        "Draft a proposal for Acme",
+        "--artefact",
+        "proposal",
+        "--plan",
+        &arch,
+        "--draft",
+        &arch,
+        "--judge",
+        &arch,
+        "--approve",
+        "--release",
+        "out",
+        "--json",
+    ]);
+    let kinds: Vec<&str> = judged["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .map(|s| str_of(&s["kind"], "kind"))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["plan", "draft", "judge", "approve", "release"],
+        "{judged}"
+    );
+    assert_eq!(judged["steps"][2]["kind"]["arch_id"], arch, "{judged}");
+
+    // It runs: the judge step is done before the task waits for its human.
+    let task = str_of(&judged, "id").to_string();
+    let waiting = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(waiting["status"], "waiting_human", "{waiting}");
+    assert_eq!(waiting["steps"][2]["status"], "done", "{waiting}");
+
+    // Ruling 28: `vk task show --json` carries, per step, what that step left
+    // in the register's `decisions` — which is H1's own check, asserted rather
+    // than inferred from prompt-token growth. The plan left one, the draft left
+    // a second, and the judge raised an open question so it left none. Metadata
+    // only: a count, a byte length and a hash, never a decision's text.
+    let shown = sh.json(&["task", "show", &task, "--json"]);
+    let decisions = shown["decisions"].as_array().expect("decisions").clone();
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|d| d["after_step"].as_u64().expect("after_step"))
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "the plan and the draft raise decisions; the judge does not: {shown}"
+    );
+    for (i, d) in decisions.iter().enumerate() {
+        assert_eq!(d["count"], i as u64 + 1, "{shown}");
+        assert!(
+            d["last_len_bytes"].as_u64().expect("last_len_bytes") > 0,
+            "a non-empty decision after step {i}: {shown}"
+        );
+        let hash = str_of(d, "last_hash");
+        assert!(hash.starts_with("sha256:"), "{shown}");
+        assert_eq!(hash.len(), 7 + 64, "{shown}");
+    }
+    assert_ne!(
+        decisions[0]["last_hash"], decisions[1]["last_hash"],
+        "the draft's decision is not the plan's: {shown}"
+    );
+    // And the human screen says it too, without saying what was decided.
+    let table = sh.ok(&["task", "show", &task]);
+    assert!(table.contains("DECISIONS"), "{table}");
+
+    // The harness shape, up to the step the generic scheduler will not run.
+    let harnessed = sh.json(&[
+        "task",
+        "submit",
+        "--goal",
+        "Draft a proposal with the harness",
+        "--artefact",
+        "proposal",
+        "--plan",
+        &arch,
+        "--harness",
+        "claude-code",
+        "--judge",
+        &arch,
+        "--approve",
+        "--release",
+        "out",
+        "--json",
+    ]);
+    assert_eq!(harnessed["steps"][1]["kind"]["kind"], "harness");
+    assert_eq!(harnessed["steps"][1]["kind"]["name"], "claude-code");
+    let task = str_of(&harnessed, "id").to_string();
+    let refused = sh.run(&["task", "step", &task, "--all"]);
+    assert!(!refused.status.success(), "a harness step is not stepped");
+    let why = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        why.contains(&format!("vk harness run {task}")),
+        "the refusal names the verb that does run it: {why}"
+    );
+    // Refused before the row was touched: the plan ran, nothing failed.
+    let shown = sh.json(&["task", "show", &task, "--json"]);
+    assert_eq!(shown["steps"][0]["status"], "done", "{shown}");
+    assert_eq!(shown["steps"][1]["status"], "pending", "{shown}");
+    assert_ne!(shown["status"], "failed", "{shown}");
+}
+
 fn path_of(p: &std::path::Path) -> String {
     p.to_str().expect("utf-8 path").to_string()
 }
@@ -357,6 +1873,9 @@ fn vkd_cmd(dir: &std::path::Path, endpoint: &str, extra: &[&str]) -> Command {
         .arg("--node-key-file")
         .arg(dir.join("node.key"))
         .arg("--auto-enroll-node")
+        // An OS-chosen port for the passkey pages: these daemons run in
+        // parallel, and beside whatever daemon the machine's owner has up.
+        .args(["--web-port", "0"])
         .args(extra);
     c
 }
@@ -409,6 +1928,7 @@ fn ledger_lines(state_dir: &std::path::Path) -> usize {
 /// forced start that still serves on it, are the same for every kind.
 fn vkd_refuses_to_serve_a_damaged_ledger_unless_forced(damage: fn(&std::path::Path)) {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let sh = Shell {
         endpoint: endpoint.clone(),
@@ -460,10 +1980,19 @@ fn vkd_refuses_to_serve_a_damaged_ledger_unless_forced(damage: fn(&std::path::Pa
     );
     let status = wait_until(&sh, true, "--force did not start a daemon").expect("status");
     assert_eq!(status["ledger_ok"], false, "{status}");
+    assert_eq!(status["forced"], true, "{status}");
     assert_eq!(
         status["stopped_scopes"],
         serde_json::json!(["node"]),
         "{status}"
+    );
+
+    // The override is itself on the record: an auditor reading the tail must
+    // find exactly why this daemon is serving a chain it says is broken.
+    let tail = sh.json(&["dmesg", "-n", "3", "--json"]);
+    assert!(
+        dmesg_kinds(&tail).contains(&"boot.forced"),
+        "a forced boot must be on the record: {tail}"
     );
 }
 
@@ -488,6 +2017,7 @@ fn vkd_refuses_to_serve_a_ledger_whose_tail_was_cut_unless_forced() {
 #[test]
 fn a_second_vkd_over_a_served_state_dir_is_refused_and_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let first = Shell {
         endpoint: vk_ipc::transport::test_endpoint().0,
         node_key: dir.path().join("node.key"),
@@ -565,6 +2095,16 @@ fn cut_ledger_tail(state_dir: &std::path::Path) {
     std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
 }
 
+/// The one SQLite row that says where a node's record ended, removed — the
+/// second half of cutting a tail without being caught (review Critical 1).
+/// Done here with the store's own API, with the daemon gone, which is the
+/// same effect as the `DELETE` an attacker with the file would run.
+fn delete_recorded_head(state_dir: &std::path::Path) {
+    let db = vk_store::db::Db::open(&state_dir.join("vk.sqlite")).expect("the metadata tier");
+    db.kv_delete(vk_store::LEDGER_HEAD).expect("delete the row");
+    assert!(db.kv_get(vk_store::LEDGER_HEAD).unwrap().is_none());
+}
+
 /// One line of a node's record rewritten, exactly as an editor would leave it:
 /// still valid JSON, so only the recomputed chain hash catches it.
 fn tamper_first_ledger_line(state_dir: &std::path::Path) {
@@ -590,6 +2130,7 @@ fn vk_boot_reports_the_daemons_refusal_and_serves_only_when_forced() {
     // build has to happen before the first boot rather than under it.
     assert!(vkd_exe().exists());
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let node_key = dir.path().join("node.key");
     let sh = Shell {
         endpoint: vk_ipc::transport::test_endpoint().0,
@@ -606,11 +2147,20 @@ fn vk_boot_reports_the_daemons_refusal_and_serves_only_when_forced() {
         &master,
         "--node-key-file",
         &key,
+        "--web-port",
+        "0",
         "--json",
     ];
 
     // A node with a record of its own, stopped again by the pid it gave back.
     let booted = sh.json(&boot);
+    let status = wait_until(&sh, true, "vk boot did not start a daemon").expect("status");
+    assert_eq!(status["forced"], false, "a healthy boot is not forced");
+    let healthy_tail = sh.json(&["dmesg", "-n", "3", "--json"]);
+    assert!(
+        !dmesg_kinds(&healthy_tail).contains(&"boot.forced"),
+        "a healthy boot must never emit boot.forced: {healthy_tail}"
+    );
     Detached(booted["pid"].as_u64().expect("a pid to stop it with")).kill();
     wait_until(&sh, false, "the daemon outlived the pid vk boot reported");
 
@@ -642,7 +2192,14 @@ fn vk_boot_reports_the_daemons_refusal_and_serves_only_when_forced() {
     let _daemon = Detached(forced["pid"].as_u64().expect("a pid to stop it with"));
     let status = wait_until(&sh, true, "--force did not start a daemon").expect("status");
     assert_eq!(status["ledger_ok"], false, "{status}");
+    assert_eq!(status["forced"], true, "{status}");
     assert_eq!(status["policies_version"], "0", "{status}");
+
+    let tail = sh.json(&["dmesg", "-n", "3", "--json"]);
+    assert!(
+        dmesg_kinds(&tail).contains(&"boot.forced"),
+        "vk boot --force must land a boot.forced event: {tail}"
+    );
 }
 
 /// `vk man` is the one verb that needs no daemon: the contracts are in the
@@ -680,4 +2237,663 @@ fn vk_man_reads_the_contracts_without_a_daemon() {
     let why = String::from_utf8(bad.stderr).unwrap();
     assert!(why.contains("no-such-contract"), "{why}");
     assert!(why.contains("ledger_event"), "{why}");
+}
+
+/// The restart case, end to end (Ruling 14). A daemon that comes up over a
+/// store with a real arch in it re-creates that arch from the spec its mount
+/// recorded — it does not put the mock there and carry on. Driven against the
+/// `claude` stand-in, so the proof is in the numbers: only the real adapter
+/// reports the provider's own token count, and a mock standing in for it would
+/// report an estimate instead.
+#[test]
+fn a_real_arch_is_re_created_when_the_daemon_restarts_and_is_never_a_mock() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    let claude = bin_arg(&fake_claude(dir.path()));
+
+    // A node with a real arch on it, then stopped.
+    let draft = {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        let mounted = sh.json(&[
+            "mount",
+            "claude-code",
+            "--bin",
+            &claude,
+            "--draft-model",
+            "claude-sonnet-5",
+            "--judge-model",
+            "claude-opus-5",
+            "--json",
+        ]);
+        str_of(&mounted["draft"], "arch_id").to_string()
+    };
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+
+    // The same store, a new daemon: the arch is there and it is ready.
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    wait_until(&sh, true, "vkd never answered after the restart").expect("status");
+    // The node answers before its arches are built, so this waits for the
+    // startup pass rather than for the endpoint (Task 1b review, Important 1).
+    settled_arches(&sh);
+    let ls = sh.json(&["ls", "/arches", "--json"]);
+    let row = ls["arches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("/arches is a list of arches: {ls}"))
+        .iter()
+        .find(|a| a["arch_id"].as_str() == Some(draft.as_str()))
+        .unwrap_or_else(|| panic!("the mounted arch did not survive the restart: {ls}"));
+    assert_eq!(
+        row["state"], "ready",
+        "a re-created arch is ready, not a placeholder: {ls}"
+    );
+    let screen = sh.ok(&["ls", "/arches"]);
+    assert!(
+        screen.contains("STATE") && screen.contains("ready"),
+        "the operator reads the state off the listing:\n{screen}"
+    );
+
+    // And it is the real adapter, not the mock `load` used to fabricate: a
+    // task runs through the stand-in and `vk top` reports the count the
+    // stand-in measured (7 + 11 + 23 a call), which no mock ever reports.
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Say something",
+            "--plan",
+            &draft,
+            "--draft",
+            &draft,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let done = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(done["status"], "done", "{done}");
+    let top = sh.json(&["top", "--json"]);
+    let stats = &top["arches"][&draft];
+    assert_eq!(stats["calls"], 2, "{top}");
+    assert_eq!(
+        stats["tokens_in"],
+        2 * (7 + 11 + 23),
+        "the arch that answered measured its own call, so it is the real one: {top}"
+    );
+    assert_eq!(top["states"][&draft], "ready", "{top}");
+    let screen = sh.ok(&["top"]);
+    assert!(
+        screen.contains("STATE"),
+        "the operator's screen says which arches are usable:\n{screen}"
+    );
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
+/// The other half of Ruling 14: an arch whose engine is gone comes back
+/// *unavailable*, with the reason, and every task step that names it is
+/// refused. The stand-in is deleted while the daemon is down, which is what an
+/// uninstalled `claude` looks like from here.
+#[test]
+fn an_arch_whose_engine_has_gone_comes_back_unavailable_and_refuses_to_run() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    let claude = fake_claude(dir.path());
+    let bin = bin_arg(&claude);
+
+    let draft = {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        let mounted = sh.json(&[
+            "mount",
+            "claude-code",
+            "--bin",
+            &bin,
+            "--draft-model",
+            "claude-sonnet-5",
+            "--judge-model",
+            "claude-opus-5",
+            "--json",
+        ]);
+        str_of(&mounted["draft"], "arch_id").to_string()
+    };
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+    std::fs::remove_file(&claude).expect("uninstall the stand-in");
+
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    wait_until(
+        &sh,
+        true,
+        "an unavailable arch must not stop the node serving",
+    )
+    .expect("status");
+    // It is `starting` until the factory has been tried and has failed; the
+    // verdict is what this test is about, so wait for the pass.
+    settled_arches(&sh);
+
+    let ls = sh.json(&["ls", "/arches", "--json"]);
+    let row = ls["arches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("/arches is a list of arches: {ls}"))
+        .iter()
+        .find(|a| a["arch_id"].as_str() == Some(draft.as_str()))
+        .unwrap_or_else(|| panic!("an unavailable arch is still listed: {ls}"));
+    assert_eq!(row["state"], "unavailable", "{ls}");
+    assert!(
+        row["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "an operator is told why: {ls}"
+    );
+
+    // A task naming it fails, saying what is wrong — it does not quietly run
+    // on a mock and hand back an answer nobody asked for.
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Say something",
+            "--plan",
+            &draft,
+            "--draft",
+            &draft,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let refused = sh.run(&["task", "step", &task, "--all"]);
+    assert!(
+        !refused.status.success(),
+        "a step on an unavailable arch must not succeed"
+    );
+    let why = String::from_utf8_lossy(&refused.stderr);
+    assert!(why.contains("arch unavailable"), "{why}");
+    let top = sh.json(&["top", "--json"]);
+    assert_eq!(top["states"][&draft], "unavailable", "{top}");
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
+/// A `claude` stand-in that is *slow* to answer `--version`, and otherwise
+/// identical to `fake_claude`'s — same version string, so the same arch
+/// identity, so the same arch id. Swapping one for the other is a node whose
+/// engine has become slow to start, which is the ordinary case after a machine
+/// reboot: Docker Desktop still coming up, a model still loading.
+fn slow_claude(dir: &std::path::Path, bin: &std::path::Path) {
+    let reply = path_of(&dir.join("reply.json"));
+    // `ping` rather than `timeout`: `timeout` refuses to run when stdin is
+    // redirected, which is exactly how the adapter runs it.
+    let script = if cfg!(windows) {
+        "@echo off\r\nif \"%~1\"==\"--version\" (\r\n  ping -n 4 127.0.0.1 >nul\r\n  \
+         echo 0.0.0-smoke\r\n  exit /b 0\r\n)\r\nfindstr \"^\" >nul\r\ntype \"{R}\"\r\nexit /b 0\r\n"
+    } else {
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 3; echo 0.0.0-smoke; exit 0; fi\n\
+         cat >/dev/null\ncat '{R}'\n"
+    };
+    std::fs::write(bin, script.replace("{R}", &reply)).expect("write the slow stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o700)).expect("chmod +x");
+    }
+}
+
+/// Every arch in `vk ls /arches --json`, by id.
+fn arch_states(sh: &Shell) -> std::collections::BTreeMap<String, String> {
+    sh.json(&["ls", "/arches", "--json"])["arches"]
+        .as_array()
+        .expect("/arches is a list of arches")
+        .iter()
+        .map(|a| {
+            (
+                str_of(a, "arch_id").to_string(),
+                str_of(a, "state").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Wait until this node's startup pass has reached every arch: none is
+/// `starting` any more, so each one is `ready` or `unavailable` for good.
+///
+/// A daemon answers *before* its arches are built (Task 1b review, Important
+/// 1), so a test that asserts what an arch came back as has to wait for the
+/// pass — the endpoint answering is no longer the same moment.
+fn settled_arches(sh: &Shell) -> std::collections::BTreeMap<String, String> {
+    let start = Instant::now();
+    loop {
+        let states = arch_states(sh);
+        if !states.values().any(|s| s == "starting") {
+            return states;
+        }
+        assert!(
+            start.elapsed() < READY_TIMEOUT * 3,
+            "the arches never finished starting: {states:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A node with real arches comes back **serving**, and re-creates them behind
+/// the endpoint (Task 1b review, Important 1).
+///
+/// Re-creation used to run inside `RealKernel::open`, before the endpoint was
+/// bound, so a node whose engine took longer than `vk boot`'s 10 s to answer
+/// was killed by the very verb documented to start it. Here the two arches
+/// take ~3 s each to probe; `vk boot` must come back in less than one of those
+/// and say how many are still coming up, the listing must show `starting` and
+/// then `ready`, a step submitted during the window must be retryable rather
+/// than failed, and a second daemon over the same store must still be refused
+/// by the store lock before anything is built.
+#[test]
+fn a_node_with_slow_arches_serves_while_they_start_and_vk_boot_does_not_kill_it() {
+    let vkd = vkd_exe();
+    assert!(vkd.exists());
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    let claude = fake_claude(dir.path());
+    let bin = bin_arg(&claude);
+
+    // Two arches, mounted while the stand-in is still fast.
+    let mounted = {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        let m = sh.json(&[
+            "mount",
+            "claude-code",
+            "--bin",
+            &bin,
+            "--draft-model",
+            "claude-sonnet-5",
+            "--judge-model",
+            "claude-opus-5",
+            "--json",
+        ]);
+        str_of(&m["draft"], "arch_id").to_string()
+    };
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+
+    // The same engine, now slow to say what version it is.
+    slow_claude(dir.path(), &claude);
+
+    // `vk boot`, the documented verb, over the same store.
+    let here = path_of(dir.path());
+    let master = path_of(&dir.path().join("master.key"));
+    let key = path_of(&dir.path().join("node.key"));
+    let boot = [
+        "boot",
+        "--state-dir",
+        &here,
+        "--master-key-file",
+        &master,
+        "--node-key-file",
+        &key,
+        "--web-port",
+        "0",
+        "--json",
+    ];
+    let started = Instant::now();
+    let booted = sh.json(&boot);
+    let took = started.elapsed();
+    let daemon = Detached(booted["pid"].as_u64().expect("a pid to stop it with"));
+    assert!(
+        took < Duration::from_secs(3),
+        "vk boot waited {took:?} for arches it should have let come up behind the endpoint"
+    );
+    assert_eq!(
+        booted["arches_starting"], 2,
+        "the node says what is still coming up: {booted}"
+    );
+    let human = sh.ok(&["ls", "/arches"]);
+    assert!(human.contains("STATE"), "{human}");
+
+    // Listed as `starting` while they come up, and a step that names one is
+    // told to retry — the task is queued, not failed.
+    let states = arch_states(&sh);
+    assert_eq!(
+        states.get(&mounted).map(String::as_str),
+        Some("starting"),
+        "{states:?}"
+    );
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Say something",
+            "--plan",
+            &mounted,
+            "--draft",
+            &mounted,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let retry = sh.run(&["task", "step", &task, "--all"]);
+    assert!(
+        !retry.status.success(),
+        "a step on a starting arch does not run yet"
+    );
+    let why = String::from_utf8_lossy(&retry.stderr);
+    assert!(why.contains("is starting; retry"), "{why}");
+    let queued = sh.json(&["task", "show", &task, "--json"]);
+    assert_eq!(
+        queued["status"], "queued",
+        "a task waiting on an arch that is coming up is queued, not failed: {queued}"
+    );
+    assert_eq!(queued["steps"][0]["status"], "pending", "{queued}");
+
+    // A second daemon over the same store is still refused — by the store
+    // lock, before it builds anything.
+    let second = Daemon(
+        vkd_cmd(dir.path(), &vk_ipc::transport::test_endpoint().0, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn a second vkd"),
+    );
+    let (exit, refusal) = exit_of(second, "a second vkd over a served store is still running");
+    assert!(!exit.success(), "a second daemon must be refused: {exit:?}");
+    assert!(
+        refusal.contains("lock"),
+        "refused by the store lock: {refusal}"
+    );
+
+    // They come up, and the very same task runs — no re-submission.
+    let states = settled_arches(&sh);
+    assert!(
+        states.values().all(|s| s == "ready"),
+        "every arch was re-created: {states:?}"
+    );
+    let done = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(done["status"], "done", "{done}");
+    let top = sh.json(&["top", "--json"]);
+    assert_eq!(
+        top["arches"][&mounted]["tokens_in"],
+        2 * (7 + 11 + 23),
+        "it is the real adapter that answered: {top}"
+    );
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+    drop(daemon);
+}
+
+/// One raw HTTP/1.1 GET against the daemon's loopback pages: the status line
+/// and the body, with no HTTP client in the way.
+fn http_get(port: u16, path_and_query: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to the pages");
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(
+        s,
+        "GET {path_and_query} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in {text}"));
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// The passkey verbs, as far as a shell can drive them without a browser and
+/// an authenticator (SP1b Task 5): `vk status` names the pages' origin; `vk
+/// passkey ls` says none is enrolled; `vk passkey enroll` prints a link that
+/// opens the enrolment page, and only a link does; `vk approve --passkey`
+/// prints the approval page's link and waits, then times out when nobody
+/// approves; and `vk approve` with the node key still completes the task
+/// through the kernel-minted challenge. The Windows Hello half is the
+/// founder's manual check (README).
+#[test]
+fn vk_passkey_verbs_print_links_that_open_the_pages_and_approve_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    let status = wait_until(&sh, true, "vkd did not answer").expect("status");
+    let origin = str_of(&status, "web").to_string();
+    assert!(
+        origin.starts_with("http://localhost:"),
+        "the pages' origin: {status}"
+    );
+    let port: u16 = origin.rsplit(':').next().unwrap().parse().unwrap();
+    let rendered = sh.ok(&["status"]);
+    assert!(
+        rendered.contains("web") && rendered.contains(&origin),
+        "the rendered status names the origin: {rendered}"
+    );
+
+    // Nothing enrolled yet, in both renderings.
+    assert_eq!(sh.json(&["passkey", "ls", "--json"]), serde_json::json!([]));
+    assert!(sh.ok(&["passkey", "ls"]).contains("no passkey enrolled"));
+
+    // The enrolment link: printed, not opened (no `--open`), and it opens
+    // the page — where no link, or a made-up one, does.
+    let enroll = sh.json(&["passkey", "enroll", "--json"]);
+    let url = str_of(&enroll, "url").to_string();
+    assert!(
+        url.starts_with(&format!("{origin}/enroll?t=")),
+        "an enrol link on the pages' origin: {url}"
+    );
+    assert_eq!(enroll["opened"], false);
+    let printed = sh.ok(&["passkey", "enroll"]);
+    assert!(
+        printed.contains(&format!("{origin}/enroll?t=")),
+        "the plain rendering prints the link too: {printed}"
+    );
+    let path = url.strip_prefix(&origin).unwrap();
+    let (code, body) = http_get(port, path);
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains("Enrol") && body.contains("/vk.js"),
+        "the enrolment page: {body}"
+    );
+    assert_eq!(http_get(port, "/enroll").0, 404, "no link, no page");
+    assert_eq!(http_get(port, "/enroll?t=made-up").0, 404);
+
+    // A task waiting for a human.
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Draft a proposal",
+            "--artefact",
+            "proposal",
+            "--plan",
+            &arch,
+            "--draft",
+            &arch,
+            "--approve",
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let waiting = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(waiting["status"], "waiting_human", "{waiting}");
+
+    // `vk approve --passkey`: the link is printed at once, the approval page
+    // opens from it, and with nobody there to approve, the wait times out —
+    // non-zero, naming the task and the link, the task still waiting.
+    let started = Instant::now();
+    let out = sh.run(&["approve", &task, "--passkey", "--timeout", "1"]);
+    assert!(!out.status.success(), "nobody approved: the wait must fail");
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let prefix = format!("{origin}/approve/{task}?t=");
+    let link = stdout
+        .split_whitespace()
+        .find(|w| w.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("the approval link must be printed before the wait: {stdout}"))
+        .to_string();
+    assert!(
+        stderr.contains("no passkey approval") && stderr.contains(&task),
+        "{stderr}"
+    );
+    let (code, body) = http_get(port, link.strip_prefix(&origin).unwrap());
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains("Draft a proposal") && body.contains("Approve with Windows Hello"),
+        "the approval page shows the goal and the button: {body}"
+    );
+    assert_eq!(
+        http_get(port, &format!("/approve/{task}")).0,
+        404,
+        "no link, no page"
+    );
+    assert_eq!(
+        sh.json(&["task", "show", &task, "--json"])["status"],
+        "waiting_human"
+    );
+    // A task that is not waiting gets no link at all.
+    let refused = sh.run(&["approve", "task-none", "--passkey", "--timeout", "1"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("not found"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // The node-key ceremony, through the kernel-minted challenge: still the
+    // way a shell approves without a browser, and it completes the task.
+    let approved = sh.json(&["approve", &task, "--json"]);
+    assert_eq!(approved["ok"], true, "{approved}");
+    let done = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(done["status"], "done", "{done}");
+    // Once done, nothing is waiting: no challenge and no link can be minted.
+    let late = sh.run(&["approve", &task]);
+    assert!(!late.status.success());
+    assert!(
+        String::from_utf8_lossy(&late.stderr).contains("not waiting"),
+        "{}",
+        String::from_utf8_lossy(&late.stderr)
+    );
+    let tail = sh.json(&["dmesg", "-n", "8", "--json"]);
+    assert!(
+        dmesg_kinds(&tail).contains(&"approval.recorded"),
+        "the approval is on the record: {tail}"
+    );
+}
+
+/// `vk secret set` is the one verb in this shell that handles a credential,
+/// and its three rules are testable without touching anybody's keyring: a
+/// name that is not one word is refused before anything is read, an empty
+/// value is refused before the keyring is opened at all, and neither refusal
+/// (nor the success line, which is not reached here) prints a value.
+///
+/// Deliberately no round trip through a real keyring. On this machine that
+/// would write to the founder's credential store, and on a headless Linux
+/// runner there is no secret service to write to — so what is pinned is the
+/// half that is this crate's, and the keyring half is `keyring`'s.
+#[test]
+fn vk_secret_set_refuses_a_bad_name_and_an_empty_value_without_touching_a_keyring() {
+    let bad_name = Command::new(vk_exe())
+        .args(["secret", "set", "two words", "--stdin"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vk");
+    assert!(
+        !bad_name.status.success(),
+        "a name with a space is not a name"
+    );
+    let err = String::from_utf8_lossy(&bad_name.stderr);
+    assert!(err.contains("one word"), "{err}");
+
+    // Nothing on stdin: `--stdin` reads end-of-file, which is not a secret.
+    // The service name is a throwaway, and nothing is written under it.
+    let empty = Command::new(vk_exe())
+        .args([
+            "secret",
+            "set",
+            "anthropic",
+            "--stdin",
+            "--service",
+            "vk-test-never-written",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vk");
+    assert!(!empty.status.success(), "an empty value is not a secret");
+    let err = String::from_utf8_lossy(&empty.stderr);
+    assert!(err.contains("the keyring was not touched"), "{err}");
+}
+
+/// `vk mount bedrock` takes an EU region and no other: the manifest's
+/// `jurisdiction: EU` *is* the region, so naming somewhere else is refused by
+/// the shell before a daemon is even dialled.
+#[test]
+fn vk_mount_bedrock_refuses_a_region_outside_the_union() {
+    let refused = Command::new(vk_exe())
+        .args(["mount", "bedrock", "--region", "us-east-1"])
+        .output()
+        .expect("run vk");
+    assert!(!refused.status.success(), "us-east-1 is not an EU region");
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        err.contains("eu-central-1") && err.contains("eu-west-1"),
+        "{err}"
+    );
 }

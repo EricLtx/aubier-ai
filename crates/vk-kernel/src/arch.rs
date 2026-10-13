@@ -3,12 +3,232 @@ use std::collections::BTreeSet;
 use vk_contracts::arch::ArchManifest;
 use vk_contracts::register::Register;
 
+/// What an arch hands back from one call: the text, plus whatever that arch
+/// measured about the call itself.
+///
+/// Only an arch that the provider tells can report the measurements, so they
+/// are optional and the mock leaves them unset (SP1b rulings 3, 7 and 8). They
+/// exist because the kernel's own numbers are estimates — `count_tokens` is a
+/// heuristic on every adapter that has no tokenizer to ask — while these are
+/// what the call actually was, and a record that can carry the measurement
+/// should not settle for the guess. The kernel prefers `tokens_in_measured`
+/// over its estimate, accumulates the cost on the arch's counters, and merges
+/// all of it into the `infer` event's payload.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Completion {
+    /// The completion itself — what `raise` puts back into the register.
+    pub text: String,
+    /// Prompt tokens as the provider counted them, cached ones included. When
+    /// an arch reports this the kernel records it instead of `count_tokens`'s
+    /// estimate, because there is no reason to keep a guess beside a
+    /// measurement of the same thing (ruling 7).
+    pub tokens_in_measured: Option<u32>,
+    /// Completion tokens as the provider counted them. The kernel has no
+    /// estimate to fall back on here — it never sees the answer before the
+    /// arch produces it — so this is `None` for an arch that reports nothing,
+    /// and the per-call usage row says `0` rather than guessing (Ruling 8).
+    pub tokens_out: Option<u32>,
+    /// List-price equivalent in USD, as the provider reported it. Under a
+    /// subscription nothing is billed per call, so this is what the same call
+    /// would have cost on the meter, not a charge; the manifest's
+    /// `cost_per_1k_tokens_eur` stays 0 and this is the honest number beside it.
+    pub cost_list_usd: Option<f64>,
+    /// Arch-specific measurements of the call (token breakdown, timings, the
+    /// provider's own id for it). Free-form on purpose: it is payload, not a
+    /// contract type, and every arch measures something different.
+    pub details: Option<serde_json::Value>,
+}
+
+impl Completion {
+    /// A completion from an arch that measured nothing — the text alone.
+    pub fn text(text: impl Into<String>) -> Completion {
+        Completion {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Why a call to an arch did not produce a completion.
+///
+/// Two arms, because the kernel owes the caller two different answers. An
+/// adapter that refuses a prompt its context cannot hold is raising the
+/// kernel's own I4′ invariant, and it must reach the client as an invariant
+/// refusal — not as "no such arch", which is what an untyped adapter error
+/// used to be flattened into (SP1b review, Important 2). Everything else is a
+/// failure of the machinery: the engine would not start, the answer would not
+/// parse, the process had to be killed.
+#[derive(Debug, thiserror::Error)]
+pub enum AdapterError {
+    /// The prompt does not fit what this arch will actually accept. `needed`
+    /// is the adapter's own count of the prompt, `ceiling` the largest it
+    /// takes — both in tokens, both as that adapter measures them.
+    #[error(
+        "I4': prompt needs about {needed} tokens, past the {ceiling} this arch accepts; \
+         refusing rather than letting the far end truncate it"
+    )]
+    I4Prime { needed: u32, ceiling: u32 },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 pub trait ArchAdapter: Send + Sync {
     fn manifest(&self) -> &ArchManifest;
-    /// Real context budget in tokens (I4'); adapters must report what is actually loaded.
+    /// The largest prompt this arch will actually accept, in tokens (I4').
+    ///
+    /// Not the manifest's `context_ceiling` unless they are the same number:
+    /// this is what the kernel projects *into*, so an adapter that keeps
+    /// headroom must report the budget after the headroom, or the kernel will
+    /// fit a prompt to a size the adapter then refuses.
     fn context_budget(&self) -> u32;
     fn count_tokens(&self, text: &str) -> u32;
-    fn complete(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<String>;
+    fn complete(&self, prompt: &str, max_tokens: u32) -> Result<Completion, AdapterError>;
+}
+
+/// How to make this arch again: the `kind` that picks an adapter and the
+/// `config` that adapter reads (SP1b ruling 14).
+///
+/// Recorded beside the manifest at `arch.mount`, because a manifest says what
+/// an arch *is* and nothing about how to build one. Without it a restart had
+/// no choice but to invent an adapter, and what it invented was the mock —
+/// so a node that had Gemma before the restart had the mock after it, under
+/// the same arch id, with nothing in the record saying so.
+///
+/// `config` is the adapter's own shape, free-form on purpose: every engine is
+/// configured differently and the kernel is not the place that knows how. What
+/// the kernel does know is what may never be in there — see [`MountSpec::new`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MountSpec {
+    pub kind: String,
+    pub config: serde_json::Value,
+}
+
+impl MountSpec {
+    /// A spec, refused if its config carries anything shaped like a credential.
+    ///
+    /// A spec is durable and unencrypted — it is in the metadata database, not
+    /// the blob store — so a secret written into one is a secret at rest in
+    /// the clear, for as long as the arch is mounted. Neither adapter this
+    /// node has takes a credential today; the guard is here so that the kind
+    /// that does is refused at the door rather than discovered later.
+    ///
+    /// The rule is on *strings* under a credential-shaped name, not on the
+    /// name alone, because `max_tokens` is a name like that and a count is not
+    /// a credential. A secret is an opaque string; a number never is one.
+    pub fn new(kind: impl Into<String>, config: serde_json::Value) -> anyhow::Result<MountSpec> {
+        let spec = MountSpec {
+            kind: kind.into(),
+            config,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// The spec that re-creates a [`MockAdapter`] exactly: the manifest is the
+    /// mock, so carrying it whole is the only way the arch id comes back the
+    /// same.
+    pub fn mock(manifest: &ArchManifest, budget: u32) -> MountSpec {
+        MountSpec {
+            kind: "mock".into(),
+            config: serde_json::json!({ "manifest": manifest, "budget": budget }),
+        }
+    }
+
+    /// [`MountSpec::new`]'s check, for a spec that was built rather than made.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.kind.is_empty(), "a mount spec must name its kind");
+        no_secrets(&self.config, None)
+    }
+}
+
+/// Does this name read like a credential? Substring rather than whole word: a
+/// later kind is as likely to call it `apiKey` or `x_auth_token` as `key`.
+/// `auth` covers `authorization`, `oauth` and `basic_auth` (Task 1b deferred
+/// minor) — and, being a substring, `author` too, which is the price of not
+/// having to guess the next spelling.
+fn secret_shaped(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "secret",
+        "token",
+        "key",
+        "password",
+        "passwd",
+        "credential",
+        "auth",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Walk a config and refuse the first string sitting under such a name,
+/// wherever in the tree it is.
+///
+/// `under` is the credential-shaped name this value is *inside*, and it is
+/// carried down through arrays and nested objects — which is the whole point
+/// (Task 1b review, Minor 1). Checking only the immediate `(name, string)`
+/// pair let `{"api_keys": ["sk-live-1"]}` through: the name sat over an array,
+/// the array's elements had no name of their own, and the credentials landed
+/// in the metadata database in the clear. A list of secrets is a secret, and
+/// so is an object full of them.
+fn no_secrets(config: &serde_json::Value, under: Option<&str>) -> anyhow::Result<()> {
+    match config {
+        serde_json::Value::String(_) => {
+            anyhow::ensure!(
+                under.is_none(),
+                "a mount spec is stored in the clear and must not carry a secret: \
+                 drop `{}` from the config, or keep it in the keyring",
+                under.unwrap_or_default()
+            );
+            Ok(())
+        }
+        serde_json::Value::Object(map) => map.iter().try_for_each(|(name, value)| {
+            // A name that reads like a credential shadows whatever it is
+            // inside; anything else keeps the verdict it inherited.
+            let under = if secret_shaped(name) {
+                Some(name.as_str())
+            } else {
+                under
+            };
+            no_secrets(value, under)
+        }),
+        serde_json::Value::Array(items) => items.iter().try_for_each(|v| no_secrets(v, under)),
+        _ => Ok(()),
+    }
+}
+
+/// How an origin reaches this machine, when it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loopback {
+    /// A loopback *address*: `127.0.0.0/8` or `::1`, however it is spelled.
+    Address,
+    /// Exactly the name `localhost` — which is whatever `hosts` says today, so
+    /// a check that will put a credential on the wire accepts only
+    /// [`Loopback::Address`].
+    Localhost,
+}
+
+/// Parse `raw` and say whether its host is this machine's loopback.
+///
+/// The one loopback check every adapter uses (final review I-4). The URL is
+/// parsed by the `url` crate — the parser `reqwest` uses — and never scanned by
+/// hand: WHATWG ends the authority of a special scheme at a backslash as well
+/// as at `/`, `?` and `#`, so a scan that took the text after the last `@`
+/// read `http://evil.example\@127.0.0.1` as loopback while the client posted
+/// to `evil.example`. One parser, one answer.
+///
+/// `Err` when `raw` is not an absolute URL; `Ok((url, None))` when it parses
+/// and its host (if any) is not loopback.
+pub fn origin_loopback(raw: &str) -> anyhow::Result<(url::Url, Option<Loopback>)> {
+    let url = url::Url::parse(raw).map_err(|e| anyhow::anyhow!("{raw} is not a URL: {e}"))?;
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => Some(Loopback::Address),
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => Some(Loopback::Address),
+        // The parser lowercases a domain, so `LOCALHOST` arrives as this.
+        Some(url::Host::Domain("localhost")) => Some(Loopback::Localhost),
+        _ => None,
+    };
+    Ok((url, loopback))
 }
 
 pub struct MockAdapter {
@@ -26,7 +246,7 @@ impl ArchAdapter for MockAdapter {
     fn count_tokens(&self, text: &str) -> u32 {
         (text.len() / 4) as u32 + 1
     }
-    fn complete(&self, prompt: &str, _max_tokens: u32) -> anyhow::Result<String> {
+    fn complete(&self, prompt: &str, _max_tokens: u32) -> Result<Completion, AdapterError> {
         let role = prompt
             .lines()
             .next()
@@ -34,7 +254,7 @@ impl ArchAdapter for MockAdapter {
             .trim_start_matches("ROLE: ")
             .to_uppercase();
         let body: String = prompt.chars().take(200).collect();
-        Ok(format!("{role}: {body}"))
+        Ok(Completion::text(format!("{role}: {body}")))
     }
 }
 
@@ -192,5 +412,24 @@ pub fn raise(reg: &mut Register, role: &str, output: &str) {
         "plan" => reg.decisions.push(format!("plan: {}", output.trim())),
         "judge" => reg.open_questions.push(format!("judge: {}", output.trim())),
         _ => reg.decisions.push(format!("{role}: {}", output.trim())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{origin_loopback, Loopback};
+
+    /// The shared check reads the host the way `reqwest` will (final review
+    /// I-4): the backslash form is `evil.example`, not loopback.
+    #[test]
+    fn origin_loopback_reads_the_host_the_client_will_use() {
+        let verdict = |raw: &str| origin_loopback(raw).unwrap().1;
+        assert_eq!(verdict("http://127.0.0.1:11434"), Some(Loopback::Address));
+        assert_eq!(verdict("http://[::1]:11434"), Some(Loopback::Address));
+        assert_eq!(verdict("http://LOCALHOST:11434"), Some(Loopback::Localhost));
+        assert_eq!(verdict(r"http://evil.example\@127.0.0.1:11434"), None);
+        assert_eq!(verdict("http://user@evil.example"), None);
+        assert_eq!(verdict("http://127.example.com"), None);
+        assert!(origin_loopback("not a url at all").is_err());
     }
 }
