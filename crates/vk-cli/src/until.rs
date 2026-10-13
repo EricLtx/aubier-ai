@@ -34,7 +34,13 @@ pub fn ttl_ms(spec: &str, now_ms: u64) -> Result<u64> {
 fn relative_ms(rel: &str) -> Result<u64> {
     let bad = || anyhow!("--until +{rel}: expected a number and a unit (+30d, +12h, +90m, +45s)");
     let unit = rel.chars().last().ok_or_else(bad)?;
-    let n: u64 = rel[..rel.len() - 1].parse().map_err(|_| bad())?;
+    // Digits only: `u64::parse` would take a second `+`; and the number is
+    // cut where the unit character starts, so a multi-byte unit cannot panic.
+    let number = &rel[..rel.len() - unit.len_utf8()];
+    if number.is_empty() || !number.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: u64 = number.parse().map_err(|_| bad())?;
     let per = match unit {
         'd' => 86_400_000,
         'h' => 3_600_000,
@@ -64,7 +70,13 @@ fn rfc3339_ms(s: &str) -> Result<u64> {
     }
     let (y, mo, d) = (digits(0, 4)?, digits(5, 2)?, digits(8, 2)?);
     let (h, mi, sec) = (digits(11, 2)?, digits(14, 2)?, digits(17, 2)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+    let month_len = match mo {
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=12).contains(&mo) || !(1..=month_len).contains(&d) || h > 23 || mi > 59 || sec > 59 {
         return Err(bad());
     }
     let mut i = 19;
@@ -89,7 +101,11 @@ fn rfc3339_ms(s: &str) -> Result<u64> {
                 b'-' => -1,
                 _ => return Err(bad()),
             };
-            sign * (digits(i + 1, 2)? * 3600 + digits(i + 4, 2)? * 60)
+            let (oh, om) = (digits(i + 1, 2)?, digits(i + 4, 2)?);
+            if oh > 23 || om > 59 {
+                return Err(bad());
+            }
+            sign * (oh * 3600 + om * 60)
         }
         _ => return Err(bad()),
     };
@@ -122,6 +138,10 @@ mod tests {
         assert!(ttl_ms("+0d", NOW).is_err());
         assert!(ttl_ms("+d", NOW).is_err());
         assert!(ttl_ms("+5w", NOW).is_err());
+        // A multi-byte unit is refused, not a panic; so is a doubled sign.
+        assert!(ttl_ms("+5é", NOW).is_err());
+        assert!(ttl_ms("+é", NOW).is_err());
+        assert!(ttl_ms("++5d", NOW).is_err());
     }
 
     #[test]
@@ -144,5 +164,7 @@ mod tests {
         assert!(ttl_ms("2024-11-14T22:13:20Z", NOW).is_err());
         assert!(ttl_ms("tomorrow", NOW).is_err());
         assert!(ttl_ms("2023-13-14T22:13:20Z", NOW).is_err());
+        assert!(ttl_ms("2023-02-31T00:00:00Z", NOW).is_err());
+        assert!(ttl_ms("2023-11-15T22:13:20+99:99", NOW).is_err());
     }
 }

@@ -31,7 +31,9 @@ pub mod launch;
 pub mod netwatch;
 /// The restricted-token launch of the harness (SP1b Task 10 group G), Windows
 /// only: on the platforms with no restricted token this module does not exist,
-/// and the harness runs under the Job Object and the fence alone.
+/// and the harness runs under the Job Object and the fence alone. Kept as
+/// reference under the execution context contract (`contracts/tcb.md`), not
+/// wired into the launch.
 #[cfg(windows)]
 pub mod restrict;
 pub mod workspace;

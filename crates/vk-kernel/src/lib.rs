@@ -3746,6 +3746,28 @@ mod tests {
         assert!(k.ledger().verify_chain());
     }
 
+    /// The record is not optional: when the ledger cannot take the event, the
+    /// renewal fails and the lease is exactly what it was.
+    #[test]
+    fn a_failed_ledger_append_fails_the_renewal_and_leaves_the_lease_unchanged() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        k.renew_liveness_persisted("acme", "laptop", 5_000).unwrap();
+        let events = k.ledger().events().len();
+        // Make the segment unwritable: a directory where the file was.
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        std::fs::remove_file(&seg).unwrap();
+        std::fs::create_dir(&seg).unwrap();
+        let err = k
+            .renew_liveness_persisted("acme", "phone", 9_000)
+            .expect_err("the append must fail");
+        assert!(matches!(err, KernelError::Store(_)), "{err}");
+        let lease = k.liveness("acme").unwrap().unwrap();
+        assert_eq!(lease.expires_at_ms, 5_000);
+        assert_eq!(lease.renewed_by_device, "laptop");
+        assert_eq!(k.ledger().events().len(), events);
+    }
+
     /// `vkd` calls this on the serve-under-force path, with the very report
     /// `boot` returned. The ledger gains a `boot.forced` event naming exactly
     /// that verdict — not a fresh recomputation, which could disagree with
