@@ -60,12 +60,16 @@ pub struct ServerConfig {
     /// since the mount spec is replayed at every boot, and from a service
     /// account whose keyring that client cannot otherwise read at all.
     pub anthropic_base_url: String,
-    /// Whether this daemon runs as the Windows service (`vkd --as-service`,
-    /// set by `vkd` from its own flag — never a request field). Under the
-    /// service a Claude Code binary a request names may not resolve into a
-    /// synced folder or a user profile (Ruling 43); an interactive daemon is
-    /// the user's own process and may run the user's own binary.
-    pub as_service: bool,
+    /// The Claude Code executable every `claude-code` arch runs — at mount,
+    /// at every boot that re-creates one, at every call (founder decision
+    /// 2026-10-13, after final review I-1; Rulings 41 and 43). Daemon
+    /// configuration, never a request field: `vkd --claude-bin`, settled by
+    /// [`claude_binary_at_start`] before the daemon serves anything, so what
+    /// is here has already passed the rule — an absolute, resolved path, or
+    /// the bare default `claude` when this daemon's `PATH` had none at start.
+    /// Under the service the rule was the service's (Ruling 43), which is why
+    /// the transport no longer needs to know which mode it is in.
+    pub claude_bin: PathBuf,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -76,7 +80,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("web", &self.web.as_ref().map(|w| w.origin()))
             .field("anthropic_keys", &self.anthropic_keys)
             .field("anthropic_base_url", &self.anthropic_base_url)
-            .field("as_service", &self.as_service)
+            .field("claude_bin", &self.claude_bin)
             .finish()
     }
 }
@@ -91,9 +95,111 @@ impl ServerConfig {
             web: None,
             anthropic_keys: vk_arch_anthropic::KeySource::Keyring,
             anthropic_base_url: vk_arch_anthropic::DEFAULT_BASE_URL.to_string(),
-            as_service: false,
+            claude_bin: PathBuf::from(DEFAULT_CLAUDE_BIN),
         }
     }
+}
+
+/// What `vkd --claude-bin` defaults to: a bare name, looked up on the
+/// daemon's own `PATH`.
+pub const DEFAULT_CLAUDE_BIN: &str = "claude";
+
+/// `vkd --claude-bin` as the daemon settles it at start — and as
+/// `vkd-service install --claude-bin` checks it before it writes it into the
+/// service's `ImagePath` — against this process's own `PATH`. See
+/// [`claude_binary_on`].
+pub fn claude_binary_at_start(
+    asked: Option<&std::path::Path>,
+    as_service: bool,
+) -> Result<PathBuf> {
+    claude_binary_on(
+        asked,
+        as_service,
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )
+}
+
+/// The Claude Code executable `asked` names, settled against `path_var`
+/// (founder decision 2026-10-13; final review I-1, Rulings 41 and 43). Every
+/// refusal names `--claude-bin` and the rule, and is the daemon's start
+/// failing — the rule SP1b applied to a mount request's `binary`, moved to
+/// the one place an operator sets it.
+///
+/// A **bare name** (`claude`, the default) is looked up on the daemon's own
+/// `PATH` — on Windows as `<name>.exe`, never a `.cmd` or `.bat` shim, which
+/// would start the real binary as a grandchild — and pinned to what was
+/// found, which is then held to the same rule as a path. An explicit name
+/// that is not there is refused; the **default** that is not there is a
+/// warning and stays `claude`, because a node starts without Claude Code
+/// installed and a `claude-code` mount then fails saying why.
+///
+/// A **path**, on every daemon, must be absolute (a relative one resolves
+/// against whatever the daemon's working directory is), have no `..`
+/// component, and resolve — symlinks and junctions followed, a loop refused —
+/// to a file that exists. The **resolved** path is what is checked and
+/// pinned; a link is not itself a reason to refuse (Ruling 43).
+///
+/// Under the Windows service (`as_service`), and only there, it must also be
+/// on a local fixed drive — by its spelling before anything is opened, and
+/// again resolved (final re-review N-2) — and must not resolve into a synced
+/// folder or a user profile: the service runs it as `NT SERVICE\vkd`, and a
+/// file the user's processes can replace would be code they choose run as
+/// that account. An interactive daemon is the user's own process, in the
+/// user's own trust domain, and may run the user's own binary.
+pub fn claude_binary_on(
+    asked: Option<&std::path::Path>,
+    as_service: bool,
+    path_var: &std::ffi::OsStr,
+) -> Result<PathBuf> {
+    let named = asked.unwrap_or(std::path::Path::new(DEFAULT_CLAUDE_BIN));
+    if !is_bare_name(named) {
+        return checked_claude_path(named, &named.display().to_string(), as_service);
+    }
+    match find_on_path(named, path_var) {
+        Some(found) => {
+            // Absolute even when found through a relative `PATH` entry.
+            let found = std::path::absolute(&found).unwrap_or(found);
+            let label = format!("{} (found on PATH at {})", named.display(), found.display());
+            checked_claude_path(&found, &label, as_service)
+        }
+        None if asked.is_none() => {
+            tracing::warn!(
+                "no `{}` on this daemon's PATH{}: every claude-code mount will be refused until \
+                 vkd is started with --claude-bin <path>",
+                named.display(),
+                if cfg!(windows) { " (as an .exe)" } else { "" }
+            );
+            Ok(named.to_path_buf())
+        }
+        None => anyhow::bail!(
+            "--claude-bin {} is not on the daemon's PATH{}: give its absolute path",
+            named.display(),
+            if cfg!(windows) {
+                " (looked up as an .exe, never a .cmd shim)"
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
+/// A name with no directory in it: what `PATH` is for.
+fn is_bare_name(p: &std::path::Path) -> bool {
+    p.components().count() == 1 && !p.is_absolute()
+}
+
+/// The first file `name` names on `path_var`: on Windows as `<name>.exe` —
+/// never `<name>.cmd` or `<name>.bat` — and elsewhere as `<name>`.
+fn find_on_path(name: &std::path::Path, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
+    let name = name.to_string_lossy();
+    let candidate = if cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe") {
+        format!("{name}.exe")
+    } else {
+        name.into_owned()
+    };
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join(&candidate))
+        .find(|p| p.is_file())
 }
 
 /// The web pages' side of `web.link` (SP1b Task 5): mint a link a person can
@@ -624,15 +730,13 @@ fn dispatch(
     // because the version is in the arch identity. That happens here, *before*
     // the kernel lock, so a binary that is slow — or missing, and about to be
     // waited out — delays this one mount rather than every other syscall on
-    // the node (SP1b review, Minor 8 / ruling 8).
-    // The config comes back with `binary` resolved: that is what is asked,
-    // persisted and run from here on (I-1 addendum).
-    let as_service = config.as_service;
+    // the node (SP1b review, Minor 8 / ruling 8). The binary is the daemon's
+    // (`vkd --claude-bin`); the request's config is checked against its
+    // closed shape before anything is run.
     let claude = (req.method == "arch.mount" && req.params["kind"] == "claude-code")
-        .then(|| -> anyhow::Result<(Value, String)> {
-            let resolved = resolved_claude_config(&req.params["config"], as_service)?;
-            let version = claude_code_version(&resolved, as_service)?;
-            Ok((resolved, version))
+        .then(|| -> anyhow::Result<String> {
+            let _: ClaudeCodeMountConfig = claude_mount_config(&req.params["config"])?;
+            claude_code_version(&config.claude_bin)
         })
         .transpose()
         .map_err(|e| bad(&format!("{e:#}")))?;
@@ -828,19 +932,13 @@ fn dispatch(
             // Recorded before anything is mounted, so a config this node could
             // not make a spec out of — one carrying a credential — is refused
             // rather than mounted into an arch no boot can bring back.
-            // A Claude Code config is the resolved one (I-1 addendum).
-            let mount_config = match &claude {
-                Some((resolved, _)) => resolved,
-                None => &p["config"],
-            };
-            let spec = mount_spec_of(kind, mount_config)?;
+            let spec = mount_spec_of(kind, &p["config"])?;
             let adapter: Arc<dyn ArchAdapter> = match kind {
                 "claude-code" => {
-                    let (resolved, version) =
-                        claude.ok_or_else(|| internal("no claude version"))?;
+                    let version = claude.ok_or_else(|| internal("no claude version"))?;
                     let state_dir = k.store().state_dir.clone();
                     Arc::new(
-                        claude_code_adapter(&state_dir, &resolved, &version, config.as_service)
+                        claude_code_adapter(&state_dir, &p["config"], &version, &config.claude_bin)
                             .map_err(|e| bad(&format!("{e:#}")))?,
                     )
                 }
@@ -1263,110 +1361,118 @@ fn dispatch(
 /// Everything `arch.mount { kind: "claude-code" }` may say, and — because of
 /// `deny_unknown_fields` — nothing else (Ruling 42).
 ///
-/// `binary` is still a request field this wave: moving it to daemon
-/// configuration (`vkd --claude-bin`, as `--harness-bin` is) is a public
-/// surface change and the founder's call (Ruling 41). Until then every value
-/// goes through [`claude_binary`]'s refusals, at mount and again at every boot
-/// that re-creates the arch from its spec.
+/// There is no `binary`: the Claude Code executable is daemon configuration
+/// (`vkd --claude-bin`, founder decision 2026-10-13, closing final review
+/// I-1's open item), and a request that names one is refused by
+/// [`claude_mount_config`] saying so.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClaudeCodeMountConfig {
-    binary: Option<String>,
     model: Option<String>,
     max_turns: Option<u32>,
     timeout_secs: Option<u32>,
     context_ceiling: Option<u32>,
 }
 
-/// The `claude` binary a config names, defaulted, resolved, and held to the
-/// rule `vkd-service install` applies to its own `ImagePath` (final review
-/// I-1, Rulings 41 and 43).
-///
-/// A bare name (`claude`, the default) is looked up on the **daemon's** own
-/// `PATH` when it is run, which is daemon configuration, not the request's.
-/// Anything with a separator is a path the request chose, and the daemon runs
-/// it at mount, at every boot and at every inference from the persisted spec.
-///
-/// Always, whatever the daemon: it must be absolute (a relative one resolves
-/// against whatever the daemon's working directory is), have no `..`
-/// component, and resolve — symlinks and junctions followed, a loop refused —
-/// to a file that is there. The **resolved** path is what is checked, stored
-/// and run; a link is not itself a reason to refuse (Ruling 43).
-///
-/// Under the Windows service (`as_service`), and only there, the resolved
-/// path must also not be in a synced folder or under a user profile: the
-/// service runs it as `NT SERVICE\vkd`, and a file the user's processes can
-/// replace would be code they choose run as that account. An interactive
-/// daemon is the user's own process, in the user's own trust domain, and may
-/// run the user's own profile-installed `claude`.
-fn claude_binary(
-    cfg: &ClaudeCodeMountConfig,
+/// A mount request's claude-code config in its closed shape. `binary` gets a
+/// refusal of its own rather than serde's "unknown field": it is the one
+/// field SP1b took, and whoever sends it needs to be told where it went.
+fn claude_mount_config(config: &Value) -> anyhow::Result<ClaudeCodeMountConfig> {
+    anyhow::ensure!(
+        config.get("binary").is_none(),
+        "claude-code: the mount does not take `binary`: the Claude Code executable is daemon \
+         configuration (vkd --claude-bin), checked when the daemon starts"
+    );
+    closed_config("claude-code", config)
+}
+
+/// A persisted claude-code config with SP1b's `binary` taken out, if it had
+/// one, and a line in the log naming what was ignored. A spec written by an
+/// SP1b `arch.mount` still carries the path its request named; it is read,
+/// not migrated, and the daemon's own binary is what runs.
+fn without_legacy_binary(config: &Value, claude_bin: &std::path::Path) -> Value {
+    let Some(legacy) = config.get("binary") else {
+        return config.clone();
+    };
+    tracing::warn!(
+        ignored_binary = %legacy.as_str().map_or_else(|| legacy.to_string(), str::to_string),
+        claude_bin = %claude_bin.display(),
+        "this claude-code arch's mount spec names a binary, which is ignored: the Claude \
+         Code executable is daemon configuration (vkd --claude-bin) since 2026-10-13, and the \
+         daemon's is what runs. The spec is left as it is; mounting the arch again writes \
+         one without it"
+    );
+    let mut config = config.clone();
+    if let Some(map) = config.as_object_mut() {
+        map.remove("binary");
+    }
+    config
+}
+
+/// `p`, held to the rule [`claude_binary_on`] describes, and resolved.
+/// `label` is how the refusals name it.
+fn checked_claude_path(
+    p: &std::path::Path,
+    label: &str,
     as_service: bool,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let Some(named) = cfg.binary.as_deref() else {
-        return Ok(ClaudeCodeConfig::default().binary);
-    };
-    let p = std::path::PathBuf::from(named);
-    if p.components().count() == 1 && !p.is_absolute() {
-        return Ok(p);
-    }
     anyhow::ensure!(
         p.is_absolute(),
-        "binary {named} is a relative path: give an absolute path, or a bare name the daemon \
-         finds on its own PATH"
+        "--claude-bin {label} is a relative path: give an absolute path, or a bare name the \
+         daemon finds on its own PATH"
     );
     anyhow::ensure!(
         !p.components()
             .any(|c| matches!(c, std::path::Component::ParentDir)),
-        "binary {named} has a `..` component: name the binary by its own path"
+        "--claude-bin {label} has a `..` component: name the binary by its own path"
     );
     // Under the service, a share is refused before it is reached for: the
-    // service account does not go to the network on a request's behalf
-    // (final re-review N-2). The resolved path is held to it again below.
+    // service account does not go to the network to settle its own
+    // configuration (final re-review N-2). The resolved path is held to it
+    // again below.
     if as_service {
         anyhow::ensure!(
-            on_a_local_fixed_drive(&p),
-            "binary {named} is not on a local fixed drive (a network share, a removable or \
-             mapped drive): the service would run whatever that drive holds at the next boot \
+            on_a_local_fixed_drive(p),
+            "--claude-bin {label} is not on a local fixed drive (a network share, a removable \
+             or mapped drive): the service would run whatever that drive holds at the next boot \
              or call. Install Claude Code on a local disk"
         );
     }
-    let resolved = match resolved_path(&p) {
+    let resolved = match resolved_path(p) {
         Ok(r) => r,
         Err(e)
             if e.downcast_ref::<std::io::Error>()
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
         {
-            anyhow::bail!("binary {named} does not exist (or is not a file)")
+            anyhow::bail!("--claude-bin {label} does not exist (or is not a file)")
         }
         // A link loop, a component that cannot be read: not a path this
         // daemon can say where it goes.
-        Err(e) => anyhow::bail!("binary {named} cannot be resolved (a link loop?): {e:#}"),
+        Err(e) => anyhow::bail!("--claude-bin {label} cannot be resolved (a link loop?): {e:#}"),
     };
     anyhow::ensure!(
         resolved.is_file(),
-        "binary {named} does not exist (or is not a file)"
+        "--claude-bin {label} does not exist (or is not a file)"
     );
     if as_service {
         anyhow::ensure!(
             on_a_local_fixed_drive(&resolved),
-            "binary {named} resolves to {}, which is not on a local fixed drive: install \
+            "--claude-bin {label} resolves to {}, which is not on a local fixed drive: install \
              Claude Code on a local disk",
             resolved.display()
         );
         vk_store::paths::refuse_sync_folder(&resolved).map_err(|_| {
             anyhow::anyhow!(
-                "binary {named} resolves to {}, inside a synced folder, which may replace the \
-                 file under the service; install Claude Code somewhere else",
+                "--claude-bin {label} resolves to {}, inside a synced folder, which may replace \
+                 the file under the service; install Claude Code somewhere else",
                 resolved.display()
             )
         })?;
         anyhow::ensure!(
             !vk_store::paths::under_a_user_profile(&resolved),
-            "binary {named} resolves to {}, inside a user profile, and the service runs it as \
-             NT SERVICE\\vkd at every boot and call: anything running as that user could \
-             replace it. Name a binary somewhere only administrators may write, or put \
-             `claude` on the service's PATH and leave --bin at its default",
+            "--claude-bin {label} resolves to {}, inside a user profile, and the service runs it \
+             as NT SERVICE\\vkd at every boot and call: anything running as that user could \
+             replace it. Name a binary somewhere only administrators may write",
             resolved.display()
         );
     }
@@ -1428,24 +1534,6 @@ fn resolved_path(p: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     Ok(canonical)
 }
 
-/// The claude-code config as it is persisted: parsed into its closed shape,
-/// with `binary` replaced by the resolved path [`claude_binary`] will run, so
-/// the spec replayed at boot names what was checked rather than what was
-/// typed (I-1 addendum).
-fn resolved_claude_config(config: &Value, as_service: bool) -> anyhow::Result<Value> {
-    let asked: ClaudeCodeMountConfig = closed_config("claude-code", config)?;
-    let mut config = if config.is_null() {
-        json!({})
-    } else {
-        config.clone()
-    };
-    if asked.binary.is_some() {
-        let binary = claude_binary(&asked, as_service)?;
-        config["binary"] = json!(binary.to_string_lossy());
-    }
-    Ok(config)
-}
-
 /// Ask that binary its version, and refuse the mount if it cannot say.
 ///
 /// The version is part of the arch identity: a mount without it would mint an
@@ -1453,11 +1541,11 @@ fn resolved_claude_config(config: &Value, as_service: bool) -> anyhow::Result<Va
 /// anyway — so it is refused here, where the person mounting is still
 /// listening. Called before the kernel lock is taken, and again at boot by the
 /// factory, where a binary that is gone is what makes the arch unavailable.
-fn claude_code_version(config: &Value, as_service: bool) -> anyhow::Result<String> {
-    let binary = claude_binary(&closed_config("claude-code", config)?, as_service)?;
-    vk_arch_claude_code::probe_version(&binary).ok_or_else(|| {
+fn claude_code_version(binary: &std::path::Path) -> anyhow::Result<String> {
+    vk_arch_claude_code::probe_version(binary).ok_or_else(|| {
         anyhow::anyhow!(
-            "cannot run `{} --version`: install Claude Code, or pass the binary's path",
+            "cannot run `{} --version`: install Claude Code, or start vkd with \
+             --claude-bin <path>",
             binary.display()
         )
     })
@@ -1485,19 +1573,23 @@ pub fn adapter_factory(
     state_dir: std::path::PathBuf,
     anthropic_keys: vk_arch_anthropic::KeySource,
     anthropic_base_url: String,
-    as_service: bool,
+    claude_bin: PathBuf,
 ) -> vk_kernel::AdapterFactory {
     let mock = vk_kernel::mock_factory();
     Arc::new(move |spec: &MountSpec| -> Result<Box<dyn ArchAdapter>> {
         match spec.kind.as_str() {
             "mock" => mock(spec),
+            // The daemon's binary, whatever the spec says: one written by
+            // SP1b may still name its own, which is ignored and logged.
             "claude-code" => {
-                let version = claude_code_version(&spec.config, as_service)?;
+                let config = without_legacy_binary(&spec.config, &claude_bin);
+                let _: ClaudeCodeMountConfig = closed_config("claude-code", &config)?;
+                let version = claude_code_version(&claude_bin)?;
                 Ok(Box::new(claude_code_adapter(
                     &state_dir,
-                    &spec.config,
+                    &config,
                     &version,
-                    as_service,
+                    &claude_bin,
                 )?))
             }
             "ollama" => Ok(Box::new(ollama_adapter(&spec.config)?)),
@@ -1763,7 +1855,7 @@ fn claude_code_adapter(
     state_dir: &std::path::Path,
     config: &Value,
     claude_version: &str,
-    as_service: bool,
+    binary: &std::path::Path,
 ) -> anyhow::Result<ClaudeCodeAdapter> {
     let defaults = ClaudeCodeConfig::default();
     let asked: ClaudeCodeMountConfig = closed_config("claude-code", config)?;
@@ -1775,7 +1867,7 @@ fn claude_code_adapter(
     vk_store::paths::private_dir(&cwd).with_context(|| format!("create {}", cwd.display()))?;
     let default_timeout = u32::try_from(defaults.timeout.as_secs()).unwrap_or(u32::MAX);
     let cfg = ClaudeCodeConfig {
-        binary: claude_binary(&asked, as_service)?,
+        binary: binary.to_path_buf(),
         model: asked.model.clone().unwrap_or(defaults.model),
         max_turns: asked.max_turns.unwrap_or(defaults.max_turns),
         timeout: Duration::from_secs(u64::from(asked.timeout_secs.unwrap_or(default_timeout))),
@@ -1989,23 +2081,8 @@ pub fn resolve_harness_binary(binary: &std::path::Path) -> Result<PathBuf> {
         return Ok(binary.to_path_buf());
     }
     let name = binary.to_string_lossy().into_owned();
-    let candidates: Vec<String> = if cfg!(windows) {
-        if name.to_ascii_lowercase().ends_with(".exe") {
-            vec![name.clone()]
-        } else {
-            vec![format!("{name}.exe")]
-        }
-    } else {
-        vec![name.clone()]
-    };
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path_var) {
-        for c in &candidates {
-            let p = dir.join(c);
-            if p.is_file() {
-                return Ok(p);
-            }
-        }
+    if let Some(found) = find_on_path(binary, &std::env::var_os("PATH").unwrap_or_default()) {
+        return Ok(found);
     }
     anyhow::bail!(
         "harness binary `{name}` not found on the daemon's PATH{}; start vkd with --harness-bin <path>",

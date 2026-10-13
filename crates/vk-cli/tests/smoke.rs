@@ -815,7 +815,7 @@ fn vk_fsck_finds_a_tampered_blob_and_exits_non_zero() {
 
 /// A scripted stand-in for `claude` at `dir/fake-claude.{cmd,sh}`: it answers
 /// `--version`, swallows the prompt on stdin and prints one canned result
-/// object. Enough for `vk mount claude-code --bin` to mount a real adapter and
+/// object. Enough for a `vkd --claude-bin` to mount a real adapter on and
 /// for a task to run through it, without a subscription, a network or a cost.
 fn fake_claude(dir: &std::path::Path) -> PathBuf {
     let reply = dir.join("reply.json");
@@ -982,26 +982,28 @@ fn vk_passkey_ls_reports_an_unreadable_passkey_as_an_error() {
     assert!(text.contains("UNREADABLE"), "{text}");
 }
 
-/// How `--bin` names the stand-in: by its absolute path, which an
+/// How `vkd --claude-bin` names the stand-in: by its absolute path, which an
 /// interactive daemon accepts even under the user profile — where `%TEMP%`
 /// is on Windows (Ruling 43; the service refuses it, see
-/// `vk-ipc/tests/mount_config.rs`).
+/// `vk-ipc/tests/claude_bin.rs`).
 fn bin_arg(fake: &std::path::Path) -> String {
     path_of(fake)
 }
 
 /// `vk mount claude-code` is the first verb that mounts a *real* adapter: two
 /// arches in one call, a draft and a judge, each named for its model and each
-/// with its own content-addressed id. Driven against the stand-in via `--bin`,
-/// so this test needs no subscription and spends nothing.
+/// with its own content-addressed id. Driven against the stand-in the daemon
+/// was started with (`vkd --claude-bin`), so this test needs no subscription
+/// and spends nothing.
 #[test]
 fn vk_mounts_two_claude_code_arches_and_a_task_runs_through_one() {
     let dir = tempfile::tempdir().unwrap();
     vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
+    let claude = bin_arg(&fake_claude(dir.path()));
     let _daemon = Daemon(
-        vkd_cmd(dir.path(), &endpoint, &[])
+        vkd_cmd(dir.path(), &endpoint, &["--claude-bin", &claude])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -1009,13 +1011,9 @@ fn vk_mounts_two_claude_code_arches_and_a_task_runs_through_one() {
     );
     let sh = Shell { endpoint, node_key };
     wait_until(&sh, true, "vkd did not answer").expect("status");
-
-    let claude = bin_arg(&fake_claude(dir.path()));
     let mounted = sh.json(&[
         "mount",
         "claude-code",
-        "--bin",
-        &claude,
         "--draft-model",
         "claude-sonnet-5",
         "--judge-model",
@@ -1042,8 +1040,6 @@ fn vk_mounts_two_claude_code_arches_and_a_task_runs_through_one() {
     let plain = sh.ok(&[
         "mount",
         "claude-code",
-        "--bin",
-        &claude,
         "--draft-model",
         "claude-sonnet-5",
         "--judge-model",
@@ -2239,6 +2235,33 @@ fn vk_man_reads_the_contracts_without_a_daemon() {
     assert!(why.contains("ledger_event"), "{why}");
 }
 
+/// The founder's decision of 2026-10-13: the Claude Code binary is the
+/// daemon's (`vkd --claude-bin`, passed on by `vk boot --claude-bin`), so
+/// `vk mount claude-code` has no `--bin` — it is an unknown argument, refused
+/// before any daemon is dialled — and its help says where the binary is set.
+#[test]
+fn vk_mount_claude_code_has_no_bin_and_says_the_binary_is_the_daemons() {
+    let vk = |args: &[&str]| {
+        Command::new(vk_exe())
+            .args(args)
+            .env("VK_ENDPOINT", "\\\\.\\pipe\\vk-no-daemon-here")
+            .output()
+            .expect("run vk")
+    };
+    let out = vk(&["mount", "claude-code", "--bin", "x"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "a usage error: {out:?}");
+    assert!(
+        err.contains("unexpected argument") && err.contains("--bin"),
+        "{err}"
+    );
+    let help = String::from_utf8(vk(&["mount", "claude-code", "--help"]).stdout).unwrap();
+    assert!(help.contains("--claude-bin"), "{help}");
+    assert!(!help.contains("--bin <"), "{help}");
+    let boot = String::from_utf8(vk(&["boot", "--help"]).stdout).unwrap();
+    assert!(boot.contains("--claude-bin"), "{boot}");
+}
+
 /// The restart case, end to end (Ruling 14). A daemon that comes up over a
 /// store with a real arch in it re-creates that arch from the spec its mount
 /// recorded — it does not put the mock there and carry on. Driven against the
@@ -2259,7 +2282,7 @@ fn a_real_arch_is_re_created_when_the_daemon_restarts_and_is_never_a_mock() {
     // A node with a real arch on it, then stopped.
     let draft = {
         let _daemon = Daemon(
-            vkd_cmd(dir.path(), &endpoint, &[])
+            vkd_cmd(dir.path(), &endpoint, &["--claude-bin", &claude])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -2269,8 +2292,6 @@ fn a_real_arch_is_re_created_when_the_daemon_restarts_and_is_never_a_mock() {
         let mounted = sh.json(&[
             "mount",
             "claude-code",
-            "--bin",
-            &claude,
             "--draft-model",
             "claude-sonnet-5",
             "--judge-model",
@@ -2283,7 +2304,7 @@ fn a_real_arch_is_re_created_when_the_daemon_restarts_and_is_never_a_mock() {
 
     // The same store, a new daemon: the arch is there and it is ready.
     let _daemon = Daemon(
-        vkd_cmd(dir.path(), &endpoint, &[])
+        vkd_cmd(dir.path(), &endpoint, &["--claude-bin", &claude])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -2347,10 +2368,13 @@ fn a_real_arch_is_re_created_when_the_daemon_restarts_and_is_never_a_mock() {
     assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
 }
 
-/// The other half of Ruling 14: an arch whose engine is gone comes back
+/// The other half of Ruling 14: an arch whose engine is broken comes back
 /// *unavailable*, with the reason, and every task step that names it is
-/// refused. The stand-in is deleted while the daemon is down, which is what an
-/// uninstalled `claude` looks like from here.
+/// refused. While the daemon is down the stand-in is first deleted — and a
+/// daemon told to run a `--claude-bin` that is not there refuses to start,
+/// naming the flag and the rule (founder decision 2026-10-13) — then put back
+/// as a `claude` that no longer answers `--version`, which is what a broken
+/// install looks like from here.
 #[test]
 fn an_arch_whose_engine_has_gone_comes_back_unavailable_and_refuses_to_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -2365,7 +2389,7 @@ fn an_arch_whose_engine_has_gone_comes_back_unavailable_and_refuses_to_run() {
 
     let draft = {
         let _daemon = Daemon(
-            vkd_cmd(dir.path(), &endpoint, &[])
+            vkd_cmd(dir.path(), &endpoint, &["--claude-bin", &bin])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -2375,8 +2399,6 @@ fn an_arch_whose_engine_has_gone_comes_back_unavailable_and_refuses_to_run() {
         let mounted = sh.json(&[
             "mount",
             "claude-code",
-            "--bin",
-            &bin,
             "--draft-model",
             "claude-sonnet-5",
             "--judge-model",
@@ -2387,9 +2409,26 @@ fn an_arch_whose_engine_has_gone_comes_back_unavailable_and_refuses_to_run() {
     };
     wait_until(&sh, false, "the killed daemon still holds the endpoint");
     std::fs::remove_file(&claude).expect("uninstall the stand-in");
+    let refused = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &["--claude-bin", &bin])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let (exit, why) = exit_of(refused, "a vkd whose --claude-bin is gone is still running");
+    assert!(
+        !exit.success(),
+        "a missing --claude-bin is a failed start: {why}"
+    );
+    assert!(
+        why.contains("--claude-bin") && why.contains("does not exist"),
+        "the refusal names the flag and the rule: {why}"
+    );
+    broken_claude(&claude);
 
     let _daemon = Daemon(
-        vkd_cmd(dir.path(), &endpoint, &[])
+        vkd_cmd(dir.path(), &endpoint, &["--claude-bin", &bin])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -2445,6 +2484,22 @@ fn an_arch_whose_engine_has_gone_comes_back_unavailable_and_refuses_to_run() {
     let top = sh.json(&["top", "--json"]);
     assert_eq!(top["states"][&draft], "unavailable", "{top}");
     assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
+/// A `claude` stand-in that no longer answers `--version`: it exits non-zero
+/// and prints nothing, so the arch it backed cannot be re-created.
+fn broken_claude(bin: &std::path::Path) {
+    let script = if cfg!(windows) {
+        "@echo off\r\nexit /b 1\r\n"
+    } else {
+        "#!/bin/sh\nexit 1\n"
+    };
+    std::fs::write(bin, script).expect("write the broken stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o700)).expect("chmod +x");
+    }
 }
 
 /// A `claude` stand-in that is *slow* to answer `--version`, and otherwise
@@ -2535,7 +2590,7 @@ fn a_node_with_slow_arches_serves_while_they_start_and_vk_boot_does_not_kill_it(
     // Two arches, mounted while the stand-in is still fast.
     let mounted = {
         let _daemon = Daemon(
-            vkd_cmd(dir.path(), &endpoint, &[])
+            vkd_cmd(dir.path(), &endpoint, &["--claude-bin", &bin])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -2545,8 +2600,6 @@ fn a_node_with_slow_arches_serves_while_they_start_and_vk_boot_does_not_kill_it(
         let m = sh.json(&[
             "mount",
             "claude-code",
-            "--bin",
-            &bin,
             "--draft-model",
             "claude-sonnet-5",
             "--judge-model",
@@ -2574,6 +2627,8 @@ fn a_node_with_slow_arches_serves_while_they_start_and_vk_boot_does_not_kill_it(
         &key,
         "--web-port",
         "0",
+        "--claude-bin",
+        &bin,
         "--json",
     ];
     let started = Instant::now();
@@ -2631,11 +2686,15 @@ fn a_node_with_slow_arches_serves_while_they_start_and_vk_boot_does_not_kill_it(
     // A second daemon over the same store is still refused — by the store
     // lock, before it builds anything.
     let second = Daemon(
-        vkd_cmd(dir.path(), &vk_ipc::transport::test_endpoint().0, &[])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn a second vkd"),
+        vkd_cmd(
+            dir.path(),
+            &vk_ipc::transport::test_endpoint().0,
+            &["--claude-bin", &bin],
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn a second vkd"),
     );
     let (exit, refusal) = exit_of(second, "a second vkd over a served store is still running");
     assert!(!exit.success(), "a second daemon must be refused: {exit:?}");

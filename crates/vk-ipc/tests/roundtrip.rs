@@ -1477,7 +1477,7 @@ fn kernel_with_arches(
             dir.to_path_buf(),
             keys.clone(),
             vk_arch_anthropic::DEFAULT_BASE_URL.to_string(),
-            false,
+            std::path::PathBuf::from("claude"),
         ),
     )
     .unwrap()

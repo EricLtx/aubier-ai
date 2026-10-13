@@ -1,6 +1,8 @@
 //! `arch.mount` configs over the pipe (final review I-1 and I-4, Ruling 41;
-//! Ruling 42): what a request may say about the binary, the container and the
-//! server a local arch runs on, and which of those take a human.
+//! Ruling 42): what a request may say about the container and the server a
+//! local arch runs on, which of those take a human — and, since the founder's
+//! decision of 2026-10-13, that it says nothing about the Claude Code binary,
+//! which is the daemon's (`vkd --claude-bin`; its rule is in `claude_bin.rs`).
 //!
 //! Every test here points `VK_DOCKER` at a path that does not exist, so no
 //! request can reach this machine's Docker — whatever the daemon decides, the
@@ -65,14 +67,15 @@ struct Node {
 }
 
 impl Node {
-    /// An interactive daemon, as every Ollama test here wants.
+    /// A daemon whose Claude Code binary is the default, as every Ollama test
+    /// here wants.
     async fn start() -> Node {
-        Node::start_as(false).await
+        Node::start_with(std::path::PathBuf::from("claude")).await
     }
 
-    /// A daemon in either mode: `as_service` is the `ServerConfig` field
-    /// `vkd --as-service` sets (Ruling 43), not a request field.
-    async fn start_as(as_service: bool) -> Node {
+    /// A daemon whose Claude Code binary is `claude_bin`: the `ServerConfig`
+    /// field `vkd --claude-bin` sets, never a request field.
+    async fn start_with(claude_bin: std::path::PathBuf) -> Node {
         no_docker();
         let d = tempfile::tempdir().unwrap();
         let k = kernel(d.path());
@@ -86,7 +89,7 @@ impl Node {
         let endpoint = vk_ipc::transport::test_endpoint();
         let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
         let config = vk_ipc::server::ServerConfig {
-            as_service,
+            claude_bin,
             ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
         };
         let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
@@ -146,18 +149,19 @@ fn bad_request(err: &CallError, needle: &str, what: &str) {
     );
 }
 
-/// A stand-in `claude` in `dir` that answers `--version` and nothing else:
-/// enough for a mount to probe it. `.cmd` on Windows, a script elsewhere.
-fn stand_in(dir: &std::path::Path) -> std::path::PathBuf {
+/// A stand-in `claude` in `dir` that answers `--version` with `version` and
+/// nothing else: enough for a mount to probe it. `.cmd` on Windows, a script
+/// elsewhere.
+fn stand_in(dir: &std::path::Path, version: &str) -> std::path::PathBuf {
     let bin = dir.join(if cfg!(windows) {
         "fake-claude.cmd"
     } else {
         "fake-claude.sh"
     });
     let script = if cfg!(windows) {
-        "@echo off\r\nif \"%~1\"==\"--version\" echo 0.0.0-test\r\nexit /b 0\r\n"
+        format!("@echo off\r\nif \"%~1\"==\"--version\" echo {version}\r\nexit /b 0\r\n")
     } else {
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.0.0-test; fi\n"
+        format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo {version}; fi\n")
     };
     std::fs::write(&bin, script).unwrap();
     #[cfg(unix)]
@@ -168,244 +172,170 @@ fn stand_in(dir: &std::path::Path) -> std::path::PathBuf {
     bin
 }
 
-/// The path the daemon stores for `p`: canonical, with Windows' verbatim
-/// prefix removed — computed here independently of the daemon's own helper.
-fn resolved(p: &std::path::Path) -> String {
-    let c = std::fs::canonicalize(p).unwrap();
-    let s = c.to_string_lossy().into_owned();
-    match s.strip_prefix(r"\\?\") {
-        Some(rest) => rest.to_string(),
-        None => s,
-    }
-}
-
-/// A directory link at `link` to `target`: a symlink on Unix, a junction on
-/// Windows (no privilege needed, unlike a symlink there).
-fn dir_link(target: &std::path::Path, link: &std::path::Path) {
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
-    #[cfg(windows)]
-    {
-        let made = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
-            .output()
-            .unwrap();
-        assert!(made.status.success(), "mklink /J: {made:?}");
-    }
-}
-
-/// Remove a directory link without following it (before the tempdir goes).
-fn remove_dir_link(link: &std::path::Path) {
-    #[cfg(unix)]
-    std::fs::remove_file(link).unwrap();
-    #[cfg(windows)]
-    std::fs::remove_dir(link).unwrap();
-}
-
-impl Node {
-    /// Mount a Claude Code arch on `binary` with a proof, and say what the
-    /// spec recorded as the binary.
-    async fn mounted_binary(&self, binary: &std::path::Path) -> Value {
-        let proof = self.proof().await;
-        // A model per directory: the arch id hashes the model and the
-        // version, so two stand-ins under one model would be one arch.
-        let model = binary
-            .parent()
-            .and_then(|d| d.file_name())
-            .map_or("m".into(), |n| n.to_string_lossy().into_owned());
-        let mounted = self
-            .c
-            .call(
-                "arch.mount",
-                json!({"kind": "claude-code", "config": {"binary": binary, "model": model}}),
-                Some(proof),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{} must be accepted: {e:#}", binary.display()));
-        let shown = self
-            .c
-            .call("arch.show", json!({"arch_id": mounted["arch_id"]}), None)
-            .await
-            .unwrap();
-        shown["config"]["binary"].clone()
-    }
-}
-
-/// Final review I-1, Ruling 43: the refusals every daemon makes — a relative
-/// path, a path with nothing there, a `..` component, a field the closed
-/// shape does not have — over the pipe, in both daemon modes.
+/// The founder's decision of 2026-10-13: a `claude-code` mount that names a
+/// binary is a bad request that says where the binary is set — whatever the
+/// value, a clean one included — and nothing is mounted on the way. The
+/// config is still a closed shape (Ruling 42): any other field it does not
+/// have is named and refused too.
 #[tokio::test]
-async fn claude_code_refuses_relative_missing_and_dot_dot_in_every_mode() {
-    for as_service in [false, true] {
-        let n = Node::start_as(as_service).await;
-        let scratch = tempfile::tempdir().unwrap();
-        vk_contracts::testing::guard_state_dir(scratch.path());
-        let bin = stand_in(scratch.path());
-        let mode = if as_service { "service" } else { "interactive" };
-
-        let err = n
-            .refused("claude-code", json!({"binary": "bin/claude"}), true)
-            .await;
-        bad_request(&err, "relative", &format!("{mode}: a relative path"));
-
-        let missing = scratch.path().join("nowhere").join("claude");
-        let err = n
-            .refused("claude-code", json!({"binary": missing}), true)
-            .await;
-        bad_request(&err, "does not exist", &format!("{mode}: nothing there"));
-
-        let dotted = scratch
-            .path()
-            .join("x")
-            .join("..")
-            .join(bin.file_name().unwrap());
-        let err = n
-            .refused("claude-code", json!({"binary": dotted}), true)
-            .await;
-        bad_request(&err, "`..` component", &format!("{mode}: a .. path"));
-
-        // A link loop resolves to nowhere (Unix: a Windows symlink needs a
-        // privilege the tests do not have).
-        #[cfg(unix)]
-        {
-            let (a, b) = (scratch.path().join("loop-a"), scratch.path().join("loop-b"));
-            std::os::unix::fs::symlink(&b, &a).unwrap();
-            std::os::unix::fs::symlink(&a, &b).unwrap();
-            let err = n
-                .refused("claude-code", json!({"binary": a.join("claude")}), true)
-                .await;
-            assert_eq!(err.code, vk_ipc::E_BAD_PARAMS, "{mode}: a loop: {err:?}");
-        }
-
-        // Ruling 42: the claude-code config is a closed shape.
+async fn a_claude_code_mount_that_names_a_binary_is_refused() {
+    let scratch = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(scratch.path());
+    let bin = stand_in(scratch.path(), "0.0.0-daemon");
+    let n = Node::start_with(bin.clone()).await;
+    for named in [json!(bin), json!("claude"), json!("bin/claude")] {
         let err = n
             .refused(
                 "claude-code",
-                json!({"binary": "bin/claude", "endpoint": "x"}),
+                json!({ "binary": named, "model": "m" }),
                 true,
             )
             .await;
-        bad_request(&err, "unknown field", &format!("{mode}: an unknown field"));
-        n.stop().await;
-    }
-}
-
-/// Ruling 43: an interactive daemon is the user's own process and may run the
-/// user's own binary — in a synced folder, and on Windows under the profile
-/// (`%TEMP%` is there) — and what it stores is the resolved path.
-#[tokio::test]
-async fn an_interactive_daemon_accepts_the_users_own_binary() {
-    let n = Node::start_as(false).await;
-    let scratch = tempfile::tempdir().unwrap();
-    vk_contracts::testing::guard_state_dir(scratch.path());
-
-    let mine = stand_in(scratch.path());
-    if cfg!(windows) {
+        bad_request(&err, "binary", &format!("binary = {named}"));
         assert!(
-            vk_store::paths::under_a_user_profile(&mine),
-            "the Windows case this test is for: an absolute path under the profile"
+            err.message.contains("--claude-bin"),
+            "the refusal names the daemon flag: {err:?}"
         );
     }
-    assert_eq!(n.mounted_binary(&mine).await, json!(resolved(&mine)));
-
-    let synced = scratch.path().join("OneDrive");
-    std::fs::create_dir(&synced).unwrap();
-    let synced = stand_in(&synced);
-    assert_eq!(n.mounted_binary(&synced).await, json!(resolved(&synced)));
+    let err = n
+        .refused("claude-code", json!({ "endpoint": "x" }), true)
+        .await;
+    bad_request(&err, "unknown field", "an unknown field");
+    let info = n.c.call("boot.info", json!({}), None).await.unwrap();
+    assert_eq!(info["arches"], 0, "nothing was mounted: {info}");
     n.stop().await;
 }
 
-/// Ruling 43: under the service, a binary that resolves into a synced folder
-/// or a user profile is refused — checked on the resolved path, so a link
-/// whose own spelling is clean does not get one through.
+/// Without a binary, the mount runs the daemon's: the version in the arch's
+/// identity is the one the daemon's stand-in answers, and the spec that boot
+/// will replay records no binary at all.
 #[tokio::test]
-async fn the_service_refuses_a_binary_that_resolves_where_the_user_can_replace_it() {
-    let n = Node::start_as(true).await;
+async fn a_claude_code_mount_runs_the_daemons_binary() {
     let scratch = tempfile::tempdir().unwrap();
     vk_contracts::testing::guard_state_dir(scratch.path());
-
-    let synced = scratch.path().join("OneDrive");
-    std::fs::create_dir(&synced).unwrap();
-    let synced_bin = stand_in(&synced);
-    let err = n
-        .refused("claude-code", json!({"binary": synced_bin}), true)
-        .await;
-    bad_request(&err, "synced folder", "a OneDrive path");
-
-    // A link spelled without any sync marker, whose target is in OneDrive.
-    let link = scratch.path().join("tools");
-    dir_link(&synced, &link);
-    let through = link.join(synced_bin.file_name().unwrap());
-    let err = n
-        .refused("claude-code", json!({"binary": through}), true)
-        .await;
-    bad_request(&err, "synced folder", "a link whose target is in OneDrive");
-    remove_dir_link(&link);
-
-    // On Windows the scratch directory is under `%TEMP%`, inside the profile:
-    // what the service would run as `NT SERVICE\vkd`.
-    if cfg!(windows) {
-        let mine = stand_in(scratch.path());
-        let err = n
-            .refused("claude-code", json!({"binary": mine}), true)
-            .await;
-        bad_request(&err, "user profile", "a file under the profile");
-    }
+    let n = Node::start_with(stand_in(scratch.path(), "0.0.0-daemon")).await;
+    let proof = n.proof().await;
+    let mounted =
+        n.c.call(
+            "arch.mount",
+            json!({"kind": "claude-code", "config": {"model": "m"}}),
+            Some(proof),
+        )
+        .await
+        .expect("a mount without a binary is accepted");
+    let shown =
+        n.c.call("arch.show", json!({"arch_id": mounted["arch_id"]}), None)
+            .await
+            .unwrap();
+    assert_eq!(
+        shown["manifest"]["identity"]["engine_version"], "0.0.0-daemon",
+        "the daemon's binary was asked its version: {shown}"
+    );
+    assert_eq!(shown["kind"], "claude-code", "{shown}");
+    assert!(
+        shown["config"].get("binary").is_none(),
+        "the spec records no binary: {shown}"
+    );
     n.stop().await;
 }
 
-/// Final re-review N-2: under the service, a binary that is not on a local
-/// fixed drive — a UNC share, in either spelling — is refused before the
-/// daemon reaches for it (no network lookup on a request's behalf). Windows
-/// only: there is no UNC elsewhere. The share does not exist, so a daemon that
-/// did reach for it would only fail to find it.
-#[cfg(windows)]
-#[tokio::test]
-async fn the_service_refuses_a_binary_that_is_not_on_a_local_fixed_drive() {
-    let n = Node::start_as(true).await;
-    for unc in [
-        r"\\127.0.0.1\vk-no-such-share\claude.exe",
-        r"\\?\UNC\127.0.0.1\vk-no-such-share\claude.exe",
-    ] {
-        let err = n
-            .refused("claude-code", json!({ "binary": unc }), true)
-            .await;
-        bad_request(&err, "local fixed drive", unc);
-    }
-    n.stop().await;
-}
-
-/// Ruling 43: a link is followed, not refused. One whose target is clean is
-/// accepted, and the spec records the target. In the service mode on Unix
-/// (no Windows profile there) as well as interactively; on Windows the
-/// service has no clean target to point at in a test, since every scratch
-/// directory is under the profile.
-#[tokio::test]
-async fn a_link_to_a_clean_target_is_accepted_and_the_target_is_recorded() {
-    let modes: &[bool] = if cfg!(windows) {
-        &[false]
-    } else {
-        &[false, true]
+/// A spec persisted by SP1b still carries the binary its request named. Boot
+/// re-creation accepts it, ignores the field — the daemon's binary is what
+/// runs — and says so in the log, naming what it ignored. No migration: the
+/// row is left as it is.
+#[test]
+fn a_legacy_spec_naming_a_binary_is_re_created_on_the_daemons_and_the_field_is_logged() {
+    use vk_kernel::arch::{ArchAdapter, MountSpec};
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().to_path_buf();
+    vk_contracts::testing::guard_state_dir(&dir);
+    let daemons = stand_in(&dir, "0.0.0-daemon");
+    let legacy = dir.join("old").join("claude");
+    let open = || {
+        vk_kernel::RealKernel::open_with_factory(
+            &dir,
+            vk_store::keys::KeySource::File(dir.join("m.key")),
+            "n1",
+            vk_ipc::server::adapter_factory(
+                dir.clone(),
+                vk_arch_anthropic::KeySource::Keyring,
+                vk_arch_anthropic::DEFAULT_BASE_URL.to_string(),
+                daemons.clone(),
+            ),
+        )
+        .unwrap()
     };
-    for &as_service in modes {
-        let n = Node::start_as(as_service).await;
-        let scratch = tempfile::tempdir().unwrap();
-        vk_contracts::testing::guard_state_dir(scratch.path());
-        let target = scratch.path().join("real");
-        std::fs::create_dir(&target).unwrap();
-        let bin = stand_in(&target);
-        let link = scratch.path().join("link");
-        dir_link(&target, &link);
-        let through = link.join(bin.file_name().unwrap());
-        assert_eq!(
-            n.mounted_binary(&through).await,
-            json!(resolved(&bin)),
-            "as_service = {as_service}"
-        );
-        remove_dir_link(&link);
-        n.stop().await;
+    // Mounted the SP1b way: the spec carries a `binary`.
+    let arch_id = {
+        let mut k = open();
+        let fresh = MountSpec::new("claude-code", json!({"model": "m"})).unwrap();
+        let built = (k.adapter_factory())(&fresh).expect("the daemon's binary builds the arch");
+        let adapter: Arc<dyn ArchAdapter> = Arc::from(built);
+        let spec = MountSpec::new(
+            "claude-code",
+            json!({"binary": legacy.to_string_lossy(), "model": "m"}),
+        )
+        .unwrap();
+        k.mount_with(adapter, spec, vk_kernel::Remount::Keep)
+            .unwrap()
+            .arch_id
+    };
+    let k = open();
+    let pending = k.pending_mounts();
+    assert_eq!(pending.len(), 1, "one arch to re-create");
+    let (id, spec) = &pending[0];
+    assert_eq!(id, &arch_id);
+    assert!(
+        spec.config.get("binary").is_some(),
+        "the row is not migrated"
+    );
+
+    let log = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .finish();
+    let made = tracing::subscriber::with_default(subscriber, || (k.adapter_factory())(spec));
+    let adapter = made.expect("a legacy spec is re-created, not refused for its field");
+    assert_eq!(
+        adapter.manifest().arch_id(),
+        arch_id,
+        "the same arch comes back"
+    );
+    assert_eq!(adapter.manifest().identity.engine_version, "0.0.0-daemon");
+    let said = log.text();
+    let legacy = legacy.to_string_lossy().into_owned();
+    assert!(
+        said.contains("binary") && said.contains("ignored") && said.contains(&legacy),
+        "the log says which binary was ignored: {said:?}"
+    );
+    assert!(said.contains("--claude-bin"), "{said:?}");
+}
+
+/// What a `tracing` subscriber wrote, for a test to read back.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
     }
 }
 

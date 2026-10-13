@@ -193,6 +193,11 @@ struct BootArgs {
     /// Loopback port for the passkey pages (`0`: one the OS picks).
     #[arg(long, default_value_t = DEFAULT_WEB_PORT)]
     web_port: u16,
+    /// The Claude Code executable the daemon's `claude-code` arches run,
+    /// passed on as `vkd --claude-bin` and checked by the daemon when it
+    /// starts (default: `claude` on the daemon's PATH).
+    #[arg(long)]
+    claude_bin: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -252,14 +257,16 @@ enum MountCmd {
     /// A cloud arch, so its clearance stops at Business and it refuses
     /// third-party data; see `contracts/tcb.md`. Customer nodes use API arches
     /// instead — a subscription is a person's, not a product's.
+    ///
+    /// The `claude` it runs is the daemon's, not this verb's: `claude` on the
+    /// daemon's PATH, or the executable the daemon was started with
+    /// (`vkd --claude-bin <path>`, `vk boot --claude-bin <path>`), checked
+    /// when the daemon starts.
     ClaudeCode {
         #[arg(long, default_value = "claude-sonnet-5")]
         draft_model: String,
         #[arg(long, default_value = "claude-opus-5")]
         judge_model: String,
-        /// The `claude` binary, if it is not on the daemon's PATH.
-        #[arg(long, default_value = "claude")]
-        bin: String,
         /// How long one call may take, in seconds.
         #[arg(long, default_value_t = 180)]
         timeout: u32,
@@ -626,7 +633,6 @@ async fn call(cli: &Cli) -> Result<()> {
                 MountCmd::ClaudeCode {
                     draft_model,
                     judge_model,
-                    bin,
                     timeout,
                 },
         } => {
@@ -644,7 +650,6 @@ async fn call(cli: &Cli) -> Result<()> {
                         json!({
                             "kind": "claude-code",
                             "config": {
-                                "binary": bin,
                                 "model": model,
                                 "timeout_secs": timeout,
                             },
@@ -1481,6 +1486,9 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
         cmd.arg("--force");
     }
     cmd.args(["--web-port", &a.web_port.to_string()]);
+    if let Some(bin) = &a.claude_bin {
+        cmd.arg("--claude-bin").arg(bin);
+    }
     if a.foreground {
         let status = cmd
             .status()
