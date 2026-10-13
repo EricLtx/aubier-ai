@@ -64,3 +64,6 @@ tempfile = "3"
 # The roundtrip test opens a kernel with this build's real adapter factory,
 # which needs the store's own key source.
 vk-store = { path = "../vk-store" }
+# Reads back the line boot logs when it re-creates a Claude Code arch from a
+# spec that still names a binary (`vkd --claude-bin`, 2026-10-13).
+tracing-subscriber.workspace = true

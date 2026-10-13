@@ -131,7 +131,7 @@ pub fn resolve_override(raw: &Path, cwd: &Path) -> PathBuf {
 /// `C:\Users\…`, by either name the machine knows it under.
 ///
 /// The rule `vkd-service install` applies to its own `ImagePath` and
-/// `arch.mount claude-code` applies to a `binary` it is asked to run (final
+/// `vkd --claude-bin` applies to the Claude Code binary it is told to run (final
 /// review I-1, Ruling 41): a file under a user profile is one that user's
 /// processes can replace, and the daemon — under the service, `NT SERVICE\vkd`
 /// — would run the replacement at the next start or call. One predicate for

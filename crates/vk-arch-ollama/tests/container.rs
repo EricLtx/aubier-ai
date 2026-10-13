@@ -11,6 +11,13 @@
 //! ```text
 //! VK_OLLAMA=1 VK_TEST_MODEL=gemma3:1b cargo test -p vk-arch-ollama --test container -- --ignored --nocapture
 //! ```
+//!
+//! The caps are the kernel's defaults (`--memory 12g --cpus 6`, the founder's
+//! machine) unless `VK_OLLAMA_MEMORY` / `VK_OLLAMA_CPUS` say otherwise: a CI
+//! runner with 4 vCPUs cannot be given 6, and Docker refuses the `run`. The
+//! test then mounts with those caps and checks the container runs under
+//! exactly them — the claim is "the caps asked for are the caps in force",
+//! not any particular size.
 use std::time::Instant;
 use vk_arch_ollama::{
     container, ContainerSpec, OllamaAdapter, OllamaConfig, PINNED_IMAGE_DIGEST, TEST_MODEL,
@@ -30,7 +37,7 @@ fn the_real_container_answers_under_the_caps_the_kernel_gave_it() {
         eprintln!("skipped: set VK_OLLAMA=1 to drive a real container");
         return;
     }
-    let spec = ContainerSpec::default();
+    let spec = test_spec();
     let model = test_model();
 
     // From a known state: a container left running by an earlier run would
@@ -75,8 +82,8 @@ fn the_real_container_answers_under_the_caps_the_kernel_gave_it() {
     let mounted = Instant::now();
     // `governed`, not the bare default: the default config is the external
     // one, and what this test is about is the container.
-    let adapter = OllamaAdapter::mount(OllamaConfig::governed(&model))
-        .expect("mount against the real container");
+    let adapter =
+        OllamaAdapter::mount(governed_on(&spec, &model)).expect("mount against the real container");
     let manifest = adapter.manifest().clone();
     eprintln!(
         "mounted {} in {:?} as {} (ceiling {}, budget {})",
@@ -111,8 +118,18 @@ fn the_real_container_answers_under_the_caps_the_kernel_gave_it() {
         "cap values are not part of the arch: {:?}",
         manifest.identity.sampling
     );
-    assert_eq!(governor.memory_bytes, 12_884_901_888, "--memory 12g");
-    assert_eq!(governor.nano_cpus, 6_000_000_000, "--cpus 6");
+    assert_eq!(
+        governor.memory_bytes,
+        memory_bytes(&spec.memory),
+        "--memory {}",
+        spec.memory
+    );
+    assert_eq!(
+        governor.nano_cpus,
+        nano_cpus(&spec.cpus),
+        "--cpus {}",
+        spec.cpus
+    );
     assert!(
         !adapter.started_here(),
         "this test started the container itself, above, so the mount adopted a running one"
@@ -179,7 +196,7 @@ fn the_real_container_answers_under_the_caps_the_kernel_gave_it() {
     // and stops it again when it goes. No model is loaded by a mount, so this
     // second one costs a container start and four HTTP calls.
     container::stop(&spec).expect("stop it, so the next mount is the one that starts it");
-    let owner = OllamaAdapter::mount(OllamaConfig::governed(&model)).expect("mount again");
+    let owner = OllamaAdapter::mount(governed_on(&spec, &model)).expect("mount again");
     assert!(
         owner.started_here(),
         "nothing was running, so this mount is what started it"
@@ -189,6 +206,46 @@ fn the_real_container_answers_under_the_caps_the_kernel_gave_it() {
         !running(&spec),
         "the arch that started the container stops it again when it goes"
     );
+}
+
+/// The container this test drives: the kernel's default, with the caps
+/// `VK_OLLAMA_MEMORY` / `VK_OLLAMA_CPUS` name when they are set (a CI runner
+/// smaller than the founder's machine).
+fn test_spec() -> ContainerSpec {
+    let defaults = ContainerSpec::default();
+    ContainerSpec {
+        memory: std::env::var("VK_OLLAMA_MEMORY").unwrap_or(defaults.memory.clone()),
+        cpus: std::env::var("VK_OLLAMA_CPUS").unwrap_or(defaults.cpus.clone()),
+        ..defaults
+    }
+}
+
+/// The governed config, on `spec` rather than the default container: a mount
+/// adopts only the container it asks for (Ruling 10).
+fn governed_on(spec: &ContainerSpec, model: &str) -> OllamaConfig {
+    OllamaConfig {
+        container: Some(spec.clone()),
+        ..OllamaConfig::governed(model)
+    }
+}
+
+/// Docker's reading of a `--memory` value (`12g` → 12 GiB in bytes).
+fn memory_bytes(v: &str) -> u64 {
+    let (digits, unit) = match v.chars().last() {
+        Some('k') => (&v[..v.len() - 1], 1u64 << 10),
+        Some('m') => (&v[..v.len() - 1], 1 << 20),
+        Some('g') => (&v[..v.len() - 1], 1 << 30),
+        _ => (v, 1),
+    };
+    digits
+        .parse::<u64>()
+        .expect("VK_OLLAMA_MEMORY: digits and k, m or g")
+        * unit
+}
+
+/// Docker's reading of a `--cpus` value, in billionths of a CPU.
+fn nano_cpus(v: &str) -> u64 {
+    (v.parse::<f64>().expect("VK_OLLAMA_CPUS: a number") * 1e9).round() as u64
 }
 
 /// Is the container up right now?

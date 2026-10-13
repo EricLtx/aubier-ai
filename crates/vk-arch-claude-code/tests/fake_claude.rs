@@ -129,12 +129,7 @@ impl Standin {
                 delay = if slow { "sleep 10" } else { ":" },
             )
         };
-        fs::write(&bin, script).expect("write the stand-in");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).expect("chmod +x");
-        }
+        write_executable(&bin, &script);
         Standin {
             _home: home,
             bin,
@@ -170,6 +165,58 @@ impl Standin {
     fn recorded_cwd(&self) -> PathBuf {
         let raw = fs::read_to_string(&self.child_cwd).expect("the stand-in recorded no cwd");
         PathBuf::from(raw.trim())
+    }
+}
+
+/// Write `script` to `bin`, flushed to disk and closed, made executable, and
+/// proven launchable before any test uses it (master CI run 38427049822).
+///
+/// On Linux a script can fail to *launch* right after it was written: any
+/// other test thread that forks while the file is open for writing carries a
+/// copy of that descriptor until its own `exec`, and `execve` of a file open
+/// for writing anywhere fails with `ETXTBSY` ("Text file busy"). The file is
+/// closed here before anything else, and then executed (`--version`, which
+/// every stand-in answers at once) until it launches: a launch that fails for
+/// `ETXTBSY` is retried for a bounded time, and any other launch error fails
+/// the test there, with the OS error, instead of later as an unexplained
+/// "launch …" in the adapter's refusal.
+fn write_executable(bin: &Path, script: &str) {
+    {
+        use std::io::Write as _;
+        let mut f = fs::File::create(bin).expect("create the stand-in");
+        f.write_all(script.as_bytes()).expect("write the stand-in");
+        f.sync_all().expect("flush the stand-in to disk");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin, fs::Permissions::from_mode(0o700)).expect("chmod +x");
+    }
+    // `ETXTBSY` on Linux and macOS.
+    const TEXT_FILE_BUSY: i32 = 26;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::process::Command::new(bin)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(_) => return,
+            Err(e)
+                if cfg!(unix)
+                    && e.raw_os_error() == Some(TEXT_FILE_BUSY)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!(
+                "the stand-in {} cannot be launched: {e} (os error {:?})",
+                bin.display(),
+                e.raw_os_error()
+            ),
+        }
     }
 }
 
@@ -374,7 +421,9 @@ fn a_stand_in_that_never_answers_is_killed_at_the_timeout() {
         .expect_err("a claude that never answers must not be waited on");
     let waited = start.elapsed();
 
-    let msg = err.to_string();
+    // The whole chain, so a launch failure shows its OS error rather than
+    // only "launch <bin> in <cwd>".
+    let msg = format!("{err:#}");
     assert!(
         msg.contains("2s") || msg.contains("2 s"),
         "the refusal must name the timeout it hit: {msg}"

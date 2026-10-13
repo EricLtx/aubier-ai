@@ -175,11 +175,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Start Ollama under the caps the kernel imposes
-        run: docker run -d --name vk-ollama -p 127.0.0.1:11434:11434 -v vk-ollama:/root/.ollama --memory 12g --cpus 6 ollama/ollama:0.33.3
+      # Sized for the runner: ubuntu-latest has 4 vCPUs and 16 GB, and Docker
+      # refuses `--cpus 6` there (exit 125). The kernel's defaults, 12g and 6
+      # CPUs, are the founder's machine; the test asks for whatever
+      # VK_OLLAMA_MEMORY / VK_OLLAMA_CPUS say and checks the container runs
+      # under exactly those, so the two numbers below and the env must agree.
+      - name: Start Ollama under the caps this job gives it
+        run: docker run -d --name vk-ollama -p 127.0.0.1:11434:11434 -v vk-ollama:/root/.ollama --memory 6g --cpus 2 ollama/ollama:0.33.3
       - name: Drive the real container
         env:
           VK_OLLAMA: '1'
+          VK_OLLAMA_MEMORY: 6g
+          VK_OLLAMA_CPUS: '2'
           # Never the demo model here: 9.6 GB a run.
           VK_TEST_MODEL: gemma3:1b
         run: cargo test -p vk-arch-ollama -- --ignored

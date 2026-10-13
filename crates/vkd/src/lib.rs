@@ -71,6 +71,18 @@ pub struct Args {
     /// How long one harness run may take before its tree is killed.
     #[arg(long, default_value_t = 300)]
     pub harness_timeout_secs: u64,
+    /// The Claude Code executable the `claude-code` arch runs, at mount, at
+    /// every boot that re-creates the arch and at every call. A bare name is
+    /// looked up on this daemon's PATH (`claude` → `claude.exe` on Windows,
+    /// never a `.cmd` shim) and pinned to what was found; a path must be
+    /// absolute, have no `..` component and resolve — links followed — to a
+    /// file that exists, and under `--as-service` must not resolve into a user
+    /// profile, a synced folder or anything but a local fixed drive. Checked
+    /// here, at start: a refused one is a start that fails, naming the rule.
+    /// Default: `claude` on this daemon's PATH, and only a warning when it is
+    /// not there. Daemon configuration only — no pipe client can name it.
+    #[arg(long)]
+    pub claude_bin: Option<PathBuf>,
     /// Loopback port for the passkey pages (`vk passkey enroll`, `vk approve
     /// --passkey`): bound on `127.0.0.1:<port>` **and** `[::1]:<port>` — both
     /// loopback families, never a routable address — and refused if either
@@ -293,6 +305,10 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     let as_service = a.as_service;
     #[cfg(not(windows))]
     let as_service = false;
+    // The Claude Code binary, settled here and nowhere else (founder decision
+    // 2026-10-13, after final review I-1): before the store is opened, so a
+    // refused path is this daemon's first and only word.
+    let claude_bin = vk_ipc::server::claude_binary_at_start(a.claude_bin.as_deref(), as_service)?;
     // `--as-service` exists only on Windows, and so does everything it
     // settles: the ProgramData state directory, the machine-wide pipe and the
     // DACL on it. On Unix the daemon below reads exactly as it did before.
@@ -376,7 +392,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
             state_dir.clone(),
             anthropic_keys.clone(),
             anthropic_base_url.clone(),
-            as_service,
+            claude_bin.clone(),
         ),
     )?;
     // The endpoint before the record. Binding is the other way a start can be
@@ -545,7 +561,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         web: Some(Arc::new(LinkMinter(web.links))),
         anthropic_keys,
         anthropic_base_url,
-        as_service,
+        claude_bin,
     };
     vk_ipc::server::serve_on(kernel, listener, config).await
 }

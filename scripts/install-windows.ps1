@@ -54,6 +54,16 @@
     Also register and start `vkd` as a Windows service (elevated; SP1 gate
     item 2).
 
+.PARAMETER ClaudeBin
+    With -Service: the Claude Code executable the service's `claude-code`
+    arches run, passed to `vkd-service install --claude-bin`. That verb
+    checks it before the service exists, by the rule the service's daemon
+    applies at start -- an absolute path (or a bare name on this shell's
+    PATH) with no `..`, resolving to a file on a local fixed drive outside
+    every user profile and synced folder -- and writes the resolved path into
+    the service's ImagePath. Without it the service looks up `claude` on its
+    own PATH when it starts, and refuses to start when there is none.
+
 .PARAMETER Uninstall
     Reverse the install instead of performing one.
 
@@ -99,6 +109,7 @@ param(
     [string]$Source = $PSScriptRoot,
     [string]$Root = (Join-Path $env:LOCALAPPDATA 'Programs\VerticalAI'),
     [switch]$Service,
+    [string]$ClaudeBin = '',
     [switch]$Uninstall,
     [switch]$DryRun,
     [string]$PathVarName = 'Path',
@@ -414,11 +425,17 @@ function Do-Install {
                 Warn 'vkd-service install needs an elevated shell. From an elevated PowerShell:'
                 $extra = @('-Service', '-Root', (Quote-Arg $Root))
                 if ($Source -ne $PSScriptRoot) { $extra += @('-Source', (Quote-Arg $Source)) }
+                if ($ClaudeBin) { $extra += @('-ClaudeBin', (Quote-Arg $ClaudeBin)) }
                 Warn ("    " + (Get-ElevatedCommand $extra))
             } else {
                 $svcBin = Join-Path $Root 'vkd-service.exe'
+                # `--claude-bin` is checked by `vkd-service install` itself,
+                # before the service exists: a path the service's daemon
+                # would refuse at start is refused here instead.
+                $installArgs = @('install', '--binary', $svcBin)
+                if ($ClaudeBin) { $installArgs += @('--claude-bin', $ClaudeBin) }
                 Step 'vkd-service install' {
-                    $r = Try-Run $svcBin @('install', '--binary', $svcBin) 30
+                    $r = Try-Run $svcBin $installArgs 30
                     if ($r.Out) { Write-Host $r.Out }
                     if ($r.Code -ne 0) { throw $r.Err }
                 }
@@ -432,6 +449,7 @@ function Do-Install {
     } finally {
         $serviceNote = 'not requested (pass -Service, elevated)'
         if ($Service) { $serviceNote = 'requested' }
+        if ($Service -and $ClaudeBin) { $serviceNote += " (claude-code binary: $ClaudeBin)" }
 
         Write-Host ''
         Write-Host '=== INSTALL SUMMARY ===' -ForegroundColor Green

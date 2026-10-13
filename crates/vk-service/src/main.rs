@@ -70,6 +70,16 @@ struct InstallArgs {
     /// an override, and whoever passes it has to tell `vk` about it.
     #[arg(long)]
     endpoint: Option<String>,
+    /// The Claude Code executable the service's `claude-code` arches run. It
+    /// is checked here, by the rule the service's daemon applies when it
+    /// starts — absolute (or a bare name, looked up on this shell's PATH), no
+    /// `..`, resolving to a file on a local fixed drive outside every user
+    /// profile and synced folder — and written into the `ImagePath` as
+    /// `vkd --claude-bin <resolved path>`. Without it the service looks up
+    /// `claude` on its own PATH when it starts, and refuses to start when there
+    /// is none.
+    #[arg(long)]
+    claude_bin: Option<PathBuf>,
     /// Run `docker info` as the service account at every start and record the
     /// verdict in the log (spike 6a: is Docker Desktop's engine reachable from
     /// a virtual account at all?).
@@ -125,7 +135,7 @@ impl RunArgs {
 fn describe(cmd: &Cmd) -> String {
     match cmd {
         Cmd::Install(a) => format!(
-            "install {} for user {} from {}, on {}{}{}, pipe DACL {}",
+            "install {} for user {} from {}, on {}{}{}{}, pipe DACL {}",
             pipe_acl::SERVICE_ACCOUNT,
             a.user_sid.as_deref().unwrap_or("<this account>"),
             a.binary
@@ -135,6 +145,10 @@ fn describe(cmd: &Cmd) -> String {
             a.endpoint
                 .as_deref()
                 .unwrap_or("<that user's own endpoint>"),
+            a.claude_bin
+                .as_deref()
+                .map(|p| format!(", running Claude Code from {}", p.display()))
+                .unwrap_or_default(),
             if a.probe_docker {
                 ", probing docker"
             } else {
@@ -157,6 +171,31 @@ fn describe(cmd: &Cmd) -> String {
             a.daemon_argv().join(" ")
         ),
     }
+}
+
+/// The daemon arguments `install` writes into the `ImagePath`: `--claude-bin`
+/// first, when it was given — checked here by the rule the service's daemon
+/// applies at start (`vk_ipc::server::claude_binary_at_start`, in service
+/// mode) and written as the path it resolves to — then whatever came after
+/// `--`. A `--claude-bin` after `--` is refused: it would reach the service
+/// unchecked, and fail its first start instead of this command.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn installed_daemon_args(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        !a.daemon_args
+            .iter()
+            .any(|x| x == "--claude-bin" || x.starts_with("--claude-bin=")),
+        "--claude-bin after `--` would reach the service unchecked: pass it as `install \
+         --claude-bin <path>`, which checks it before the service exists"
+    );
+    let mut args = Vec::new();
+    if let Some(asked) = &a.claude_bin {
+        let pinned = vk_ipc::server::claude_binary_at_start(Some(asked), true)?;
+        args.push("--claude-bin".to_string());
+        args.push(pinned.to_string_lossy().into_owned());
+    }
+    args.extend(a.daemon_args.iter().cloned());
+    Ok(args)
 }
 
 fn daemon_args_suffix(args: &[String]) -> String {
@@ -209,7 +248,7 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
 
 #[cfg(windows)]
 mod scm {
-    use super::{describe, pipe_acl, InstallArgs, RunArgs};
+    use super::{describe, installed_daemon_args, pipe_acl, InstallArgs, RunArgs};
     use anyhow::{Context, Result};
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
@@ -249,6 +288,9 @@ mod scm {
     // ---------------------------------------------------------------- install
 
     pub fn install(a: InstallArgs) -> Result<()> {
+        // First: a `--claude-bin` the service's daemon would refuse at its
+        // start is refused here, before anything is created.
+        let daemon_args = installed_daemon_args(&a)?;
         let user_sid = match a.user_sid {
             Some(s) => s,
             None => pipe_acl::interactive_user_sid()
@@ -283,9 +325,9 @@ mod scm {
         if a.probe_docker {
             launch.push("--probe-docker".into());
         }
-        if !a.daemon_args.is_empty() {
+        if !daemon_args.is_empty() {
             launch.push("--".into());
-            launch.extend(a.daemon_args.iter().map(OsString::from));
+            launch.extend(daemon_args.iter().map(OsString::from));
         }
         let manager = ServiceManager::local_computer(
             None::<&str>,
@@ -806,6 +848,7 @@ mod tests {
                 user_sid: Some(USER.into()),
                 binary: None,
                 endpoint: None,
+                claude_bin: None,
                 probe_docker: false,
                 daemon_args: vec![],
             })
@@ -965,6 +1008,117 @@ mod tests {
         assert!(is_pipe_name(&ep), "the fixture is a pipe name: {ep:?}");
         let explicit = describe(&explicit);
         assert!(explicit.contains(r"\\.\pipe\vk-elsewhere"), "{explicit}");
+    }
+
+    /// `install --claude-bin` (founder decision 2026-10-13): the Claude Code
+    /// executable the service's `claude-code` arches run, checked by the rule
+    /// the service's own daemon applies at start — before any service exists
+    /// — and written into the `ImagePath` as the daemon's `--claude-bin`,
+    /// resolved. Given after `--` instead it would skip that check, so it is
+    /// refused there.
+    #[test]
+    fn install_checks_claude_bin_by_the_services_rule_before_anything_is_created() {
+        let install = |args: &[&str]| {
+            let mut argv = vec!["vkd-service", "install", "--user-sid", USER];
+            argv.extend_from_slice(args);
+            let Cmd::Install(a) = parse(&argv) else {
+                panic!("that is an install");
+            };
+            a
+        };
+        let refused = |args: &[&str], needle: &str| {
+            let err = format!(
+                "{:#}",
+                installed_daemon_args(&install(args)).expect_err("must be refused")
+            );
+            assert!(
+                err.contains("--claude-bin") && err.contains(needle),
+                "{args:?}: wanted {needle:?} in {err}"
+            );
+        };
+        let here = std::env::current_exe().unwrap();
+        refused(&["--claude-bin", "bin/claude"], "relative");
+        let missing = here.with_file_name("no-such-claude");
+        refused(
+            &["--claude-bin", missing.to_str().unwrap()],
+            "does not exist",
+        );
+        refused(
+            &["--", "--claude-bin", here.to_str().unwrap()],
+            "install --claude-bin",
+        );
+        // The refusals by location, on paths this test makes itself rather
+        // than on where the runner happens to keep its target directory or
+        // its temp directory (CI run 38429982921: the Windows runner builds
+        // on `D:\a\`, outside every profile; the SP1b Ruling 35 lesson).
+        // A synced folder, on every OS:
+        let scratch = tempfile::tempdir().unwrap();
+        let synced = scratch.path().join("OneDrive");
+        std::fs::create_dir(&synced).unwrap();
+        let synced_bin = synced.join("claude.exe");
+        std::fs::write(&synced_bin, b"").unwrap();
+        refused(
+            &["--claude-bin", synced_bin.to_str().unwrap()],
+            "synced folder",
+        );
+        // And on Windows a file under `%USERPROFILE%`, by construction.
+        #[cfg(windows)]
+        {
+            let profile = std::env::var("USERPROFILE").expect("USERPROFILE");
+            let home = tempfile::Builder::new()
+                .prefix(".vk-test-claude-bin-")
+                .tempdir_in(&profile)
+                .unwrap();
+            let mine = home.path().join("claude.exe");
+            std::fs::write(&mine, b"").unwrap();
+            assert!(
+                vk_store::paths::under_a_user_profile(&mine),
+                "the case this is for: {}",
+                mine.display()
+            );
+            refused(&["--claude-bin", mine.to_str().unwrap()], "user profile");
+        }
+
+        let clean = if cfg!(windows) {
+            std::path::PathBuf::from(
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()),
+            )
+            .join("System32")
+            .join("cmd.exe")
+        } else {
+            here.clone()
+        };
+        let args = installed_daemon_args(&install(&[
+            "--claude-bin",
+            clean.to_str().unwrap(),
+            "--",
+            "--node-id",
+            "n1",
+        ]))
+        .expect("a clean absolute path is accepted");
+        let pinned = vk_ipc::server::claude_binary_at_start(Some(&clean), true).unwrap();
+        assert_eq!(
+            args,
+            [
+                "--claude-bin".to_string(),
+                pinned.to_string_lossy().into_owned(),
+                "--node-id".to_string(),
+                "n1".to_string()
+            ]
+        );
+        // Without the flag, the daemon arguments are passed through as given.
+        assert_eq!(
+            installed_daemon_args(&install(&["--", "--node-id", "n1"])).unwrap(),
+            ["--node-id", "n1"]
+        );
+        // And the sentence says which binary the service will be told to run.
+        let said = describe(&parse(&[
+            "vkd-service",
+            "install",
+            "--claude-bin",
+            clean.to_str().unwrap(),
+        ]));
+        assert!(said.contains(clean.to_str().unwrap()), "{said}");
     }
 
     #[test]
