@@ -54,6 +54,9 @@ windows = { version = "0.62", features = [
     # client just opened, so a squatter on a well-known name is refused
     # rather than served (fix round 1, Important 3).
     "Win32_System_Pipes",
+    # `GetDriveTypeW`: under the service a Claude Code binary must be on a
+    # local fixed drive (final re-review N-2).
+    "Win32_Storage_FileSystem",
 ] }
 
 [dev-dependencies]

@@ -1320,6 +1320,17 @@ fn claude_binary(
             .any(|c| matches!(c, std::path::Component::ParentDir)),
         "binary {named} has a `..` component: name the binary by its own path"
     );
+    // Under the service, a share is refused before it is reached for: the
+    // service account does not go to the network on a request's behalf
+    // (final re-review N-2). The resolved path is held to it again below.
+    if as_service {
+        anyhow::ensure!(
+            on_a_local_fixed_drive(&p),
+            "binary {named} is not on a local fixed drive (a network share, a removable or \
+             mapped drive): the service would run whatever that drive holds at the next boot \
+             or call. Install Claude Code on a local disk"
+        );
+    }
     let resolved = match resolved_path(&p) {
         Ok(r) => r,
         Err(e)
@@ -1337,6 +1348,12 @@ fn claude_binary(
         "binary {named} does not exist (or is not a file)"
     );
     if as_service {
+        anyhow::ensure!(
+            on_a_local_fixed_drive(&resolved),
+            "binary {named} resolves to {}, which is not on a local fixed drive: install \
+             Claude Code on a local disk",
+            resolved.display()
+        );
         vk_store::paths::refuse_sync_folder(&resolved).map_err(|_| {
             anyhow::anyhow!(
                 "binary {named} resolves to {}, inside a synced folder, which may replace the \
@@ -1354,6 +1371,42 @@ fn claude_binary(
         );
     }
     Ok(resolved)
+}
+
+/// Is `p` on a local fixed drive (final re-review N-2)? A drive letter, plain
+/// or verbatim (`C:\…`, `\\?\C:\…`), whose root `GetDriveTypeW` reports as
+/// `DRIVE_FIXED`. A UNC share (`\\host\share\…`, `\\?\UNC\…`), a device
+/// namespace path, and a removable, network-mapped, CD or RAM drive are not.
+/// Answered from the spelling and the drive's type alone — nothing on a share
+/// is opened to decide.
+#[cfg(windows)]
+fn on_a_local_fixed_drive(p: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+    let letter = match p.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(l) | Prefix::VerbatimDisk(l) => l,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let root: Vec<u16> = format!("{}:\\", char::from(letter))
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    // `DRIVE_FIXED` is 3 (`fileapi.h`).
+    const DRIVE_FIXED: u32 = 3;
+    // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call.
+    unsafe {
+        windows::Win32::Storage::FileSystem::GetDriveTypeW(windows::core::PCWSTR(root.as_ptr()))
+            == DRIVE_FIXED
+    }
+}
+
+/// Elsewhere there is no service, no drive letter and no UNC: every absolute
+/// path is local in the sense this asks.
+#[cfg(not(windows))]
+fn on_a_local_fixed_drive(_: &std::path::Path) -> bool {
+    true
 }
 
 /// The canonical form of a path — every symlink and junction followed, the
@@ -2166,6 +2219,33 @@ fn harness_run(kernel: &Shared, config: &ServerConfig, p: Value) -> Result<Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Final re-review N-2: the system drive is a local fixed drive by either
+    /// spelling; a share, by either spelling, and a device path are not.
+    #[cfg(windows)]
+    #[test]
+    fn a_share_or_device_path_is_not_a_local_fixed_drive() {
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        for local in [
+            format!(r"{system}\x\claude.exe"),
+            format!(r"\\?\{system}\x\claude.exe"),
+        ] {
+            assert!(
+                on_a_local_fixed_drive(std::path::Path::new(&local)),
+                "{local}"
+            );
+        }
+        for remote in [
+            r"\\host\share\claude.exe",
+            r"\\?\UNC\host\share\claude.exe",
+            r"\\.\COM1",
+        ] {
+            assert!(
+                !on_a_local_fixed_drive(std::path::Path::new(remote)),
+                "{remote}"
+            );
+        }
+    }
 
     /// Ruling 42: the plain values the CLI and the plan use pass; the pinned
     /// image passes by tag, by digest and by both.

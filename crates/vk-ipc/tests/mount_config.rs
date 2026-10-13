@@ -356,6 +356,27 @@ async fn the_service_refuses_a_binary_that_resolves_where_the_user_can_replace_i
     n.stop().await;
 }
 
+/// Final re-review N-2: under the service, a binary that is not on a local
+/// fixed drive — a UNC share, in either spelling — is refused before the
+/// daemon reaches for it (no network lookup on a request's behalf). Windows
+/// only: there is no UNC elsewhere. The share does not exist, so a daemon that
+/// did reach for it would only fail to find it.
+#[cfg(windows)]
+#[tokio::test]
+async fn the_service_refuses_a_binary_that_is_not_on_a_local_fixed_drive() {
+    let n = Node::start_as(true).await;
+    for unc in [
+        r"\\127.0.0.1\vk-no-such-share\claude.exe",
+        r"\\?\UNC\127.0.0.1\vk-no-such-share\claude.exe",
+    ] {
+        let err = n
+            .refused("claude-code", json!({ "binary": unc }), true)
+            .await;
+        bad_request(&err, "local fixed drive", unc);
+    }
+    n.stop().await;
+}
+
 /// Ruling 43: a link is followed, not refused. One whose target is clean is
 /// accepted, and the spec records the target. In the service mode on Unix
 /// (no Windows profile there) as well as interactively; on Windows the
