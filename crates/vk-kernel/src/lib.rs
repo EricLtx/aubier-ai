@@ -17,7 +17,10 @@ use vk_contracts::locks::{Lease, LockHome, LockTable};
 use vk_contracts::module::{GateKind, GateVerdict, ModuleManifest};
 use vk_contracts::principal::{Approval, ApprovalKind, Challenge, DeviceRegistry, Principal};
 use vk_contracts::register::{ArtefactRef, Register, RegisterId};
-use vk_contracts::stop::{LivenessLease, ResumeEvent, StopError, StopEvent, StopSet};
+use vk_contracts::stop::{
+    LivenessLease, LivenessRenewed, ResumeEvent, StopError, StopEvent, StopSet,
+    LIVENESS_SCOPE_AUTOMATIC,
+};
 use vk_contracts::storage::{BlobEnvelope, StorageError};
 use vk_contracts::syscalls::{Ctx, InferOutcome, Kernel, KernelError};
 use vk_contracts::testing::KernelTestHooks;
@@ -2170,6 +2173,22 @@ impl RealKernel {
         device_id: &str,
         expires_at_ms: u64,
     ) -> Result<(), KernelError> {
+        // The record is not optional (founder decision 2026-10-13), and it
+        // goes first, as everywhere in this kernel: an event whose row then
+        // fails to write is a renewal that was attempted and says so; a row
+        // with no event would be a renewal nobody can account for.
+        let previous = self.liveness(business)?.map(|l| l.expires_at_ms);
+        self.log(
+            "liveness.renewed",
+            now_ms(),
+            &LivenessRenewed {
+                business: business.into(),
+                device_id: device_id.into(),
+                until_ms: expires_at_ms,
+                previous_until_ms: previous,
+                scope: LIVENESS_SCOPE_AUTOMATIC.into(),
+            },
+        )?;
         self.store
             .db
             .put_json(
@@ -3697,6 +3716,34 @@ mod tests {
         assert!(!k.forced_boot());
         k.boot().unwrap();
         assert!(!k.forced_boot(), "a healthy boot must not look forced");
+    }
+
+    /// Founder decision 2026-10-13: a liveness renewal is on the record. One
+    /// `liveness.renewed` event per renewal, naming the device, the new expiry
+    /// and the one it replaced (`None` the first time).
+    #[test]
+    fn a_liveness_renewal_appends_exactly_one_event_with_the_previous_expiry() {
+        use vk_contracts::stop::LivenessRenewed;
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let before = k.ledger().events().len();
+        k.renew_liveness_persisted("acme", "laptop", 5_000).unwrap();
+        k.renew_liveness_persisted("acme", "phone", 9_000).unwrap();
+        let events: Vec<_> = k.ledger().events()[before..].to_vec();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.kind == "liveness.renewed"));
+        let record = |device: &str, until: u64, previous: Option<u64>| {
+            hash_canonical(&LivenessRenewed {
+                business: "acme".into(),
+                device_id: device.into(),
+                until_ms: until,
+                previous_until_ms: previous,
+                scope: "automatic".into(),
+            })
+        };
+        assert_eq!(events[0].payload_hash, record("laptop", 5_000, None));
+        assert_eq!(events[1].payload_hash, record("phone", 9_000, Some(5_000)));
+        assert!(k.ledger().verify_chain());
     }
 
     /// `vkd` calls this on the serve-under-force path, with the very report

@@ -91,6 +91,16 @@ async fn liveness_renew_is_a_human_act_that_feeds_top() {
     let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let c = Client::connect(&endpoint).await.unwrap();
+    // The record: refusals append nothing, the renewal appends one
+    // `liveness.renewed` event.
+    let renewed_events = |k: &Arc<Mutex<vk_kernel::RealKernel>>| {
+        let k = k.lock().unwrap();
+        vk_contracts::syscalls::Kernel::ledger(&*k)
+            .events()
+            .iter()
+            .filter(|e| e.kind == "liveness.renewed")
+            .count()
+    };
 
     let err = c
         .call(
@@ -112,6 +122,7 @@ async fn liveness_renew_is_a_human_act_that_feeds_top() {
         .await
         .unwrap_err();
     assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{err}");
+    assert_eq!(renewed_events(&k), 0, "a refused renewal appends nothing");
 
     let proof = prove(&c, &device).await;
     let renewed = c
@@ -129,6 +140,8 @@ async fn liveness_renew_is_a_human_act_that_feeds_top() {
 
     let top = c.call("top", json!({}), None).await.unwrap();
     assert_eq!(top["liveness"]["acme"].as_u64(), Some(expires));
+
+    assert_eq!(renewed_events(&k), 1, "the renewal is on the record, once");
 
     drop(c);
     shutdown(server, k, d).await;

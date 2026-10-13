@@ -79,6 +79,7 @@ vk task step $TASK --all        # waits for a human approval
 vk approve $TASK                # signed with this node's device key
 vk task step $TASK --all
 vk ledger verify                # the hash chain verifies
+vk liveness renew --business acme --until +30d   # a human extends the automatic window; on the ledger as liveness.renewed
 vk man                          # the contracts this kernel speaks
 ```
 

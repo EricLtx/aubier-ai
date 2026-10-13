@@ -879,6 +879,7 @@ fn vk_does_not_mint_a_device_key_it_was_never_enrolled_with() {
         vec!["approve", "task-none"],
         vec!["stop"],
         vec!["resume", "stop-none"],
+        vec!["liveness", "renew", "--business", "acme"],
     ] {
         let out = sh.run(&verb);
         let err = String::from_utf8_lossy(&out.stderr);
@@ -892,6 +893,66 @@ fn vk_does_not_mint_a_device_key_it_was_never_enrolled_with() {
             "vk {verb:?} minted a key: the file is there"
         );
     }
+}
+
+/// Founder decision 2026-10-13: `vk liveness renew` is a presence-gated
+/// human act, and the renewal is on the ledger as `liveness.renewed`, with
+/// `vk top` showing the new expiry. A refused renewal records nothing.
+#[test]
+fn vk_liveness_renew_signs_with_the_nodes_key_and_lands_on_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell {
+        endpoint,
+        node_key: dir.path().join("node.key"),
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let renewed_count = |sh: &Shell| {
+        let tail = sh.json(&["dmesg", "-n", "200", "--json"]);
+        dmesg_kinds(&tail)
+            .iter()
+            .filter(|k| **k == "liveness.renewed")
+            .count()
+    };
+    assert_eq!(renewed_count(&sh), 0);
+
+    // Refused before it is signed: a lease past thirty days, a past time, nonsense.
+    for bad in ["+31d", "2001-01-01T00:00:00Z", "someday"] {
+        let out = sh.run(&["liveness", "renew", "--business", "acme", "--until", bad]);
+        assert!(!out.status.success(), "--until {bad} must be refused");
+    }
+    assert_eq!(renewed_count(&sh), 0, "a refused renewal records nothing");
+
+    let before = vk_kernel::now_ms();
+    let answer = sh.json(&[
+        "liveness",
+        "renew",
+        "--json",
+        "--business",
+        "acme",
+        "--until",
+        "+2h",
+    ]);
+    assert_eq!(answer["business"], "acme", "{answer}");
+    assert!(str_of(&answer, "renewed_by_device").starts_with("node:"));
+    let until = answer["expires_at_ms"].as_u64().unwrap();
+    assert!(until >= before + 2 * 3_600_000, "{answer}");
+    assert_eq!(renewed_count(&sh), 1, "the renewal is on the ledger once");
+
+    let top = sh.json(&["top", "--json"]);
+    assert_eq!(top["liveness"]["acme"].as_u64(), Some(until), "{top}");
+
+    // The default (+7d) works too.
+    sh.ok(&["liveness", "renew", "--business", "acme"]);
+    assert_eq!(renewed_count(&sh), 2);
 }
 
 /// The other half of I-2: a key this account does have, for a node that
