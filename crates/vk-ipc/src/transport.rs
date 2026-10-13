@@ -1127,7 +1127,9 @@ pub mod os {
 
         /// A socket directory another account made is "not yours" (review
         /// M6), not a confusing chmod failure: `/tmp` is root's. Skipped as
-        /// root, where the directory would be the caller's own.
+        /// root, where the directory would be the caller's own. `/tmp` is
+        /// canonicalised first: on macOS it is a link to `/private/tmp`, and
+        /// a link is refused as a link before its owner is asked (Minor 3).
         #[tokio::test]
         async fn a_directory_owned_by_another_user_is_refused_by_name() {
             // SAFETY: `geteuid` reads the process's effective uid and nothing else.
@@ -1135,8 +1137,10 @@ pub mod os {
                 eprintln!("running as root: skipped");
                 return;
             }
+            let tmp = std::fs::canonicalize("/tmp").unwrap();
             let ep = Endpoint(format!(
-                "/tmp/vk-owner-test-{}.sock",
+                "{}/vk-owner-test-{}.sock",
+                tmp.display(),
                 uuid::Uuid::new_v4().simple()
             ));
             let Err(err) = bind(&ep).await else {

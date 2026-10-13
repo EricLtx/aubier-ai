@@ -227,7 +227,10 @@ mod tests {
     /// A state directory another account made is refused by name (review
     /// M6), before its mode is touched: `/tmp` is root's, so it is "not
     /// yours", not "permission denied on chmod". Skipped as root, where
-    /// `/tmp` *is* the caller's and this test would then set its mode.
+    /// `/tmp` *is* the caller's and this test would then set its mode. The
+    /// path is `/tmp` canonicalised: on macOS `/tmp` is a link to
+    /// `/private/tmp`, and a link is refused as a link before its owner is
+    /// asked (Minor 3) — this test is about the owner.
     #[cfg(unix)]
     #[test]
     fn a_directory_owned_by_another_user_is_refused_by_name() {
@@ -236,7 +239,8 @@ mod tests {
             eprintln!("running as root: skipped");
             return;
         }
-        let err = private_dir(Path::new("/tmp")).expect_err("/tmp is not this user's");
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
+        let err = private_dir(&tmp).expect_err("/tmp is not this user's");
         let msg = err.to_string();
         assert!(msg.contains("owned by uid 0"), "{msg}");
         assert!(msg.contains("not this user"), "{msg}");
