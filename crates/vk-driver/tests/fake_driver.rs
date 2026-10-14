@@ -17,6 +17,8 @@
 //! Python interpreters start at once; a bound at the brief's 2–3 s held in
 //! most full-suite runs here and failed in one.
 use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -58,6 +60,37 @@ for line in sys.stdin:
     env = {k: os.environ.get(k) for k in names}
     env["cwd"] = os.getcwd()
     say({"id": r["id"], "ok": True, "result": env})
+"#;
+
+/// A driver whose one action, `link`, plants a link at
+/// `<evidence_dir>/note.txt` — a junction to the directory `args.target` on
+/// Windows (`mklink /J`, which needs no privilege), a symlink to it elsewhere
+/// — and names it as evidence. `made` says whether the link could be created.
+const LINK_DRIVER: &str = r#"import json, os, subprocess, sys
+def say(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+say({"hello": {"protocol": 1, "driver": "link", "version": "0", "actions": ["link"]}})
+for line in sys.stdin:
+    r = json.loads(line); p = os.path.join(r["evidence_dir"], "note.txt"); target = r["args"]["target"]
+    if os.name == "nt":
+        res = subprocess.run(["cmd", "/c", "mklink", "/J", p, target], capture_output=True, text=True)
+        made, err = res.returncode == 0, res.stdout + res.stderr
+    else:
+        os.symlink(target, p); made, err = True, ""
+    ev = [{"name": "note.txt", "mime": "text/plain", "path": p}] if made else []
+    say({"id": r["id"], "ok": made, "result": {"made": made, "err": err[-300:]}, "evidence": ev})
+"#;
+
+/// A driver whose one action, `fetch`, has a child Python of its own fetch
+/// `args.url` — so the socket belongs to a grandchild of the host, as a
+/// Playwright driver's sockets belong to its browser.
+const NET_DRIVER: &str = r#"import json, subprocess, sys
+def say(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+say({"hello": {"protocol": 1, "driver": "net", "version": "0", "actions": ["fetch"]}})
+for line in sys.stdin:
+    r = json.loads(line)
+    code = "import urllib.request; urllib.request.urlopen(%r).read()" % r["args"]["url"]
+    res = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True)
+    say({"id": r["id"], "ok": res.returncode == 0, "result": {"rc": res.returncode, "err": res.stderr[-300:]}})
 "#;
 
 /// Caps wide enough that nothing in these tests trips them unless a test
@@ -319,8 +352,10 @@ fn an_evidence_path_outside_the_dir_is_refused() {
             &never,
         )
         .expect_err("a path outside the evidence directory is refused");
+    // The refusal names the path the driver gave, not the declared name: the
+    // name is fine, the path is what points elsewhere (ruling R9).
     assert!(
-        matches!(&err, HostError::EvidenceEscape(name) if name == "note.txt"),
+        matches!(&err, HostError::EvidenceEscape(path) if path.ends_with("secret.txt")),
         "{err}"
     );
     assert!(rig.evidence_root_is_empty());
@@ -607,5 +642,117 @@ fn tree_is_contained_on_windows() {
         .expect("echo answers under the job");
     assert!(out.ok);
     assert_eq!(out.result["echo"]["x"], 1);
+    // `hosts_seen` is the list of `ip:port` endpoints seen; a driver that
+    // talks to nothing leaves it empty, and nothing in it is anything else.
+    assert!(
+        out.hosts_seen.iter().all(|h| h
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| port.parse::<u16>().is_ok())),
+        "hosts_seen carries `ip:port` entries: {:?}",
+        out.hosts_seen
+    );
+    host.shutdown();
+}
+
+/// A link planted at the evidence name — a junction on Windows, a symlink
+/// elsewhere — is refused as an escape although its path is under the
+/// directory, and removing the directory afterwards does not reach through it.
+#[test]
+fn a_link_at_the_evidence_name_is_refused() {
+    if !python_available() {
+        return;
+    }
+    let rig = Rig::new(LINK_DRIVER);
+    // What the link points at: a directory with a file in it. A junction needs
+    // a directory target; the symlink takes the same one.
+    let outside = rig.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), b"must survive").unwrap();
+    let m = rig.manifest(
+        rig.command(),
+        json!([{"name": "link", "reversible": true, "args": {"type": "object"}, "evidence": ["note.txt"]}]),
+    );
+    let mut host = rig.spawn(&m);
+    let outcome = host.act(
+        action(&m, "link"),
+        &json!({"target": outside.display().to_string()}),
+        Duration::from_secs(10),
+        WIDE,
+        &never,
+    );
+    match outcome {
+        Ok(out) if out.result["made"] == false => {
+            eprintln!(
+                "the driver could not create the link; skipping ({})",
+                out.result["err"]
+            );
+            return;
+        }
+        Ok(out) => panic!("a link as evidence was accepted: {out:?}"),
+        Err(err) => assert!(
+            matches!(&err, HostError::EvidenceEscape(name) if name == "note.txt"),
+            "{err}"
+        ),
+    }
+    assert!(
+        outside.join("keep.txt").exists(),
+        "removing the evidence directory must not reach through the link"
+    );
+    assert!(rig.evidence_root_is_empty());
+}
+
+/// The egress the host records is the whole tree's, not the leader's: a fake
+/// driver whose child Python fetches from a local server the test runs shows
+/// that server's `127.0.0.1:<port>` in `hosts_seen`. The pids come from the
+/// Job Object (ruling R8), so this proves itself on Windows only; elsewhere
+/// the host sees the leader alone and the test says so and returns. The
+/// server holds the connection for 1.5 s: the sampler looks every 500 ms, and
+/// a server that answered at once would be gone between two looks.
+#[test]
+fn egress_of_the_whole_tree_is_seen_under_the_job() {
+    if !cfg!(windows) {
+        eprintln!("no process governor on this platform, so the tree's pids are unknown; skipping");
+        return;
+    }
+    if !python_available() {
+        return;
+    }
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind a loopback port");
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let Ok((mut socket, _)) = listener.accept() else {
+            return;
+        };
+        let mut head = [0u8; 1024];
+        let _ = socket.read(&mut head);
+        std::thread::sleep(Duration::from_millis(1500));
+        let _ = socket
+            .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    });
+    let rig = Rig::new(NET_DRIVER);
+    let m = rig.manifest(
+        rig.command(),
+        json!([{"name": "fetch", "reversible": true, "args": {"type": "object"}, "evidence": []}]),
+    );
+    let governor = vk_harness::confine::for_this_platform(1 << 30, None).expect("a governor");
+    let mut host = DriverHost::spawn(&m, &rig.work, &rig.profile, &rig.evidence, governor)
+        .expect("the net driver says hello under the job");
+    assert!(host.governed());
+    let out = host
+        .act(
+            action(&m, "fetch"),
+            &json!({"url": format!("http://127.0.0.1:{port}/")}),
+            Duration::from_secs(20),
+            WIDE,
+            &never,
+        )
+        .expect("fetch answers");
+    assert!(out.ok, "the grandchild's fetch failed: {:?}", out.result);
+    server.join().expect("the server thread");
+    assert!(
+        out.hosts_seen.iter().any(|h| h.contains("127.0.0.1")),
+        "the grandchild's connection is in hosts_seen: {:?}",
+        out.hosts_seen
+    );
     host.shutdown();
 }

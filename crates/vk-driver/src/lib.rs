@@ -10,11 +10,15 @@
 //! and the mount refused. [`DriverHost::act`] is one request and one response:
 //! the host creates a per-action evidence directory, writes the request line,
 //! and waits — polling the kernel's `should_stop` every 250 ms and sampling
-//! the child's egress every 500 ms — until the response with that id arrives,
-//! the deadline passes or a STOP comes; the last two kill the tree. Evidence
-//! comes back by path, never inline: each declared file is opened once, its
-//! real path checked to lie under the evidence directory, its size held under
-//! the per-file and per-action caps, and the directory is removed whatever
+//! the egress of every process under the governor (the whole tree under the
+//! Job on Windows, the leader alone when ungoverned) every 500 ms — until the
+//! response with that id arrives, the deadline passes or a STOP comes; the
+//! last two kill the tree. Evidence comes back by name, never inline: the
+//! driver names a file the manifest declares for the action, and the host
+//! reads `<evidence dir>/<name>` — a plain token, so it cannot leave the
+//! directory — opened without following a link and only if it is a regular
+//! file, treats the path the driver gives as a cross-check, holds the size
+//! under the per-file and per-action caps, and removes the directory whatever
 //! happened.
 //!
 //! What the host is, and is not. It is a plain value the daemon owns, with no
@@ -79,8 +83,8 @@ pub struct EvidenceFile {
 }
 
 /// What one act came to: the driver's answer, the evidence read back, how long
-/// the driver took, and the remote endpoints its process was seen connected to
-/// while it worked (sampled every 500 ms, deduplicated, sorted).
+/// the driver took, and the remote endpoints its processes were seen connected
+/// to while it worked.
 #[derive(Debug, Clone)]
 pub struct ActOutcome {
     pub ok: bool,
@@ -89,6 +93,10 @@ pub struct ActOutcome {
     pub result: Value,
     pub evidence: Vec<EvidenceFile>,
     pub duration_ms: u64,
+    /// Remote `ip:port` endpoints seen in established TCP connections of the
+    /// driver's processes while the action ran: the whole tree under the Job
+    /// on Windows; the leader only when ungoverned. Sampled every 500 ms,
+    /// deduplicated, sorted.
     pub hosts_seen: Vec<String>,
 }
 
@@ -124,9 +132,10 @@ pub struct DriverHost {
     /// Every line the driver prints on stdout, from the reader thread, which
     /// ends on its own when the pipe closes.
     lines: Receiver<String>,
-    /// Held for its drop, which comes after the kill in [`Drop`]: a Job
-    /// Object closing terminates whatever the driver left running.
-    _governor: Box<dyn Governor>,
+    /// The governor the tree is under: asked for its process list at every
+    /// egress sample, and dropped last — after the kill in [`Drop`] — so a
+    /// Job Object closing terminates whatever the driver left running.
+    governor: Box<dyn Governor>,
     governed: bool,
     next_id: u64,
     hello: Hello,
@@ -267,7 +276,7 @@ impl DriverHost {
         let stdout = child.stdout.take().expect("stdout was piped");
         let lines = read_lines(stdout);
 
-        let hello = match await_hello(&lines, &mut child, hello_timeout, manifest) {
+        let hello = match await_hello(&lines, &mut child, hello_timeout, manifest, governed) {
             Ok(hello) => hello,
             Err(e) => {
                 tracing::warn!(error = %e, "driver refused at hello; tree killed");
@@ -287,7 +296,7 @@ impl DriverHost {
             child,
             stdin,
             lines,
-            _governor: governor,
+            governor,
             governed,
             next_id: 1,
             hello,
@@ -403,18 +412,28 @@ impl DriverHost {
             .write_all(line.as_bytes())
             .and_then(|()| self.stdin.flush())
         {
-            let exit = reap(&mut self.child);
+            let exit = reap(&mut self.child, self.governed);
             return Err(HostError::Dead(format!(
                 "{exit} (the request could not be written: {e})"
             )));
         }
         let deadline_at = started + deadline;
-        let pid = self.child.id();
+        let leader = self.child.id();
         let mut hosts = BTreeSet::new();
         let mut last_sample: Option<Instant> = None;
         let response = loop {
             if last_sample.is_none_or(|t| t.elapsed() >= SAMPLE_EVERY) {
-                hosts.extend(netwatch::sample(pid));
+                // Every process the governor holds — the whole tree under the
+                // Job on Windows, where a browser's sockets sit levels below
+                // the leader — and the leader, which is all there is to see
+                // when ungoverned (ruling R8).
+                let mut pids = self.governor.pids();
+                pids.push(leader);
+                pids.sort_unstable();
+                pids.dedup();
+                for pid in pids {
+                    hosts.extend(netwatch::sample(pid));
+                }
                 last_sample = Some(Instant::now());
             }
             if should_stop() {
@@ -446,7 +465,7 @@ impl DriverHost {
                 },
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(HostError::Dead(reap(&mut self.child)));
+                    return Err(HostError::Dead(reap(&mut self.child, self.governed)));
                 }
             }
         };
@@ -457,9 +476,14 @@ impl DriverHost {
         })
     }
 
-    /// Read back the evidence a response names, each file once: the name must
-    /// pass the artefact-kind rule and be declared for the action, the opened
-    /// file's real path must lie under `dir`, and the size must stay under the
+    /// Read back the evidence a response names, each file once and by name
+    /// (ruling R9): the name must pass the artefact-kind rule and be declared
+    /// for the action, so `<dir>/<name>` cannot leave the directory; that path
+    /// is what is read — opened without following a link of any kind, and
+    /// only if it is a regular file. The driver's `path` is a cross-check and
+    /// never what is opened: it must resolve to that same file, or the
+    /// evidence is an escape — a path that does not exist or sits anywhere
+    /// else is `EvidenceEscape`, not a protocol error. Sizes stay under the
     /// per-file cap and the running per-action total.
     fn collect_evidence(
         &self,
@@ -468,8 +492,6 @@ impl DriverHost {
         dir: &Path,
         caps: EvidenceCaps,
     ) -> Result<Vec<EvidenceFile>, HostError> {
-        let dir_real = canonical(dir)
-            .map_err(|e| host_io(format!("resolve evidence dir {}", dir.display()), e))?;
         let mut total = 0u64;
         let mut seen = BTreeSet::new();
         let mut files = Vec::with_capacity(refs.len());
@@ -483,15 +505,33 @@ impl DriverHost {
                     r.name
                 )));
             }
+            let ours = dir.join(&r.name);
+            // The path the driver gives must be our file. Both sides resolve
+            // the same way, so a link at either shows as a difference, and a
+            // path that does not exist resolves to nothing.
+            match (std::fs::canonicalize(&r.path), std::fs::canonicalize(&ours)) {
+                (Ok(claimed), Ok(expected)) if claimed == expected => {}
+                _ => return Err(HostError::EvidenceEscape(r.path.clone())),
+            }
             let at = |e: std::io::Error| {
-                HostError::Protocol(format!("evidence {} at {}: {e}", r.name, r.path))
+                HostError::Protocol(format!("evidence {} at {}: {e}", r.name, ours.display()))
             };
-            let mut file = File::open(&r.path).map_err(at)?;
-            let real = canonical(Path::new(&r.path)).map_err(at)?;
-            if !real.starts_with(&dir_real) {
+            // Only a regular file at `<dir>/<name>` itself: a symlink, a
+            // junction or a directory there is refused here, and a link
+            // planted between this check and the open is not followed by it.
+            if !std::fs::symlink_metadata(&ours)
+                .map_err(at)?
+                .file_type()
+                .is_file()
+            {
                 return Err(HostError::EvidenceEscape(r.name.clone()));
             }
-            let len = file.metadata().map_err(at)?.len();
+            let mut file = open_no_follow(&ours).map_err(at)?;
+            let meta = file.metadata().map_err(at)?;
+            if !meta.file_type().is_file() {
+                return Err(HostError::EvidenceEscape(r.name.clone()));
+            }
+            let len = meta.len();
             if len > caps.per_file {
                 return Err(HostError::EvidenceTooLarge {
                     name: r.name.clone(),
@@ -551,14 +591,22 @@ impl DriverHost {
     fn kill(&mut self, why: &str) {
         tracing::warn!(pid = self.child.id(), why, "driver tree killed");
         kill_tree(&mut self.child);
+        // `kill_tree` ends with this too; said again here so a `taskkill` that
+        // failed cannot leave the wait below open-ended.
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 
     /// Kill what still runs and reap; idempotent, so `shutdown` and `Drop`
-    /// may both run it.
+    /// may both run it. A leader already reaped still has its tree swept
+    /// where no governor will ([`sweep`]); under the Job Object the drop of
+    /// the governor, right after this, does that.
     fn terminate(&mut self) {
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            sweep(&mut self.child, self.governed);
+        } else {
             kill_tree(&mut self.child);
+            let _ = self.child.kill();
         }
         let _ = self.child.wait();
     }
@@ -577,12 +625,16 @@ fn await_hello(
     child: &mut Child,
     timeout: Duration,
     manifest: &DriverManifest,
+    governed: bool,
 ) -> Result<Hello, HostError> {
     let line = match lines.recv_timeout(timeout) {
         Ok(line) => line,
         Err(RecvTimeoutError::Timeout) => return Err(HostError::HelloTimeout(timeout)),
         Err(RecvTimeoutError::Disconnected) => {
-            return Err(HostError::Dead(format!("{} before any hello", reap(child))));
+            return Err(HostError::Dead(format!(
+                "{} before any hello",
+                reap(child, governed)
+            )));
         }
     };
     let hello = serde_json::from_str::<HelloLine>(&line)
@@ -661,13 +713,14 @@ fn read_lines(stdout: impl Read + Send + 'static) -> Receiver<String> {
 
 /// The driver closed its stdout. An exiting process closes its pipes a moment
 /// before it is gone, so it gets [`EXIT_GRACE`] to finish on its own and
-/// report its true exit; what is still running after that is killed. The
-/// answer is the exit, worded for a `Dead` message.
-fn reap(child: &mut Child) -> String {
+/// report its true exit; what is still running after that is killed. Either
+/// way, what the leader may have left behind is then swept where no governor
+/// will ([`sweep`]). The answer is the exit, worded for a `Dead` message.
+fn reap(child: &mut Child, governed: bool) -> String {
     let until = Instant::now() + EXIT_GRACE;
-    loop {
+    let exit = loop {
         match child.try_wait() {
-            Ok(Some(status)) => return exit_label(status),
+            Ok(Some(status)) => break exit_label(status),
             Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
                 tracing::warn!(
@@ -675,7 +728,8 @@ fn reap(child: &mut Child) -> String {
                     "driver closed its stdout but kept running; tree killed"
                 );
                 kill_tree(child);
-                return match child.wait() {
+                let _ = child.kill();
+                break match child.wait() {
                     Ok(status) => format!(
                         "stdout closed while running; killed ({})",
                         exit_label(status)
@@ -685,8 +739,23 @@ fn reap(child: &mut Child) -> String {
                     }
                 };
             }
-            Err(e) => return format!("exit unreadable: {e}"),
+            Err(e) => break format!("exit unreadable: {e}"),
         }
+    };
+    sweep(child, governed);
+    exit
+}
+
+/// Sweep what a leader that is gone may have left behind, where no governor
+/// will: on Unix `kill_tree` signals the leader's own process group, exact and
+/// free even once the leader is reaped, so it always runs; on Windows an
+/// ungoverned tree gets `taskkill /T` as a best effort (it finds children by
+/// parent pid, and nothing once the parent is gone), while a governed tree is
+/// left to the Job Object, which terminates every member when the governor
+/// drops.
+fn sweep(child: &mut Child, governed: bool) {
+    if cfg!(unix) || !governed {
+        kill_tree(child);
     }
 }
 
@@ -697,17 +766,26 @@ fn exit_label(status: ExitStatus) -> String {
     }
 }
 
-/// `canonicalize`, with the `\\?\` verbatim prefix Windows puts on the result
-/// stripped, so two canonical paths compare component by component.
-fn canonical(path: &Path) -> std::io::Result<PathBuf> {
-    let real = std::fs::canonicalize(path)?;
+/// Open `path` for reading without following a link at it: on Windows
+/// `FILE_FLAG_OPEN_REPARSE_POINT` opens a reparse point (a symlink, a
+/// junction) as itself and never as its target; on Unix `O_NOFOLLOW` refuses
+/// a symlink at the final component. What the handle then is, its metadata
+/// says, and the caller refuses anything but a regular file.
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
     #[cfg(windows)]
     {
-        if let Some(stripped) = real.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-            return Ok(PathBuf::from(stripped));
-        }
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    Ok(real)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
 }
 
 /// The artefact-kind rule, as `vk_contracts::driver::plain_token` states it

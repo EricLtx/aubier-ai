@@ -35,6 +35,15 @@ pub trait Governor: Send + Sync {
     /// `governed` field carries. False before any `contain`, false after one
     /// that failed, and always false for [`NoopGovernor`].
     fn governed(&self) -> bool;
+
+    /// The pids of every process under this governor right now: the Job
+    /// Object's process list on Windows — the whole tree the contained child
+    /// spawned — and empty for [`NoopGovernor`], which holds nothing. For the
+    /// egress sampler of a driver host: a browser driver's sockets belong to
+    /// the browser, levels below the process the kernel started (ruling R8).
+    /// A list that could not be read is empty too, with a warning in the log;
+    /// the caller then sees the leader alone.
+    fn pids(&self) -> Vec<u32>;
 }
 
 /// A governor that enforces nothing — the one platforms without a governor
@@ -66,6 +75,11 @@ impl Governor for NoopGovernor {
 
     fn governed(&self) -> bool {
         false
+    }
+
+    /// Nothing: this governor holds no process.
+    fn pids(&self) -> Vec<u32> {
+        Vec::new()
     }
 }
 
@@ -116,16 +130,17 @@ mod job {
     use std::process::Child;
     use std::sync::atomic::{AtomicBool, Ordering};
     use windows::core::BOOL;
-    use windows::Win32::Foundation::{HANDLE, STILL_ACTIVE};
+    use windows::Win32::Foundation::{ERROR_MORE_DATA, HANDLE, STILL_ACTIVE};
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectBasicProcessIdList,
         JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
         QueryInformationJobObject, SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
-        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
-        JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+        JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, GetExitCodeProcess};
 
@@ -333,6 +348,68 @@ mod job {
             }
             outcome
         }
+
+        /// The pids of every process in the job, by
+        /// `QueryInformationJobObject(JobObjectBasicProcessIdList)`. The list
+        /// comes back in a buffer the caller sizes: when the job holds more
+        /// than fits — `NumberOfProcessIdsInList` below
+        /// `NumberOfAssignedProcesses`, or `ERROR_MORE_DATA` — the buffer is
+        /// grown to what the header says, and more, and the query repeated;
+        /// a few times, since the tree may be spawning meanwhile.
+        fn process_ids(&self) -> Result<Vec<u32>> {
+            // The header is two u32s; the pids follow as `usize`s. A buffer of
+            // `usize`s keeps the alignment the struct needs, with the header
+            // in its first word(s).
+            const HEADER_WORDS: usize =
+                std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList)
+                    / size_of::<usize>();
+            let mut capacity = 64usize;
+            for _ in 0..8 {
+                let mut buf = vec![0usize; HEADER_WORDS + capacity];
+                let bytes = u32::try_from(buf.len() * size_of::<usize>())
+                    .context("the pid buffer does not fit a u32 length")?;
+                // SAFETY: the pointer and the length describe `buf`, alive for
+                // the call, aligned for the struct and at least a header long;
+                // the job handle is owned by `self`; the OS writes within the
+                // length it is given.
+                let queried = unsafe {
+                    QueryInformationJobObject(
+                        Some(self.handle()),
+                        JobObjectBasicProcessIdList,
+                        buf.as_mut_ptr() as *mut c_void,
+                        bytes,
+                        None,
+                    )
+                };
+                // SAFETY: `buf` starts with a fully written header (the OS
+                // fills the counts whether or not the list fit, and the buffer
+                // was zeroed before), at the alignment the struct needs.
+                let (assigned, listed) = unsafe {
+                    let header = &*(buf.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST);
+                    (
+                        header.NumberOfAssignedProcesses as usize,
+                        header.NumberOfProcessIdsInList as usize,
+                    )
+                };
+                match queried {
+                    Ok(()) if listed >= assigned => {
+                        let listed = listed.min(capacity);
+                        return Ok(buf[HEADER_WORDS..HEADER_WORDS + listed]
+                            .iter()
+                            .map(|&pid| u32::try_from(pid).unwrap_or(u32::MAX))
+                            .collect());
+                    }
+                    Ok(()) => {}
+                    Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {}
+                    Err(e) => {
+                        return Err(e)
+                            .context("QueryInformationJobObject(JobObjectBasicProcessIdList)");
+                    }
+                }
+                capacity = assigned.max(capacity * 2) + 16;
+            }
+            bail!("the job's process list outgrew the buffer across eight queries");
+        }
     }
 
     impl Governor for JobGovernor {
@@ -345,6 +422,21 @@ mod job {
 
         fn governed(&self) -> bool {
             self.verified.load(Ordering::SeqCst) && !self.refused.load(Ordering::SeqCst)
+        }
+
+        /// [`JobGovernor::process_ids`]; a list that could not be read is
+        /// empty, and the log says why.
+        fn pids(&self) -> Vec<u32> {
+            match self.process_ids() {
+                Ok(pids) => pids,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "the job's process list could not be read; the leader alone is sampled"
+                    );
+                    Vec::new()
+                }
+            }
         }
     }
 
@@ -452,5 +544,35 @@ mod job {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    /// A child the job holds is in its process list. `cmd /c ping` is two
+    /// processes once ping has started; the one asserted is the child itself,
+    /// whose pid is known.
+    #[test]
+    fn the_job_lists_the_pids_it_holds() {
+        let governor = JobGovernor::new(256 << 20, None).expect("a job object");
+        let mut child = Command::new("cmd")
+            .args(["/c", "ping", "-n", "3", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd /c ping");
+        governor.contain(&child).expect("contain the child");
+        let pids = governor.pids();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            pids.contains(&child.id()),
+            "the job lists the child it holds: {pids:?}"
+        );
+        drop(governor);
     }
 }

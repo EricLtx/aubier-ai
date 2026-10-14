@@ -19,5 +19,10 @@ vk-contracts = { path = "../vk-contracts" }
 # kernel depends on this crate.
 vk-harness = { path = "../vk-harness" }
 
+[target.'cfg(unix)'.dependencies]
+# `O_NOFOLLOW` for the evidence open: a link at `<evidence dir>/<name>` is
+# refused, never followed (ruling R9).
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
