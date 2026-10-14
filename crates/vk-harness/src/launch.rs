@@ -862,8 +862,9 @@ fn spawn(program: &Path) -> Command {
 /// Kill the child and everything it started. The governor's Job Object already
 /// does this on Windows when dropped; this is the belt-and-braces path, and the
 /// only kill on platforms with no governor — where the child leads its own
-/// process group, which is signalled whole.
-fn kill_tree(child: &mut Child) {
+/// process group, which is signalled whole. Public for `vk-driver`, whose host
+/// kills a driver tree the same way.
+pub fn kill_tree(child: &mut Child) {
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")

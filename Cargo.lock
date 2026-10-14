@@ -3767,6 +3767,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vk-driver"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "vk-contracts",
+ "vk-harness",
+]
+
+[[package]]
 name = "vk-harness"
 version = "0.1.0"
 dependencies = [
