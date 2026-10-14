@@ -887,9 +887,17 @@ impl RealKernel {
             StepKind::Judge { arch_id } => {
                 let o = self.infer(ctx, arch_id, Capability::Judge, register)?;
                 let reg = self.read_register(ctx, register)?;
-                if let Some(verdict) = reg.open_questions.last() {
-                    self.attach_artefact(ctx, register, "verdict.md", verdict.as_bytes())?;
-                }
+                // The same filter as the draft's: `arch::raise` pushes
+                // `judge: ` for an empty completion, and a verdict of nothing
+                // is not one to sign (review round 1, minor 2).
+                let verdict = reg
+                    .open_questions
+                    .last()
+                    .filter(|q| !q.trim_start_matches("judge:").trim().is_empty())
+                    .ok_or_else(|| {
+                        KernelError::Gate(format!("arch {arch_id} returned no verdict to attach"))
+                    })?;
+                self.attach_artefact(ctx, register, "verdict.md", verdict.as_bytes())?;
                 Ok((StepStatus::Done, o.tokens_in))
             }
             // Never reached through `run_task_step`, which refuses a harness step

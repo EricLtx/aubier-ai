@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use vk_contracts::arch::ArchManifest;
 use vk_contracts::driver::{
-    hash_dir, DriverActed, DriverAction, DriverKind, DriverManifest, DriverMounted, DriverProgram,
+    DriverActed, DriverAction, DriverKind, DriverManifest, DriverMounted, DriverProgram,
     DriverUnmounted,
 };
 use vk_contracts::hash_canonical;
@@ -338,7 +338,7 @@ fn mount_is_a_human_act_and_is_idempotent() {
             driver_id: row.driver_id.clone(),
             name: "maskai-1".into(),
             manifest_hash: hash_canonical(&row.manifest),
-            profile_dir_hash: hash_dir(&dirs.profile).unwrap(),
+            profile_dir_hash: vk_contracts::hash_bytes(dirs.profile.to_string_lossy().as_bytes()),
             governed: true,
             by: "phone-1".into(),
         }),
@@ -1151,4 +1151,378 @@ fn settle_after_the_run_ended_still_records_the_action() {
         .unwrap();
     k.driver_act_begin(&l2.token, 15, "maskai-1", "look", &serde_json::json!({}))
         .unwrap();
+}
+
+/// A successful action whose evidence is `files`.
+fn outcome_with(files: Vec<EvidenceFile>) -> ActOutcome {
+    ActOutcome {
+        evidence: files,
+        ..echo_outcome("x")
+    }
+}
+
+fn note(bytes: Vec<u8>) -> EvidenceFile {
+    EvidenceFile {
+        name: "note.txt".into(),
+        mime: "text/plain".into(),
+        bytes,
+    }
+}
+
+/// The `driver.acted{ok:false}` record a settle-door refusal leaves: the
+/// outcome's own result hash, duration and hosts; nothing kept as evidence.
+fn refused_acted(t: &Task, row: &DriverRow, outcome: &ActOutcome, why: &str) -> DriverActed {
+    DriverActed {
+        task_id: t.id.clone(),
+        step_index: 0,
+        driver_id: row.driver_id.clone(),
+        action: "echo".into(),
+        args_hash: hash_canonical(&echo_args()),
+        result_hash: hash_canonical(&outcome.result),
+        ok: false,
+        reason: Some(why.into()),
+        duration_ms: outcome.duration_ms,
+        evidence: vec![],
+        evidence_bytes: 0,
+        hosts_seen: outcome.hosts_seen.clone(),
+    }
+}
+
+/// Review round 1, finding 1: an action schema the library will not compile is
+/// refused at mount with its remedy; a row that reached the table behind the
+/// mount's back still gets a refusal from `driver_act_begin`, never a panic
+/// under the kernel lock.
+#[test]
+fn a_schema_that_does_not_compile_is_refused_at_mount_and_is_a_gate_at_begin() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let mut m = maskai_like();
+    m.actions[0].args = serde_json::json!({
+        "type": "object",
+        "properties": { "case": { "type": "strnig" } }
+    });
+    let err = k
+        .mount_driver(&human(1), m.clone(), root(), true)
+        .unwrap_err();
+    assert!(matches!(err, KernelError::Gate(_)), "{err}");
+    assert!(err.to_string().contains("does not compile"), "{err}");
+    assert!(k.drivers().unwrap().is_empty());
+
+    let row = DriverRow {
+        driver_id: m.driver_id(),
+        manifest: m,
+        root: root(),
+        mounted_ms: 1,
+        state: DriverState::Ready,
+        last_act_ms: 0,
+    };
+    k.store().db.put_json("drivers", "maskai-1", &row).unwrap();
+    let t = one_level(&mut k);
+    let l = launch(&mut k, &t.id);
+    let err = k
+        .driver_act_begin(&l.token, 5, "maskai-1", "echo", &echo_args())
+        .unwrap_err();
+    assert!(matches!(err, KernelError::Gate(_)), "{err}");
+    assert!(err.to_string().contains("args for echo"), "{err}");
+    assert!(err.to_string().contains("does not compile"), "{err}");
+    // Nothing was claimed: the sound action goes through.
+    k.driver_act_begin(&l.token, 6, "maskai-1", "look", &serde_json::json!({}))
+        .unwrap();
+}
+
+/// Review round 1, finding 3 (i): an evidence name the action did not declare
+/// is refused at the kernel's door — `driver.acted{ok:false, reason}`, no
+/// artefact, the clock moved, the driver free again.
+#[test]
+fn settle_refuses_an_evidence_name_the_action_did_not_declare() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let row = mount(&mut k);
+    let t = one_level(&mut k);
+    let l = launch(&mut k, &t.id);
+    let plan = k
+        .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    let outcome = outcome_with(vec![EvidenceFile {
+        name: "other.txt".into(),
+        mime: "text/plain".into(),
+        bytes: b"x".to_vec(),
+    }]);
+    let err = k
+        .driver_act_settle(&l.token, 20, &plan, Ok(outcome.clone()))
+        .unwrap_err();
+    let why = "evidence other.txt is not a name the manifest allows for echo";
+    assert!(matches!(err, KernelError::Gate(_)), "{err}");
+    assert!(err.to_string().contains(why), "{err}");
+    let acted = events_of(&k, "driver.acted");
+    assert_eq!(acted.len(), 1);
+    assert_eq!(
+        acted[0].payload_hash,
+        hash_canonical(&refused_acted(&t, &row, &outcome, why))
+    );
+    assert!(k
+        .read_register(&machine(21), &t.register)
+        .unwrap()
+        .artefacts
+        .is_empty());
+    assert_eq!(k.driver("maskai-1").unwrap().unwrap().last_act_ms, 20);
+    k.driver_act_begin(&l.token, 22, "maskai-1", "look", &serde_json::json!({}))
+        .unwrap();
+}
+
+/// Review round 1, finding 3 (ii): a file over the per-file cap is refused,
+/// recorded, and remembered on the token so the run fails naming it.
+#[test]
+fn settle_refuses_a_file_over_the_per_file_cap_and_the_run_fails_naming_it() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let row = mount(&mut k);
+    let t = one_level(&mut k);
+    let l = launch(&mut k, &t.id);
+    let plan = k
+        .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    let len = HARNESS_MAX_FILE_BYTES + 1;
+    let outcome = outcome_with(vec![note(vec![b'x'; len as usize])]);
+    let err = k
+        .driver_act_settle(&l.token, 20, &plan, Ok(outcome.clone()))
+        .unwrap_err();
+    let why = format!(
+        "note.txt is {len} bytes, above the {HARNESS_MAX_FILE_BYTES}-byte limit for one file"
+    );
+    assert!(matches!(err, KernelError::Gate(_)), "{err}");
+    assert!(err.to_string().contains(&why), "{err}");
+    let acted = events_of(&k, "driver.acted");
+    assert_eq!(acted.len(), 1);
+    assert_eq!(
+        acted[0].payload_hash,
+        hash_canonical(&refused_acted(&t, &row, &outcome, &why))
+    );
+    assert!(k
+        .read_register(&machine(21), &t.register)
+        .unwrap()
+        .artefacts
+        .is_empty());
+    assert_eq!(k.driver("maskai-1").unwrap().unwrap().last_act_ms, 20);
+    k.driver_act_begin(&l.token, 22, "maskai-1", "look", &serde_json::json!({}))
+        .unwrap();
+
+    // Remembered: the run fails at settle, naming the file.
+    let settled = k
+        .harness_settle(
+            &machine(30),
+            &t.id,
+            &l,
+            &run_ending(ExitReason::Exited(0)),
+            false,
+        )
+        .unwrap();
+    assert_eq!(settled.status, TaskStatus::Failed);
+    match &settled.steps[0].status {
+        StepStatus::Failed(w) => assert!(w.contains("note.txt"), "{w}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Review round 1, finding 3 (iii): evidence that would take the run past its
+/// 16 MiB total is refused whole, recorded, and remembered so the run fails
+/// naming the file; what was attached before the breach stays.
+#[test]
+fn settle_refuses_evidence_past_the_run_total_and_the_run_fails_naming_it() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let row = mount(&mut k);
+    let t = recette_task(
+        &mut k,
+        vec![harness_step(&["maskai-1"], None), StepKind::Approve],
+    );
+    let l = launch(&mut k, &t.id);
+    // Exactly at the cap: eight files of exactly the per-file maximum.
+    let acts = HARNESS_MAX_RUN_BYTES / HARNESS_MAX_FILE_BYTES;
+    for i in 0..acts {
+        let now = 10 + i;
+        let plan = k
+            .driver_act_begin(&l.token, now, "maskai-1", "echo", &echo_args())
+            .unwrap();
+        k.driver_act_settle(
+            &l.token,
+            now,
+            &plan,
+            Ok(outcome_with(vec![note(vec![
+                i as u8;
+                HARNESS_MAX_FILE_BYTES
+                    as usize
+            ])])),
+        )
+        .unwrap();
+    }
+    let before = k
+        .read_register(&machine(50), &t.register)
+        .unwrap()
+        .artefacts
+        .len();
+    assert_eq!(before, acts as usize);
+
+    let plan = k
+        .driver_act_begin(&l.token, 100, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    let outcome = outcome_with(vec![note(b"1".to_vec())]);
+    let err = k
+        .driver_act_settle(&l.token, 101, &plan, Ok(outcome.clone()))
+        .unwrap_err();
+    let why = format!(
+        "evidence of echo (1 bytes) would take the run past the {HARNESS_MAX_RUN_BYTES}-byte limit"
+    );
+    assert!(matches!(err, KernelError::Gate(_)), "{err}");
+    assert!(err.to_string().contains(&why), "{err}");
+    let acted = events_of(&k, "driver.acted");
+    assert_eq!(acted.len(), acts as usize + 1);
+    assert_eq!(
+        acted.last().unwrap().payload_hash,
+        hash_canonical(&refused_acted(&t, &row, &outcome, &why))
+    );
+    assert_eq!(
+        k.read_register(&machine(102), &t.register)
+            .unwrap()
+            .artefacts
+            .len(),
+        before,
+        "nothing of the refused action is kept"
+    );
+    assert_eq!(k.driver("maskai-1").unwrap().unwrap().last_act_ms, 101);
+
+    let settled = k
+        .harness_settle(
+            &machine(110),
+            &t.id,
+            &l,
+            &run_ending(ExitReason::Exited(0)),
+            false,
+        )
+        .unwrap();
+    assert_eq!(settled.status, TaskStatus::Failed);
+    match &settled.steps[0].status {
+        StepStatus::Failed(w) => assert!(w.contains("note.txt"), "{w}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Review round 1, finding 4: an act the daemon dropped without settling must
+/// not hold the driver busy for ever. Unmounting clears it with the row, and
+/// the remount acts again.
+#[test]
+fn unmount_clears_an_act_left_in_flight_so_a_remount_can_act() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let row = mount(&mut k);
+    let t = one_level(&mut k);
+    let l = launch(&mut k, &t.id);
+    k.driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    let err = k
+        .driver_act_begin(&l.token, 11, "maskai-1", "look", &serde_json::json!({}))
+        .unwrap_err();
+    assert!(err.to_string().contains("in flight"), "{err}");
+
+    let gone = k
+        .unmount_driver("maskai-1", "operator")
+        .unwrap()
+        .expect("the row was there");
+    assert_eq!(gone.driver_id, row.driver_id);
+    assert!(k.driver("maskai-1").unwrap().is_none());
+    let unmounted = events_of(&k, "driver.unmounted");
+    assert_eq!(unmounted.len(), 1);
+    assert_eq!(
+        unmounted[0].payload_hash,
+        hash_canonical(&DriverUnmounted {
+            driver_id: row.driver_id.clone(),
+            reason: "operator".into(),
+        })
+    );
+    assert!(
+        k.unmount_driver("maskai-1", "operator").unwrap().is_none(),
+        "a second unmount finds nothing and logs nothing"
+    );
+    assert_eq!(events_of(&k, "driver.unmounted").len(), 1);
+
+    let back = mount(&mut k);
+    assert_eq!(back.state, DriverState::Ready);
+    k.driver_act_begin(&l.token, 12, "maskai-1", "look", &serde_json::json!({}))
+        .unwrap();
+}
+
+/// Ruling R12: every host-side failure degrades the driver — a process that
+/// would not start, printed no hello, timed out, died or broke protocol is
+/// not one to send the next request to. Only the kernel's own evidence
+/// refusals (the settle door) leave it `Ready`.
+#[test]
+fn settle_on_any_host_failure_degrades_the_driver() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let row = mount(&mut k);
+    let t = one_level(&mut k);
+    let l = launch(&mut k, &t.id);
+    let plan = k
+        .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    let reason = "driver would not start: spawn failed";
+    let err = k
+        .driver_act_settle(&l.token, 30, &plan, Err(reason.into()))
+        .unwrap_err();
+    assert!(matches!(err, KernelError::Gate(_)), "{err}");
+    assert!(err.to_string().contains(reason), "{err}");
+    assert_eq!(
+        k.driver("maskai-1").unwrap().unwrap().state,
+        DriverState::Degraded {
+            reason: reason.into()
+        }
+    );
+    let unmounted = events_of(&k, "driver.unmounted");
+    assert_eq!(unmounted.len(), 1);
+    assert_eq!(
+        unmounted[0].payload_hash,
+        hash_canonical(&DriverUnmounted {
+            driver_id: row.driver_id.clone(),
+            reason: reason.into(),
+        })
+    );
+    let err = k
+        .driver_act_begin(&l.token, 31, "maskai-1", "look", &serde_json::json!({}))
+        .unwrap_err();
+    assert!(err.to_string().contains("degraded"), "{err}");
+}
+
+/// Reviewer minor 2: a judge whose completion is empty after `arch::raise`'s
+/// `judge: ` prefix has no verdict to attach, and the step fails by name
+/// rather than leaving the approve after it waiting on a blank.
+#[test]
+fn a_judge_that_returns_nothing_fails_the_step() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let silent_manifest = mock_manifest("silent");
+    let silent = k
+        .mount(
+            Arc::new(Silent(silent_manifest.clone())),
+            MountSpec::mock(&silent_manifest, silent_manifest.context_ceiling),
+        )
+        .unwrap()
+        .arch_id;
+    let t = recette_task(
+        &mut k,
+        vec![StepKind::Judge { arch_id: silent }, StepKind::Approve],
+    );
+    let err = k.run_task_step(&machine(2), &t.id).unwrap_err();
+    assert!(matches!(err, KernelError::Gate(_)), "{err}");
+    assert!(
+        err.to_string().contains("returned no verdict to attach"),
+        "{err}"
+    );
+    let row = k.task(&machine(3), &t.id).unwrap().unwrap();
+    assert_eq!(row.status, TaskStatus::Failed);
+    assert!(matches!(row.steps[0].status, StepStatus::Failed(_)));
+    assert!(k
+        .read_register(&machine(4), &t.register)
+        .unwrap()
+        .artefacts
+        .is_empty());
 }

@@ -116,8 +116,16 @@ impl DriverAction {
     /// first failure, in the schema library's own words, so the refusal names
     /// the field. The one place in the workspace that knows the library; the
     /// kernel's `driver_act_begin` calls this and nothing else.
+    ///
+    /// Never panics: a schema that does not compile is a refusal like any
+    /// other (`jsonschema::validate` would `expect` on it — under the kernel
+    /// lock). `DriverManifest::validate` compiles every schema at mount, so
+    /// this arm is for a row that reached the table some other way.
     pub fn validate_args(&self, args: &Value) -> Result<(), String> {
-        jsonschema::validate(&self.args, args).map_err(|e| e.to_string())
+        jsonschema::validator_for(&self.args)
+            .map_err(|e| format!("schema does not compile: {e}"))?
+            .validate(args)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -193,6 +201,16 @@ impl DriverManifest {
             if a.args.get("type").and_then(Value::as_str) != Some("object") {
                 return invalid(format!(
                     "action `{}`: args must be a JSON Schema object with \"type\": \"object\"",
+                    a.name
+                ));
+            }
+            // Compiled here, at mount, so a schema the library will not take
+            // (`"type": "strnig"`) is refused with its remedy and never reaches
+            // `validate_args` under the kernel lock.
+            if let Err(e) = jsonschema::validator_for(&a.args) {
+                return invalid(format!(
+                    "action `{}`: args schema does not compile ({e}); \
+                     correct it in the manifest before mounting",
                     a.name
                 ));
             }
@@ -285,6 +303,12 @@ pub struct DriverMounted {
     pub driver_id: String,
     pub name: String,
     pub manifest_hash: String,
+    /// SHA-256 (`sha256:` + hex) of the profile directory's **path** as the
+    /// kernel composes it (`<state_dir>/drivers/<name>/profile`), not of its
+    /// contents (Ruling R11): a browser profile changes on every run and a
+    /// populated one is hundreds of MB with locked files, so a content hash
+    /// would be meaningless and could fail the remount a degraded driver's
+    /// remedy asks for. It says which profile this mount drove.
     pub profile_dir_hash: String,
     pub governed: bool,
     pub by: String,
@@ -306,6 +330,10 @@ pub struct DriverActed {
     pub duration_ms: u64,
     pub evidence: Vec<String>,
     pub evidence_bytes: u64,
+    /// Remote endpoints seen in established TCP connections of the driver's
+    /// processes while the action ran — the whole tree under the Job on
+    /// Windows, the leader only when ungoverned; copied from the host's
+    /// outcome (Ruling R8).
     pub hosts_seen: Vec<String>,
 }
 
@@ -354,6 +382,18 @@ mod tests {
             .validate_args(&serde_json::json!({"case": "x", "extra": 1}))
             .is_err());
         assert!(a.validate_args(&serde_json::json!({})).is_err());
+        // A schema the library will not compile is a refusal, never a panic.
+        let broken = DriverAction {
+            args: serde_json::json!({
+                "type": "object",
+                "properties": { "case": { "type": "strnig" } }
+            }),
+            ..a.clone()
+        };
+        let e = broken
+            .validate_args(&serde_json::json!({"case": "x"}))
+            .unwrap_err();
+        assert!(e.contains("does not compile"), "{e}");
     }
     #[test]
     fn host_with_scheme_or_path_is_refused() {
@@ -405,6 +445,15 @@ mod tests {
         refuse(
             &|m| m.actions[0].args = serde_json::json!({"type":"string"}),
             "args",
+        );
+        refuse(
+            &|m| {
+                m.actions[0].args = serde_json::json!({
+                    "type": "object",
+                    "properties": { "case": { "type": "strnig" } }
+                })
+            },
+            "does not compile",
         );
         refuse(
             &|m| m.actions[0].evidence = vec![".hidden".into()],

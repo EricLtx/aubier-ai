@@ -30,6 +30,7 @@
       "minimum": 0
     },
     "hosts_seen": {
+      "description": "Remote endpoints seen in established TCP connections of the driver's\nprocesses while the action ran — the whole tree under the Job on\nWindows, the leader only when ungoverned; copied from the host's\noutcome (Ruling R8).",
       "type": "array",
       "items": {
         "type": "string"

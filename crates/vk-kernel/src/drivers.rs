@@ -24,13 +24,13 @@ use crate::{store_failed, RealKernel};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use vk_contracts::driver::{
-    hash_dir, DriverActed, DriverAction, DriverManifest, DriverMounted, DriverUnmounted,
+    DriverActed, DriverAction, DriverManifest, DriverMounted, DriverUnmounted,
 };
-use vk_contracts::hash_canonical;
 use vk_contracts::labels::Origin;
 use vk_contracts::principal::Principal;
 use vk_contracts::register::{Evidence, Register};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
+use vk_contracts::{hash_bytes, hash_canonical};
 use vk_driver::{ActOutcome, EvidenceCaps, HostError};
 
 /// The metadata table of mounted drivers, keyed by the manifest's `name`.
@@ -114,8 +114,11 @@ pub struct DriverActPlan {
 
 /// The reason string the daemon hands [`RealKernel::driver_act_settle`] for a
 /// host failure, from the host's own error. One mapping, here, so the ledger's
-/// `reason` and the degrade rule read the same words: `timeout`, `dead: …`,
-/// `protocol: …`, `stopped`, `hello timeout`, `evidence …`.
+/// `reason` reads the same words everywhere: `timeout`, `dead: …`,
+/// `protocol: …`, `stopped`, `hello timeout: …`, `evidence …`. A failure the
+/// host has no variant for — the pool could not start the program — is the
+/// daemon's own text (`driver would not start: …`); the settle treats every
+/// `Err` alike (Ruling R12), so the words are for the reader, not for a rule.
 pub fn host_error_reason(e: &HostError) -> String {
     match e {
         HostError::Timeout => "timeout".into(),
@@ -129,15 +132,6 @@ pub fn host_error_reason(e: &HostError) -> String {
         }
         HostError::EvidenceNotDeclared(name) => format!("evidence not declared: {name}"),
     }
-}
-
-/// Does a host failure with this reason degrade the driver? A timeout, a dead
-/// process or a protocol breach means the process behind the driver can no
-/// longer be trusted to answer the next request; a STOP or a refused evidence
-/// file says nothing about the process.
-fn degrades(reason: &str) -> bool {
-    let head = reason.split(':').next().unwrap_or("").trim();
-    matches!(head, "timeout" | "dead" | "protocol")
 }
 
 impl RealKernel {
@@ -178,8 +172,13 @@ impl RealKernel {
     /// the row comes back and nothing is logged. Over a `Degraded` row it is a
     /// real mount — that is the remedy the degrade refusal names — and the
     /// cadence clock is kept, because the site's rate limit did not reset when
-    /// this node's process died. A different manifest under the same name is
-    /// refused with its remedy: unmount first.
+    /// this node's process died; an act left in flight on the dead process is
+    /// forgotten with it. A different manifest under the same name is refused
+    /// with its remedy: unmount first.
+    ///
+    /// `profile_dir_hash` on the event is the hash of the profile directory's
+    /// *path*, not of its contents (Ruling R11): a browser profile changes on
+    /// every run and a populated one is hundreds of MB with locked files.
     pub fn mount_driver(
         &mut self,
         ctx: &Ctx,
@@ -217,7 +216,10 @@ impl RealKernel {
         for dir in [&dirs.profile, &dirs.work, &dirs.evidence] {
             vk_store::paths::private_dir(dir).map_err(store_failed)?;
         }
-        let profile_dir_hash = hash_dir(&dirs.profile).map_err(store_failed)?;
+        let profile_dir_hash = hash_bytes(dirs.profile.to_string_lossy().as_bytes());
+        // A fresh row starts with nothing in flight: whatever the previous
+        // process was doing died with it.
+        self.in_flight.remove(&name);
         let row = DriverRow {
             manifest,
             driver_id: driver_id.clone(),
@@ -247,9 +249,12 @@ impl RealKernel {
     }
 
     /// Drop a driver's row and log `driver.unmounted{reason}`. `None` for a
-    /// name that is not mounted, with nothing logged. The directories stay:
-    /// the profile is a browser session an operator may want back on the next
-    /// mount, and the evidence files are already blobs.
+    /// name that is not mounted, with nothing logged. An act still in flight
+    /// goes with the row (review round 1, finding 4): the daemon drops the
+    /// host at unmount, so a settle that never comes must not hold the name
+    /// busy for ever. The directories stay: the profile is a browser session
+    /// an operator may want back on the next mount, and the evidence files
+    /// are already blobs.
     pub fn unmount_driver(
         &mut self,
         name: &str,
@@ -258,6 +263,7 @@ impl RealKernel {
         let Some(row) = self.driver(name)? else {
             return Ok(None);
         };
+        self.in_flight.remove(name);
         self.log(
             "driver.unmounted",
             crate::now_ms(),
@@ -461,12 +467,15 @@ impl RealKernel {
     /// register's evidence when the action says `to_register`; `driver.acted`
     /// is logged with hashes only; the row's `last_act_ms` moves; the harness
     /// gets `result` and never the evidence bytes. On `Err(reason)` — the
-    /// daemon's [`host_error_reason`] — `driver.acted{ok:false, reason}` is
-    /// logged, the driver is degraded for a timeout, a dead process or a
-    /// protocol breach, the row's clock moves all the same, and the harness
-    /// gets `Gate(reason)`. A token that no longer resolves — the run settled
-    /// while the act was out — gets its I1 refusal back, after
-    /// `driver.acted{ok:false}` has said the action happened.
+    /// daemon's [`host_error_reason`], or its own words for a process that
+    /// would not start — `driver.acted{ok:false, reason}` is logged, **the
+    /// driver is degraded whatever the reason** (Ruling R12: a process that
+    /// would not start, printed no hello, timed out, died or broke protocol is
+    /// not one to send the next request to; only the kernel's own evidence
+    /// refusals above leave it `Ready`), the row's clock moves all the same,
+    /// and the harness gets `Gate(reason)`. A token that no longer resolves —
+    /// the run settled while the act was out — gets its I1 refusal back,
+    /// after `driver.acted{ok:false}` has said the action happened.
     ///
     /// The acted event comes after the attachments because it names their
     /// hashes — the order `harness_settle` keeps between collection and its
@@ -506,13 +515,12 @@ impl RealKernel {
                         ..base
                     },
                 )?;
-                if degrades(&reason) {
-                    // A driver unmounted while its act was in flight has no
-                    // row to degrade, and that is not an error of this settle.
-                    match self.degrade_driver(&plan.name, &reason) {
-                        Ok(()) | Err(KernelError::NotFound(_)) => {}
-                        Err(e) => return Err(e),
-                    }
+                // Every host failure degrades (Ruling R12). A driver unmounted
+                // while its act was in flight has no row to degrade, and that
+                // is not an error of this settle.
+                match self.degrade_driver(&plan.name, &reason) {
+                    Ok(()) | Err(KernelError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
                 }
                 self.touch_driver(&plan.name, now_ms)?;
                 return Err(KernelError::Gate(reason));
@@ -693,26 +701,39 @@ impl RealKernel {
 mod tests {
     use super::*;
 
+    /// The ledger's words for each host failure: short, stable, and never
+    /// carrying anything but the host's own message.
     #[test]
-    fn only_a_timeout_a_death_or_a_protocol_breach_degrades() {
-        assert!(degrades(&host_error_reason(&HostError::Timeout)));
-        assert!(degrades(&host_error_reason(&HostError::Dead(
-            "code 1".into()
-        ))));
-        assert!(degrades(&host_error_reason(&HostError::Protocol(
-            "no reply".into()
-        ))));
-        assert!(!degrades(&host_error_reason(&HostError::Stopped)));
-        assert!(!degrades(&host_error_reason(
-            &HostError::EvidenceNotDeclared("x.png".into())
-        )));
-        assert!(!degrades(&host_error_reason(
-            &HostError::EvidenceTooLarge {
+    fn host_error_reasons_are_short_stable_words() {
+        assert_eq!(host_error_reason(&HostError::Timeout), "timeout");
+        assert_eq!(host_error_reason(&HostError::Stopped), "stopped");
+        assert_eq!(
+            host_error_reason(&HostError::Dead("code 1".into())),
+            "dead: code 1"
+        );
+        assert_eq!(
+            host_error_reason(&HostError::Protocol("no reply".into())),
+            "protocol: no reply"
+        );
+        assert!(
+            host_error_reason(&HostError::HelloTimeout(std::time::Duration::from_secs(3)))
+                .starts_with("hello timeout: ")
+        );
+        assert_eq!(
+            host_error_reason(&HostError::EvidenceNotDeclared("x.png".into())),
+            "evidence not declared: x.png"
+        );
+        assert_eq!(
+            host_error_reason(&HostError::EvidenceEscape("x.png".into())),
+            "evidence escape: x.png"
+        );
+        assert_eq!(
+            host_error_reason(&HostError::EvidenceTooLarge {
                 name: "x".into(),
                 len: 2,
                 cap: 1
-            }
-        )));
-        assert!(!degrades("dialog"));
+            }),
+            "evidence too large: x is 2 bytes, above 1"
+        );
     }
 }
