@@ -17,6 +17,5 @@
       "kind": "teleport",
       "arch_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
-  ],
-  "_why": "unknown_kind: a step kind the kernel does not know"
+  ]
 }

@@ -12,6 +12,5 @@
     "Procédure : sept étapes, grille N0–N9, barème §7 de PROCEDURE.md (résumé joint).",
     "Cas : voir drivers/maskai-recette/cases.json ; identifiants par niveau dans l'instruction de chaque pas."
   ],
-  "steps": "plan, release, release",
-  "_why": "two_releases: two release steps in a steps value that is not even a list"
+  "steps": "plan, release, release"
 }

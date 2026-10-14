@@ -21,6 +21,5 @@
     "max_scope": "business",
     "third_party_allowed": true
   },
-  "governed": false,
-  "_why": "no_actions: the actions list is absent"
+  "governed": false
 }

@@ -19,6 +19,7 @@ pub enum DriverKind {
 
 /// The process the host spawns for this driver.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DriverProgram {
     /// `python-playwright` for the pilot; informative, part of the identity.
     pub runtime: String,
@@ -32,6 +33,7 @@ pub struct DriverProgram {
 
 /// One action the driver implements, and the shape of what it may return.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DriverAction {
     pub name: String,
     pub reversible: bool,
@@ -45,7 +47,10 @@ pub struct DriverAction {
     pub to_register: bool,
 }
 
+/// Unknown fields are refused at parse time: a stray `token` or a typo such as
+/// `to_registre` must fail loudly, not be dropped before `validate` can see it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DriverManifest {
     pub name: String,
     pub kind: DriverKind,
@@ -214,9 +219,12 @@ impl DriverManifest {
 /// `sha256:<hex>` over a driver's directory, so a changed file is a new driver.
 ///
 /// Every regular file under `dir` is listed by its path relative to `dir` with
-/// forward slashes; any path whose first component is `__pycache__`, `tests` or
-/// `fixture` is skipped; the list is sorted by path; `path\0bytes\0` is fed to
-/// SHA-256 for each entry. Directory order and build debris do not change it.
+/// forward slashes; any path with a component equal to `__pycache__`, `.venv`,
+/// `tests` or `fixture`, at any depth, is skipped, and so is any top-level file
+/// named `manifest*.json` (the manifest carries this very hash, so it cannot be
+/// part of it); the list is sorted by path; `path\0bytes\0` is fed to SHA-256
+/// for each entry. Directory order, build debris and per-machine directories do
+/// not change it.
 pub fn hash_dir(dir: &Path) -> std::io::Result<String> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
@@ -228,16 +236,21 @@ pub fn hash_dir(dir: &Path) -> std::io::Result<String> {
                 .components()
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect();
-            if matches!(
-                rel.first().map(String::as_str),
-                Some("__pycache__" | "tests" | "fixture")
-            ) {
+            if rel
+                .iter()
+                .any(|c| matches!(c.as_str(), "__pycache__" | ".venv" | "tests" | "fixture"))
+            {
                 continue;
             }
             let kind = entry.file_type()?;
             if kind.is_dir() {
                 walk(root, &path, out)?;
             } else if kind.is_file() {
+                let top_manifest =
+                    rel.len() == 1 && rel[0].starts_with("manifest") && rel[0].ends_with(".json");
+                if top_manifest {
+                    continue;
+                }
                 out.push((rel.join("/"), std::fs::read(&path)?));
             }
         }
@@ -398,6 +411,59 @@ mod tests {
             h1,
             "sha256:".to_string() + &hex::encode(sha2::Sha256::digest(b"a.py\0A\0b.py\0B\0"))
         );
+    }
+    #[test]
+    fn hash_dir_skips_per_machine_dirs_at_any_depth_and_top_level_manifests_only() {
+        let d = tempfile::tempdir().unwrap();
+        let put = |p: &str, b: &[u8]| {
+            let f = d.path().join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b).unwrap();
+        };
+        put("a.py", b"A");
+        put("sub/m.py", b"M");
+        let base = hash_dir(d.path()).unwrap();
+        put("sub/__pycache__/x.pyc", b"junk");
+        put(".venv/lib/x.py", b"venv");
+        put("sub/.venv/y.py", b"venv");
+        put("sub/tests/t.py", b"T");
+        put("manifest.json", b"{}");
+        put("manifest-fixture.json", b"{}");
+        assert_eq!(
+            base,
+            hash_dir(d.path()).unwrap(),
+            "debris and manifests are not identity"
+        );
+        put("sub/manifest.json", b"{}");
+        assert_ne!(
+            base,
+            hash_dir(d.path()).unwrap(),
+            "a nested manifest.json is a driver file"
+        );
+    }
+    #[test]
+    fn a_stray_key_or_a_typo_is_refused_at_parse_time() {
+        let mut v = serde_json::to_value(manifest()).unwrap();
+        v["program"]["token"] = serde_json::json!("abc");
+        let e = serde_json::from_value::<DriverManifest>(v)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("token"), "{e}");
+        let mut v = serde_json::to_value(manifest()).unwrap();
+        v["api_key"] = serde_json::json!("abc");
+        assert!(serde_json::from_value::<DriverManifest>(v).is_err());
+        let mut v = serde_json::to_value(manifest()).unwrap();
+        v["actions"][0]["to_registre"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<DriverManifest>(v).is_err());
+    }
+    #[test]
+    fn the_invalid_secret_in_program_example_is_refused_for_its_token() {
+        let e = serde_json::from_str::<DriverManifest>(include_str!(
+            "../../../contracts/examples/driver_manifest/invalid/secret_in_program.json"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("token"), "{e}");
     }
     #[test]
     fn hash_dir_walks_subdirectories_with_forward_slashes() {

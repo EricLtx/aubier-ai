@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum RecipeStep {
     Plan {
         arch_id: String,
@@ -38,6 +38,7 @@ pub enum RecipeStep {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TaskRecipe {
     pub goal: String,
     pub artefact_kind: String,
@@ -157,6 +158,17 @@ mod tests {
             },
             "twice",
         );
+    }
+    #[test]
+    fn a_typo_in_a_recipe_or_a_step_is_refused() {
+        assert!(serde_json::from_str::<TaskRecipe>(
+            r#"{"goal":"g","artefact_kind":"r.md","steps":[],"contraints":[]}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<RecipeStep>(
+            r#"{"kind":"harness","name":"h","driver":["x"]}"#
+        )
+        .is_err());
     }
     #[test]
     fn harness_options_default_when_absent() {

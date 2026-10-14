@@ -215,6 +215,5 @@
     "max_scope": "business",
     "third_party_allowed": true
   },
-  "governed": false,
-  "_why": "host_with_scheme: hosts must be an array of bare host names; a URL string is refused"
+  "governed": false
 }

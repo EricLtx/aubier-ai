@@ -47,6 +47,5 @@
     "max_scope": "business",
     "third_party_allowed": true
   },
-  "governed": false,
-  "_why": "duplicate_action: actions must be a list; two entries sharing a name do not make an object keyed by name"
+  "governed": false
 }
