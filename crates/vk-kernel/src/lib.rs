@@ -6,7 +6,7 @@ pub mod presence;
 pub mod tasks;
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vk_contracts::arch::{ArchManifest, Capability};
@@ -482,13 +482,19 @@ pub struct RealKernel {
     /// The token itself is never stored, logged or put in a payload; the
     /// ledger and every principal carry the lease id.
     harness_tokens: BTreeMap<String, HarnessTokenState>,
-    /// The drivers with a `driver.act` in flight right now, by name (pilot
-    /// spec §4.3). Set by `driver_act_begin` under the lock, cleared first
-    /// thing by `driver_act_settle` whatever the outcome: one action per
-    /// driver at a time, because the process behind it answers one request
-    /// at a time. In memory only — no driver process outlives the daemon
-    /// that holds its stdio, so nothing is in flight after a restart.
-    in_flight: HashSet<String>,
+    /// The drivers with a `driver.act` in flight right now, by name, each
+    /// with the id of the act that holds it (pilot spec §4.3; review round
+    /// 2). Set by `driver_act_begin` under the lock; cleared by the settle
+    /// that presents the same id — the settle of an act begun before an
+    /// unmount and remount is stale and touches nothing — and by unmount:
+    /// one action per driver at a time, because the process behind it
+    /// answers one request at a time. In memory only — no driver process
+    /// outlives the daemon that holds its stdio, so nothing is in flight
+    /// after a restart.
+    in_flight: HashMap<String, u64>,
+    /// The last act id handed out; `driver_act_begin` takes the next. In
+    /// memory only, like the flags it identifies.
+    act_counter: u64,
     /// The approval challenges this kernel has minted and no approval has
     /// spent yet, keyed by nonce (SP1b Task 5, invariant I1). In memory only:
     /// a challenge is a moment's thing, bound to a task that is waiting *now*,
@@ -761,7 +767,8 @@ impl RealKernel {
             infer_log: vec![],
             counter: 0,
             harness_tokens: BTreeMap::new(),
-            in_flight: HashSet::new(),
+            in_flight: HashMap::new(),
+            act_counter: 0,
             approval_challenges: BTreeMap::new(),
             usage_step: None,
         };

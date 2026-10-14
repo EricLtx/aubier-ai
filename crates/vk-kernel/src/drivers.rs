@@ -110,6 +110,11 @@ pub struct DriverActPlan {
     pub caps: EvidenceCaps,
     pub dirs: DriverDirs,
     pub begun_ms: u64,
+    /// The act's identity inside this process: what `in_flight` holds for the
+    /// driver while the act runs, and what the settle must present to touch
+    /// the row (review round 2). The settle of a plan begun before an unmount
+    /// and remount goes into the record and nowhere else.
+    pub act_id: u64,
 }
 
 /// The reason string the daemon hands [`RealKernel::driver_act_settle`] for a
@@ -117,8 +122,12 @@ pub struct DriverActPlan {
 /// `reason` reads the same words everywhere: `timeout`, `dead: …`,
 /// `protocol: …`, `stopped`, `hello timeout: …`, `evidence …`. A failure the
 /// host has no variant for — the pool could not start the program — is the
-/// daemon's own text (`driver would not start: …`); the settle treats every
-/// `Err` alike (Ruling R12), so the words are for the reader, not for a rule.
+/// daemon's own text (`driver would not start: …`). The settle degrades the
+/// driver on every one of them but the three that start with `evidence`
+/// (Ruling R12): those are read back after the action, with the tree alive
+/// and in step, and `evidence too large: <name> …` is the one the settle
+/// remembers as the run's `oversize`, so the prefix and the name's place in
+/// it are load-bearing.
 pub fn host_error_reason(e: &HostError) -> String {
     match e {
         HostError::Timeout => "timeout".into(),
@@ -217,9 +226,6 @@ impl RealKernel {
             vk_store::paths::private_dir(dir).map_err(store_failed)?;
         }
         let profile_dir_hash = hash_bytes(dirs.profile.to_string_lossy().as_bytes());
-        // A fresh row starts with nothing in flight: whatever the previous
-        // process was doing died with it.
-        self.in_flight.remove(&name);
         let row = DriverRow {
             manifest,
             driver_id: driver_id.clone(),
@@ -245,6 +251,11 @@ impl RealKernel {
             .db
             .put_json(DRIVERS, &name, &row)
             .map_err(store_failed)?;
+        // A fresh row starts with nothing in flight: whatever the previous
+        // process was doing died with it, and its settle, if one still comes,
+        // presents an act id this row never held. After the row is written, so
+        // a mount that failed leaves the live act guarded.
+        self.in_flight.remove(&name);
         Ok(row)
     }
 
@@ -252,9 +263,11 @@ impl RealKernel {
     /// name that is not mounted, with nothing logged. An act still in flight
     /// goes with the row (review round 1, finding 4): the daemon drops the
     /// host at unmount, so a settle that never comes must not hold the name
-    /// busy for ever. The directories stay: the profile is a browser session
-    /// an operator may want back on the next mount, and the evidence files
-    /// are already blobs.
+    /// busy for ever — and one that does come presents an act id nothing
+    /// holds any more, and is stale. The flag goes once the row is gone, so
+    /// an unmount that failed leaves the live act guarded (round 1, minor 3).
+    /// The directories stay: the profile is a browser session an operator may
+    /// want back on the next mount, and the evidence files are already blobs.
     pub fn unmount_driver(
         &mut self,
         name: &str,
@@ -263,7 +276,6 @@ impl RealKernel {
         let Some(row) = self.driver(name)? else {
             return Ok(None);
         };
-        self.in_flight.remove(name);
         self.log(
             "driver.unmounted",
             crate::now_ms(),
@@ -273,6 +285,7 @@ impl RealKernel {
             },
         )?;
         self.store.db.delete(DRIVERS, name).map_err(store_failed)?;
+        self.in_flight.remove(name);
         Ok(Some(row))
     }
 
@@ -428,12 +441,14 @@ impl RealKernel {
         // One action per driver at a time: the process behind it answers one
         // request at a time, and a second one would wait on the first's
         // deadline with nothing to show for it.
-        if self.in_flight.contains(name) {
+        if self.in_flight.contains_key(name) {
             return Err(KernelError::Gate(format!(
                 "driver {name} has an action in flight; wait for it to settle"
             )));
         }
-        self.in_flight.insert(name.to_string());
+        self.act_counter += 1;
+        let act_id = self.act_counter;
+        self.in_flight.insert(name.to_string(), act_id);
         if let Some(state) = self.harness_tokens.get_mut(&key) {
             state.actions += 1;
         }
@@ -452,14 +467,21 @@ impl RealKernel {
             },
             dirs: self.driver_dirs(name),
             begun_ms: now_ms,
+            act_id,
         })
     }
 
     /// Phase two of `driver.act`, under the kernel lock, once the daemon has
     /// the host's answer.
     ///
-    /// **The driver is free again first**, whatever follows: `in_flight` is
-    /// cleared before anything can fail. Then, on `Ok(outcome)`: each evidence
+    /// **The settle is matched to its act first**: the plan's `act_id` must be
+    /// the one `in_flight` holds for the driver, or this is the settle of an
+    /// act begun before an unmount and remount, arriving up to `max_action_ms`
+    /// later (review round 2). A stale settle still logs `driver.acted` — the
+    /// site was acted on — and then returns `Gate("stale act: …")` without
+    /// touching the new row, its clock, its state, or the flag the live act
+    /// holds. A live settle frees the driver before anything can fail.
+    /// Then, on `Ok(outcome)`: each evidence
     /// file becomes an artefact under its own name, at the register's label
     /// plus `Origin::ThirdPartyInbound`, counted against the run's 16 MiB
     /// (Ruling 21.6; a breach is refused and remembered on the token, so the
@@ -468,14 +490,18 @@ impl RealKernel {
     /// is logged with hashes only; the row's `last_act_ms` moves; the harness
     /// gets `result` and never the evidence bytes. On `Err(reason)` — the
     /// daemon's [`host_error_reason`], or its own words for a process that
-    /// would not start — `driver.acted{ok:false, reason}` is logged, **the
-    /// driver is degraded whatever the reason** (Ruling R12: a process that
-    /// would not start, printed no hello, timed out, died or broke protocol is
-    /// not one to send the next request to; only the kernel's own evidence
-    /// refusals above leave it `Ready`), the row's clock moves all the same,
-    /// and the harness gets `Gate(reason)`. A token that no longer resolves —
-    /// the run settled while the act was out — gets its I1 refusal back,
-    /// after `driver.acted{ok:false}` has said the action happened.
+    /// would not start — `driver.acted{ok:false, reason}` is logged and the
+    /// row's clock moves. Then Ruling R12: the driver is degraded **unless the
+    /// reason is one of the host's evidence refusals** (`evidence …`) — an
+    /// escaping, oversize or undeclared file is read back *after* the action,
+    /// with the tree alive and in step, where a process that would not start,
+    /// printed no hello, timed out, died or broke protocol is not one to send
+    /// the next request to. The host's too-large refusal is remembered on the
+    /// token as `oversize`, exactly as the door below does, so the run fails
+    /// naming the file (Ruling 21.6). The harness gets `Gate(reason)`. A
+    /// token that no longer resolves — the run settled while the act was out
+    /// — gets its I1 refusal back, after `driver.acted{ok:false}` has said
+    /// the action happened.
     ///
     /// The acted event comes after the attachments because it names their
     /// hashes — the order `harness_settle` keeps between collection and its
@@ -487,7 +513,10 @@ impl RealKernel {
         plan: &DriverActPlan,
         outcome: Result<ActOutcome, String>,
     ) -> Result<serde_json::Value, KernelError> {
-        self.in_flight.remove(&plan.name);
+        let live = self.in_flight.get(&plan.name) == Some(&plan.act_id);
+        if live {
+            self.in_flight.remove(&plan.name);
+        }
         let key = RealKernel::harness_token_key(token);
         let base = DriverActed {
             task_id: plan.task_id.clone(),
@@ -504,6 +533,31 @@ impl RealKernel {
             hosts_seen: vec![],
         };
 
+        if !live {
+            // The act this settle closes was begun before the driver was
+            // unmounted and mounted again. The site was acted on, so the record
+            // says so — with the host's reason, or with the staleness when
+            // there was an outcome nothing is left to receive — and nothing
+            // else moves: the row, its clock, its state and the flag belong to
+            // the act that is live now.
+            let stale = "stale act: the driver was remounted since";
+            let record = match &outcome {
+                Ok(o) => DriverActed {
+                    result_hash: hash_canonical(&o.result),
+                    reason: Some(stale.into()),
+                    duration_ms: o.duration_ms,
+                    hosts_seen: o.hosts_seen.clone(),
+                    ..base
+                },
+                Err(reason) => DriverActed {
+                    reason: Some(reason.clone()),
+                    ..base
+                },
+            };
+            self.log("driver.acted", now_ms, &record)?;
+            return Err(KernelError::Gate(stale.into()));
+        }
+
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(reason) => {
@@ -515,12 +569,28 @@ impl RealKernel {
                         ..base
                     },
                 )?;
-                // Every host failure degrades (Ruling R12). A driver unmounted
-                // while its act was in flight has no row to degrade, and that
-                // is not an error of this settle.
-                match self.degrade_driver(&plan.name, &reason) {
-                    Ok(()) | Err(KernelError::NotFound(_)) => {}
-                    Err(e) => return Err(e),
+                if let Some(rest) = reason.strip_prefix("evidence") {
+                    // The host read the files back after the action, with the
+                    // tree alive and in step: nothing to degrade (Ruling R12).
+                    // Its too-large refusal is the door's, remembered the same
+                    // way, so the run fails naming the file (Ruling 21.6).
+                    let too_large = rest
+                        .strip_prefix(" too large: ")
+                        .and_then(|r| r.split(" is ").next())
+                        .filter(|name| !name.is_empty());
+                    if let Some(file) = too_large {
+                        if let Some(state) = self.harness_tokens.get_mut(&key) {
+                            state.oversize.get_or_insert(file.to_string());
+                        }
+                    }
+                } else {
+                    // Every other host failure degrades (Ruling R12). A driver
+                    // unmounted while its act was in flight has no row to
+                    // degrade, and that is not an error of this settle.
+                    match self.degrade_driver(&plan.name, &reason) {
+                        Ok(()) | Err(KernelError::NotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    }
                 }
                 self.touch_driver(&plan.name, now_ms)?;
                 return Err(KernelError::Gate(reason));
