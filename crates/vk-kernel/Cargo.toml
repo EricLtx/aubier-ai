@@ -14,6 +14,12 @@ vk-store = { path = "../vk-store" }
 # runs this way only — `vk-harness` depends on `vk-contracts`, never back on the
 # kernel — so the kernel can call it while `vk-harness` stays a leaf.
 vk-harness = { path = "../vk-harness" }
+# The driver host's *types* only — `ActOutcome`, `EvidenceCaps`, `HostError` —
+# for the two halves of `driver.act` (pilot spec §4.3). The kernel never
+# spawns a driver: the daemon owns the processes and hands the kernel what
+# came back. `vk-driver` depends on `vk-contracts` and `vk-harness`, never on
+# the kernel, so it stays a leaf like `vk-harness`.
+vk-driver = { path = "../vk-driver" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

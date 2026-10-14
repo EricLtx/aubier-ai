@@ -111,6 +111,16 @@ fn secret_key(v: &Value) -> Option<String> {
     }
 }
 
+impl DriverAction {
+    /// Hold `args` to this action's JSON Schema (pilot spec §4.3, item 3): the
+    /// first failure, in the schema library's own words, so the refusal names
+    /// the field. The one place in the workspace that knows the library; the
+    /// kernel's `driver_act_begin` calls this and nothing else.
+    pub fn validate_args(&self, args: &Value) -> Result<(), String> {
+        jsonschema::validate(&self.args, args).map_err(|e| e.to_string())
+    }
+}
+
 impl DriverManifest {
     /// `sha256:<hex>` of the canonical manifest with `governed` forced to false,
     /// so what the host observed does not change who the driver is. Formed like
@@ -329,6 +339,21 @@ mod tests {
         );
         assert!(m.driver_id().starts_with("sha256:"));
         assert_eq!(m.driver_id().len(), 7 + 64, "one prefix, not two");
+    }
+    #[test]
+    fn args_are_held_to_the_actions_schema() {
+        let m = manifest();
+        let a = m.action("joindre_document").unwrap();
+        a.validate_args(&serde_json::json!({"case": "N1-1"}))
+            .unwrap();
+        let e = a
+            .validate_args(&serde_json::json!({"case": 3}))
+            .unwrap_err();
+        assert!(e.contains("string"), "the refusal names the type: {e}");
+        assert!(a
+            .validate_args(&serde_json::json!({"case": "x", "extra": 1}))
+            .is_err());
+        assert!(a.validate_args(&serde_json::json!({})).is_err());
     }
     #[test]
     fn host_with_scheme_or_path_is_refused() {

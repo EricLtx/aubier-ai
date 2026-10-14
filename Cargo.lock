@@ -3840,6 +3840,7 @@ dependencies = [
  "url",
  "uuid",
  "vk-contracts",
+ "vk-driver",
  "vk-harness",
  "vk-store",
  "zeroize",

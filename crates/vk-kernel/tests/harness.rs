@@ -111,6 +111,10 @@ fn harness_connections_events(k: &RealKernel) -> usize {
 fn harness_task(k: &mut RealKernel, with_approve: bool) -> vk_kernel::tasks::Task {
     let mut steps = vec![StepKind::Harness {
         name: "claude-code".into(),
+        drivers: vec![],
+        instruction: None,
+        max_actions: None,
+        timeout_s: None,
     }];
     if with_approve {
         steps.push(StepKind::Approve);
@@ -120,6 +124,8 @@ fn harness_task(k: &mut RealKernel, with_approve: bool) -> vk_kernel::tasks::Tas
         "Draft a proposal for Acme",
         "proposal",
         Label::bottom(),
+        &[],
+        &[],
         steps,
     )
     .unwrap()
@@ -562,8 +568,14 @@ fn a_task_with_a_bad_artefact_type_is_refused_at_creation() {
             "x",
             "bad kind!",
             Label::bottom(),
+            &[],
+            &[],
             vec![StepKind::Harness {
                 name: "claude-code".into(),
+                drivers: vec![],
+                instruction: None,
+                max_actions: None,
+                timeout_s: None,
             }],
         )
         .unwrap_err();

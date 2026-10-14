@@ -151,6 +151,8 @@ fn waiting_task_with(kernel: &Shared, name: &str, tail: Vec<StepKind>) -> (Strin
             "Draft a proposal for Acme",
             "proposal",
             Label::bottom(),
+            &[],
+            &[],
             steps,
         )
         .unwrap()
@@ -797,6 +799,8 @@ async fn without_a_passkey_or_a_waiting_task_no_challenge_is_minted() {
             "later",
             "note",
             Label::bottom(),
+            &[],
+            &[],
             vec![StepKind::Draft { arch_id: arch }, StepKind::Approve],
         )
         .unwrap()
@@ -817,6 +821,8 @@ async fn without_a_passkey_or_a_waiting_task_no_challenge_is_minted() {
                 "show {{subject}} <b>bold</b>",
                 "note",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Draft { arch_id: arch }, StepKind::Approve],
             )
             .unwrap()

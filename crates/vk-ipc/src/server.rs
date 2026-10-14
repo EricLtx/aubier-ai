@@ -1234,7 +1234,7 @@ fn dispatch(
             let artefact_type = p["artefact_type"].as_str().unwrap_or("note");
             let steps: Vec<StepKind> = serde_json::from_value(p["steps"].clone())
                 .map_err(|e| bad(&format!("steps: {e}")))?;
-            k.create_task(&ctx, goal, artefact_type, Label::bottom(), steps)
+            k.create_task(&ctx, goal, artefact_type, Label::bottom(), &[], &[], steps)
                 .map_err(kerr)
                 .and_then(to_value)
         }

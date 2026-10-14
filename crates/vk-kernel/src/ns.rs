@@ -1,6 +1,7 @@
 //! The namespace (SP1 design §7): everything the kernel manages has a path, so
 //! a shell, the CLI and a future `vk cat` all name the same objects the same
 //! way. Resolution is read-only and never mutates the kernel.
+use crate::drivers::DriverRow;
 use crate::tasks::Task;
 use crate::RealKernel;
 use vk_contracts::arch::ArchManifest;
@@ -50,6 +51,11 @@ pub enum Entry {
     Device {
         id: String,
     },
+    /// One mounted driver (pilot spec §4): the row as stored — manifest,
+    /// identity, root, state — so `vk driver show` can say why a degraded
+    /// one is degraded. Beside `Device`, which stays the enrolled *human*
+    /// devices: a driver is a peripheral, not a person.
+    Driver(Box<DriverRow>),
     LedgerTail {
         events: Vec<LedgerEvent>,
     },
@@ -67,6 +73,7 @@ pub fn resolve(k: &RealKernel, ctx: &Ctx, path: &str) -> Result<Entry, KernelErr
                 "tasks".into(),
                 "artefacts".into(),
                 "devices".into(),
+                "drivers".into(),
                 "ledger".into(),
             ],
         }),
@@ -131,6 +138,19 @@ pub fn resolve(k: &RealKernel, ctx: &Ctx, path: &str) -> Result<Entry, KernelErr
             .get_json::<serde_json::Value>("devices", id)
             .map_err(crate::store_failed)?
             .map(|_| Entry::Device { id: (*id).into() })
+            .ok_or_else(|| KernelError::NotFound(path.into())),
+        // The mounted drivers, by name; a store that cannot list them fails
+        // the read (Ruling 43), as for the devices.
+        ["drivers"] => Ok(Entry::Dir {
+            entries: k
+                .drivers()?
+                .into_iter()
+                .map(|row| row.manifest.name)
+                .collect(),
+        }),
+        ["drivers", name] => k
+            .driver(name)?
+            .map(|row| Entry::Driver(Box::new(row)))
             .ok_or_else(|| KernelError::NotFound(path.into())),
         ["ledger"] => Ok(Entry::LedgerTail {
             events: k.store().ledger.tail(LEDGER_TAIL),

@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use vk_contracts::arch::Capability;
-use vk_contracts::labels::Label;
+use vk_contracts::labels::{Label, Origin};
 use vk_contracts::locks::Lease;
 use vk_contracts::principal::{ApprovalKind, Principal};
-use vk_contracts::register::{Register, RegisterId};
+use vk_contracts::register::{Evidence, Register, RegisterId};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
 use vk_contracts::testing::KernelTestHooks;
 
@@ -33,6 +33,10 @@ pub const HARNESS_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// The most a harness run may attach in total (Ruling 21.6).
 pub const HARNESS_MAX_RUN_BYTES: u64 = 16 * 1024 * 1024;
 
+/// How many `driver.act` calls one harness run may begin when its step says
+/// nothing (pilot spec §5.2: a level of the recette is at most this many).
+pub const DEFAULT_MAX_ACTIONS: u32 = 200;
+
 /// The egress sample interval recorded in `harness.connections`; matches
 /// `vk_harness::launch::SAMPLE_EVERY`.
 const HARNESS_SAMPLE_EVERY_MS: u64 = 500;
@@ -43,12 +47,43 @@ const HARNESS_SAMPLE_EVERY_MS: u64 = 500;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum StepKind {
-    Plan { arch_id: String },
-    Draft { arch_id: String },
-    Judge { arch_id: String },
-    Harness { name: String },
+    Plan {
+        arch_id: String,
+    },
+    Draft {
+        arch_id: String,
+    },
+    Judge {
+        arch_id: String,
+    },
+    /// A confined harness run (SP1b Task 4), with what a recipe may add to it
+    /// (pilot spec §5.1). Every addition defaults, so a step written before
+    /// recipes existed — `{"kind":"harness","name":"claude-code"}` — reads back
+    /// exactly as it was. Serde-identical to `vk_contracts::recipe::RecipeStep`,
+    /// pinned by `recipe_steps_deserialize_as_step_kinds`.
+    Harness {
+        name: String,
+        /// The drivers this step may `driver.act` on, by mounted name. A
+        /// driver not listed here is refused by name (spec §4.3, item 2).
+        #[serde(default)]
+        drivers: Vec<String>,
+        /// The prompt the harness is launched with; [`HARNESS_PROMPT`] when
+        /// absent.
+        #[serde(default)]
+        instruction: Option<String>,
+        /// How many `driver.act` calls this run may begin;
+        /// [`DEFAULT_MAX_ACTIONS`] when absent (spec §4.3, item 5).
+        #[serde(default)]
+        max_actions: Option<u32>,
+        /// The run's own time budget, in seconds; the daemon takes the smaller
+        /// of this and its own.
+        #[serde(default)]
+        timeout_s: Option<u64>,
+    },
     Approve,
-    Release { to_dir: String },
+    Release {
+        to_dir: String,
+    },
 }
 
 impl StepKind {
@@ -171,6 +206,10 @@ pub struct HarnessLaunch {
     /// How many artefacts the register held before the run, so settle can tell
     /// what the harness attached explicitly over MCP (Ruling 21.6).
     pub artefacts_before: usize,
+    /// The step's own time budget, in seconds, when the recipe gave one
+    /// (pilot spec §5.1). The daemon runs for the smaller of this and its own
+    /// `--timeout`; `None` leaves the daemon's alone.
+    pub timeout_s: Option<u64>,
 }
 
 /// By hand, not derived: a derived `Debug` would print the token into any
@@ -187,6 +226,7 @@ impl std::fmt::Debug for HarnessLaunch {
             .field("name", &self.name)
             .field("step_index", &self.step_index)
             .field("artefacts_before", &self.artefacts_before)
+            .field("timeout_s", &self.timeout_s)
             .finish()
     }
 }
@@ -341,12 +381,26 @@ pub struct TopView {
 }
 
 impl RealKernel {
+    /// Create a task over a fresh register and its steps.
+    ///
+    /// `constraints` and `evidence` are what a recipe gives the first arch to
+    /// read (pilot spec §5.2, step 1: the rules of conduct and the case list):
+    /// written into the register at creation, as the owner's own words
+    /// (`Origin::OwnerAuthored`), before any step runs. Both empty is the
+    /// pre-recipe task, and writes nothing extra.
+    ///
+    /// Eight parameters, one more than clippy likes: the signature is the
+    /// plan's interface (Task 2), and a struct for two slices would be a type
+    /// for one call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_task(
         &mut self,
         ctx: &Ctx,
         goal: &str,
         artefact_type: &str,
         label: Label,
+        constraints: &[String],
+        evidence: &[String],
         steps: Vec<StepKind>,
     ) -> Result<Task, KernelError> {
         // The artefact type becomes a file name (`<hash>.<kind>` on release,
@@ -359,7 +413,17 @@ impl RealKernel {
         // payload tier keys every artefact under `task:{register.task_id}`, so
         // a `Task` carrying a different id would name a subject no blob, and no
         // shred, has ever heard of.
-        let id = self.read_register(ctx, &register)?.task_id;
+        let mut reg = self.read_register(ctx, &register)?;
+        let id = reg.task_id.clone();
+        if !constraints.is_empty() || !evidence.is_empty() {
+            reg.constraints.extend(constraints.iter().cloned());
+            reg.evidence.extend(evidence.iter().map(|content| Evidence {
+                content: content.clone(),
+                origin: Origin::OwnerAuthored,
+                source_hash: vk_contracts::hash_canonical(content),
+            }));
+            self.write_register(ctx, reg)?;
+        }
         let task = Task {
             id,
             register,
@@ -382,7 +446,7 @@ impl RealKernel {
         Ok(task)
     }
 
-    fn save_task(&mut self, t: &Task) -> Result<(), KernelError> {
+    pub(crate) fn save_task(&mut self, t: &Task) -> Result<(), KernelError> {
         self.store
             .db
             .put_json("tasks", &t.id, t)
@@ -391,7 +455,7 @@ impl RealKernel {
 
     /// The row as stored, with no question asked about who is looking. Every
     /// read that leaves the kernel goes through `task`, which asks it.
-    fn task_row(&self, id: &str) -> Result<Option<Task>, KernelError> {
+    pub(crate) fn task_row(&self, id: &str) -> Result<Option<Task>, KernelError> {
         self.store.db.get_json("tasks", id).map_err(store_failed)
     }
 
@@ -797,16 +861,35 @@ impl RealKernel {
             StepKind::Draft { arch_id } => {
                 let o = self.infer(ctx, arch_id, Capability::Generate, register)?;
                 let reg = self.read_register(ctx, register)?;
-                let drafted = reg.decisions.last().cloned().ok_or_else(|| {
-                    KernelError::Gate(format!(
-                        "arch {arch_id} returned nothing to attach as the task's {artefact_type}"
-                    ))
-                })?;
+                // `arch::raise` always pushes `draft: <text>`, so a completion
+                // of nothing is a decision of nothing but its role prefix — and
+                // that is not an artefact. The step fails here, by name, rather
+                // than leaving an approve step waiting on a blank (pilot plan,
+                // Review Focus 5).
+                let drafted = reg
+                    .decisions
+                    .last()
+                    .filter(|d| !d.trim_start_matches("draft:").trim().is_empty())
+                    .cloned()
+                    .ok_or_else(|| {
+                        KernelError::Gate(format!(
+                            "arch {arch_id} returned nothing to attach as the task's {artefact_type}"
+                        ))
+                    })?;
                 self.attach_artefact(ctx, register, artefact_type, drafted.as_bytes())?;
                 Ok((StepStatus::Done, o.tokens_in))
             }
+            // The judge raises an open question, not a decision; the recette
+            // recipe puts a human approval right after it (pilot spec §5.2,
+            // step 12), and an approval signs the register's latest artefact.
+            // So the verdict is attached as one, `verdict.md`, and that is what
+            // the founder signs — never a driver's last evidence file.
             StepKind::Judge { arch_id } => {
                 let o = self.infer(ctx, arch_id, Capability::Judge, register)?;
+                let reg = self.read_register(ctx, register)?;
+                if let Some(verdict) = reg.open_questions.last() {
+                    self.attach_artefact(ctx, register, "verdict.md", verdict.as_bytes())?;
+                }
                 Ok((StepStatus::Done, o.tokens_in))
             }
             // Never reached through `run_task_step`, which refuses a harness step
@@ -953,8 +1036,19 @@ impl RealKernel {
                 "task {task_id} has no steps left to run"
             )));
         };
-        let step_name = match &t.steps[i].kind {
-            StepKind::Harness { name } => name.clone(),
+        let (step_name, drivers, instruction, timeout_s) = match &t.steps[i].kind {
+            StepKind::Harness {
+                name,
+                drivers,
+                instruction,
+                timeout_s,
+                ..
+            } => (
+                name.clone(),
+                drivers.clone(),
+                instruction.clone(),
+                *timeout_s,
+            ),
             other => {
                 return Err(KernelError::Gate(format!(
                     "the next step of task {task_id} is not a harness step: {other:?}"
@@ -978,7 +1072,7 @@ impl RealKernel {
         // workspace cannot be materialised nothing ran: the lease is released and
         // the token forgotten before returning.
         let lease = self.harness_lease(ctx, task_id, timeout_ms + HARNESS_SETTLE_SLACK_MS)?;
-        let token = self.mint_harness_token(&lease.id, task_id);
+        let token = self.mint_harness_token(&lease.id, task_id, i, drivers);
         let hctx = Ctx {
             principal: Principal::Machine {
                 node_id: self.node_id.clone(),
@@ -1013,10 +1107,13 @@ impl RealKernel {
             config_dir: self.harness_config_dir(task_id),
             lease_id: lease.id,
             token,
-            prompt: HARNESS_PROMPT.into(),
+            // The recipe's instruction for this level, or the fixed drafting
+            // prompt when the step gave none (pilot spec §5.1).
+            prompt: instruction.unwrap_or_else(|| HARNESS_PROMPT.into()),
             name: step_name,
             step_index: i,
             artefacts_before,
+            timeout_s,
         })
     }
 
@@ -1498,6 +1595,8 @@ mod tests {
                 "Draft a proposal for Acme",
                 "proposal",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![
                     StepKind::Plan {
                         arch_id: arch.clone(),
@@ -1550,6 +1649,8 @@ mod tests {
                 "Draft a proposal for Acme",
                 "proposal",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![
                     StepKind::Draft { arch_id: arch },
                     StepKind::Release {
@@ -1605,6 +1706,8 @@ mod tests {
                 "Draft a proposal for Acme",
                 "proposal",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![
                     StepKind::Plan {
                         arch_id: arch.clone(),
@@ -1683,6 +1786,8 @@ mod tests {
                     data_class: DataClass::Own,
                     origins: Default::default(),
                 },
+                &[],
+                &[],
                 vec![StepKind::Plan { arch_id: arch }],
             )
             .unwrap();
@@ -1716,6 +1821,8 @@ mod tests {
                 "Draft a proposal for Acme",
                 "proposal",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Draft { arch_id: arch }, StepKind::Approve],
             )
             .unwrap();
@@ -1750,6 +1857,8 @@ mod tests {
                 "x",
                 "note",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Plan { arch_id: arch }],
             )
             .unwrap();
@@ -1771,6 +1880,8 @@ mod tests {
                 "draft a proposal",
                 "note",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Plan { arch_id: arch }],
             )
             .unwrap();
@@ -1783,6 +1894,8 @@ mod tests {
                 "x",
                 "note",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Plan {
                     arch_id: "arch-nope".into(),
                 }],
@@ -1816,6 +1929,8 @@ mod tests {
                 "x",
                 "proposal",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Release {
                     to_dir: "out".into(),
                 }],
@@ -1852,6 +1967,8 @@ mod tests {
                     "x",
                     "proposal",
                     Label::bottom(),
+                    &[],
+                    &[],
                     vec![StepKind::Release {
                         to_dir: bad.clone(),
                     }],
@@ -1885,6 +2002,8 @@ mod tests {
                 "x",
                 "proposal",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Release {
                     to_dir: "out".into(),
                 }],
@@ -1930,6 +2049,8 @@ mod tests {
                     "x",
                     "note",
                     Label::bottom(),
+                    &[],
+                    &[],
                     vec![StepKind::Plan {
                         arch_id: "arch-nope".into(),
                     }],
@@ -1953,6 +2074,8 @@ mod tests {
                     "x",
                     "note",
                     Label::bottom(),
+                    &[],
+                    &[],
                     vec![StepKind::Plan { arch_id: arch }],
                 )
                 .unwrap();
@@ -2012,6 +2135,8 @@ mod tests {
                     "draft a proposal",
                     "note",
                     Label::bottom(),
+                    &[],
+                    &[],
                     vec![StepKind::Plan {
                         arch_id: arch.clone(),
                     }],
@@ -2108,6 +2233,8 @@ mod tests {
                 "the confidential goal",
                 "note",
                 above,
+                &[],
+                &[],
                 vec![StepKind::Plan {
                     arch_id: arch.clone(),
                 }],
@@ -2119,6 +2246,8 @@ mod tests {
                 "a public goal",
                 "note",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Plan { arch_id: arch }],
             )
             .unwrap();
@@ -2203,6 +2332,8 @@ mod tests {
                 "x",
                 "proposal",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Release {
                     to_dir: "out/deep".into(),
                 }],
@@ -2245,6 +2376,8 @@ mod tests {
                     "Draft a proposal for Acme",
                     "proposal",
                     Label::bottom(),
+                    &[],
+                    &[],
                     vec![
                         StepKind::Plan {
                             arch_id: arch.clone(),
