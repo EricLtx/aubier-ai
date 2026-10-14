@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DriverActed",
+  "description": "Ledger payload of `driver.acted`: one action, by hashes only — what was asked\nand what came back live in the evidence, never on the ledger.",
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string"
+    },
+    "args_hash": {
+      "type": "string"
+    },
+    "driver_id": {
+      "type": "string"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "hosts_seen": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result_hash": {
+      "type": "string"
+    },
+    "step_index": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "task_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "task_id",
+    "step_index",
+    "driver_id",
+    "action",
+    "args_hash",
+    "result_hash",
+    "ok",
+    "duration_ms",
+    "evidence",
+    "evidence_bytes",
+    "hosts_seen"
+  ]
+}

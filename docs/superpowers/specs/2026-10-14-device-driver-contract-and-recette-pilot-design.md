@@ -1,6 +1,6 @@
 # Device driver contract and the MaskAI recette pilot — Design
 
-**Status:** approved section by section in brainstorming (2026-10-14, remote-control session), pending founder review of this document
+**Status:** approved section by section in brainstorming (2026-10-14, remote-control session), pending founder review of this document; refined by the plan of 2026-10-14: the word is *driver* (`/devices` already names enrolled human devices) and the recette needs eleven business actions.
 **Date:** 2026-10-14
 **Scope:** the kernel's first supervised device — a browser behind a driver, reachable only by syscall — and the first task that uses it: the Aubier recette of a chat AI (MaskAI), run as a governed process of the kernel from plan to release. One implementation plan follows this spec.
 **Inputs:** founder decisions of 2026-10-14 (below); `docs/use-cases/recettage-chat-ia/PROCEDURE.md` (the recette: seven steps, grid N0–N9, six NFRs, journal format); the concept-1 spikes of 2026-10-05 (`.superpowers/spikes/2026-10-05-pilotes/report.md` and `report-D.md`, private); the system design `2026-09-22-verticalai-design.md` (§3.3 governed processes, §3.7 arch manifests, invariant I2, Rulings 10, 19, 22, 28); the harness fence as built (`crates/vk-harness/src/launch.rs`).

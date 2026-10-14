@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DriverUnmounted",
+  "description": "Ledger payload of `driver.unmounted`.",
+  "type": "object",
+  "properties": {
+    "driver_id": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "driver_id",
+    "reason"
+  ]
+}

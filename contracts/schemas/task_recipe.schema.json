@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskRecipe",
+  "type": "object",
+  "properties": {
+    "artefact_kind": {
+      "type": "string"
+    },
+    "constraints": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "goal": {
+      "type": "string"
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RecipeStep"
+      }
+    }
+  },
+  "required": [
+    "goal",
+    "artefact_kind",
+    "steps"
+  ],
+  "$defs": {
+    "RecipeStep": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "arch_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "plan"
+            }
+          },
+          "required": [
+            "kind",
+            "arch_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arch_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "draft"
+            }
+          },
+          "required": [
+            "kind",
+            "arch_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arch_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "judge"
+            }
+          },
+          "required": [
+            "kind",
+            "arch_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "drivers": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "instruction": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "kind": {
+              "type": "string",
+              "const": "harness"
+            },
+            "max_actions": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "default": null,
+              "minimum": 0
+            },
+            "name": {
+              "type": "string"
+            },
+            "timeout_s": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "default": null,
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "approve"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "release"
+            },
+            "to_dir": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "to_dir"
+          ]
+        }
+      ]
+    }
+  }
+}

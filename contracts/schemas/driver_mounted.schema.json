@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DriverMounted",
+  "description": "Ledger payload of `driver.mounted`: the identity and what the host read back.",
+  "type": "object",
+  "properties": {
+    "by": {
+      "type": "string"
+    },
+    "driver_id": {
+      "type": "string"
+    },
+    "governed": {
+      "type": "boolean"
+    },
+    "manifest_hash": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "profile_dir_hash": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "driver_id",
+    "name",
+    "manifest_hash",
+    "profile_dir_hash",
+    "governed",
+    "by"
+  ]
+}

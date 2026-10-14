@@ -1,0 +1,22 @@
+{
+  "goal": "Recette fonctionnelle et benchmark de MaskAI (app.maskai.fr), version courante, selon PROCEDURE.md: niveaux N0 à N9, six ENF, verdicts par oracles, rapport public expurgé.",
+  "artefact_kind": "report.md",
+  "constraints": [
+    "Données fictives uniquement (corpus/ et corpus-v2/).",
+    "Pas de création de compte, pas de mot de passe, pas d'achat, pas de message au nom de l'utilisateur.",
+    "Ne rien supprimer qui existait avant ; lister ce qui a été créé.",
+    "Un défaut de sécurité est signalé tout de suite ; le rapport reste privé tant qu'il n'est pas corrigé.",
+    "Version publique : aucune adresse interne, aucun compte, aucune donnée personnelle réelle."
+  ],
+  "evidence": [
+    "Procédure : sept étapes, grille N0–N9, barème §7 de PROCEDURE.md (résumé joint).",
+    "Cas : voir drivers/maskai-recette/cases.json ; identifiants par niveau dans l'instruction de chaque pas."
+  ],
+  "steps": [
+    {
+      "kind": "teleport",
+      "arch_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "_why": "unknown_kind: a step kind the kernel does not know"
+}

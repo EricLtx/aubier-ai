@@ -1,0 +1,59 @@
+{
+  "goal": "Recette fonctionnelle et benchmark de MaskAI (app.maskai.fr), version courante, selon PROCEDURE.md: niveaux N0 à N9, six ENF, verdicts par oracles, rapport public expurgé.",
+  "artefact_kind": "report.md",
+  "constraints": [
+    "Données fictives uniquement (corpus/ et corpus-v2/).",
+    "Pas de création de compte, pas de mot de passe, pas d'achat, pas de message au nom de l'utilisateur.",
+    "Ne rien supprimer qui existait avant ; lister ce qui a été créé.",
+    "Un défaut de sécurité est signalé tout de suite ; le rapport reste privé tant qu'il n'est pas corrigé.",
+    "Version publique : aucune adresse interne, aucun compte, aucune donnée personnelle réelle."
+  ],
+  "evidence": [
+    "Procédure : sept étapes, grille N0–N9, barème §7 de PROCEDURE.md (résumé joint).",
+    "Cas : voir drivers/maskai-recette/cases.json ; identifiants par niveau dans l'instruction de chaque pas."
+  ],
+  "steps": [
+    {
+      "kind": "plan",
+      "arch_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "kind": "harness",
+      "name": "claude-code",
+      "drivers": [
+        "maskai-1"
+      ],
+      "instruction": "Niveau N0 (socle). Appelle vk_driver_act sur le driver maskai-1 : mesurer_chargement trois fois, puis capture_ecran, puis exporter_journal. Consigne chaque résultat avec vk_log. N'écris aucun fichier.",
+      "max_actions": 60,
+      "timeout_s": 1800
+    },
+    {
+      "kind": "harness",
+      "name": "claude-code",
+      "drivers": [
+        "maskai-1"
+      ],
+      "instruction": "Niveau N1 (conversation). Pour chaque cas de la liste [N1-1, N1-2, N1-3] : nouvelle_conversation ; envoyer_message avec le texte du cas (cases.json) ; verdict_oracle. Termine par exporter_journal.",
+      "max_actions": 80,
+      "timeout_s": 2400
+    },
+    {
+      "kind": "judge",
+      "arch_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "kind": "approve"
+    },
+    {
+      "kind": "draft",
+      "arch_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "kind": "approve"
+    },
+    {
+      "kind": "release",
+      "to_dir": "recettage-chat-ia/runs/2026-10"
+    }
+  ]
+}

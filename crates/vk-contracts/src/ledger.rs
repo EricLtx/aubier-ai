@@ -283,6 +283,12 @@ pub const ALLOWED_KINDS: &[&str] = &[
     // 2026-10-13): who, until when, and the expiry it replaced. The payload is
     // `stop::LivenessRenewed`; a free string on the wire, like the rest.
     "liveness.renewed",
+    // A driver — a peripheral behind a process this kernel starts — was mounted,
+    // acted on behalf of a harness step, or was unmounted (founder decisions
+    // 2026-10-14, driver-contract pilot). `driver.acted` carries hashes only.
+    "driver.mounted",
+    "driver.acted",
+    "driver.unmounted",
     "shred",
 ];
 
