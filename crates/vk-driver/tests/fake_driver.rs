@@ -114,10 +114,15 @@ fn kill_bound() -> Duration {
     }
 }
 
+/// The interpreter the fake drivers run under: `python` on Windows (where
+/// `python3` may be the Store's stub), `python3` elsewhere (PEP 394: a Unix
+/// need not have a `python`, and WSL's Ubuntu has none).
+const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
+
 /// Is a `python` on PATH? When not, say so — the test is then skipped out
 /// loud, never failed and never silently green.
 fn python_available() -> bool {
-    match Command::new("python")
+    match Command::new(PYTHON)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -126,7 +131,7 @@ fn python_available() -> bool {
     {
         Ok(status) if status.success() => true,
         other => {
-            eprintln!("no python on PATH; skipping ({other:?})");
+            eprintln!("no {PYTHON} on PATH; skipping ({other:?})");
             false
         }
     }
@@ -165,7 +170,7 @@ impl Rig {
     /// The argv that runs this rig's script, isolated.
     fn command(&self) -> Vec<String> {
         vec![
-            "python".into(),
+            PYTHON.into(),
             "-I".into(),
             self.script.display().to_string(),
         ]
@@ -483,7 +488,7 @@ fn no_hello_within_the_timeout_is_refused() {
     }
     let rig = Rig::new(FAKE_DRIVER);
     let silent = vec![
-        "python".to_string(),
+        PYTHON.to_string(),
         "-I".to_string(),
         "-c".to_string(),
         "import time; time.sleep(60)".to_string(),

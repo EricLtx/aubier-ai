@@ -56,10 +56,15 @@ for line in sys.stdin:
     elif a == "die": sys.exit(3)
 "#;
 
+/// The interpreter the fake drivers run under: `python` on Windows (where
+/// `python3` may be the Store's stub), `python3` elsewhere (PEP 394: a Unix
+/// need not have a `python`, and WSL's Ubuntu has none).
+const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
+
 /// Is a `python` on PATH? When not, say so — the test is then skipped out
 /// loud, never failed and never silently green.
 fn python_available() -> bool {
-    match Command::new("python")
+    match Command::new(PYTHON)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -68,7 +73,7 @@ fn python_available() -> bool {
     {
         Ok(status) if status.success() => true,
         other => {
-            eprintln!("no python on PATH; skipping ({other:?})");
+            eprintln!("no {PYTHON} on PATH; skipping ({other:?})");
             false
         }
     }
@@ -125,7 +130,8 @@ for line in sys.stdin:
     say({"id": r["id"], "ok": True, "result": {"met": os.path.exists(other)}})
 "#;
 
-/// Is the process with this id still running?
+/// Is the process with this id still running? A zombie is not: it has
+/// exited and only waits for its parent to reap it ([`zombie`]).
 fn process_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
@@ -141,8 +147,35 @@ fn process_alive(pid: u32) -> bool {
     {
         // SAFETY: `kill(pid, 0)` sends no signal; it asks whether the process
         // exists.
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        let exists = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        exists && !zombie(pid)
     }
+}
+
+/// Has `pid` exited, and only waits to be reaped? On Unix a killed driver
+/// whose host is still in the pool stays a zombie until the host reaps it —
+/// at the next act's `ensure` — and `kill(pid, 0)` still finds it; to these
+/// tests it is gone. Linux reads the state from `/proc/<pid>/stat`; where
+/// there is no `/proc` (macOS), `ps` prints it.
+#[cfg(unix)]
+fn zombie(pid: u32) -> bool {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // `pid (comm) state …`: the state follows the last `)`, because the
+        // command name may hold anything, parentheses included.
+        return stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next())
+            .is_some_and(|state| matches!(state, 'Z' | 'X'));
+    }
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim_start()
+                .starts_with('Z')
+        })
+        .unwrap_or(false)
 }
 
 /// Poll `cond` every 50 ms for up to ten seconds.
@@ -174,7 +207,7 @@ fn manifest(files_sha256: &str) -> Value {
         "kind": "browser",
         "program": {
             "runtime": "python",
-            "command": ["python", "-I", "fake_driver.py"],
+            "command": [PYTHON, "-I", "fake_driver.py"],
             "files_sha256": files_sha256,
             "browser_channel": null,
             "headless": true
@@ -1130,7 +1163,7 @@ async fn the_script_is_held_to_root() {
     let absolute = drv.path().join("fake_driver.py").display().to_string();
     for script in ["../fake_driver.py", absolute.as_str()] {
         let mut params = mount_params(drv.path());
-        params["manifest"]["program"]["command"] = json!(["python", "-I", script]);
+        params["manifest"]["program"]["command"] = json!([PYTHON, "-I", script]);
         let proof = node.proof().await;
         let err = node
             .c
