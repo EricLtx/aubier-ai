@@ -2002,6 +2002,184 @@ fn task_submit_with_steps_posts_the_recipe() {
     assert_eq!(sh.json(&["driver", "ls", "--json"]), serde_json::json!([]));
 }
 
+/// The `kind` object of every step of a created task, in order.
+fn step_kinds(created: &Value) -> Vec<&Value> {
+    created["steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no steps in {created}"))
+        .iter()
+        .map(|s| &s["kind"])
+        .collect()
+}
+
+/// Ruling R21: a recipe names its arches by manifest name, because an arch id
+/// is a content hash that differs per machine and per Claude version and a
+/// committed recipe cannot carry one. `vk task submit --steps` resolves every
+/// `arch_id` that is not a `sha256:` id through `arch.ls`, and refuses a name
+/// no mounted arch carries — before anything is posted, pointing at the
+/// listing that has the names.
+#[test]
+fn task_submit_with_steps_resolves_arches_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let recipes = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+
+    let write = |name: &str, arch_name: &str| {
+        let file = recipes.path().join(name);
+        std::fs::write(
+            &file,
+            serde_json::json!({
+                "goal": "Run the recette",
+                "artefact_kind": "report",
+                "steps": [
+                    {"kind": "plan", "arch_id": arch_name},
+                    {"kind": "approve"},
+                    {"kind": "release", "to_dir": "runs"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        path_of(&file)
+    };
+
+    // By name: the task carries the id the name resolved to.
+    let created = sh.json(&[
+        "task",
+        "submit",
+        "--steps",
+        &write("named.json", "m1"),
+        "--json",
+    ]);
+    let kinds = step_kinds(&created);
+    assert_eq!(kinds[0]["arch_id"], arch.as_str(), "{created}");
+    let task = str_of(&created, "id").to_string();
+    let waiting = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(waiting["status"], "waiting_human", "{waiting}");
+
+    // An id is posted as written, mounted or not: the kernel judges it.
+    let created = sh.json(&[
+        "task",
+        "submit",
+        "--steps",
+        &write("by-id.json", &arch),
+        "--json",
+    ]);
+    assert_eq!(
+        step_kinds(&created)[0]["arch_id"],
+        arch.as_str(),
+        "{created}"
+    );
+
+    // A name nothing carries is refused here, naming it and the listing.
+    let o = sh.run(&[
+        "task",
+        "submit",
+        "--steps",
+        &write("unknown.json", "no-such-arch"),
+    ]);
+    assert!(!o.status.success(), "an unknown arch name is refused");
+    let why = String::from_utf8_lossy(&o.stderr);
+    assert!(why.contains("no-such-arch"), "{why}");
+    assert!(why.contains("vk ls /arches"), "{why}");
+    let tasks = sh.json(&["ps", "--json"]);
+    assert_eq!(tasks.as_array().map(Vec::len), Some(2), "{tasks}");
+}
+
+/// The two committed recipes (Task 5), exactly as they are in the repository,
+/// against a daemon whose arches are mocks mounted under the names the recipes
+/// use: the sixteen-step MaskAI recette (plan and draft on the claude-code
+/// draft arch's name, judge on the judge arch's) and the eight-step fixture
+/// dry run (the mock by name). Both validate, resolve and are created whole.
+#[test]
+fn the_committed_recipes_submit_by_name_against_mock_arches() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let mount =
+        |name: &str| str_of(&sh.json(&["mount", "mock", name, "--json"]), "arch_id").to_string();
+    let draft = mount("claude-code/claude-sonnet-5");
+    let judge = mount("claude-code/claude-opus-5");
+    let mock = mount("mock");
+
+    let recette = path_of(&repo.join("recipes/recette-maskai.json"));
+    let created = sh.json(&["task", "submit", "--steps", &recette, "--json"]);
+    let kinds = step_kinds(&created);
+    let names: Vec<&str> = kinds.iter().map(|k| str_of(k, "kind")).collect();
+    let mut expected = vec!["plan"];
+    expected.extend(["harness"; 10]);
+    expected.extend(["judge", "approve", "draft", "approve", "release"]);
+    assert_eq!(names, expected, "{created}");
+    assert_eq!(kinds[0]["arch_id"], draft.as_str(), "plan: {created}");
+    assert_eq!(kinds[11]["arch_id"], judge.as_str(), "judge: {created}");
+    assert_eq!(kinds[13]["arch_id"], draft.as_str(), "draft: {created}");
+    assert_eq!(
+        kinds[15]["to_dir"], "recettage-chat-ia/runs/2026-10",
+        "{created}"
+    );
+    for (level, k) in kinds[1..=10].iter().enumerate() {
+        assert_eq!(k["name"], "claude-code", "{k}");
+        assert_eq!(k["drivers"], serde_json::json!(["maskai-1"]), "{k}");
+        let instruction = str_of(k, "instruction");
+        assert!(
+            instruction.starts_with(&format!("Niveau N{level} ")),
+            "step {} is level N{level}: {instruction}",
+            level + 1
+        );
+        assert!(k["max_actions"].as_u64().is_some(), "{k}");
+        assert!(k["timeout_s"].as_u64().is_some(), "{k}");
+    }
+    assert_eq!(created["artefact_type"], "report.md", "{created}");
+    assert!(
+        str_of(&created, "goal").contains("https://app.maskai.fr/new"),
+        "the entry URL is in the goal: {created}"
+    );
+
+    let fixture = path_of(&repo.join("recipes/recette-fixture.json"));
+    let created = sh.json(&["task", "submit", "--steps", &fixture, "--json"]);
+    let kinds = step_kinds(&created);
+    let names: Vec<&str> = kinds.iter().map(|k| str_of(k, "kind")).collect();
+    assert_eq!(
+        names,
+        ["plan", "harness", "harness", "judge", "approve", "draft", "approve", "release"],
+        "{created}"
+    );
+    for i in [0, 3, 5] {
+        assert_eq!(
+            kinds[i]["arch_id"],
+            mock.as_str(),
+            "step {}: {created}",
+            i + 1
+        );
+    }
+    for k in &kinds[1..=2] {
+        assert_eq!(k["drivers"], serde_json::json!(["maskai-fixture"]), "{k}");
+    }
+}
+
 /// The scripted driver of Task 1's brief, verbatim (`crates/vk-driver/tests/
 /// fake_driver.rs`): copied, because one test binary does not import another.
 const FAKE_DRIVER: &str = r#"import json, os, sys, time

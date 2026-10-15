@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use vk_contracts::principal::{Approval, ApprovalKind, Challenge, HumanKey, Principal};
+use vk_contracts::recipe::RecipeStep;
 use vk_ipc::client::Client;
 use vk_ipc::transport::{default_endpoint, Endpoint};
 use vk_ipc::PresenceProof;
@@ -466,7 +467,9 @@ enum TaskCmd {
         release: Option<String>,
         /// A task recipe (JSON: goal, artefact_kind, constraints, evidence,
         /// steps), checked here and posted whole. The recipe is the whole
-        /// task, so no other submit flag may be given beside it.
+        /// task, so no other submit flag may be given beside it. A step's
+        /// `arch_id` is an id (`sha256:…`) or the manifest name of a mounted
+        /// arch (`vk ls /arches`), resolved here to the one arch carrying it.
         #[arg(
             long,
             value_name = "FILE",
@@ -1060,7 +1063,14 @@ async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
         TaskCmd::Submit {
             steps: Some(file), ..
         } => {
-            let recipe = recipe(file)?;
+            let mut recipe = recipe(file)?;
+            // Ruling R21: arches by name. Asked for only when a step needs
+            // it, and resolved before anything is posted.
+            if recipe.steps.iter().any(names_an_arch) {
+                let arches = c.call("arch.ls", json!({}), None).await?;
+                resolve_arch_names(&mut recipe.steps, &arches)
+                    .map_err(|e| anyhow!("{}: {e}", file.display()))?;
+            }
             let created = c
                 .call(
                     "task.create",
@@ -1224,6 +1234,89 @@ fn recipe(file: &Path) -> Result<vk_contracts::recipe::TaskRecipe> {
         .validate()
         .map_err(|e| anyhow!("{}: {e}", file.display()))?;
     Ok(recipe)
+}
+
+/// The arch a plan, draft or judge step runs on, with its role; `None` for
+/// the steps that run on no arch.
+fn step_arch(step: &mut RecipeStep) -> Option<(&'static str, &mut String)> {
+    match step {
+        RecipeStep::Plan { arch_id } => Some(("plan", arch_id)),
+        RecipeStep::Draft { arch_id } => Some(("draft", arch_id)),
+        RecipeStep::Judge { arch_id } => Some(("judge", arch_id)),
+        RecipeStep::Harness { .. } | RecipeStep::Approve | RecipeStep::Release { .. } => None,
+    }
+}
+
+/// Does this step name its arch rather than give its id?
+fn names_an_arch(step: &RecipeStep) -> bool {
+    match step {
+        RecipeStep::Plan { arch_id }
+        | RecipeStep::Draft { arch_id }
+        | RecipeStep::Judge { arch_id } => !arch_id.starts_with("sha256:"),
+        RecipeStep::Harness { .. } | RecipeStep::Approve | RecipeStep::Release { .. } => false,
+    }
+}
+
+/// Ruling R21: a recipe may name an arch by its manifest name, because an
+/// arch id is a content hash that differs per machine and per Claude version,
+/// so a committed recipe cannot carry one. Every `arch_id` that is not a
+/// `sha256:` id is replaced by the id of the one arch `arches` (an `arch.ls`
+/// answer) lists under that name. No arch, or several, is a refusal naming
+/// the step, the name and — for several — every id that carries it, and
+/// pointing at `vk ls /arches`, where the names and ids are. An id is left as
+/// written: whether it is mounted is the kernel's to say when the step runs.
+fn resolve_arch_names(steps: &mut [RecipeStep], arches: &Value) -> Result<()> {
+    let rows = arches
+        .as_array()
+        .ok_or_else(|| anyhow!("arch.ls answered something other than a list: {arches}"))?;
+    for (i, step) in steps.iter_mut().enumerate() {
+        let Some((role, arch)) = step_arch(step) else {
+            continue;
+        };
+        if arch.starts_with("sha256:") {
+            continue;
+        }
+        let carrying: Vec<&Value> = rows
+            .iter()
+            .filter(|a| a["manifest"]["name"].as_str() == Some(arch.as_str()))
+            .collect();
+        match carrying.as_slice() {
+            [one] => {
+                *arch = one["arch_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("arch.ls listed `{arch}` without an id: {one}"))?
+                    .to_string();
+            }
+            [] => {
+                return Err(anyhow!(
+                    "step {} ({role}): no mounted arch is named `{arch}`; mount it, or write \
+                     its id instead (`vk ls /arches` lists the names and ids this node has)",
+                    i + 1
+                ))
+            }
+            many => {
+                let ids = many
+                    .iter()
+                    .map(|a| {
+                        format!(
+                            "{} ({})",
+                            a["arch_id"].as_str().unwrap_or("?"),
+                            a["state"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(anyhow!(
+                    "step {} ({role}): {} mounted arches are named `{arch}`: {ids}; unmount the \
+                     one you do not mean (`vk umount <ID>`) or write its id instead \
+                     (`vk ls /arches` lists them)",
+                    i + 1,
+                    many.len()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `vk mount driver --manifest FILE`'s request: the manifest as written, and
@@ -1838,5 +1931,85 @@ mod detach_tests {
             let ours = unsafe { libc::getpgrp() };
             assert_ne!(pgid, ours, "and it is not this process's group");
         }
+    }
+}
+
+#[cfg(test)]
+mod recipe_tests {
+    use super::{names_an_arch, resolve_arch_names, RecipeStep};
+    use serde_json::json;
+
+    fn listing() -> serde_json::Value {
+        json!([
+            {"arch_id": "sha256:aaa", "manifest": {"name": "claude-code/claude-sonnet-5"}, "state": "ready", "reason": null},
+            {"arch_id": "sha256:bbb", "manifest": {"name": "claude-code/claude-opus-5"}, "state": "ready", "reason": null},
+            {"arch_id": "sha256:c01", "manifest": {"name": "twice"}, "state": "ready", "reason": null},
+            {"arch_id": "sha256:c02", "manifest": {"name": "twice"}, "state": "unavailable", "reason": "gone"}
+        ])
+    }
+
+    fn plan(arch: &str) -> RecipeStep {
+        RecipeStep::Plan {
+            arch_id: arch.into(),
+        }
+    }
+
+    /// Ruling R21: names become the ids `arch.ls` lists under them, ids and
+    /// the steps that run on no arch are left exactly as written.
+    #[test]
+    fn a_name_resolves_to_the_one_arch_carrying_it_and_an_id_is_left_alone() {
+        let mut steps = vec![
+            plan("claude-code/claude-sonnet-5"),
+            RecipeStep::Harness {
+                name: "claude-code".into(),
+                drivers: vec!["maskai-1".into()],
+                instruction: None,
+                max_actions: None,
+                timeout_s: None,
+            },
+            RecipeStep::Judge {
+                arch_id: "claude-code/claude-opus-5".into(),
+            },
+            RecipeStep::Approve,
+            RecipeStep::Draft {
+                arch_id: "sha256:not-mounted".into(),
+            },
+            RecipeStep::Release {
+                to_dir: "runs".into(),
+            },
+        ];
+        assert!(steps.iter().any(names_an_arch));
+        let before = steps.clone();
+        resolve_arch_names(&mut steps, &listing()).unwrap();
+        assert_eq!(steps[0], plan("sha256:aaa"));
+        assert_eq!(
+            steps[2],
+            RecipeStep::Judge {
+                arch_id: "sha256:bbb".into()
+            }
+        );
+        for i in [1, 3, 4, 5] {
+            assert_eq!(steps[i], before[i], "step {i} untouched");
+        }
+        assert!(!steps.iter().any(names_an_arch));
+    }
+
+    #[test]
+    fn no_arch_or_several_under_a_name_is_refused_with_the_listing_named() {
+        let e = resolve_arch_names(&mut [RecipeStep::Approve, plan("nobody")], &listing())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("step 2 (plan)"), "{e}");
+        assert!(e.contains("`nobody`"), "{e}");
+        assert!(e.contains("vk ls /arches"), "{e}");
+
+        let e = resolve_arch_names(&mut [plan("twice")], &listing())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("2 mounted arches are named `twice`"), "{e}");
+        assert!(e.contains("sha256:c01 (ready)"), "{e}");
+        assert!(e.contains("sha256:c02 (unavailable)"), "{e}");
+        assert!(e.contains("vk umount"), "{e}");
+        assert!(e.contains("vk ls /arches"), "{e}");
     }
 }
