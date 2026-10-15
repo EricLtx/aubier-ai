@@ -1,5 +1,6 @@
 //! Arch adapters (spec §3.7) and IR lowering/raising (spec §3.2).
 use std::collections::BTreeSet;
+use std::time::Duration;
 use vk_contracts::arch::ArchManifest;
 use vk_contracts::register::Register;
 
@@ -51,13 +52,20 @@ impl Completion {
 
 /// Why a call to an arch did not produce a completion.
 ///
-/// Two arms, because the kernel owes the caller two different answers. An
-/// adapter that refuses a prompt its context cannot hold is raising the
-/// kernel's own I4′ invariant, and it must reach the client as an invariant
-/// refusal — not as "no such arch", which is what an untyped adapter error
-/// used to be flattened into (SP1b review, Important 2). Everything else is a
-/// failure of the machinery: the engine would not start, the answer would not
-/// parse, the process had to be killed.
+/// The kernel owes the caller a different answer for each arm. An adapter
+/// that refuses a prompt its context cannot hold is raising the kernel's own
+/// I4′ invariant, and it must reach the client as an invariant refusal — not
+/// as "no such arch", which is what an untyped adapter error used to be
+/// flattened into (SP1b review, Important 2). The three provider arms are
+/// what the far end said about the *plan* rather than about this one call
+/// (founder decision 2026-10-15): the kernel keeps them as the arch's health
+/// ([`crate::health::ArchHealth`]) and routes later steps by it. Everything
+/// else is a failure of the machinery: the engine would not start, the answer
+/// would not parse, the process had to be killed.
+///
+/// Every `detail` is what the adapter already scrubbed — the provider's own
+/// words, never a credential — because it is printed by `vk arch show` and
+/// written into a failed step's reason.
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
     /// The prompt does not fit what this arch will actually accept. `needed`
@@ -68,8 +76,40 @@ pub enum AdapterError {
          refusing rather than letting the far end truncate it"
     )]
     I4Prime { needed: u32, ceiling: u32 },
+    /// The provider asked this node to slow down: HTTP 429, or a
+    /// subscription's usage window that is full. `retry_after` is the
+    /// provider's own figure (`Retry-After`) when it gave one; `None` is "it
+    /// did not say", which the kernel reads as its 60-second default and
+    /// never as zero.
+    #[error("the provider is rate-limiting this arch{}", retry_note(.retry_after))]
+    RateLimited { retry_after: Option<Duration> },
+    /// The plan has nothing left to spend: HTTP 402, a credit balance too low,
+    /// a quota used up. Calling again will not help until somebody pays.
+    #[error("the provider's plan for this arch is exhausted: {detail}")]
+    Exhausted { detail: String },
+    /// The provider no longer serves this model: HTTP 404 on the model, "no
+    /// longer available". Calling again will never help.
+    #[error("the provider no longer serves this arch's model: {detail}")]
+    Retired { detail: String },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// `; it asked for 30 s`, or nothing when the provider named no wait.
+fn retry_note(retry_after: &Option<Duration>) -> String {
+    retry_after
+        .map(|d| format!("; it asked for {} s", d.as_secs()))
+        .unwrap_or_default()
+}
+
+/// A `Retry-After` value as a wait: the delta-seconds form only.
+///
+/// The HTTP-date form is not read — neither provider this node talks to over
+/// HTTP sends it, and a date read against a skewed clock is a worse guess than
+/// the kernel's own default. `None` for anything else, which the kernel reads
+/// as "the provider did not say", never as "retry now".
+pub fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 pub trait ArchAdapter: Send + Sync {

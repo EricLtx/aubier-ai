@@ -64,6 +64,15 @@ pub enum KernelError {
     /// needed to wait.
     #[error("arch {0} is starting; retry")]
     ArchStarting(String),
+    /// The arch's provider has asked this node to slow down — an HTTP 429,
+    /// a subscription's usage window that is full — and the wait it named,
+    /// or the kernel's 60-second default when it named none, has not passed
+    /// (founder decision 2026-10-15). **Retryable**, like `ArchStarting` and
+    /// for the same reason: nothing is wrong with the task, so the step that
+    /// met it goes back to `Pending` instead of failing. The text names the
+    /// arch and when to come back.
+    #[error("arch rate-limited: {0}")]
+    ArchRateLimited(String),
     /// A durable write or read failed. A syscall that cannot persist its effect
     /// must fail loudly: a swallowed write is an invariant that survives only
     /// until the next restart.

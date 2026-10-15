@@ -344,6 +344,14 @@ pub struct TopView {
     /// nothing to explain.
     #[serde(default)]
     pub unavailable: BTreeMap<String, String>,
+    /// What each mounted arch's provider last said about its plan —
+    /// `healthy`, `rate_limited`, `exhausted`, `retired` — with since when and
+    /// the provider's words (2026-10-15). Beside `states` rather than folded
+    /// into it: a state says whether the adapter is there, this says whether
+    /// the far end will answer it, and an arch can be `ready` and `exhausted`
+    /// at once.
+    #[serde(default)]
+    pub health: BTreeMap<String, crate::health::ArchHealth>,
     /// What a thousand prompt tokens cost on each mounted arch, in euros, as
     /// its manifest states it — `None` inside the `Some` for an arch whose
     /// price this node does not know (SP1b Task 2b fix round 1). Beside the
@@ -863,7 +871,15 @@ impl RealKernel {
             // `vk task step` runs it (Task 1b review, Important 1). Marking it
             // `Failed` would make a task need a human to re-submit it because
             // a container took four seconds to start.
-            Err(e @ KernelError::ArchStarting(_)) => {
+            //
+            // A rate-limited arch takes the same path, by the same reasoning
+            // (2026-10-15): the provider asked for a wait, not for the task to
+            // be abandoned. There is no step timeout to run out — the step
+            // waits as long as the caller keeps stepping it, and the refusal
+            // says when the next try can go out. An *exhausted* or *retired*
+            // arch is not here: it arrives as `ArchUnavailable`, below, and
+            // fails the step with the remedy in its reason.
+            Err(e @ (KernelError::ArchStarting(_) | KernelError::ArchRateLimited(_))) => {
                 t.steps[i].status = StepStatus::Pending;
                 t.steps[i].started_ms = None;
                 t.status = TaskStatus::Queued;
@@ -1567,6 +1583,9 @@ impl RealKernel {
             v.locality.insert(id.clone(), locality_name(m.locality));
             v.jurisdiction.insert(id.clone(), m.jurisdiction.clone());
             v.states.insert(id.clone(), state.name().into());
+            if let Some(h) = self.arch_health(&id) {
+                v.health.insert(id.clone(), h);
+            }
             if let Some(why) = state.reason() {
                 v.unavailable.insert(id, why.into());
             }

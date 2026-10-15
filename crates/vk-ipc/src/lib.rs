@@ -89,7 +89,8 @@ pub const E_STORE: i32 = -32005;
 /// Nothing is wrong and the call had no effect: something it needs is still
 /// coming up, and sending it again in a moment will work. The only code that
 /// asks a caller to retry — an arch whose adapter is still being built after
-/// a restart (SP1b Task 1b).
+/// a restart (SP1b Task 1b), or one whose provider has rate-limited it and
+/// whose wait has not passed (2026-10-15; the message says until when).
 pub const E_RETRY: i32 = -32006;
 /// JSON-RPC 2.0: method not found.
 pub const E_METHOD: i32 = -32601;

@@ -487,7 +487,8 @@ impl From<KernelError> for WebError {
             KernelError::Gate(_) | KernelError::Stopped(_) => StatusCode::CONFLICT,
             KernelError::Store(_)
             | KernelError::ArchUnavailable(_)
-            | KernelError::ArchStarting(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            | KernelError::ArchStarting(_)
+            | KernelError::ArchRateLimited(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::FORBIDDEN,
         };
         WebError::new(status, e.to_string())

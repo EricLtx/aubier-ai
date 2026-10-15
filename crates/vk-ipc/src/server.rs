@@ -587,7 +587,11 @@ pub(crate) fn kerr(e: KernelError) -> RpcError {
         // code does: wait and send this again. A client that cannot tell it
         // from `E_STORE` has to treat a four-second container start as a
         // failure (Task 1b review, Important 1).
-        KernelError::ArchStarting(_) => E_RETRY,
+        //
+        // A rate-limited arch asks the same of the caller, for longer: the
+        // provider named a wait (or the kernel's 60 s default stands), and
+        // the step that met it is `Pending` again, not failed.
+        KernelError::ArchStarting(_) | KernelError::ArchRateLimited(_) => E_RETRY,
         KernelError::I1(_)
         | KernelError::I2(_)
         | KernelError::I3(_)

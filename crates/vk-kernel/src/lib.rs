@@ -1,6 +1,7 @@
 //! The real single-node kernel (spec §3): the stub's semantics over vk-store.
 pub mod arch;
 pub mod drivers;
+pub mod health;
 pub mod ns;
 pub mod presence;
 pub mod tasks;
@@ -271,7 +272,11 @@ struct InferRecord<'a> {
     /// M2). Two events of one kind rather than two kinds, because they are one
     /// thing — a call — and an auditor reading the chain wants them adjacent
     /// and comparable. A `requested` with no `completed` after it is a call
-    /// that left this kernel and never came back.
+    /// that left this kernel and never came back. `failed` is the third: the
+    /// call came back with the provider refusing it on its plan's account —
+    /// rate-limited, exhausted, retired — and `health_after` says which. A
+    /// failure that says nothing about the provider (an I4′ refusal, a
+    /// process that would not start) writes no `failed` event, as before.
     phase: &'a str,
     /// Prompt tokens: the arch's own count when it reported one, this node's
     /// estimate otherwise. `measured` says which, so the record never leaves a
@@ -285,6 +290,15 @@ struct InferRecord<'a> {
     /// `Completion::details` — the arch's own measurements of the call.
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<&'a serde_json::Value>,
+    /// The arch's health once this call came back — `rate_limited`,
+    /// `exhausted`, `retired`, or `healthy` again — and only when the call
+    /// **changed** it (2026-10-15). A call on a healthy arch that stays
+    /// healthy carries nothing here, so its payload, and the hash the ledger
+    /// keeps of it, are what they were before health existed. A call the
+    /// provider refused on its plan's account is the `failed` phase of this
+    /// same kind, never a kind of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health_after: Option<&'a str>,
 }
 
 /// What a mount did, and what it left the caller holding (Ruling 13).
@@ -327,7 +341,60 @@ pub enum Remount {
 fn adapter_failed(arch_id: &str, e: arch::AdapterError) -> KernelError {
     match e {
         arch::AdapterError::I4Prime { .. } => KernelError::I4Prime(format!("arch {arch_id}: {e}")),
+        // Normally answered by `health_refusal`, from the health this failure
+        // has just recorded. These arms are for the one case it has nothing
+        // to say: a provider that asked for a wait of zero seconds.
+        arch::AdapterError::RateLimited { .. } => {
+            KernelError::ArchRateLimited(format!("arch {arch_id}: {e}; step it again"))
+        }
+        arch::AdapterError::Exhausted { .. } | arch::AdapterError::Retired { .. } => {
+            KernelError::ArchUnavailable(format!("arch {arch_id}: {e}"))
+        }
         arch::AdapterError::Other(e) => KernelError::Store(format!("arch {arch_id} failed: {e}")),
+    }
+}
+
+/// The refusal a call meets on an arch whose provider has said no on its
+/// plan's account — or `None` when the arch may be called (2026-10-15).
+///
+/// Each one names its remedy, because each asks something different of the
+/// person reading it:
+/// - **rate-limited**, inside the wait: retryable (`ArchRateLimited`, which
+///   the scheduler treats like `ArchStarting` — the step goes back to
+///   `Pending`), and the text says how long. Once the wait has passed this
+///   is `None`: the next call goes out, and its answer decides.
+/// - **exhausted**: not retryable — calling again only spends a request on a
+///   refusal. `ArchUnavailable`, which fails the step: pay, then `vk mount`
+///   the arch again, which clears the state; or choose another arch.
+/// - **retired**: the same, and only one of the remedies works — the model is
+///   gone, so the arch must be unmounted and another chosen.
+fn health_refusal(arch_id: &str, h: &health::ArchHealth, now_ms: u64) -> Option<KernelError> {
+    let said = h.last_error.as_deref().unwrap_or("no detail was given");
+    match h.state {
+        health::HealthState::Healthy => None,
+        health::HealthState::RateLimited { until_ms } => {
+            let held = h.held_until_ms()?;
+            if now_ms >= held {
+                return None;
+            }
+            let whose = if until_ms.is_some() {
+                "the provider's own figure"
+            } else {
+                "the kernel's 60 s default; the provider named no wait"
+            };
+            Some(KernelError::ArchRateLimited(format!(
+                "arch {arch_id}: {said}; the step waits — step it again in {} s ({whose})",
+                (held - now_ms).div_ceil(1000)
+            )))
+        }
+        health::HealthState::Exhausted => Some(KernelError::ArchUnavailable(format!(
+            "arch {arch_id} is exhausted: {said} — top up the plan and run `vk mount` for this \
+             arch again, which clears it, or choose another arch"
+        ))),
+        health::HealthState::Retired => Some(KernelError::ArchUnavailable(format!(
+            "arch {arch_id} is retired: {said} — the provider no longer serves this model; \
+             `vk umount {arch_id}` and choose another arch"
+        ))),
     }
 }
 
@@ -513,6 +580,15 @@ pub struct RealKernel {
     /// an inference outside a task leaves it `None` and the row names no
     /// task rather than the last one that happened to run.
     usage_step: Option<(String, usize)>,
+    /// What each mounted arch's provider last said about its plan (founder
+    /// decision 2026-10-15). In memory only, like `harness_tokens`: a
+    /// restart re-makes every adapter, which is a remount, and a remount
+    /// clears health. An arch with no entry is healthy since `opened_ms` or
+    /// since its mount; see [`health`] for the transitions.
+    health: BTreeMap<String, health::ArchHealth>,
+    /// When this kernel was opened — the `since` of an arch that has been
+    /// healthy for as long as this process has known it.
+    opened_ms: u64,
 }
 
 /// One completed call on an arch: which arch, which step of which task, what
@@ -771,6 +847,8 @@ impl RealKernel {
             act_counter: 0,
             approval_challenges: BTreeMap::new(),
             usage_step: None,
+            health: BTreeMap::new(),
+            opened_ms: now_ms(),
         };
         k.load()?;
         Ok(k)
@@ -1609,6 +1687,13 @@ impl RealKernel {
             // describes, and replacing the spec without replacing the adapter
             // would make the next boot build something this one never ran.
             if remount == Remount::Keep && self.mounted_arch_is_ready(&id) {
+                // The one thing a repeat mount does change: it clears what the
+                // provider last said (2026-10-15). It is the remedy an
+                // `exhausted` refusal names — pay, then mount again — and it
+                // writes nothing durable and appends nothing, so the mount
+                // stays idempotent on disk and on the record.
+                self.health
+                    .insert(id.clone(), health::ArchHealth::healthy(now_ms()));
                 return Ok(MountOutcome {
                     arch_id: id,
                     replaced: None,
@@ -1617,6 +1702,8 @@ impl RealKernel {
             }
             self.persist_mount(&id, &m, &spec)?;
             self.budgets.insert(id.clone(), adapter.context_budget());
+            self.health
+                .insert(id.clone(), health::ArchHealth::healthy(now_ms()));
             // The replaced adapter leaves by the return value, never by a
             // dropped temporary: dropping it here would run its `Drop` — a
             // `docker stop` for the Ollama arch — with the kernel mutex held.
@@ -1635,6 +1722,8 @@ impl RealKernel {
         self.starting.remove(&id);
         self.budgets.insert(id.clone(), adapter.context_budget());
         self.adapters.insert(id.clone(), adapter);
+        self.health
+            .insert(id.clone(), health::ArchHealth::healthy(now_ms()));
         self.log("arch.mounted", now_ms(), &id)?;
         Ok(MountOutcome {
             arch_id: id,
@@ -1701,6 +1790,7 @@ impl RealKernel {
         self.unavailable.remove(arch_id);
         self.starting.remove(arch_id);
         self.budgets.remove(arch_id);
+        self.health.remove(arch_id);
         self.log("arch.unmounted", now_ms(), &arch_id)?;
         Ok(removed)
     }
@@ -1761,6 +1851,20 @@ impl RealKernel {
         self.unavailable
             .get(arch_id)
             .map(|u| ArchState::Unavailable(u.reason.clone()))
+    }
+
+    /// What one mounted arch's provider last said about its plan; `None` for
+    /// an id this node has never mounted (2026-10-15). What `arch.show` and
+    /// `top` print beside the state: the state says whether the adapter is
+    /// there, this says whether the provider will answer it.
+    pub fn arch_health(&self, arch_id: &str) -> Option<health::ArchHealth> {
+        self.arch_state(arch_id)?;
+        Some(
+            self.health
+                .get(arch_id)
+                .cloned()
+                .unwrap_or_else(|| health::ArchHealth::healthy(self.opened_ms)),
+        )
     }
 
     pub fn store(&self) -> &Store {
@@ -2467,6 +2571,48 @@ impl RealKernel {
             .map_err(store_failed)
     }
 
+    /// A call the adapter failed: record what it says about the provider,
+    /// and turn it into the refusal the caller is owed (2026-10-15).
+    ///
+    /// A failure that says something about the plan — rate-limited,
+    /// exhausted, retired — becomes the arch's health and is written down as
+    /// the `failed` phase of the `infer` event, beside the `requested` one
+    /// already on the record, so the ledger says why the call never
+    /// completed. Any other failure leaves health and the record as they
+    /// were. A failure to write that event is what the caller gets instead:
+    /// a node that cannot record what happened must say so (Ruling 8).
+    fn call_failed(
+        &mut self,
+        arch_id: &str,
+        reg_id: &RegisterId,
+        estimated: u32,
+        e: arch::AdapterError,
+        observed_ms: u64,
+    ) -> KernelError {
+        let Some(h) = health::ArchHealth::after_error(&e, observed_ms) else {
+            return adapter_failed(arch_id, e);
+        };
+        self.health.insert(arch_id.into(), h.clone());
+        let logged = self.log(
+            "infer",
+            now_ms(),
+            &InferRecord {
+                arch_id,
+                register: &reg_id.0,
+                phase: "failed",
+                tokens_in: estimated,
+                measured: false,
+                cost_list_usd: None,
+                details: None,
+                health_after: Some(h.name()),
+            },
+        );
+        if let Err(store) = logged {
+            return store;
+        }
+        health_refusal(arch_id, &h, observed_ms).unwrap_or_else(|| adapter_failed(arch_id, e))
+    }
+
     /// Accumulate the per-arch counters `vk top` reads back — and, for an arch
     /// that measures its own calls, the only place those measurements outlive
     /// the call until per-call usage rows exist (SP1b rulings 7 and 8).
@@ -2648,6 +2794,17 @@ impl Kernel for RealKernel {
                 })
             }
         };
+        // The same rule for an arch whose provider has already said no on its
+        // plan's account (2026-10-15): refused before the register is read or
+        // anything is appended, so a step that never reached the provider
+        // leaves no `infer` event claiming it did.
+        if let Some(refused) = self
+            .health
+            .get(arch_id)
+            .and_then(|h| health_refusal(arch_id, h, ctx.now_ms))
+        {
+            return Err(refused);
+        }
         let mut reg = self.read_register(ctx, reg_id)?;
         interceptors::i2_flow(&reg.label, adapter.manifest())?;
         let role = match capability {
@@ -2698,16 +2855,30 @@ impl Kernel for RealKernel {
                 measured: false,
                 cost_list_usd: None,
                 details: None,
+                health_after: None,
             },
         )?;
         // Timed here and nowhere else: this is the only span in the kernel
         // that is the arch's own, and it is what the per-call usage row
         // reports as `duration_ms` (ruling 8).
         let called_at = std::time::Instant::now();
-        let completion = adapter
-            .complete(&prompt, budget.min(1024))
-            .map_err(|e| adapter_failed(arch_id, e))?;
+        let called = adapter.complete(&prompt, budget.min(1024));
         let duration_ms = u64::try_from(called_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // When the answer came back, on the caller's clock: what a health
+        // change is stamped with, and what a provider's `Retry-After` counts
+        // from.
+        let observed_ms = ctx.now_ms.saturating_add(duration_ms);
+        let completion = match called {
+            Ok(completion) => completion,
+            Err(e) => return Err(self.call_failed(arch_id, reg_id, estimated, e, observed_ms)),
+        };
+        // A call that came back clears whatever the provider last said; the
+        // record says so only when there was something to clear.
+        let recovered = self.health.get(arch_id).is_some_and(|h| !h.is_healthy());
+        if recovered {
+            self.health
+                .insert(arch_id.into(), health::ArchHealth::healthy(observed_ms));
+        }
         // An arch that counted the prompt itself has the number; the estimate
         // was only ever a stand-in for it (ruling 7).
         let tokens_in = completion.tokens_in_measured.unwrap_or(estimated);
@@ -2730,6 +2901,7 @@ impl Kernel for RealKernel {
                 measured: completion.tokens_in_measured.is_some(),
                 cost_list_usd: completion.cost_list_usd,
                 details: completion.details.as_ref(),
+                health_after: recovered.then_some("healthy"),
             },
         )?;
         self.infer_log.push((arch_id.into(), reg.label.clone()));
@@ -6044,5 +6216,333 @@ mod tests {
         assert!(k.ledger_holds(), "a fresh store holds");
         let report = k.fsck();
         assert!(report.ok, "{report:?}");
+    }
+
+    // ------------------------------------------------- provider health (2026-10-15)
+
+    /// A scripted arch that answers from a queue, one entry per call, and
+    /// counts how often it was really called — so a refusal can be shown to
+    /// have been decided by the kernel, without a request reaching the arch.
+    fn queued(
+        k: &mut RealKernel,
+        name: &str,
+        answers: Vec<Result<arch::Completion, arch::AdapterError>>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let queue = std::sync::Mutex::new(std::collections::VecDeque::from(answers));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let id = scripted(k, name, move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(arch::Completion::text("ok")))
+        });
+        (id, calls)
+    }
+
+    fn called(calls: &std::sync::atomic::AtomicUsize) -> usize {
+        calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The `infer` payload this kernel would write for `phase`, hashed — the
+    /// way an auditor recomputes it. The prompt estimate is the scripted
+    /// adapter's own ruler over the lowered register.
+    fn infer_hash(
+        arch_id: &str,
+        reg: &Register,
+        phase: &str,
+        health_after: Option<&str>,
+    ) -> String {
+        let tokens_in = (arch::lower(reg, "plan").len() / 4) as u32 + 1;
+        hash_canonical(&InferRecord {
+            arch_id,
+            register: &reg.id.0,
+            phase,
+            tokens_in,
+            measured: false,
+            cost_list_usd: None,
+            details: None,
+            health_after,
+        })
+    }
+
+    /// 429 → `rate_limited`, held for the provider's own window: the next step
+    /// inside it is refused by the kernel as retryable, without the provider
+    /// being asked; the first one after it goes out and decides. The record
+    /// carries the change both ways on the `infer` kind it already had — a
+    /// `failed` phase with `health_after`, and `health_after: healthy` on the
+    /// call that cleared it — and nothing on a call that changed nothing.
+    #[test]
+    fn a_rate_limited_arch_is_held_for_its_window_and_the_next_call_decides() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let (id, calls) = queued(
+            &mut k,
+            "limited",
+            vec![Err(arch::AdapterError::RateLimited {
+                retry_after: Some(std::time::Duration::from_secs(30)),
+            })],
+        );
+        let r = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        let fresh = k.read_register(&machine(1), &r).unwrap();
+        assert_eq!(k.arch_health(&id).unwrap().name(), "healthy");
+
+        let before = k.ledger().events().len();
+        let err = k
+            .infer(&machine(1_000), &id, Capability::Plan, &r)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::ArchRateLimited(m)
+                if m.contains("30 s") && m.contains("provider's own figure")),
+            "{err}"
+        );
+        let new = &k.ledger().events()[before..];
+        assert_eq!(
+            new.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+            ["infer", "infer"],
+            "the send, and why it did not complete"
+        );
+        assert_eq!(
+            new[0].payload_hash,
+            infer_hash(&id, &fresh, "requested", None)
+        );
+        assert_eq!(
+            new[1].payload_hash,
+            infer_hash(&id, &fresh, "failed", Some("rate_limited"))
+        );
+        let h = k.arch_health(&id).unwrap();
+        assert_eq!(h.name(), "rate_limited");
+        let held = h.held_until_ms().unwrap();
+        assert!((31_000..31_100).contains(&held), "{held}");
+
+        // Inside the window: refused by the kernel, retryable, nothing sent
+        // and nothing recorded.
+        let quiet = k.ledger().events().len();
+        let err = k
+            .infer(&machine(20_000), &id, Capability::Plan, &r)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::ArchRateLimited(_)), "{err}");
+        assert_eq!(called(&calls), 1, "the provider was not asked again");
+        assert_eq!(k.ledger().events().len(), quiet, "and nothing was written");
+
+        // After it: the call goes out, comes back, and clears the state.
+        k.infer(&machine(32_000), &id, Capability::Plan, &r)
+            .expect("the window has passed");
+        assert_eq!(called(&calls), 2);
+        assert_eq!(k.arch_health(&id).unwrap().name(), "healthy");
+        let completed = k
+            .ledger()
+            .events()
+            .iter()
+            .filter(|e| e.kind == "infer")
+            .nth(3)
+            .unwrap()
+            .payload_hash
+            .clone();
+        assert_eq!(
+            completed,
+            infer_hash(&id, &fresh, "completed", Some("healthy")),
+            "the call that cleared it says so"
+        );
+
+        // And a call that changes nothing carries nothing: its payload is
+        // the one this kernel wrote before health existed.
+        let reg = k.read_register(&machine(32_001), &r).unwrap();
+        k.infer(&machine(32_002), &id, Capability::Plan, &r)
+            .unwrap();
+        let last = k
+            .ledger()
+            .events()
+            .iter()
+            .rfind(|e| e.kind == "infer")
+            .unwrap()
+            .payload_hash
+            .clone();
+        assert_eq!(last, infer_hash(&id, &reg, "completed", None));
+    }
+
+    /// A provider that rate-limits without naming a wait is held for the
+    /// kernel's 60 s, and the refusal says the figure is the kernel's.
+    #[test]
+    fn a_rate_limit_without_a_figure_holds_for_sixty_seconds() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let (id, calls) = queued(
+            &mut k,
+            "silent",
+            vec![Err(arch::AdapterError::RateLimited { retry_after: None })],
+        );
+        let r = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        assert!(k.infer(&machine(1_000), &id, Capability::Plan, &r).is_err());
+        let err = k
+            .infer(&machine(60_000), &id, Capability::Plan, &r)
+            .unwrap_err();
+        assert!(err.to_string().contains("kernel's 60 s default"), "{err}");
+        assert_eq!(called(&calls), 1);
+        k.infer(&machine(61_100), &id, Capability::Plan, &r)
+            .expect("sixty seconds have passed");
+        assert_eq!(called(&calls), 2);
+    }
+
+    /// 402 → `exhausted`: the step fails naming the remedy, and stays refused
+    /// however long it waits — calling again would only spend a request on a
+    /// refusal. A remount, even of the same arch, is the remedy, and clears
+    /// it; it writes nothing and appends nothing doing so.
+    #[test]
+    fn an_exhausted_arch_is_refused_until_it_is_mounted_again() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let (id, calls) = queued(
+            &mut k,
+            "spent",
+            vec![Err(arch::AdapterError::Exhausted {
+                detail: "Your credit balance is too low".into(),
+            })],
+        );
+        let r = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        let err = k.infer(&machine(2), &id, Capability::Plan, &r).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, KernelError::ArchUnavailable(_)), "{err:?}");
+        for needed in ["exhausted", "credit balance", "vk mount", "another arch"] {
+            assert!(text.contains(needed), "the refusal names {needed}: {text}");
+        }
+        let err = k
+            .infer(&machine(86_400_000), &id, Capability::Plan, &r)
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelError::ArchUnavailable(_)),
+            "sticky: {err}"
+        );
+        assert_eq!(called(&calls), 1, "a sticky state is decided here");
+
+        // The remedy: mount it again. Idempotent — the adapter that is there
+        // stays, nothing is appended — and the health is cleared.
+        let events = k.ledger().events().len();
+        let manifest = local_named("spent", personal());
+        let spec = arch::MountSpec::mock(&manifest, manifest.context_ceiling);
+        let again = k
+            .mount(
+                Arc::new(Scripted {
+                    manifest,
+                    answer: Box::new(|| Ok(arch::Completion::text("newcomer"))),
+                }),
+                spec,
+            )
+            .unwrap();
+        assert!(again.already_mounted);
+        assert_eq!(k.ledger().events().len(), events);
+        assert_eq!(k.arch_health(&id).unwrap().name(), "healthy");
+        k.infer(&machine(86_400_001), &id, Capability::Plan, &r)
+            .expect("paid and remounted");
+        assert_eq!(called(&calls), 2, "the arch that was there answered");
+    }
+
+    /// What a `retired` arch does to a running task: the step that meets the
+    /// 404 fails and the task with it, the reason naming the remedy; a step of
+    /// another task on the same arch fails at once, before anything is sent.
+    /// A rate-limited one, by contrast, sends its step back to `Pending`.
+    #[test]
+    fn a_step_on_a_retired_arch_fails_with_its_remedy_and_a_rate_limited_one_waits() {
+        use crate::tasks::{StepKind, StepStatus, TaskStatus};
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let (gone, gone_calls) = queued(
+            &mut k,
+            "gone",
+            vec![Err(arch::AdapterError::Retired {
+                detail: "not_found_error: model: claude-2.1".into(),
+            })],
+        );
+        let (busy, _) = queued(
+            &mut k,
+            "busy",
+            vec![Err(arch::AdapterError::RateLimited {
+                retry_after: Some(std::time::Duration::from_secs(5)),
+            })],
+        );
+        let task = |k: &mut RealKernel, arch_id: &str| {
+            k.create_task(
+                &machine(1),
+                "say something",
+                "note",
+                Label::bottom(),
+                &[],
+                &[],
+                vec![StepKind::Plan {
+                    arch_id: arch_id.into(),
+                }],
+            )
+            .unwrap()
+        };
+
+        let first = task(&mut k, &gone);
+        let err = k.run_task_step(&machine(2), &first.id).unwrap_err();
+        let row = k.task(&machine(3), &first.id).unwrap().unwrap();
+        assert!(matches!(row.status, TaskStatus::Failed), "{:?}", row.status);
+        let StepStatus::Failed(why) = &row.steps[0].status else {
+            panic!("the step failed: {:?}", row.steps[0].status)
+        };
+        assert_eq!(*why, err.to_string());
+        let umount = format!("vk umount {gone}");
+        for needed in ["retired", "claude-2.1", umount.as_str()] {
+            assert!(why.contains(needed), "the reason names {needed}: {why}");
+        }
+
+        let second = task(&mut k, &gone);
+        assert!(k.run_task_step(&machine(4), &second.id).is_err());
+        assert_eq!(called(&gone_calls), 1, "the second step never reached it");
+        let row = k.task(&machine(5), &second.id).unwrap().unwrap();
+        assert!(matches!(row.status, TaskStatus::Failed));
+
+        let waiting = task(&mut k, &busy);
+        let err = k.run_task_step(&machine(6), &waiting.id).unwrap_err();
+        assert!(matches!(err, KernelError::ArchRateLimited(_)), "{err}");
+        let row = k.task(&machine(7), &waiting.id).unwrap().unwrap();
+        assert!(matches!(row.status, TaskStatus::Queued), "{:?}", row.status);
+        assert!(matches!(row.steps[0].status, StepStatus::Pending));
+        let done = k.run_task_step(&machine(6_000), &waiting.id).unwrap();
+        assert!(matches!(done.status, TaskStatus::Done), "{:?}", done.status);
+
+        // `top` carries both, beside the states.
+        let top = k.top(&machine(6_001)).unwrap();
+        assert_eq!(top.health[&gone].name(), "retired");
+        assert_eq!(top.health[&busy].name(), "healthy");
+        assert_eq!(top.states[&gone], "ready", "the adapter is still there");
+    }
+
+    /// Health is about the provider, so a failure that is not the provider's
+    /// — an I4′ refusal, an engine that died — leaves it exactly as it was,
+    /// and an unmount forgets it.
+    #[test]
+    fn only_the_provider_s_refusals_change_health_and_an_unmount_forgets_it() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let (id, _) = queued(
+            &mut k,
+            "flaky",
+            vec![
+                Err(arch::AdapterError::Other(anyhow::anyhow!("engine died"))),
+                Err(arch::AdapterError::I4Prime {
+                    needed: 9,
+                    ceiling: 8,
+                }),
+            ],
+        );
+        let r = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        assert!(k.infer(&machine(2), &id, Capability::Plan, &r).is_err());
+        assert!(k.infer(&machine(3), &id, Capability::Plan, &r).is_err());
+        assert_eq!(k.arch_health(&id).unwrap().name(), "healthy");
+        drop(k.unmount(&id).unwrap());
+        assert_eq!(k.arch_health(&id), None);
     }
 }
