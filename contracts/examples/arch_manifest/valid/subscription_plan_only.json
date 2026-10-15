@@ -1,0 +1,6 @@
+{ "name": "claude-code/sonnet", "capabilities": ["generate"], "locality": "cloud", "jurisdiction": "US", "retention_days": 30,
+  "cost_per_1k_tokens_eur": 0.0, "latency_ms_p50": 10000, "context_ceiling": 200000, "determinism": "non_deterministic",
+  "identity": { "weights_sha256": "model:sonnet", "engine": "claude-code", "engine_version": "2.1.281", "backend": "anthropic-subscription", "quant": "-",
+                "kv_cache": "-", "threads": 0, "batch": 0, "sampling": {}, "seed": null },
+  "clearance": { "max_scope": "business", "third_party_allowed": false }, "governed": false,
+  "quota": { "plan": "subscription" } }

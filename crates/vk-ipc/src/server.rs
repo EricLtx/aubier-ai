@@ -2138,6 +2138,7 @@ fn mock_manifest(name: &str, ctx: u32) -> ArchManifest {
             third_party_allowed: true,
         },
         governed: true,
+        quota: None,
     }
 }
 

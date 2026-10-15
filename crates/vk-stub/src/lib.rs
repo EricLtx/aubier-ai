@@ -490,6 +490,7 @@ mod tests {
             },
             clearance,
             governed: true,
+            quota: None,
         }
     }
     fn machine_ctx(now: u64) -> Ctx {

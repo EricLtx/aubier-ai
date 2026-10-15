@@ -490,6 +490,7 @@ impl AnthropicAdapter {
             // Anthropic's servers are not a process this kernel launched and
             // contains (spec §3.3).
             governed: false,
+            quota: None,
         }
     }
 

@@ -268,6 +268,7 @@ fn mock_manifest(name: &str) -> ArchManifest {
             third_party_allowed: true,
         },
         governed: true,
+        quota: None,
     }
 }
 

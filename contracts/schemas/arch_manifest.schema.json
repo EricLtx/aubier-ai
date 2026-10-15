@@ -51,6 +51,17 @@
     "name": {
       "type": "string"
     },
+    "quota": {
+      "description": "What the provider's plan lets this arch be asked for, when the\nmanifest makes a claim about it (founder decision 2026-10-15).\n\nA **claim**, like `retention_days` and `cost_per_1k_tokens_eur`: what\nthe plan says, not what this node has measured and not something the\nkernel enforces. What the kernel *observes* — a 429, a spent balance,\na model the provider has withdrawn — is the arch's health, which the\nkernel holds beside the manifest and never writes into it.\n\nPart of the arch id when present (see [`ArchManifest::arch_id`]): a\nplan change is a new arch. Absent, it is not serialised at all, so a\nmanifest written before this field existed keeps both its arch id and\nits canonical hash — which is what the `arches` table holds and what\nthe boot path compares against.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/QuotaProfile"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "retention_days": {
       "type": [
         "integer",
@@ -172,6 +183,46 @@
         "on_prem",
         "peer",
         "cloud"
+      ]
+    },
+    "QuotaProfile": {
+      "description": "The provider plan an arch is used under, and the limits that plan states.\n\nEvery limit is optional, because a plan does not always publish one — a\nsubscription states a usage window rather than a token rate — and a limit\nthis node does not know is left out rather than guessed. A limit of zero\nis refused (schema and [`ArchManifest::validate`] alike): absent already\nsays \"no figure\", and a plan that allows nothing is not a plan the arch is\nused under but a spent one, which is health the kernel observes\n(`exhausted`), not a claim a manifest makes.\n\nUnknown fields are refused: `tokens_per_min` mistyped for\n`tokens_per_minute` would otherwise read back as \"no limit stated\", the\none silent misreading a quota can have. Absent limits are not serialised,\nso the arch id of a quota stays the same if a later limit is added to this\ntype and left unset.",
+      "type": "object",
+      "properties": {
+        "plan": {
+          "description": "A free label for the plan: `subscription`, `pay-as-you-go`,\n`free-tier`, a provider's tier name. Printed by `vk arch show`, so at\nmost 64 characters and never blank.",
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1
+        },
+        "requests_per_minute": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "tokens_per_day": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1
+        },
+        "tokens_per_minute": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "plan"
       ]
     },
     "Scope": {

@@ -134,6 +134,7 @@ fn mock_manifest(name: &str) -> vk_contracts::arch::ArchManifest {
             third_party_allowed: true,
         },
         governed: true,
+        quota: None,
     }
 }
 

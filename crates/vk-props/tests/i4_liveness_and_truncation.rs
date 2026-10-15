@@ -33,6 +33,7 @@ fn local() -> ArchManifest {
             third_party_allowed: true,
         },
         governed: true,
+        quota: None,
     }
 }
 

@@ -154,6 +154,7 @@ impl ClaudeCodeAdapter {
             // Anthropic's servers are not a process this kernel launched and
             // contains (spec §3.3), whatever the CLI in front of them is.
             governed: false,
+            quota: None,
         }
     }
 

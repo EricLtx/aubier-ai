@@ -33,6 +33,7 @@ fn arch(max_scope: Scope, third_party: bool) -> ArchManifest {
             third_party_allowed: third_party,
         },
         governed: false,
+        quota: None,
     }
 }
 

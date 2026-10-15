@@ -160,6 +160,7 @@ pub fn manifest_for(cfg: &BedrockConfig) -> ArchManifest {
             third_party_allowed: false,
         },
         governed: false,
+        quota: None,
     }
 }
 

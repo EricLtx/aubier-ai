@@ -415,6 +415,7 @@ impl OllamaAdapter {
                 }
             },
             governed,
+            quota: None,
         }
     }
 
