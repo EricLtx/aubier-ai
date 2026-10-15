@@ -41,25 +41,26 @@ Une séance complète se déroule ainsi :
 
 Docker n'est pas requis.
 
-**1.1 Python 3.13**
+**1.1 Un CPython 3.13 non empaqueté.** Le Python du Microsoft Store ne convient pas (voir plus bas). Le plus simple est celui que `uv` gère :
 ```powershell
-python --version
+uv python install 3.13
+uv python find --managed-python 3.13
 ```
-Attendu : `Python 3.13.x`
+Attendu : un chemin sous `%APPDATA%\uv\python\cpython-3.13-...\python.exe`. Un Python de python.org convient aussi ; on le passera alors à `setup.ps1` avec `-Python <chemin>\python.exe`.
 
 **1.2 Le virtualenv du driver** : Playwright 1.64.0, Chromium, et le contrôle de l'empreinte.
 ```powershell
 powershell -ExecutionPolicy Bypass -File drivers\maskai-recette\setup.ps1
 ```
-Attendu, en dernières lignes :
+Attendu, en première ligne, `python de base : ` suivi du chemin du 1.1, puis en dernières lignes :
 ```
-files_sha256 : sha256:92c4a3ef4729825917e74954d08cbb45482a55e026ddef5e36ac56796ba5641d
+files_sha256 : sha256:cbb66e658807314c9211c91b29fd623609e20e9c9bc93a192a5934a12ebf9b39
 manifest.json : à jour
 manifest-fixture.json : à jour
 ```
 Pourquoi un virtualenv à part ? Les chemins internes de Playwright dépassent la limite MAX_PATH de 260 caractères sous OneDrive. Le virtualenv vit donc sous `%LOCALAPPDATA%\vk\venvs\maskai-recette`, et `drivers\maskai-recette\.venv` est une jonction vers lui. `.venv` est exclu de l'empreinte.
 
-**Le Python de base compte.** Le virtualenv est construit sur le Python qui lance `setup.ps1`. Le Python du Microsoft Store (celui de ce nœud au 2026-10-15) est une application empaquetée : Windows démarre ses enfants non empaquetés, donc le nœud Playwright et Chrome, **hors du Job Object**. Chrome n'a alors ni le plafond mémoire, ni l'arrêt avec le démon, et `hosts_seen` ne voit pas ses connexions. L'arrêt par l'arbre des processus (échéance, STOP, démontage) l'atteint toujours. Pour que le confinement tienne, construisez le virtualenv sur un Python non empaqueté (python.org, ou `uv python install 3.13`).
+**Le Python de base compte (ruling R27).** Le virtualenv est construit sur le Python de base, et c'est lui que le démon lancera. Le Python du Microsoft Store est une application empaquetée : Windows démarre ses enfants non empaquetés, donc le nœud Playwright et Chrome, **hors du Job Object**. Chrome n'a alors ni le plafond mémoire, ni l'arrêt avec le démon, et `hosts_seen` ne voit pas ses connexions. L'arrêt par l'arbre des processus (échéance, STOP, démontage) l'atteint toujours. `setup.ps1` refuse donc une base sous `WindowsApps`, et refuse aussi un virtualenv déjà construit dessus : dans ce cas, renommez `%LOCALAPPDATA%\vk\venvs\maskai-recette`, supprimez la jonction `drivers\maskai-recette\.venv` si elle existe, puis relancez le 1.2. Sans `-Python`, le script prend le CPython de `uv` ; à défaut, `python` du PATH.
 
 **1.3 Google Chrome**, parce que le manifeste dit `browser_channel: "chrome"`.
 ```powershell
