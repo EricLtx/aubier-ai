@@ -12,7 +12,9 @@
 //! (a daemon restart) from the row; an evidence refusal keeps the host, a
 //! driver that dies is dropped and degraded and a remount brings it back; an
 //! act without a live token is refused and spawns nothing; unmounting drops
-//! the host.
+//! the host, and kills the process of an act still in flight (Ruling R13); a
+//! mount racing a lazy re-spawn starts one process, not two; the script the
+//! manifest names is held to its root.
 //!
 //! When no `python` is on PATH a test says so on stderr and returns; it never
 //! fails silently and never passes vacuously without saying why.
@@ -20,6 +22,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use vk_contracts::labels::{Clearance, Scope};
 use vk_contracts::principal::{HumanKey, Principal, SoftwareHumanKey};
 use vk_ipc::client::{CallError, Client};
@@ -71,16 +74,56 @@ fn python_available() -> bool {
 /// The driver's own directory, apart from the state directory: the script and
 /// nothing else, so `hash_dir` of it is the hash of exactly that script.
 fn driver_dir() -> tempfile::TempDir {
+    driver_dir_of(FAKE_DRIVER)
+}
+
+fn driver_dir_of(script: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    std::fs::write(dir.path().join("fake_driver.py"), FAKE_DRIVER).expect("write the driver");
+    std::fs::write(dir.path().join("fake_driver.py"), script).expect("write the driver");
     dir
 }
 
-/// A manifest over the fake driver with three of its actions: `echo`, which
+/// Put in front of the fake driver: each start appends a line to
+/// `<work dir>/starts.txt`, then waits a second before the hello — long
+/// enough for a second request to arrive while the first spawn is under way.
+const COUNTING: &str = "import os, time\n\
+open(os.path.join(os.environ[\"VK_DRIVER_WORK_DIR\"], \"starts.txt\"), \"a\").write(\"start\\n\")\n\
+time.sleep(1)\n";
+
+/// Is the process with this id still running?
+fn process_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+            Err(_) => false,
+        }
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(pid, 0)` sends no signal; it asks whether the process
+        // exists.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+}
+
+/// Poll `cond` every 50 ms for up to ten seconds.
+async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A manifest over the fake driver with four of its actions: `echo`, which
 /// returns `note.txt`; `big`, whose 3 MiB `big.bin` is over the per-file cap;
-/// and `die`, which exits mid-request. The command is relative, as a
-/// manifest's is (Ruling R6): the daemon resolves it against the `root` the
-/// mount names.
+/// `die`, which exits mid-request; and `slow`, which sleeps thirty seconds.
+/// The command is relative, as a manifest's is (Ruling R6): the daemon
+/// resolves it against the `root` the mount names.
 fn manifest(files_sha256: &str) -> Value {
     let action = |name: &str, evidence: &[&str]| {
         json!({
@@ -106,6 +149,7 @@ fn manifest(files_sha256: &str) -> Value {
             action("echo", &["note.txt"]),
             action("big", &["big.bin"]),
             action("die", &[]),
+            action("slow", &[]),
         ],
         "min_interval_ms": 0,
         "max_action_ms": 60_000,
@@ -129,6 +173,8 @@ struct Node {
     device: SoftwareHumanKey,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
     c: Client,
+    /// For a second connection: one client has one call in flight at a time.
+    endpoint: vk_ipc::transport::Endpoint,
 }
 
 impl Node {
@@ -166,6 +212,7 @@ impl Node {
             device,
             server,
             c,
+            endpoint,
         }
     }
 
@@ -626,5 +673,150 @@ async fn unmount_drops_the_host() {
         .await
         .unwrap_err();
     assert_eq!(call_error(&err).code, vk_ipc::E_NOT_FOUND, "{err}");
+    node.shutdown().await;
+}
+
+/// Ruling R13: unmounting a driver whose act is still running kills that
+/// act's process — a browser profile is never open in two processes, and
+/// nothing keeps acting on the site for minutes after `vk driver umount`.
+/// The act comes back long before the thirty seconds `slow` sleeps, with the
+/// host's failure, and its settle is the kernel's stale path.
+#[tokio::test]
+async fn unmount_kills_an_act_in_flight() {
+    if !python_available() {
+        return;
+    }
+    let drv = driver_dir();
+    let node = Node::start().await;
+    node.mount(drv.path()).await;
+    let token = node.token().await;
+    let pid = node.pool.pid("fake").expect("the mounted driver's process");
+    assert!(process_alive(pid));
+
+    let second = Client::connect(&node.endpoint).await.unwrap();
+    let started = Instant::now();
+    let slow = tokio::spawn(async move {
+        second
+            .call(
+                "driver.act",
+                json!({"token": token, "driver": "fake", "action": "slow"}),
+                None,
+            )
+            .await
+    });
+    // The host makes the act's evidence directory just before it writes the
+    // request: once it is there, the act is in flight.
+    let evidence = node.d.path().join("drivers").join("fake").join("evidence");
+    eventually("the slow act never started", || {
+        std::fs::read_dir(&evidence).is_ok_and(|mut d| d.next().is_some())
+    })
+    .await;
+
+    let gone = node
+        .c
+        .call("driver.unmount", json!({"name": "fake"}), None)
+        .await
+        .unwrap();
+    assert_eq!(gone["name"], "fake", "{gone}");
+    let answer = tokio::time::timeout(Duration::from_secs(15), slow)
+        .await
+        .expect("the act came back once its process was killed")
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "well before the thirty seconds `slow` sleeps: {:?}",
+        started.elapsed()
+    );
+    let err = answer.unwrap_err();
+    let e = call_error(&err);
+    assert_eq!(e.code, vk_ipc::E_INVARIANT, "{err}");
+    assert!(e.message.contains("stale act"), "{err}");
+    eventually("the driver's process is gone", || !process_alive(pid)).await;
+    assert!(!node.pool.has_host("fake"));
+    assert_eq!(node.events("driver.acted"), 1, "the stale act is recorded");
+    node.shutdown().await;
+}
+
+/// Reviewer minor 3: a mount and an act that both find no process — after a
+/// restart — start one between them. The driver here counts its starts and
+/// takes a second to say hello, so the two requests overlap the spawn.
+#[tokio::test]
+async fn a_mount_racing_a_lazy_respawn_spawns_one_process() {
+    if !python_available() {
+        return;
+    }
+    let drv = driver_dir_of(&format!("{COUNTING}{FAKE_DRIVER}"));
+    let node = Node::start().await;
+    node.mount(drv.path()).await;
+    let token = node.token().await;
+    let starts = node
+        .d
+        .path()
+        .join("drivers")
+        .join("fake")
+        .join("work")
+        .join("starts.txt");
+    let count = || {
+        std::fs::read_to_string(&starts)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+    assert_eq!(count(), 1);
+    // A restart's empty pool.
+    node.pool.drop_host("fake");
+
+    let other = Client::connect(&node.endpoint).await.unwrap();
+    let proof = node.proof().await;
+    let act = json!({"token": token, "driver": "fake", "action": "echo", "args": {"case": "race"}});
+    let (mounted, acted) = tokio::join!(
+        node.c
+            .call("driver.mount", mount_params(drv.path()), Some(proof)),
+        other.call("driver.act", act, None),
+    );
+    let mounted = mounted.unwrap();
+    assert_eq!(mounted["already_mounted"], true, "{mounted}");
+    let acted = acted.unwrap();
+    assert_eq!(acted["result"]["echo"]["case"], "race", "{acted}");
+    assert_eq!(count(), 2, "two requests, one process");
+    drop(other);
+    node.shutdown().await;
+}
+
+/// Reviewer Important 1: the script the manifest names lives under the root
+/// it is mounted from. A `..` path would hash one directory and run another,
+/// and an absolute one would ignore the root and bind the manifest to one
+/// machine; both are refused at mount, before anything runs.
+#[tokio::test]
+async fn the_script_is_held_to_root() {
+    if !python_available() {
+        return;
+    }
+    let drv = driver_dir();
+    let node = Node::start().await;
+    let absolute = drv.path().join("fake_driver.py").display().to_string();
+    for script in ["../fake_driver.py", absolute.as_str()] {
+        let mut params = mount_params(drv.path());
+        params["manifest"]["program"]["command"] = json!(["python", "-I", script]);
+        let proof = node.proof().await;
+        let err = node
+            .c
+            .call("driver.mount", params, Some(proof))
+            .await
+            .unwrap_err();
+        let e = call_error(&err);
+        assert_eq!(e.code, vk_ipc::E_BAD_PARAMS, "{script}: {err}");
+        assert!(
+            e.message.contains(
+                "program.command paths must be relative to the manifest's directory, without `..`"
+            ),
+            "{script}: {err}"
+        );
+    }
+    assert!(!node.pool.has_host("fake"), "nothing ran");
+    assert_eq!(node.events("driver.mounted"), 0);
+
+    // The relative script still mounts.
+    node.mount(drv.path()).await;
+    assert!(node.pool.has_host("fake"));
     node.shutdown().await;
 }

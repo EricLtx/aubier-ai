@@ -318,6 +318,13 @@ impl DriverHost {
         &self.hello
     }
 
+    /// The driver process's id: on Unix also the id of the process group it
+    /// leads. What the daemon keeps while an act holds the host, so an
+    /// unmount can kill the tree with [`kill_pid_tree`].
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Has the driver process exited? `Some` once it has been reaped — after
     /// a deadline or STOP kill, a [`HostError::Dead`] outcome or `shutdown` —
     /// and `None` while it runs. The read-back the daemon puts in a
@@ -615,6 +622,49 @@ impl DriverHost {
 impl Drop for DriverHost {
     fn drop(&mut self) {
         self.terminate();
+    }
+}
+
+/// Kill the driver tree whose leader is `pid`, from outside the thread that
+/// owns its [`DriverHost`] — what an unmount does to a host an act holds
+/// (Ruling R13). The owning act sees the driver die and answers
+/// [`HostError::Dead`]; dropping its host then kills and reaps what is left.
+///
+/// On Windows, `taskkill /PID <pid> /T /F`: Windows does not reuse an id
+/// while a handle to the process is open, and the host's `Child` holds one
+/// until the host is dropped, so the id still names this driver as long as
+/// the caller keeps the host from being dropped meanwhile (the daemon kills
+/// with its pool locked, which is where the acting thread must pass before it
+/// drops its host). On Unix, `SIGKILL` to the process group the host made the
+/// driver lead at spawn (`process_group(0)`, the harness's convention), so
+/// the browser below it goes too. **Caveat:** a Unix id is free for reuse
+/// once the leader has been reaped, and the host reaps a driver that exited
+/// on its own; a driver that died in the instant before this call could, in
+/// principle, leave its group id to an unrelated group. The window is the
+/// span between that reap and this signal.
+pub fn kill_pid_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // Never 0 or 1: `kill(0, …)` would signal our own group and
+        // `kill(-1, …)` every process we may signal.
+        if let Ok(pgid) = i32::try_from(pid) {
+            if pgid > 1 {
+                // SAFETY: a negative pid signals the process group the host
+                // made this driver lead; no other process of ours is in it.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
     }
 }
 

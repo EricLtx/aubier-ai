@@ -94,7 +94,7 @@ pub async fn call(
 
 /// The syscall a tool call becomes: its method, and its params with `token`
 /// injected. `vk_driver_act`'s `args` is an empty object when the model gives
-/// none.
+/// none, or gives `null`.
 fn request(token: &str, name: &str, args: &Value) -> Result<(&'static str, Value), String> {
     let str_arg = |key: &str| -> Result<String, String> {
         args.get(key)
@@ -123,7 +123,11 @@ fn request(token: &str, name: &str, args: &Value) -> Result<(&'static str, Value
                 "token": token,
                 "driver": str_arg("driver")?,
                 "action": str_arg("action")?,
-                "args": args.get("args").cloned().unwrap_or(json!({})),
+                "args": args
+                    .get("args")
+                    .filter(|a| a.is_object())
+                    .cloned()
+                    .unwrap_or(json!({})),
             }),
         ),
         other => return Err(format!("no such tool: {other}")),
@@ -180,6 +184,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["args"], json!({ "case": "N0-1" }));
+
+        // A model that sends `null` for no arguments gets the empty object
+        // too, not a `null` the action's schema would refuse.
+        let (_, params) = request(
+            "tok-1",
+            "vk_driver_act",
+            &json!({ "driver": "maskai-1", "action": "look", "args": null }),
+        )
+        .unwrap();
+        assert_eq!(params["args"], json!({}));
 
         let err = request("tok-1", "vk_driver_act", &json!({ "action": "look" })).unwrap_err();
         assert!(err.contains("driver"), "{err}");

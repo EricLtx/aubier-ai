@@ -13,14 +13,18 @@
 //! acts on the owned value and puts it back. That is the shape of
 //! `harness.run`, for the same reason: an action lasts seconds to minutes, and
 //! the harness that asked for it is calling back over MCP meanwhile.
+//!
+//! One name never has two processes: a spawn in progress is a marker every
+//! other caller waits on, and an unmount kills the tree of an act still in
+//! flight rather than letting it run on (Ruling R13) — a browser profile is
+//! never open in two processes.
 use crate::server::{bad, internal, kerr, lock, Shared};
 use crate::RpcError;
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use vk_contracts::driver::{hash_dir, DriverAction, DriverManifest};
 use vk_contracts::syscalls::Ctx;
@@ -34,33 +38,34 @@ const DRIVER_MAX_MEMORY: u64 = 2 * 1024 * 1024 * 1024;
 /// What the pool holds for one mounted name.
 enum Slot {
     /// Waiting for the next act. Boxed: a host is a few hundred bytes, the
-    /// marker a few dozen.
-    Idle {
-        driver_id: String,
-        host: Box<DriverHost>,
-    },
-    /// Taken out by the act holding `ticket`, which puts it back when it
-    /// returns — unless the slot is no longer its own by then: an unmount
-    /// removed it, or a remount put a new host in its place.
-    Acting {
-        driver_id: String,
-        governed: bool,
-        ticket: u64,
-    },
+    /// two markers a few.
+    Idle(Box<DriverHost>),
+    /// A spawn is under way with the map unlocked. The `ensure` that set it
+    /// is the only one that clears it ([`Claim`]); every other caller waits
+    /// on [`DriverPool::settled`], so a mount racing a lazy re-spawn starts
+    /// one process, not two (reviewer minor 3).
+    Spawning,
+    /// Taken out by an act, which puts it back when it returns unless the
+    /// slot is no longer this marker by then. `pid` is the driver's: what an
+    /// unmount kills while the act holds the host (Ruling R13), and how the
+    /// act knows the marker is still its own.
+    Acting { pid: u32 },
 }
 
 /// The driver processes this daemon owns, by mounted name. Shared by every
 /// connection through `ServerConfig::drivers`; no kernel state lives here.
 pub struct DriverPool {
     hosts: Mutex<HashMap<String, Slot>>,
-    tickets: AtomicU64,
+    /// Signalled whenever a `Spawning` marker is resolved, into a host or
+    /// into nothing.
+    settled: Condvar,
 }
 
 impl DriverPool {
     pub fn new() -> Arc<DriverPool> {
         Arc::new(DriverPool {
             hosts: Mutex::new(HashMap::new()),
-            tickets: AtomicU64::new(1),
+            settled: Condvar::new(),
         })
     }
 
@@ -71,66 +76,72 @@ impl DriverPool {
         self.hosts.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether the pool holds a process for `name`, idle or acting. A daemon
-    /// that has just restarted holds none: the first act re-spawns it.
+    /// Wait until some spawn resolves, the map released meanwhile.
+    fn wait<'a>(
+        &self,
+        map: MutexGuard<'a, HashMap<String, Slot>>,
+    ) -> MutexGuard<'a, HashMap<String, Slot>> {
+        self.settled
+            .wait(map)
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the pool holds a process for `name` — idle, starting or
+    /// acting. A daemon that has just restarted holds none.
     pub fn has_host(&self, name: &str) -> bool {
         self.map().contains_key(name)
+    }
+
+    /// The id of `name`'s driver process, idle or acting; `None` while there
+    /// is none, or while it is still starting.
+    pub fn pid(&self, name: &str) -> Option<u32> {
+        match self.map().get(name) {
+            Some(Slot::Idle(host)) => Some(host.pid()),
+            Some(Slot::Acting { pid }) => Some(*pid),
+            Some(Slot::Spawning) | None => None,
+        }
     }
 
     /// Spawn (or re-spawn) the host for `row` with the platform governor
     /// (2 GiB, no CPU cap); returns what the host observed (`governed`).
     ///
-    /// A live host already held for the same `driver_id` is kept, idle or
-    /// acting, and its `governed` returned: a repeat mount does not restart
-    /// the browser. Otherwise the driver's files are held to `files_sha256`
-    /// again, the three directories are made private, the command is resolved
-    /// against `row.root` (Ruling R6, [`spawnable`]) and the driver is spawned
-    /// with the map unlocked — a hello can take thirty seconds — then put in
-    /// the pool. A governor the OS refuses is no spawn.
+    /// A live idle host is kept and its `governed` returned: a repeat mount
+    /// does not restart the browser. An acting one is the host the row
+    /// describes — the kernel admits one act per driver — so the row's
+    /// `governed` is returned. A spawn under way is waited for. Otherwise —
+    /// no host, or one that died idle (reviewer minor 2) — this caller marks
+    /// the slot `Spawning`, spawns with the map unlocked ([`spawn_host`]; a
+    /// hello can take thirty seconds) and puts the host in its place.
     pub fn ensure(&self, row: &DriverRow, dirs: &DriverDirs) -> anyhow::Result<bool> {
         let name = &row.manifest.name;
-        match self.map().get_mut(name) {
-            Some(Slot::Idle { driver_id, host }) if *driver_id == row.driver_id => {
-                if matches!(host.try_wait(), Ok(None)) {
-                    return Ok(host.governed());
+        let mut map = self.map();
+        let dead = loop {
+            let alive = match map.get_mut(name) {
+                Some(Slot::Spawning) => {
+                    map = self.wait(map);
+                    continue;
                 }
+                Some(Slot::Acting { .. }) => return Ok(row.manifest.governed),
+                Some(Slot::Idle(host)) => match host.try_wait() {
+                    Ok(None) => Some(host.governed()),
+                    _ => None,
+                },
+                None => None,
+            };
+            if let Some(governed) = alive {
+                return Ok(governed);
             }
-            Some(Slot::Acting {
-                driver_id,
-                governed,
-                ..
-            }) if *driver_id == row.driver_id => return Ok(*governed),
-            _ => {}
-        }
-        files_hold(&row.manifest, &row.root)?;
-        for dir in [&dirs.profile, &dirs.work, &dirs.evidence] {
-            vk_store::paths::private_dir(dir)
-                .with_context(|| format!("create {}", dir.display()))?;
-        }
-        let manifest = spawnable(&row.manifest, &row.root);
-        let governor =
-            vk_harness::confine::for_this_platform(DRIVER_MAX_MEMORY, None).context("governor")?;
-        let host = DriverHost::spawn(
-            &manifest,
-            &dirs.work,
-            &dirs.profile,
-            &dirs.evidence,
-            governor,
-        )
-        .map(Box::new)
-        .map_err(|e| anyhow!("{e}"))?;
+            break map.insert(name.clone(), Slot::Spawning);
+        };
+        drop(map);
+        // A host that died idle: reaped, what is left of its tree killed,
+        // with the map unlocked.
+        drop(dead);
+        let claim = Claim { pool: self, name };
+        let host = spawn_host(row, dirs)?;
         let governed = host.governed();
-        // The guard is gone at the end of this statement, so what the insert
-        // replaced — a dead or stale host — is dropped (its tree killed) with
-        // the map unlocked.
-        let replaced = self.map().insert(
-            name.clone(),
-            Slot::Idle {
-                driver_id: row.driver_id.clone(),
-                host,
-            },
-        );
-        drop(replaced);
+        self.map().insert(name.clone(), Slot::Idle(host));
+        drop(claim);
         Ok(governed)
     }
 
@@ -152,23 +163,18 @@ impl DriverPool {
         caps: EvidenceCaps,
         should_stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<ActOutcome, String> {
-        let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
-        let (driver_id, mut host) = {
+        let mut host = {
             let mut map = self.map();
             match map.remove(name) {
-                Some(Slot::Idle { driver_id, host }) => {
-                    let acting = Slot::Acting {
-                        driver_id: driver_id.clone(),
-                        governed: host.governed(),
-                        ticket,
-                    };
-                    map.insert(name.to_string(), acting);
-                    (driver_id, host)
+                Some(Slot::Idle(host)) => {
+                    map.insert(name.to_string(), Slot::Acting { pid: host.pid() });
+                    host
                 }
-                Some(acting @ Slot::Acting { .. }) => {
-                    map.insert(name.to_string(), acting);
+                Some(other) => {
+                    map.insert(name.to_string(), other);
                     return Err(format!(
-                        "driver would not start: driver {name}'s process is busy with another act"
+                        "driver would not start: driver {name}'s process is starting or busy \
+                         with another act"
                     ));
                 }
                 None => {
@@ -178,6 +184,7 @@ impl DriverPool {
                 }
             }
         };
+        let pid = host.pid();
         let outcome = host.act(action, args, deadline, caps, should_stop);
         let keep = matches!(
             &outcome,
@@ -188,10 +195,9 @@ impl DriverPool {
         );
         let leftover = {
             let mut map = self.map();
-            let ours =
-                matches!(map.get(name), Some(Slot::Acting { ticket: t, .. }) if *t == ticket);
+            let ours = matches!(map.get(name), Some(Slot::Acting { pid: p }) if *p == pid);
             if ours && keep {
-                map.insert(name.to_string(), Slot::Idle { driver_id, host });
+                map.insert(name.to_string(), Slot::Idle(host));
                 None
             } else {
                 if ours {
@@ -205,31 +211,113 @@ impl DriverPool {
         outcome.map_err(|e| host_error_reason(&e))
     }
 
-    /// Forget `name`'s host and kill its tree. An act in progress holds its
-    /// host outside the map; it finds its slot gone when it returns and drops
-    /// the host then, and the kernel's act id makes that act's settle stale.
+    /// Forget `name`'s process and kill its tree, whatever it is doing; when
+    /// this returns, nothing of `name` runs.
+    ///
+    /// An idle host is removed and dropped (killed, reaped) with the map
+    /// unlocked. An acting one is held by its act, so its tree is killed by
+    /// pid (Ruling R13) — **with the map held**: the acting thread must take
+    /// the map to find its slot gone before it drops, and so reaps, its host,
+    /// so the pid still names that driver when the kill lands. The act comes
+    /// back with the host's failure, drops its host, and its settle is the
+    /// kernel's stale path. A spawn under way is waited for, then dropped
+    /// like an idle host.
     pub fn drop_host(&self, name: &str) {
-        let gone = self.map().remove(name);
-        // Unlocked, as in `act`.
+        let mut map = self.map();
+        loop {
+            match map.get(name) {
+                Some(Slot::Spawning) => map = self.wait(map),
+                Some(Slot::Acting { pid }) => {
+                    let pid = *pid;
+                    map.remove(name);
+                    vk_driver::kill_pid_tree(pid);
+                    return;
+                }
+                Some(Slot::Idle(_)) | None => break,
+            }
+        }
+        let gone = map.remove(name);
+        drop(map);
         drop(gone);
+    }
+
+    /// After an act panicked: its host went with the unwinding (dropped, so
+    /// killed and reaped), and its marker is cleared **without** a kill — the
+    /// pid it holds may no longer name anything of ours. A spawn's marker is
+    /// its `Claim`'s to clear, and an idle host is left as it is.
+    fn clear_acting(&self, name: &str) {
+        let mut map = self.map();
+        if matches!(map.get(name), Some(Slot::Acting { .. })) {
+            map.remove(name);
+        }
     }
 }
 
+/// The `Spawning` marker one `ensure` set, cleared however that `ensure`
+/// ends — a refusal, an error, a panic — and every waiter woken. A spawn that
+/// succeeded has already put its host in the marker's place, which is left
+/// as it is.
+struct Claim<'a> {
+    pool: &'a DriverPool,
+    name: &'a str,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        let mut map = self.pool.map();
+        if matches!(map.get(self.name), Some(Slot::Spawning)) {
+            map.remove(self.name);
+        }
+        drop(map);
+        self.pool.settled.notify_all();
+    }
+}
+
+/// Start the driver `row` describes: its files held to `files_sha256` again
+/// ([`files_hold`]: a file changed since the mount is a new driver, never the
+/// old one re-spawned after a restart), the three directories made private
+/// before the process exists, the command resolved against `row.root`
+/// (Ruling R6, [`spawnable`]) and the platform governor made first — a
+/// governor the OS refuses is no spawn.
+fn spawn_host(row: &DriverRow, dirs: &DriverDirs) -> anyhow::Result<Box<DriverHost>> {
+    files_hold(&row.manifest, &row.root)?;
+    for dir in [&dirs.profile, &dirs.work, &dirs.evidence] {
+        vk_store::paths::private_dir(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let manifest = spawnable(&row.manifest, &row.root);
+    let governor =
+        vk_harness::confine::for_this_platform(DRIVER_MAX_MEMORY, None).context("governor")?;
+    DriverHost::spawn(
+        &manifest,
+        &dirs.work,
+        &dirs.profile,
+        &dirs.evidence,
+        governor,
+    )
+    .map(Box::new)
+    .map_err(|e| anyhow!("{e}"))
+}
+
+/// A path a manifest's command may name a file under its root with: relative
+/// and made of plain names only (`driver.py`, `vkdriver/driver.py`,
+/// `./driver.py`) — no `..`, no root, no drive.
+fn under_root(p: &Path) -> bool {
+    p.is_relative()
+        && p.components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 /// The manifest as the host spawns it (Ruling R6): every `command` element
-/// that is a relative path — no `..`, no drive — to a file under `root`
-/// becomes that file's absolute path. The mounted manifest keeps its relative
-/// command, because the driver's identity must not vary per machine; the
-/// process's working directory stays the driver's work directory.
+/// that is [`under_root`] and names a file under `root` becomes that file's
+/// absolute path. The mounted manifest keeps its relative command, because
+/// the driver's identity must not vary per machine; the process's working
+/// directory stays the driver's work directory.
 fn spawnable(manifest: &DriverManifest, root: &Path) -> DriverManifest {
     let mut m = manifest.clone();
     for arg in &mut m.program.command {
         let rel = Path::new(arg.as_str());
-        let plain = rel.is_relative()
-            && rel
-                .components()
-                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
         let file = root.join(rel);
-        if plain && file.is_file() {
+        if under_root(rel) && file.is_file() {
             *arg = file.display().to_string();
         }
     }
@@ -263,10 +351,13 @@ fn checked_mount(manifest: &DriverManifest, root: &Path) -> anyhow::Result<()> {
 }
 
 /// The directory of the command's script — its first element ending in
-/// `.py`, resolved against `root` — hashes to `files_sha256`, so the code that
-/// runs is the code the manifest names. Checked at mount and again before
-/// every spawn: a file changed since the mount is a new driver, never the old
-/// one re-spawned after a restart.
+/// `.py`, which must be [`under_root`], resolved against `root` — hashes to
+/// `files_sha256`, so the code that runs is the code the manifest names.
+/// Under the root because anything else breaks that: `../x.py` would hash one
+/// directory while the process ran another, and an absolute path would ignore
+/// the root and bind the manifest to one machine (review round 1, Important
+/// 1). Checked at mount and again before every spawn: a file changed since
+/// the mount is a new driver, never the old one re-spawned after a restart.
 fn files_hold(manifest: &DriverManifest, root: &Path) -> anyhow::Result<()> {
     let script = manifest
         .program
@@ -279,6 +370,11 @@ fn files_hold(manifest: &DriverManifest, root: &Path) -> anyhow::Result<()> {
                  to files_sha256"
             )
         })?;
+    anyhow::ensure!(
+        under_root(Path::new(script)),
+        "program.command paths must be relative to the manifest's directory, without `..`: \
+         `{script}` is not"
+    );
     let script = root.join(script);
     anyhow::ensure!(
         script.is_file(),
@@ -387,13 +483,16 @@ fn no_args() -> Value {
 /// `harness.run`, so the kernel lock is never held across the action.
 ///
 /// Phase one, under the lock, is the kernel's seven refusals and the plan.
-/// Phase two, unlocked, spawns the host if the pool has none — what a daemon
-/// restart leaves — and acts, polling the node's STOP; a panic in it is an
-/// act that failed, never an act left in flight. Phase three, under the lock,
-/// settles on every outcome and answers `{ok: true, result}`.
+/// Phase two, unlocked, makes sure of a host — spawning one if the pool has
+/// none live, which is what a daemon restart leaves — and acts, polling the
+/// node's STOP; a panic in it is an act that failed, never an act left in
+/// flight. Phase three, under the lock, settles on every outcome and answers
+/// `{ok: true, result}`.
 ///
 /// A STOP degrades the driver: the host kills the tree, the settle records
-/// `stopped`, and after the STOP is lifted the operator remounts.
+/// `stopped`, and after the STOP is lifted the operator remounts. An unmount
+/// while the act runs kills the tree too (Ruling R13), and the settle is the
+/// kernel's stale path.
 pub(crate) fn act(kernel: &Shared, pool: &DriverPool, p: Value) -> Result<Value, RpcError> {
     let ActParams {
         token,
@@ -419,7 +518,7 @@ pub(crate) fn act(kernel: &Shared, pool: &DriverPool, p: Value) -> Result<Value,
         run_act(kernel, pool, &plan, &should_stop)
     }));
     let outcome = acted.unwrap_or_else(|_| {
-        pool.drop_host(&plan.name);
+        pool.clear_acting(&plan.name);
         Err("the driver act panicked".to_string())
     });
     let result = lock(kernel)?
@@ -428,37 +527,43 @@ pub(crate) fn act(kernel: &Shared, pool: &DriverPool, p: Value) -> Result<Value,
     Ok(json!({ "ok": true, "result": result }))
 }
 
-/// Phase two of `driver.act`: a host for the driver — the pool's, or one
-/// spawned now from the row, read under a short lock — then the act itself,
-/// within what is left of the plan's deadline. A host that cannot be had is
-/// the daemon's own reason, `driver would not start: …`.
+/// Phase two of `driver.act`: a host for the driver, then the act itself.
+///
+/// `ensure` runs every time, on the row read under a short lock: it keeps a
+/// live host, re-spawns one that died idle rather than letting the act find it
+/// dead and degrade a driver that could simply be started again (reviewer
+/// minor 2), and fills a restarted daemon's empty pool. It runs **before** the
+/// act's clock starts: the act gets the action's whole `max_action_ms`, and a
+/// spawn's time — a hello can take thirty seconds — is on top of it, not
+/// charged to it (minor 9). A host that cannot be had is the daemon's own
+/// reason, `driver would not start: …`.
 fn run_act(
     kernel: &Shared,
     pool: &DriverPool,
     plan: &DriverActPlan,
     should_stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<ActOutcome, String> {
-    if !pool.has_host(&plan.name) {
-        let row = kernel
-            .lock()
-            .map_err(|_| "driver would not start: kernel lock poisoned".to_string())?
-            .driver(&plan.name)
-            .map_err(|e| format!("driver would not start: {e}"))?
-            .ok_or_else(|| {
-                format!(
-                    "driver would not start: driver {} is no longer mounted",
-                    plan.name
-                )
-            })?;
-        pool.ensure(&row, &plan.dirs)
-            .map_err(|e| format!("driver would not start: {e:#}"))?;
-    }
-    let deadline = Duration::from_millis(plan.deadline_ms.saturating_sub(now_ms()));
+    let row = kernel
+        .lock()
+        .map_err(|_| "driver would not start: kernel lock poisoned".to_string())?
+        .driver(&plan.name)
+        .map_err(|e| format!("driver would not start: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "driver would not start: driver {} is no longer mounted",
+                plan.name
+            )
+        })?;
+    pool.ensure(&row, &plan.dirs)
+        .map_err(|e| format!("driver would not start: {e:#}"))?;
+    // `deadline_ms` is `begun_ms + max_action_ms`: the action's whole budget,
+    // counted from now.
+    let budget = Duration::from_millis(plan.deadline_ms.saturating_sub(plan.begun_ms));
     pool.act(
         &plan.name,
         &plan.action,
         &plan.args,
-        deadline,
+        budget,
         plan.caps,
         should_stop,
     )

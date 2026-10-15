@@ -548,6 +548,47 @@ fn stop_kills_the_tree() {
     );
 }
 
+/// Ruling R13: the daemon kills the tree of a host an act holds, by the pid
+/// the host reports, from another thread — what an unmount does. The act
+/// comes back `Dead`, well within the thirty seconds `slow` sleeps, and the
+/// driver is gone.
+#[test]
+fn kill_pid_tree_ends_an_act_from_outside() {
+    if !python_available() {
+        return;
+    }
+    let rig = Rig::new(FAKE_DRIVER);
+    let m = rig.fake_manifest();
+    let mut host = rig.spawn(&m);
+    let pid = host.pid();
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        vk_driver::kill_pid_tree(pid);
+    });
+    let started = Instant::now();
+    let err = host
+        .act(
+            action(&m, "slow"),
+            &json!({}),
+            Duration::from_secs(30),
+            WIDE,
+            &never,
+        )
+        .expect_err("the kill ends the action");
+    let elapsed = started.elapsed();
+    killer.join().expect("the killer thread");
+    assert!(matches!(err, HostError::Dead(_)), "{err}");
+    assert!(
+        elapsed < kill_bound(),
+        "the act came back {elapsed:?} after the request (bound {:?})",
+        kill_bound()
+    );
+    assert!(
+        host.try_wait().expect("try_wait").is_some(),
+        "the driver is dead after the kill"
+    );
+}
+
 #[test]
 fn the_environment_names_the_dirs_the_mode_and_the_hosts() {
     if !python_available() {
