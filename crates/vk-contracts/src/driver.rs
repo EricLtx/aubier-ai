@@ -23,13 +23,32 @@ pub enum DriverKind {
 pub struct DriverProgram {
     /// `python-playwright` for the pilot; informative, part of the identity.
     pub runtime: String,
-    /// argv the host spawns, relative paths resolved against the daemon's cwd.
+    /// argv the host spawns. Relative paths are relative to the manifest
+    /// file's directory (the mount's `root`, pilot ruling R6), so the
+    /// identity does not vary per machine; the process runs in the driver's
+    /// work directory.
     pub command: Vec<String>,
     /// `hash_dir` of the driver's directory (see [`hash_dir`]).
     pub files_sha256: String,
     pub browser_channel: Option<String>,
     pub headless: bool,
+    /// The committed-memory cap on the driver's whole process tree, in bytes,
+    /// at least 256 MiB (`MIN_DRIVER_MEMORY`). Absent, the daemon applies
+    /// the kind's default (6 GiB for a browser: a headed Chrome with two
+    /// tabs, Node and Python). A browser starved by its cap fails
+    /// allocations inside the page ("Aw, Snap") or dies; the remedy is a
+    /// larger value and a remount. Part of the identity when present; not
+    /// serialised when absent, so a manifest that never named it keeps its
+    /// `driver_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 268_435_456))]
+    pub max_memory_bytes: Option<u64>,
 }
+
+/// The least `program.max_memory_bytes` a manifest may name: 256 MiB. A
+/// floor, not a recommendation: it refuses a cap written in the wrong unit
+/// (MiB where bytes are meant) before a browser is starved by it.
+pub const MIN_DRIVER_MEMORY: u64 = 256 * 1024 * 1024;
 
 /// One action the driver implements, and the shape of what it may return.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -141,8 +160,9 @@ impl DriverManifest {
     }
 
     /// Every refusal names its remedy. Checked in this order: name, command,
-    /// `files_sha256`, hosts, actions (count, duplicates, names, `args`,
-    /// evidence), the interval ceiling, and last the credential-shaped keys.
+    /// `files_sha256`, the memory cap's floor, hosts, actions (count,
+    /// duplicates, names, `args`, evidence), the interval ceiling, and last
+    /// the credential-shaped keys.
     pub fn validate(&self) -> Result<(), DriverError> {
         let name_ok = !self.name.is_empty()
             && self.name.len() <= 32
@@ -164,6 +184,14 @@ impl DriverManifest {
                 "program.files_sha256 must be `sha256:` and 64 lower-case hex digits \
                  (the `hash_dir` of the driver's directory)",
             );
+        }
+        if let Some(cap) = self.program.max_memory_bytes {
+            if cap < MIN_DRIVER_MEMORY {
+                return invalid(format!(
+                    "program.max_memory_bytes ({cap}) is below {MIN_DRIVER_MEMORY} (256 MiB): \
+                     name a larger cap, or leave it out for the kind's default"
+                ));
+            }
         }
         if self.hosts.is_empty() {
             return invalid("hosts is empty: list the host names the driver may reach");
@@ -538,6 +566,41 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("token"), "{e}");
+    }
+    /// Final review I2: the memory cap on the driver's tree is the manifest's
+    /// to say. Absent, it is `None` — the pool picks the kind's default — and
+    /// leaves the identity of a manifest that never named it unchanged; named,
+    /// it is part of the identity; below 256 MiB it is refused with its remedy.
+    #[test]
+    fn max_memory_bytes_is_optional_part_of_the_identity_and_has_a_floor() {
+        let m = manifest();
+        assert_eq!(
+            m.program.max_memory_bytes,
+            Some(6 * 1024 * 1024 * 1024),
+            "the contract example says 6 GiB explicitly"
+        );
+        let mut v = serde_json::to_value(&m).unwrap();
+        v["program"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_memory_bytes");
+        let absent: DriverManifest = serde_json::from_value(v).unwrap();
+        assert_eq!(absent.program.max_memory_bytes, None);
+        absent.validate().unwrap();
+        // The identity is the hash of these bytes: with the field absent they
+        // are the bytes of the manifest before the field existed, so an older
+        // manifest keeps its `driver_id`.
+        let bytes = serde_json::to_string(&absent).unwrap();
+        assert!(!bytes.contains("max_memory_bytes"), "{bytes}");
+        assert_ne!(absent.driver_id(), m.driver_id(), "a named cap is identity");
+
+        let mut low = m.clone();
+        low.program.max_memory_bytes = Some(256 * 1024 * 1024 - 1);
+        let e = low.validate().unwrap_err().to_string();
+        assert!(e.contains("max_memory_bytes"), "{e}");
+        assert!(e.contains("268435456"), "the refusal names the floor: {e}");
+        low.program.max_memory_bytes = Some(256 * 1024 * 1024);
+        low.validate().unwrap();
     }
     #[test]
     fn hash_dir_walks_subdirectories_with_forward_slashes() {

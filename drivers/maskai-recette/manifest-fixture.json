@@ -10,7 +10,8 @@
     ],
     "files_sha256": "sha256:aac9f78802f462317a793f1197dd0bbe47312176b7e2098253dfceac621823ee",
     "browser_channel": null,
-    "headless": true
+    "headless": true,
+    "max_memory_bytes": 6442450944
   },
   "hosts": [
     "127.0.0.1"

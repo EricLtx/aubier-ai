@@ -101,6 +101,7 @@ fn maskai_like() -> DriverManifest {
             files_sha256: format!("sha256:{}", "0".repeat(64)),
             browser_channel: None,
             headless: true,
+            max_memory_bytes: None,
         },
         hosts: vec!["app.maskai.fr".into()],
         actions: vec![

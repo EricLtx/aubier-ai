@@ -124,7 +124,7 @@
           ]
         },
         "command": {
-          "description": "argv the host spawns, relative paths resolved against the daemon's cwd.",
+          "description": "argv the host spawns. Relative paths are relative to the manifest\nfile's directory (the mount's `root`, pilot ruling R6), so the\nidentity does not vary per machine; the process runs in the driver's\nwork directory.",
           "type": "array",
           "items": {
             "type": "string"
@@ -136,6 +136,15 @@
         },
         "headless": {
           "type": "boolean"
+        },
+        "max_memory_bytes": {
+          "description": "The committed-memory cap on the driver's whole process tree, in bytes,\nat least 256 MiB (`MIN_DRIVER_MEMORY`). Absent, the daemon applies\nthe kind's default (6 GiB for a browser: a headed Chrome with two\ntabs, Node and Python). A browser starved by its cap fails\nallocations inside the page (\"Aw, Snap\") or dies; the remedy is a\nlarger value and a remount. Part of the identity when present; not\nserialised when absent, so a manifest that never named it keeps its\n`driver_id`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 268435456
         },
         "runtime": {
           "description": "`python-playwright` for the pilot; informative, part of the identity.",
