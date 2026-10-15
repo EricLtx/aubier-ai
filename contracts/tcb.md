@@ -132,7 +132,10 @@ tests and by AWS's documentation, and by nothing that has run.
 ### Mistral, Gemini and OpenAI-compatible adapters
 
 The same discipline as the Anthropic arch, shared rather than copied: the key
-type, the scrub and the keyring loader are `vk-arch-anthropic`'s, the client
+type, the scrub and the keyring loader are `vk-arch-anthropic`'s — and the key
+reaches a request only through `SecretString::authorize`, which refuses one
+that is not under the checked origin (same scheme, host and port, a path at or
+below the base's), so no caller can put it on a request bound elsewhere — the client
 (no redirects followed, rustls, connect timeout) and the `http status <code>:`
 classification are `vk-arch-openai-compat`'s, every origin is daemon
 configuration bounded by the same `check_base_url`, every mount config is a

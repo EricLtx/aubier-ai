@@ -526,8 +526,12 @@ impl GeminiAdapter {
             .header("content-type", "application/json")
             .timeout(timeout)
             .json(body);
-        let request = self.key.authorize(request, KEY_HEADER, "");
-        let r = http::send(Some(&self.key), request)?;
+        // Only through `authorize`, which refuses a request that is not under
+        // the checked origin (review M-4).
+        let request = self
+            .key
+            .authorize(request, &self.cfg.base_url, KEY_HEADER, "")?;
+        let r = http::send(&self.client, Some(&self.key), request)?;
         http::read_json(PROVIDER, path, Some(&self.key), r)
     }
 

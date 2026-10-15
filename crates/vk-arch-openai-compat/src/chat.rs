@@ -17,7 +17,7 @@
 //! mounted with is the window it really has, which for `openai-compat` is the
 //! operator's claim (see the crate documentation).
 use crate::http::{self, answer_tokens, estimate_tokens, usable};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client;
 use serde_json::Value;
 use std::time::Duration;
@@ -122,17 +122,22 @@ impl ChatArch {
             "{}{CHAT_PATH}",
             self.settings.base_url.trim_end_matches('/')
         );
-        let mut request = self
+        let builder = self
             .client
             .post(url)
             .header("content-type", "application/json")
             .timeout(self.settings.timeout)
             .json(body);
-        if let Some(key) = &self.key {
-            request = key.authorize(request, "authorization", "Bearer ");
-        }
+        // The key goes on only through `authorize`, which refuses a request
+        // that is not under the checked origin (review M-4).
+        let request = match &self.key {
+            Some(key) => {
+                key.authorize(builder, &self.settings.base_url, "authorization", "Bearer ")?
+            }
+            None => builder.build().context("build the request")?,
+        };
         let key = self.key.as_ref();
-        let r = http::send(key, request)?;
+        let r = http::send(&self.client, key, request)?;
         http::read_json(self.settings.provider, CHAT_PATH, key, r)
     }
 }

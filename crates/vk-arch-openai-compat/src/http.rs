@@ -9,7 +9,7 @@
 //! `http status <code>:` first so it can be told apart from a transport
 //! failure, and the estimate a prompt is projected by runs high.
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::blocking::{Client, RequestBuilder, Response};
+use reqwest::blocking::{Client, Request, Response};
 use serde_json::Value;
 use std::time::Duration;
 use vk_arch_anthropic::SecretString;
@@ -150,11 +150,13 @@ pub fn build_client(user_agent: &str) -> Result<Client> {
         .context("build the HTTPS client")
 }
 
-/// Send `request`. A transport error can name the URL; it cannot be allowed
-/// to name anything else this node put on the request.
-pub fn send(key: Option<&SecretString>, request: RequestBuilder) -> Result<Response> {
-    request
-        .send()
+/// Send `request` — built, and when it carries a key, built by
+/// [`SecretString::authorize`], which checked where it goes. A transport
+/// error can name the URL; it cannot be allowed to name anything else this
+/// node put on the request.
+pub fn send(client: &Client, key: Option<&SecretString>, request: Request) -> Result<Response> {
+    client
+        .execute(request)
         .map_err(|e| anyhow!(scrub(key, &format!("{e:#}"))))
 }
 
