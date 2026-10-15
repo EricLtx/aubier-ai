@@ -11,6 +11,8 @@ Any object reachable by an unmediated channel is treated as projected to that ch
 
 ## Arch adapters (SP1b)
 
+**Quota and health (2026-10-15).** A manifest's `quota` is the provider plan's own claim and an arch's health is what this kernel observed in the provider's last answer (429, 402, a 404 on the model); neither is enforcement — nothing meters calls against the quota, nothing guarantees the provider honours it, and health only keeps the scheduler from sending a step to an arch whose provider has already refused it.
+
 ### Claude Code adapter
 
 Pure completion, no tools. The kernel launches the installed `claude` with every built-in tool removed (`--tools ""`), MCP connectors off (`--safe-mode --strict-mcp-config`), one turn (`--max-turns 1`) and no session written to disk (`--no-session-persistence`); the prompt goes in on stdin, so no process list on this machine shows it. The child runs in one fixed, empty directory (`<state_dir>/claude-code-cwd`, `0700` on Unix), which is also the only directory it could reach if a tool were ever re-enabled.

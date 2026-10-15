@@ -267,6 +267,79 @@ call from its own estimate, and after it from the server's `prompt_eval_count`.
 Nothing is billed, so there is no `COST`; what `vk top` shows is the tokens the
 server itself counted.
 
+### Arches: quota and health
+
+Two things about a provider an operator needs beside the price, and they are
+kept apart on purpose (founder decision 2026-10-15).
+
+**The quota is a claim.** A manifest may carry `quota`: the plan the arch is
+used under and the limits that plan states —
+
+```json
+"quota": { "plan": "pay-as-you-go", "requests_per_minute": 50, "tokens_per_minute": 30000 }
+```
+
+`plan` is a free label (`subscription`, `pay-as-you-go`, `free-tier`, a
+provider's tier name, at most 64 characters); `requests_per_minute`,
+`tokens_per_minute` and `tokens_per_day` are each optional and left out when
+the plan states none — never written as `0`, which the contract refuses, nor
+as "unlimited". Like `retention_days` it is what the provider says, not what
+this node measured, and **the kernel does not enforce it**: nothing meters the
+calls against it. Unlike `retention_days` it is **part of the arch id**: the id
+hashes the identity tuple and, when one is declared, the quota — so a plan
+change is a new arch, and the counters, usage rows and health of a
+subscription and of a metered key on the same model never mix. A manifest with
+no quota hashes exactly as it did before the field existed, so no mounted arch
+changed id. No adapter on this branch declares a quota yet; `vk arch show`
+prints `none declared` for them.
+
+**Health is an observation.** The kernel keeps, per mounted arch and in memory
+only, what the provider last said about the plan:
+
+| state | set by | what a step on that arch gets | cleared by |
+|---|---|---|---|
+| `healthy` | a mount; a call that came back | the call | — |
+| `rate_limited` | HTTP 429, a full usage window | **retryable** refusal (`arch rate-limited: …; step it again in N s`) until the provider's `Retry-After` — or 60 s when it named none — has passed; then the next call goes out and decides | the wait passing and a call coming back; a remount |
+| `exhausted` | HTTP 402, "credit balance is too low" | **refusal that fails the step**: `arch … is exhausted: … — top up the plan and run vk mount for this arch again, which clears it, or choose another arch` | a remount (or a restart) |
+| `retired` | HTTP 404 on the model | **refusal that fails the step**: `arch … is retired: … — vk umount <id> and choose another arch` | a remount (or a restart) |
+
+A rate-limited step takes the path a step on a still-`starting` arch already
+takes: it goes back to `Pending`, the task to `Queued`, the client gets
+`E_RETRY` (`-32006`), and the next `vk task step` runs it — there is no step
+timeout to run out. An exhausted or retired arch arrives as `arch unavailable`
+(`E_STORE`), and the step and its task are `Failed` with that sentence as the
+reason; another task's step on the same arch is refused at once, before
+anything is sent, so the provider is not asked again for an answer it has
+already refused. A repeat `vk mount` of the same arch stays idempotent on disk
+and on the record — the adapter is kept, nothing is appended — and clears its
+health: that is the remedy the `exhausted` refusal names.
+
+Health is not on the ledger as a kind of its own. A call the provider refused
+on its plan's account writes the `failed` phase of the `infer` event it
+already wrote `requested` for, with `health_after`; the call that clears a
+state carries `health_after: "healthy"` on its `completed` phase; a call that
+changes nothing carries nothing, so its payload is what it always was. A
+failure that says nothing about the plan — an I4′ refusal, an engine that
+would not start — leaves health as it was and writes no `failed` event.
+
+`vk arch show <id>` prints both, the claim and the observation:
+
+```
+quota   pay-as-you-go (50 requests/min, 30000 tokens/min)
+health  rate_limited until 1760000031000 ms (the provider's figure) since 1760000001000 ms: the provider is rate-limiting this arch; it asked for 30 s
+```
+
+and `vk top` has a `HEALTH` column after `GOVERNED`, with the provider's words
+under the table for every arch that is not healthy. The adapters map what they
+see: the first-party Anthropic arch 429 → `rate_limited` (reading
+`retry-after`), 402 `billing_error` and a 400 whose message says the credit
+balance is too low → `exhausted`, 404 `not_found_error` on `model:` →
+`retired`; the Bedrock arch 429 → `rate_limited`, 404 → `retired`; the Ollama
+arch 429 → `rate_limited`, a 404 naming the model → `retired`; the Claude Code
+arch a usage-limit message or `api_error_status` 429 → `rate_limited`, 402 or
+a too-low credit balance → `exhausted`, 404 → `retired`. Anything else is the
+failure it always was.
+
 ### Drivers: a browser this kernel controls
 
 A **driver** is a Python process this kernel starts, caps and talks to, and
