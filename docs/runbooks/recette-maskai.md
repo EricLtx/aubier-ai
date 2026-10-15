@@ -107,6 +107,10 @@ Le démon tourne en mode interactif, dans son propre terminal (P7) : Chrome doit
 ```powershell
 Get-Process vkd -ErrorAction SilentlyContinue | Stop-Process
 ```
+Si la tâche planifiée du §3.3 est inscrite, arrêtez plutôt la tâche : un `Stop-Process` pourrait être lu comme un échec, et la tâche relancerait le démon une minute plus tard.
+```powershell
+Stop-ScheduledTask -TaskName "Aubier vkd"
+```
 
 **3.2 Démarrage**, dans un terminal dédié qu'on laisse ouvert toute la séance :
 ```powershell
@@ -121,6 +125,26 @@ vkd listening endpoint=\\.\pipe\…
 Pourquoi `vkd` et pas `vk boot` ? `vk boot` ne transmet pas `--harness-timeout-secs`. Le chien de garde global resterait alors à 300 s, et il couperait chaque niveau à cinq minutes. Les pas lourds (N4, N6, N8) demandent `timeout_s = 2700`. Le démon prend le plus petit des deux budgets, donc le sien doit être au moins aussi grand.
 
 Fermer ce terminal, c'est couper l'alimentation : le driver et son Chrome meurent avec le démon. C'est voulu (Job Object, kill-on-close).
+
+**3.3 Mode quotidien, facultatif : la tâche planifiée « Aubier vkd ».** Pour le pilote, la façon documentée reste le terminal du §3.2. Pour un usage de tous les jours (spec P7, condition (b)), `scripts\vkd-logon-task.ps1` inscrit une tâche planifiée qui lance la même ligne, `vkd --auto-enroll-node --harness-timeout-secs 2700`, à l'ouverture de votre session. Elle tourne dans votre session interactive, sans élévation, pour que Chrome s'ouvre sur votre bureau. Si elle échoue, Windows la relance chaque minute, trois fois au plus. Elle n'a pas de limite de durée et tourne aussi sur batterie.
+
+Une fois, après le build du §2, dans un PowerShell élevé (« Exécuter en tant qu'administrateur ») ouvert depuis votre propre compte, à la racine du dépôt :
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\vkd-logon-task.ps1
+```
+Attendu : `tâche « Aubier vkd » inscrite pour <DOMAINE>\<vous>`, puis la ligne lancée. Le compte affiché doit être le vôtre. Le script est idempotent : relancé, il remplace la tâche.
+
+Pour l'essayer sans attendre la prochaine session :
+```powershell
+Start-ScheduledTask -TaskName "Aubier vkd"
+```
+Attendu : la fenêtre console de `vkd` s'ouvre, avec les traces du §3.2. La fermer arrête le démon, comme au §3.2. Avec la tâche, sautez le §3.2.
+
+Pour la retirer :
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\vkd-logon-task.ps1 -Remove
+```
+Attendu : `tâche « Aubier vkd » désinscrite`.
 
 ---
 
@@ -305,7 +329,7 @@ vk artefact cat $a[-1].hash
 ```
 Attendu : le texte du verdict, qui commence par `judge:`.
 
-`vk artefact cat` est un acte humain, signé par la clé de l'appareil comme `vk approve`. C'est aussi une sortie de texte en clair hors du noyau. Le ledger l'inscrit donc avant de rendre les octets (Ruling R24) : un `artefact.released` qui nomme la tâche, l'adresse et la destination `terminal:<appareil>`. Une lecture refusée n'inscrit rien. Pour un artefact qui n'est pas du texte, ajoutez `--out fichier`. La page `vk task show $t` le dit aussi, sur la ligne `artefacts` : `N, latest verdict.md sha256:…`.
+`vk artefact cat` est un acte humain, signé par la clé de l'appareil comme `vk approve`. C'est aussi une sortie de texte en clair hors du noyau. Le ledger l'inscrit donc avant de rendre les octets (Ruling R24) : un `artefact.released`, dont le hash engage la tâche, l'adresse de l'artefact et la destination `terminal:<appareil>`. Le ledger ne porte que ce hash, pas ces valeurs en clair. Une lecture refusée n'inscrit rien. Pour un artefact qui n'est pas du texte, ajoutez `--out fichier`. La page `vk task show $t` le dit aussi, sur la ligne `artefacts` : `N, latest verdict.md sha256:…`.
 
 ```powershell
 vk approve $t                   # 13 : verdict et KO sécurité
@@ -326,10 +350,16 @@ notepad "$env:TEMP\rapport-a-signer.md"
 ```
 Attendu : `wrote N bytes to …`, puis le rapport dans le Bloc-notes, où les accents s'affichent sans faute quelle que soit la page de code du terminal.
 
-**S'il ne convient pas, ne le signez pas.** La tâche reste en attente sur la ligne 15, et rien n'est publié. Pour faire refaire le juge et la rédaction, appliquez la reprise (§12) : les dix niveaux sont rejoués depuis le journal sans toucher MaskAI.
+**S'il ne convient pas, ne le signez pas.** La tâche reste en attente sur la ligne 15, et rien n'est publié. Supprimez la copie lue, qui peut porter ce qui doit rester privé :
+```powershell
+Remove-Item "$env:TEMP\rapport-a-signer.md"
+```
+Pour faire refaire le juge et la rédaction, appliquez la reprise (§12) : les dix niveaux sont rejoués depuis le journal sans toucher MaskAI.
 
+S'il convient, signez-le, puis supprimez la copie lue de la même façon :
 ```powershell
 vk approve $t                   # 15 : le rapport
+Remove-Item "$env:TEMP\rapport-a-signer.md"
 vk task step $t --all           # 15 se ferme, puis 16 publication
 ```
 Attendu : `approved sha256:…`, puis `status    done` et seize lignes `done`. La ligne 16 donne le chemin complet de publication, sous `…\exports\recettage-chat-ia\runs\2026-10`.
@@ -422,12 +452,14 @@ $S = (vk status --json | ConvertFrom-Json).state_dir
 $n = 1                                   # 1 au premier essai repris, puis 2, 3…
 vk driver umount maskai-1
 $obs = "$S\drivers\maskai-1\work\observations.json"
-if (Test-Path $obs) { Rename-Item $obs "observations-essai$n.json" }
+if (Test-Path $obs) { Rename-Item $obs "observations-essai$n.json" -ErrorAction Stop }
 $src = "$S\exports\recettage-chat-ia\runs\2026-10"
-if (Test-Path $src) { Rename-Item $src "2026-10-essai$n" }
+if (Test-Path $src) { Rename-Item $src "2026-10-essai$n" -ErrorAction Stop }
 vk mount driver --manifest drivers\maskai-recette\manifest.json
 $t = (vk task submit --steps recipes\recette-maskai.json --json | ConvertFrom-Json).id
 ```
+Si un `Rename-Item` échoue, le nom `…essai$n` est déjà pris : arrêtez-vous, prenez le `$n` suivant et recommencez.
+
 Attendu :
 - `unmounted driver maskai-1`, puis le tableau `DRIVER … maskai-1 … yes` ;
 - Chrome se rouvre, avec la même session MaskAI ;

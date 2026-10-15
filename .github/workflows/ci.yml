@@ -196,7 +196,7 @@ jobs:
   driver-browser:
     # The MaskAI driver against its local fixture page, headless Chromium: the
     # eleven actions, the dialog guard and the host allow-list, then the
-    # recette scripts (evaluator, journal). Every push, like `test`: the
+    # recette scripts (evaluator). Every push, like `test`: the
     # fixture tests take about 90 s, nothing here pulls a model or a container.
     runs-on: ubuntu-latest
     timeout-minutes: 20

@@ -381,9 +381,9 @@ may cap `max_actions` and `timeout_s`. A recipe names its arches by manifest
 name, and `vk task submit --steps` resolves each to the one mounted arch of
 that name, refusing none or several (pilot ruling R21), because an arch id is
 a hash that differs by machine and by model version. `--steps` conflicts with
-the flag-built task (`--goal`, `--plan`, `--draft`, `--harness`, `--judge`,
-`--approve`, `--release`); a harness step is then run with `vk harness run
-TASK`, as before.
+the flag-built task (`--goal`, `--artefact`, `--plan`, `--draft`, `--harness`,
+`--judge`, `--approve`, `--release`); a harness step is then run with
+`vk harness run TASK`, as before.
 
 The first use is the MaskAI recette, sixteen steps. The procedure for the
 founder, in French, from the first boot to the release, is
