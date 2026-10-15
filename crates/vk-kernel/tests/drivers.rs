@@ -1107,6 +1107,67 @@ fn boot_marks_a_manifest_that_no_longer_validates_degraded() {
         .unwrap();
 }
 
+/// Final review I3: a row of the `drivers` table this binary can no longer
+/// read as a `DriverRow` — a field it does not know (a manifest mounted by a
+/// newer binary, then a rollback), a hand edit — must not fail the boot, and
+/// with it every CLI remedy while the daemon is down. Boot logs it, records
+/// `driver.unmounted{driver_id: <key>, reason: "row unreadable at boot"}`,
+/// removes it and goes on: the sound row stays, the listing works again, and
+/// a second boot has nothing more to say.
+#[test]
+fn boot_removes_a_driver_row_that_no_longer_deserialises() {
+    let d = tempfile::tempdir().unwrap();
+    let row = {
+        let mut k = open(d.path());
+        mount(&mut k)
+    };
+    let mut k = open(d.path());
+    let mut newer = serde_json::to_value(&row).unwrap();
+    newer["manifest"]["name"] = serde_json::json!("newer");
+    newer["manifest"]["program"]["sandbox"] =
+        serde_json::json!("a field this binary never heard of");
+    k.store().db.put_json("drivers", "newer", &newer).unwrap();
+    k.store()
+        .db
+        .put_json("drivers", "garbled", &serde_json::json!({"manifest": 3}))
+        .unwrap();
+    assert!(
+        k.drivers().is_err(),
+        "before boot, one bad row fails the listing"
+    );
+
+    k.boot().expect("boot goes on past rows it cannot read");
+    assert_eq!(
+        k.drivers().unwrap(),
+        vec![row.clone()],
+        "the sound row stays"
+    );
+    assert!(k.driver("newer").unwrap().is_none());
+    assert!(k.driver("garbled").unwrap().is_none());
+    let unmounted = events_of(&k, "driver.unmounted");
+    let expected: Vec<String> = ["garbled", "newer"]
+        .iter()
+        .map(|key| {
+            hash_canonical(&DriverUnmounted {
+                driver_id: (*key).into(),
+                reason: "row unreadable at boot".into(),
+            })
+        })
+        .collect();
+    assert_eq!(
+        unmounted
+            .iter()
+            .map(|e| e.payload_hash.clone())
+            .collect::<Vec<_>>(),
+        expected,
+        "one event per removed row, by key, in key order"
+    );
+
+    k.boot().unwrap();
+    assert_eq!(events_of(&k, "driver.unmounted").len(), 2);
+    assert_eq!(k.drivers().unwrap(), vec![row]);
+}
+
 #[test]
 fn recipe_steps_deserialize_as_step_kinds() {
     let recipe: TaskRecipe = serde_json::from_str(include_str!(

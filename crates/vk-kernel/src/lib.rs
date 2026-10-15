@@ -1079,8 +1079,10 @@ impl RealKernel {
         self.sweep_harness_state()?;
         // Every driver row's manifest must still validate (pilot Task 2): a
         // row whose manifest the rules no longer accept is degraded, with the
-        // reason on the row and on the ledger, never quietly served. Nothing
-        // is spawned here — the daemon owns the processes.
+        // reason on the row and on the ledger, never quietly served; a row
+        // that no longer reads as one at all is recorded and removed, never
+        // a boot that fails (final review I3). Nothing is spawned here — the
+        // daemon owns the processes.
         self.degrade_invalid_drivers()?;
         // And the rows past their retention (Task 10 group C). The daemon
         // repeats this on its schedule for as long as it runs.

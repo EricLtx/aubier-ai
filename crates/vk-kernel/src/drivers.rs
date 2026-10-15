@@ -41,6 +41,10 @@ const DRIVERS: &str = "drivers";
 /// The reason `boot` degrades a row whose stored manifest no longer validates.
 pub const MANIFEST_INVALID_AT_BOOT: &str = "manifest invalid at boot";
 
+/// The reason `boot` removes a row it cannot read as a [`DriverRow`] at all
+/// (final review I3).
+pub const ROW_UNREADABLE_AT_BOOT: &str = "row unreadable at boot";
+
 /// Whether a mounted driver may be acted on.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "state")]
@@ -407,9 +411,30 @@ impl RealKernel {
     /// degraded with [`MANIFEST_INVALID_AT_BOOT`]. Nothing is spawned — the
     /// daemon owns the processes — and a row already degraded is left as it
     /// is, so a second boot adds nothing.
+    ///
+    /// The table is listed raw and each row parsed on its own (final review
+    /// I3): a row this binary cannot read as a [`DriverRow`] — a field it does
+    /// not know, written by a newer binary before a rollback, or a hand edit
+    /// — must not fail the boot, and with it every CLI remedy while the
+    /// daemon is down. Such a row is logged, recorded as
+    /// `driver.unmounted{reason: ROW_UNREADABLE_AT_BOOT}` and removed
+    /// ([`RealKernel::remove_unreadable_driver`]); its driver is mounted again
+    /// from its manifest.
     pub(crate) fn degrade_invalid_drivers(&mut self) -> Result<Vec<String>, KernelError> {
         let mut degraded = Vec::new();
-        for row in self.drivers()? {
+        let rows = self
+            .store
+            .db
+            .list_json::<serde_json::Value>(DRIVERS)
+            .map_err(store_failed)?;
+        for (key, value) in rows {
+            let row = match serde_json::from_value::<DriverRow>(value) {
+                Ok(row) => row,
+                Err(e) => {
+                    self.remove_unreadable_driver(&key, &e)?;
+                    continue;
+                }
+            };
             if row.state == DriverState::Ready && row.manifest.validate().is_err() {
                 self.degrade_driver(&row.manifest.name, MANIFEST_INVALID_AT_BOOT)?;
                 tracing::warn!(
@@ -420,6 +445,41 @@ impl RealKernel {
             }
         }
         Ok(degraded)
+    }
+
+    /// Remove the `drivers` row under `key` that does not deserialise, after
+    /// logging the serde error and recording `driver.unmounted{driver_id:
+    /// <key>, reason: ROW_UNREADABLE_AT_BOOT}` — ledger before the row, as
+    /// everywhere. The key stands for the identity the row can no longer
+    /// give; it is a manifest name, written by a mount, and one that is not
+    /// shaped like one (a hand edit) is recorded as `unknown`. Whatever was in
+    /// flight for it goes with it.
+    fn remove_unreadable_driver(
+        &mut self,
+        key: &str,
+        e: &serde_json::Error,
+    ) -> Result<(), KernelError> {
+        tracing::error!(
+            driver = %key,
+            error = %e,
+            "a mounted driver's row no longer deserialises; removed at boot, mount the driver again"
+        );
+        let name_shaped = !key.is_empty()
+            && key.len() <= 32
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        self.log(
+            "driver.unmounted",
+            crate::now_ms(),
+            &DriverUnmounted {
+                driver_id: if name_shaped { key } else { "unknown" }.into(),
+                reason: ROW_UNREADABLE_AT_BOOT.into(),
+            },
+        )?;
+        self.store.db.delete(DRIVERS, key).map_err(store_failed)?;
+        self.in_flight.remove(key);
+        Ok(())
     }
 
     /// Phase one of `driver.act`, under the kernel lock: the seven refusals of
