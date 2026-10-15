@@ -64,18 +64,27 @@ fn quota(q: &Value) -> String {
 }
 
 /// What the kernel last saw of an arch's provider, on one line: the state,
-/// until when for a rate limit (and whose figure that is), since when, and
-/// the provider's own words (2026-10-15). A dash for no entry — an arch that
-/// is no longer mounted.
+/// the seconds left for a rate limit (and whose figure that wait is), since
+/// when, and the provider's own words (2026-10-15). A dash for no entry — an
+/// arch that is no longer mounted.
+///
+/// The seconds left, not the instant the wait ends (review M2): the daemon
+/// counts them when it answers (`retry_in_s`), on the clock it holds the arch
+/// by, so this screen and the refusal a step meets say the same number.
 fn health(h: &Value) -> String {
     let Some(state) = h["state"].as_str() else {
         return "-".into();
     };
     let mut line = state.to_string();
     if state == "rate_limited" {
-        line.push_str(&match h["until_ms"].as_u64() {
-            Some(until) => format!(" until {until} ms (the provider's figure)"),
-            None => " (no figure from the provider; held 60 s by the kernel)".into(),
+        let whose = if h["until_ms"].is_u64() {
+            "the provider's figure"
+        } else {
+            "the kernel's 60 s default"
+        };
+        line.push_str(&match h["retry_in_s"].as_u64() {
+            Some(left) => format!(", next call in {left} s ({whose})"),
+            None => format!(" ({whose})"),
         });
     }
     line.push_str(&format!(" since {} ms", text(&h["since_ms"])));
@@ -1595,7 +1604,7 @@ mod tests {
                 "sha256:ok": {"state": "healthy", "since_ms": 1},
                 "sha256:spent": {"state": "exhausted", "since_ms": 5,
                                  "last_error": "credit balance is too low"},
-                "sha256:slow": {"state": "rate_limited", "since_ms": 7},
+                "sha256:slow": {"state": "rate_limited", "since_ms": 7, "retry_in_s": 53},
             },
             "governed": {}, "locality": {}, "jurisdiction": {}, "price_eur_per_1k": {},
             "tasks": {}, "stopped_scopes": [], "liveness": {},
@@ -1614,7 +1623,9 @@ mod tests {
             "{screen}"
         );
         assert!(
-            screen.contains("sha256:slow is rate_limited (no figure from the provider"),
+            screen.contains(
+                "sha256:slow is rate_limited, next call in 53 s (the kernel's 60 s default)"
+            ),
             "{screen}"
         );
         assert!(
@@ -1649,7 +1660,7 @@ mod tests {
         };
         let metered = page(
             json!({"plan": "pay-as-you-go", "requests_per_minute": 50, "tokens_per_minute": 30000}),
-            json!({"state": "rate_limited", "until_ms": 31000, "since_ms": 1000,
+            json!({"state": "rate_limited", "until_ms": 31000, "since_ms": 1000, "retry_in_s": 12,
                    "last_error": "the provider is rate-limiting this arch; it asked for 30 s"}),
         );
         assert!(
@@ -1660,10 +1671,14 @@ mod tests {
             !metered.contains("tokens/day"),
             "an unstated limit is not printed: {metered}"
         );
+        // Review M2: the seconds left, not a wall-clock instant nobody can
+        // read at a glance.
         assert!(
-            metered.contains("rate_limited until 31000 ms (the provider's figure) since 1000 ms"),
+            metered
+                .contains("rate_limited, next call in 12 s (the provider's figure) since 1000 ms"),
             "{metered}"
         );
+        assert!(!metered.contains("31000"), "{metered}");
         let plain = page(
             json!({"plan": "subscription"}),
             json!({"state": "healthy", "since_ms": 3}),

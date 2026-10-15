@@ -37,6 +37,11 @@ const APPROVAL_POLL: Duration = Duration::from_millis(500);
 /// A `--all` run drives one step per call; this bounds it so a task that never
 /// settles is reported rather than looped on forever.
 const MAX_STEPS: usize = 256;
+
+/// The longest `vk task step --all` waits on a rate-limited arch before it
+/// steps again — once (review M6). A refusal naming a longer wait is waited
+/// this long and tried; still held, the command ends with the refusal.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(300);
 /// How long `vk boot` waits for the daemon it started to answer.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1171,7 +1176,11 @@ async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
         }
         TaskCmd::Step { task_id, all } => {
             let step = || c.call("task.step", json!({ "task_id": task_id }), None);
-            let mut t = step().await?;
+            // `--all` waits out one rate limit, once, for the time the
+            // refusal names (review M6); a single step answers at once, as
+            // it always has. `may_wait` is spent by that one wait.
+            let mut may_wait = *all;
+            let mut t = step_waiting_once(step, &mut may_wait).await?;
             if *all {
                 let mut runs = 1;
                 while !settled(&t) {
@@ -1180,7 +1189,7 @@ async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
                             "task {task_id} had not settled after {MAX_STEPS} steps"
                         ));
                     }
-                    t = step().await?;
+                    t = step_waiting_once(step, &mut may_wait).await?;
                     runs += 1;
                 }
             }
@@ -1419,6 +1428,46 @@ fn driver_manifest(file: &Path) -> Result<(Value, String)> {
 
 /// A task that will not move again without something else happening: a human,
 /// a fix, or a resume.
+/// How long to wait on a refusal before stepping again: the wait a
+/// rate-limit refusal names, at most [`MAX_RETRY_WAIT`]. `None` for anything
+/// else — an arch still starting names no wait, and an error that is not
+/// `E_RETRY` is not one to wait on — so the caller ends with it as before.
+fn retry_wait(e: &anyhow::Error) -> Option<Duration> {
+    let call = e.downcast_ref::<vk_ipc::client::CallError>()?;
+    if call.code != vk_ipc::E_RETRY {
+        return None;
+    }
+    let secs = vk_kernel::health::retry_in_s_of(&call.message)?;
+    Some(Duration::from_secs(secs).min(MAX_RETRY_WAIT))
+}
+
+/// One `task.step` — and, while `may_wait` holds, one more after waiting out
+/// the rate limit the first refusal named (review M6). The wait is the
+/// refusal's own figure, at most five minutes, and it is spent: a second
+/// refusal, now or on a later step of the same `--all`, is the answer, and
+/// the command ends with it, `E_RETRY` and all. No loop.
+async fn step_waiting_once<F, Fut>(mut step: F, may_wait: &mut bool) -> Result<Value>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    match step().await {
+        Ok(t) => Ok(t),
+        Err(e) => match retry_wait(&e).filter(|_| *may_wait) {
+            Some(wait) => {
+                *may_wait = false;
+                eprintln!(
+                    "{e}\nwaiting {} s, once, then stepping again",
+                    wait.as_secs()
+                );
+                tokio::time::sleep(wait).await;
+                step().await
+            }
+            None => Err(e),
+        },
+    }
+}
+
 fn settled(t: &Value) -> bool {
     matches!(
         t["status"].as_str(),
@@ -2002,6 +2051,114 @@ mod detach_tests {
             let ours = unsafe { libc::getpgrp() };
             assert_ne!(pgid, ours, "and it is not this process's group");
         }
+    }
+}
+
+#[cfg(test)]
+mod step_wait_tests {
+    use super::{retry_wait, step_waiting_once, MAX_RETRY_WAIT};
+    use serde_json::{json, Value};
+    use std::cell::RefCell;
+    use std::time::Duration;
+    use vk_ipc::client::CallError;
+
+    fn refused(code: i32, message: &str) -> anyhow::Error {
+        CallError {
+            code,
+            message: message.into(),
+        }
+        .into()
+    }
+
+    fn held(secs: u64) -> anyhow::Error {
+        refused(
+            vk_ipc::E_RETRY,
+            &format!(
+                "arch rate-limited: arch a: x; the step waits — step it again in {secs} s (y)"
+            ),
+        )
+    }
+
+    /// Review M6: the wait is the refusal's own figure, at most five
+    /// minutes, and only a rate limit's — an arch still starting names none,
+    /// and nothing that is not `E_RETRY` is waited on at all.
+    #[test]
+    fn the_wait_is_the_refusal_s_figure_capped_at_five_minutes() {
+        assert_eq!(retry_wait(&held(42)), Some(Duration::from_secs(42)));
+        assert_eq!(retry_wait(&held(86_400)), Some(MAX_RETRY_WAIT));
+        assert_eq!(MAX_RETRY_WAIT, Duration::from_secs(300));
+        assert_eq!(
+            retry_wait(&refused(vk_ipc::E_RETRY, "arch a is starting; retry")),
+            None
+        );
+        assert_eq!(
+            retry_wait(&refused(vk_ipc::E_STORE, "x; step it again in 5 s")),
+            None
+        );
+        assert_eq!(retry_wait(&anyhow::anyhow!("step it again in 5 s")), None);
+    }
+
+    /// Scripted answers to `task.step`, and how many were asked for.
+    fn script(answers: Vec<anyhow::Result<Value>>) -> RefCell<Vec<anyhow::Result<Value>>> {
+        RefCell::new(answers.into_iter().rev().collect())
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_is_waited_out_once_and_the_step_tried_again() {
+        let answers = script(vec![Err(held(0)), Ok(json!({"status": "done"}))]);
+        let mut may_wait = true;
+        let t = step_waiting_once(
+            || async { answers.borrow_mut().pop().unwrap() },
+            &mut may_wait,
+        )
+        .await
+        .expect("the second try ran");
+        assert_eq!(t["status"], "done");
+        assert!(!may_wait, "the one wait is spent");
+        assert!(answers.borrow().is_empty(), "two calls, no more");
+    }
+
+    #[tokio::test]
+    async fn a_second_refusal_is_the_answer_with_its_e_retry() {
+        let answers = script(vec![Err(held(0)), Err(held(7)), Ok(json!({}))]);
+        let mut may_wait = true;
+        let err = step_waiting_once(
+            || async { answers.borrow_mut().pop().unwrap() },
+            &mut may_wait,
+        )
+        .await
+        .expect_err("still held");
+        let call = err
+            .downcast_ref::<CallError>()
+            .expect("the daemon's own error");
+        assert_eq!(call.code, vk_ipc::E_RETRY);
+        assert_eq!(answers.borrow().len(), 1, "no third call");
+        // And once the wait is spent, a refusal ends the command at once.
+        let answers = script(vec![Err(held(0)), Ok(json!({}))]);
+        assert!(step_waiting_once(
+            || async { answers.borrow_mut().pop().unwrap() },
+            &mut may_wait
+        )
+        .await
+        .is_err());
+        assert_eq!(answers.borrow().len(), 1, "no wait, no second call");
+    }
+
+    #[tokio::test]
+    async fn a_starting_arch_is_not_waited_on() {
+        let answers = script(vec![
+            Err(refused(vk_ipc::E_RETRY, "arch a is starting; retry")),
+            Ok(json!({})),
+        ]);
+        let mut may_wait = true;
+        assert!(step_waiting_once(
+            || async { answers.borrow_mut().pop().unwrap() },
+            &mut may_wait
+        )
+        .await
+        .is_err());
+        assert!(may_wait, "nothing was waited");
+        assert_eq!(answers.borrow().len(), 1);
     }
 }
 
