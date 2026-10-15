@@ -14,8 +14,10 @@
 //!
 //! What reaches the ledger is hashes (P10, Ruling 28): `driver.mounted` names
 //! the identity, `driver.acted` the hashes of what was asked and what came
-//! back, `driver.unmounted` the reason. The words live in the evidence, under
-//! the register's label plus the third-party origin.
+//! back, `driver.unmounted` the reason. A failure's reason is a word of a
+//! closed vocabulary ([`DRIVER_FAILURE_REASONS`]), never the host's message.
+//! The words live in the evidence, under the register's label plus the
+//! third-party origin.
 use crate::tasks::{
     StepKind, StepStatus, TaskStatus, DEFAULT_MAX_ACTIONS, HARNESS_MAX_FILE_BYTES,
     HARNESS_MAX_RUN_BYTES,
@@ -31,7 +33,7 @@ use vk_contracts::principal::Principal;
 use vk_contracts::register::{Evidence, Register};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
 use vk_contracts::{hash_bytes, hash_canonical};
-use vk_driver::{ActOutcome, EvidenceCaps, HostError};
+use vk_driver::{ActOutcome, EvidenceCaps, HostError, ProtocolFault};
 
 /// The metadata table of mounted drivers, keyed by the manifest's `name`.
 const DRIVERS: &str = "drivers";
@@ -117,29 +119,113 @@ pub struct DriverActPlan {
     pub act_id: u64,
 }
 
-/// The reason string the daemon hands [`RealKernel::driver_act_settle`] for a
-/// host failure, from the host's own error. One mapping, here, so the ledger's
-/// `reason` reads the same words everywhere: `timeout`, `dead: …`,
-/// `protocol: …`, `stopped`, `hello timeout: …`, `evidence …`. A failure the
-/// host has no variant for — the pool could not start the program — is the
-/// daemon's own text (`driver would not start: …`). The settle degrades the
-/// driver on every one of them but the three that start with `evidence`
-/// (Ruling R12): those are read back after the action, with the tree alive
-/// and in step, and `evidence too large: <name> …` is the one the settle
-/// remembers as the run's `oversize`, so the prefix and the name's place in
-/// it are load-bearing.
+/// Every `reason` a failed act can leave on `driver.acted` and
+/// `driver.unmounted`, and on a degraded row: a closed vocabulary (Ruling 28,
+/// final review I1). `evidence too large` is followed by `: <name>` when the
+/// file's name is a plain token, as every name the host reads back is.
+/// Nothing else a host or the daemon says about a failure — a path, a hash,
+/// an exit code, an excerpt of the driver's output and the site's words in
+/// it — reaches the record: that is [`DriverFailure::detail`], for the
+/// daemon's log and the driver's `driver.log`.
+pub const DRIVER_FAILURE_REASONS: &[&str] = &[
+    "timeout",
+    "stopped",
+    "dead",
+    "hello timeout",
+    "protocol: not started",
+    "protocol: not contained",
+    "protocol: bad hello",
+    "protocol: foreign id",
+    "protocol: malformed response",
+    "protocol: host i/o",
+    "evidence escape",
+    "evidence not declared",
+    "evidence too large",
+    "would not start",
+    "panicked",
+];
+
+/// The ledger's word for a host failure, from the variant and its fault
+/// alone — never from the message (see [`DRIVER_FAILURE_REASONS`]). One
+/// mapping, here, so the record reads the same words everywhere. The one
+/// value it carries is the too-large file's name, which the run's failure
+/// names too (Ruling 21.6), and only when it is a plain token.
 pub fn host_error_reason(e: &HostError) -> String {
     match e {
         HostError::Timeout => "timeout".into(),
-        HostError::Dead(why) => format!("dead: {why}"),
-        HostError::Protocol(why) => format!("protocol: {why}"),
         HostError::Stopped => "stopped".into(),
-        HostError::HelloTimeout(after) => format!("hello timeout: {after:?}"),
-        HostError::EvidenceEscape(name) => format!("evidence escape: {name}"),
-        HostError::EvidenceTooLarge { name, len, cap } => {
-            format!("evidence too large: {name} is {len} bytes, above {cap}")
+        HostError::Dead(_) => "dead".into(),
+        HostError::HelloTimeout(_) => "hello timeout".into(),
+        HostError::Protocol { fault, .. } => format!(
+            "protocol: {}",
+            match fault {
+                ProtocolFault::NotStarted => "not started",
+                ProtocolFault::NotContained => "not contained",
+                ProtocolFault::BadHello => "bad hello",
+                ProtocolFault::ForeignId => "foreign id",
+                ProtocolFault::MalformedResponse => "malformed response",
+                ProtocolFault::HostIo => "host i/o",
+            }
+        ),
+        HostError::EvidenceEscape(_) => "evidence escape".into(),
+        HostError::EvidenceNotDeclared(_) => "evidence not declared".into(),
+        HostError::EvidenceTooLarge { name, .. } => match plain_name(name) {
+            Some(name) => format!("evidence too large: {name}"),
+            None => "evidence too large".into(),
+        },
+    }
+}
+
+/// `name` when it passes the artefact-kind rule — what an evidence file's
+/// name is once the host has read it back — and so may stand on the ledger.
+fn plain_name(name: &str) -> Option<&str> {
+    crate::validate_artefact_kind(name).ok().map(|()| name)
+}
+
+/// Why a `driver.act` came back without an outcome: what the daemon hands
+/// [`RealKernel::driver_act_settle`] in place of one. Typed, so the settle
+/// decides what to degrade and what to remember from the variant, never from
+/// words (Task 2 re-review), and the ledger's `reason` is
+/// [`reason`](Self::reason), one of [`DRIVER_FAILURE_REASONS`].
+#[derive(Debug)]
+pub enum DriverFailure {
+    /// The host refused, or could not finish, the act.
+    Host(HostError),
+    /// The daemon could not give the act a process: the program would not
+    /// start, its files no longer hold to `files_sha256`, the slot is busy
+    /// with another act, the row went. The string is the daemon's account of
+    /// it, which may name paths and hashes.
+    WouldNotStart(String),
+    /// The act panicked in the daemon. Its host went with the unwinding,
+    /// killed and reaped.
+    Panicked,
+}
+
+impl From<HostError> for DriverFailure {
+    fn from(e: HostError) -> DriverFailure {
+        DriverFailure::Host(e)
+    }
+}
+
+impl DriverFailure {
+    /// The ledger's word for this failure: one of [`DRIVER_FAILURE_REASONS`].
+    pub fn reason(&self) -> String {
+        match self {
+            DriverFailure::Host(e) => host_error_reason(e),
+            DriverFailure::WouldNotStart(_) => "would not start".into(),
+            DriverFailure::Panicked => "panicked".into(),
         }
-        HostError::EvidenceNotDeclared(name) => format!("evidence not declared: {name}"),
+    }
+
+    /// Everything said about the failure, for the daemon's log and the
+    /// driver's `driver.log` — **never for the ledger**: it may name a path or
+    /// a hash, or quote the driver's own output.
+    pub fn detail(&self) -> String {
+        match self {
+            DriverFailure::Host(e) => e.to_string(),
+            DriverFailure::WouldNotStart(why) => why.clone(),
+            DriverFailure::Panicked => "the driver act panicked".into(),
+        }
     }
 }
 
@@ -490,20 +576,23 @@ impl RealKernel {
     /// harness step fails naming the file); `result.text` is appended to the
     /// register's evidence when the action says `to_register`; `driver.acted`
     /// is logged with hashes only; the row's `last_act_ms` moves; the harness
-    /// gets `result` and never the evidence bytes. On `Err(reason)` — the
-    /// daemon's [`host_error_reason`], or its own words for a process that
-    /// would not start — `driver.acted{ok:false, reason}` is logged and the
-    /// row's clock moves. Then Ruling R12: the driver is degraded **unless the
-    /// reason is one of the host's evidence refusals** (`evidence …`) — an
+    /// gets `result` and never the evidence bytes. On `Err(failure)` — a
+    /// [`DriverFailure`] — `driver.acted{ok:false, reason}` is logged with
+    /// [`DriverFailure::reason`], a word of the closed vocabulary
+    /// ([`DRIVER_FAILURE_REASONS`], Ruling 28): the failure's detail, which
+    /// may quote the driver, never reaches the record. The row's clock moves.
+    /// Then Ruling R12, decided on the variant: the driver is degraded
+    /// **unless the failure is one of the host's evidence refusals** — an
     /// escaping, oversize or undeclared file is read back *after* the action,
     /// with the tree alive and in step, where a process that would not start,
     /// printed no hello, timed out, died or broke protocol is not one to send
     /// the next request to. The host's too-large refusal is remembered on the
-    /// token as `oversize`, exactly as the door below does, so the run fails
-    /// naming the file (Ruling 21.6). The harness gets `Gate(reason)`. A
-    /// token that no longer resolves — the run settled while the act was out
-    /// — gets its I1 refusal back, after `driver.acted{ok:false}` has said
-    /// the action happened.
+    /// token as `oversize`, by the name the variant carries, exactly as the
+    /// door below does, so the run fails naming the file (Ruling 21.6). The
+    /// harness gets `Gate(reason)`, the word alone. A token that no longer
+    /// resolves — the run settled while the act was out — gets its I1
+    /// refusal back, after `driver.acted{ok:false}` has said the action
+    /// happened.
     ///
     /// The acted event comes after the attachments because it names their
     /// hashes — the order `harness_settle` keeps between collection and its
@@ -513,7 +602,7 @@ impl RealKernel {
         token: &str,
         now_ms: u64,
         plan: &DriverActPlan,
-        outcome: Result<ActOutcome, String>,
+        outcome: Result<ActOutcome, DriverFailure>,
     ) -> Result<serde_json::Value, KernelError> {
         let live = self.in_flight.get(&plan.name) == Some(&plan.act_id);
         if live {
@@ -552,8 +641,8 @@ impl RealKernel {
                     hosts_seen: o.hosts_seen.clone(),
                     ..base
                 },
-                Err(reason) => DriverActed {
-                    reason: Some(format!("stale act: {reason}")),
+                Err(failure) => DriverActed {
+                    reason: Some(format!("stale act: {}", failure.reason())),
                     ..base
                 },
             };
@@ -563,7 +652,8 @@ impl RealKernel {
 
         let outcome = match outcome {
             Ok(outcome) => outcome,
-            Err(reason) => {
+            Err(failure) => {
+                let reason = failure.reason();
                 self.log(
                     "driver.acted",
                     now_ms,
@@ -572,28 +662,27 @@ impl RealKernel {
                         ..base
                     },
                 )?;
-                if let Some(rest) = reason.strip_prefix("evidence") {
+                match &failure {
                     // The host read the files back after the action, with the
                     // tree alive and in step: nothing to degrade (Ruling R12).
                     // Its too-large refusal is the door's, remembered the same
                     // way, so the run fails naming the file (Ruling 21.6).
-                    let too_large = rest
-                        .strip_prefix(" too large: ")
-                        .and_then(|r| r.split(" is ").next())
-                        .filter(|name| !name.is_empty());
-                    if let Some(file) = too_large {
+                    DriverFailure::Host(HostError::EvidenceTooLarge { name, .. }) => {
+                        let file = plain_name(name).unwrap_or("evidence");
                         if let Some(state) = self.harness_tokens.get_mut(&key) {
                             state.oversize.get_or_insert(file.to_string());
                         }
                     }
-                } else {
-                    // Every other host failure degrades (Ruling R12). A driver
+                    DriverFailure::Host(
+                        HostError::EvidenceEscape(_) | HostError::EvidenceNotDeclared(_),
+                    ) => {}
+                    // Every other failure degrades (Ruling R12). A driver
                     // unmounted while its act was in flight has no row to
                     // degrade, and that is not an error of this settle.
-                    match self.degrade_driver(&plan.name, &reason) {
+                    _ => match self.degrade_driver(&plan.name, &reason) {
                         Ok(()) | Err(KernelError::NotFound(_)) => {}
                         Err(e) => return Err(e),
-                    }
+                    },
                 }
                 self.touch_driver(&plan.name, now_ms)?;
                 return Err(KernelError::Gate(reason));
@@ -774,39 +863,74 @@ impl RealKernel {
 mod tests {
     use super::*;
 
-    /// The ledger's words for each host failure: short, stable, and never
-    /// carrying anything but the host's own message.
+    /// The ledger's words for each failure (final review I1, Ruling 28): one
+    /// fixed word per variant and fault, whatever the message carried — here
+    /// a path, a hash and the site's words, none of which comes out. The one
+    /// value let through is a too-large file's name, and only a plain token.
     #[test]
-    fn host_error_reasons_are_short_stable_words() {
-        assert_eq!(host_error_reason(&HostError::Timeout), "timeout");
-        assert_eq!(host_error_reason(&HostError::Stopped), "stopped");
-        assert_eq!(
-            host_error_reason(&HostError::Dead("code 1".into())),
-            "dead: code 1"
-        );
-        assert_eq!(
-            host_error_reason(&HostError::Protocol("no reply".into())),
-            "protocol: no reply"
-        );
-        assert!(
-            host_error_reason(&HostError::HelloTimeout(std::time::Duration::from_secs(3)))
-                .starts_with("hello timeout: ")
-        );
-        assert_eq!(
-            host_error_reason(&HostError::EvidenceNotDeclared("x.png".into())),
-            "evidence not declared: x.png"
-        );
-        assert_eq!(
-            host_error_reason(&HostError::EvidenceEscape("x.png".into())),
-            "evidence escape: x.png"
-        );
-        assert_eq!(
-            host_error_reason(&HostError::EvidenceTooLarge {
-                name: "x".into(),
-                len: 2,
-                cap: 1
-            }),
-            "evidence too large: x is 2 bytes, above 1"
-        );
+    fn host_error_reasons_are_a_closed_vocabulary() {
+        let leak = "C:\\Users\\x\\driver.py sha256:abc0 the site's answer";
+        let protocol = |fault| HostError::Protocol {
+            fault,
+            detail: leak.into(),
+        };
+        let cases = [
+            (HostError::Timeout, "timeout"),
+            (HostError::Stopped, "stopped"),
+            (HostError::Dead(leak.into()), "dead"),
+            (
+                HostError::HelloTimeout(std::time::Duration::from_secs(3)),
+                "hello timeout",
+            ),
+            (protocol(ProtocolFault::NotStarted), "protocol: not started"),
+            (
+                protocol(ProtocolFault::NotContained),
+                "protocol: not contained",
+            ),
+            (protocol(ProtocolFault::BadHello), "protocol: bad hello"),
+            (protocol(ProtocolFault::ForeignId), "protocol: foreign id"),
+            (
+                protocol(ProtocolFault::MalformedResponse),
+                "protocol: malformed response",
+            ),
+            (protocol(ProtocolFault::HostIo), "protocol: host i/o"),
+            (HostError::EvidenceEscape(leak.into()), "evidence escape"),
+            (
+                HostError::EvidenceNotDeclared(leak.into()),
+                "evidence not declared",
+            ),
+            (
+                HostError::EvidenceTooLarge {
+                    name: "answer.png".into(),
+                    len: 2,
+                    cap: 1,
+                },
+                "evidence too large: answer.png",
+            ),
+            (
+                HostError::EvidenceTooLarge {
+                    name: leak.into(),
+                    len: 2,
+                    cap: 1,
+                },
+                "evidence too large",
+            ),
+        ];
+        for (e, word) in cases {
+            let reason = host_error_reason(&e);
+            assert_eq!(reason, word, "{e}");
+            let listed = DRIVER_FAILURE_REASONS
+                .iter()
+                .any(|w| reason == *w || reason.starts_with(&format!("{w}: ")));
+            assert!(listed, "{reason} is not in the vocabulary");
+            assert_eq!(DriverFailure::Host(e).reason(), word);
+        }
+        let spawn = DriverFailure::WouldNotStart(leak.into());
+        assert_eq!(spawn.reason(), "would not start");
+        assert_eq!(spawn.detail(), leak, "the detail is kept, for the log");
+        assert_eq!(DriverFailure::Panicked.reason(), "panicked");
+        for w in ["would not start", "panicked"] {
+            assert!(DRIVER_FAILURE_REASONS.contains(&w), "{w}");
+        }
     }
 }

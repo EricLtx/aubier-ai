@@ -105,13 +105,22 @@ pub struct ActOutcome {
 /// Why the host refused, or could not finish, what it was asked. `Protocol`
 /// also carries the host-side failures the protocol has no better word for —
 /// a program that could not be started, a tree that could not be contained, a
-/// directory that could not be made — each with its cause in the message.
+/// directory that could not be made — each typed by its [`ProtocolFault`],
+/// with its cause in `detail`.
+///
+/// The messages are for a log, not for the ledger: a detail may name a path,
+/// a hash, or quote the driver's own output — the site's words with it. The
+/// kernel words the ledger from the variant and the fault alone (Ruling 28,
+/// final review I1).
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
     #[error("driver printed no hello within {0:?}")]
     HelloTimeout(Duration),
-    #[error("driver protocol: {0}")]
-    Protocol(String),
+    #[error("driver protocol: {detail}")]
+    Protocol {
+        fault: ProtocolFault,
+        detail: String,
+    },
     #[error("driver exited: {0}")]
     Dead(String),
     #[error("action exceeded its deadline; driver tree killed")]
@@ -124,6 +133,38 @@ pub enum HostError {
     EvidenceTooLarge { name: String, len: u64, cap: u64 },
     #[error("evidence {0} is not a name the manifest allows for this action")]
     EvidenceNotDeclared(String),
+}
+
+/// Which kind of failure a [`HostError::Protocol`] is: a closed set, so a
+/// reader of the error decides from the kind and never from the words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolFault {
+    /// The program could not be started, or what it needs could not be made
+    /// first: an empty command, the work directory, the log, the evidence
+    /// root.
+    NotStarted,
+    /// The governor refused the tree, so it was killed before it ran
+    /// (Windows, fail closed).
+    NotContained,
+    /// The first line was not a hello this host takes: unreadable, another
+    /// protocol, or the manifest's actions missing from it.
+    BadHello,
+    /// A response under another request's id: a driver out of step.
+    ForeignId,
+    /// A response under this request's id that this host cannot read, or
+    /// one that lists an evidence file twice.
+    MalformedResponse,
+    /// A host-side I/O failure during an act: the evidence directory could
+    /// not be made, or a named evidence file could not be read.
+    HostIo,
+}
+
+/// A [`HostError::Protocol`] of this `fault`.
+fn protocol(fault: ProtocolFault, detail: impl Into<String>) -> HostError {
+    HostError::Protocol {
+        fault,
+        detail: detail.into(),
+    }
 }
 
 /// A running driver process and the host's end of its stdio. Owned by the
@@ -231,17 +272,24 @@ impl DriverHost {
     ) -> Result<DriverHost, HostError> {
         let argv = &manifest.program.command;
         let Some(program) = argv.first() else {
-            return Err(HostError::Protocol(
-                "program.command is empty: nothing to spawn".into(),
+            return Err(protocol(
+                ProtocolFault::NotStarted,
+                "program.command is empty: nothing to spawn",
             ));
         };
-        std::fs::create_dir_all(work_dir)
-            .map_err(|e| host_io(format!("create work dir {}", work_dir.display()), e))?;
+        std::fs::create_dir_all(work_dir).map_err(|e| {
+            host_io(
+                ProtocolFault::NotStarted,
+                format!("create work dir {}", work_dir.display()),
+                e,
+            )
+        })?;
         let log_path = work_dir.join("driver.log");
         let log = open_log(&log_path)?;
         let child_stderr = open_log(&log_path)?;
         let evidence_root = std::path::absolute(evidence_root).map_err(|e| {
             host_io(
+                ProtocolFault::NotStarted,
                 format!("resolve evidence root {}", evidence_root.display()),
                 e,
             )
@@ -272,10 +320,13 @@ impl DriverHost {
             cmd.process_group(0);
         }
         let mut child = cmd.spawn().map_err(|e| {
-            HostError::Protocol(format!(
-                "`{program}` could not be started in {}: {e}",
-                work_dir.display()
-            ))
+            protocol(
+                ProtocolFault::NotStarted,
+                format!(
+                    "`{program}` could not be started in {}: {e}",
+                    work_dir.display()
+                ),
+            )
         })?;
 
         // Immediately after spawn, before the child can do much: contain the
@@ -290,7 +341,10 @@ impl DriverHost {
                     tracing::error!(error = %format!("{e:#}"), "driver not contained: killed before it ran");
                     signal_tree(&mut child, &signals);
                     let _ = child.wait();
-                    return Err(HostError::Protocol(format!("not contained: {e:#}")));
+                    return Err(protocol(
+                        ProtocolFault::NotContained,
+                        format!("not contained: {e:#}"),
+                    ));
                 }
                 tracing::warn!(error = %format!("{e:#}"), "driver launched ungoverned: no governor on this platform");
                 false
@@ -425,8 +479,13 @@ impl DriverHost {
         let id = self.next_id;
         self.next_id += 1;
         let dir = self.evidence_root.join(id.to_string());
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| host_io(format!("create evidence dir {}", dir.display()), e))?;
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            host_io(
+                ProtocolFault::HostIo,
+                format!("create evidence dir {}", dir.display()),
+                e,
+            )
+        })?;
 
         let request = Request {
             id,
@@ -525,16 +584,17 @@ impl DriverHost {
                     Line::Other => self.log_line(&text),
                     Line::Foreign(other) => {
                         self.kill("foreign response id");
-                        return Err(HostError::Protocol(format!(
-                            "response id {other} while request {id} was in flight"
-                        )));
+                        return Err(protocol(
+                            ProtocolFault::ForeignId,
+                            format!("response id {other} while request {id} was in flight"),
+                        ));
                     }
                     Line::Malformed(why) => {
                         self.kill("malformed response");
-                        return Err(HostError::Protocol(format!(
-                            "response {id} is unreadable ({why}): {}",
-                            excerpt(&text)
-                        )));
+                        return Err(protocol(
+                            ProtocolFault::MalformedResponse,
+                            format!("response {id} is unreadable ({why}): {}", excerpt(&text)),
+                        ));
                     }
                 },
                 Err(RecvTimeoutError::Timeout) => {}
@@ -574,10 +634,10 @@ impl DriverHost {
                 return Err(HostError::EvidenceNotDeclared(r.name.clone()));
             }
             if !seen.insert(r.name.as_str()) {
-                return Err(HostError::Protocol(format!(
-                    "evidence {} is listed twice",
-                    r.name
-                )));
+                return Err(protocol(
+                    ProtocolFault::MalformedResponse,
+                    format!("evidence {} is listed twice", r.name),
+                ));
             }
             let ours = dir.join(&r.name);
             // The path the driver gives must be our file. Both sides resolve
@@ -588,7 +648,10 @@ impl DriverHost {
                 _ => return Err(HostError::EvidenceEscape(r.path.clone())),
             }
             let at = |e: std::io::Error| {
-                HostError::Protocol(format!("evidence {} at {}: {e}", r.name, ours.display()))
+                protocol(
+                    ProtocolFault::HostIo,
+                    format!("evidence {} at {}: {e}", r.name, ours.display()),
+                )
             };
             // Only a regular file at `<dir>/<name>` itself: a symlink, a
             // junction or a directory there is refused here, and a link
@@ -787,17 +850,17 @@ fn await_hello(
     };
     let hello = serde_json::from_str::<HelloLine>(&line)
         .map_err(|e| {
-            HostError::Protocol(format!(
-                "the first line is not a hello ({e}): {}",
-                excerpt(&line)
-            ))
+            protocol(
+                ProtocolFault::BadHello,
+                format!("the first line is not a hello ({e}): {}", excerpt(&line)),
+            )
         })?
         .hello;
     if hello.protocol != PROTOCOL {
-        return Err(HostError::Protocol(format!(
-            "protocol {} is not {PROTOCOL}",
-            hello.protocol
-        )));
+        return Err(protocol(
+            ProtocolFault::BadHello,
+            format!("protocol {} is not {PROTOCOL}", hello.protocol),
+        ));
     }
     let missing: Vec<&str> = manifest
         .actions
@@ -806,11 +869,14 @@ fn await_hello(
         .filter(|name| !hello.actions.iter().any(|h| h == name))
         .collect();
     if !missing.is_empty() {
-        return Err(HostError::Protocol(format!(
-            "the driver does not implement {} of the manifest's actions: {}",
-            missing.len(),
-            missing.join(", ")
-        )));
+        return Err(protocol(
+            ProtocolFault::BadHello,
+            format!(
+                "the driver does not implement {} of the manifest's actions: {}",
+                missing.len(),
+                missing.join(", ")
+            ),
+        ));
     }
     Ok(hello)
 }
@@ -999,12 +1065,18 @@ fn open_log(path: &Path) -> Result<File, HostError> {
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| host_io(format!("open {}", path.display()), e))
+        .map_err(|e| {
+            host_io(
+                ProtocolFault::NotStarted,
+                format!("open {}", path.display()),
+                e,
+            )
+        })
 }
 
-/// A host-side I/O failure, worded with what was attempted.
-fn host_io(what: String, e: std::io::Error) -> HostError {
-    HostError::Protocol(format!("{what}: {e}"))
+/// A host-side I/O failure of this `fault`, worded with what was attempted.
+fn host_io(fault: ProtocolFault, what: String, e: std::io::Error) -> HostError {
+    protocol(fault, format!("{what}: {e}"))
 }
 
 fn millis(d: Duration) -> u64 {

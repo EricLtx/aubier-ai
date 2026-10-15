@@ -29,7 +29,7 @@ use std::time::Duration;
 use vk_contracts::driver::{hash_dir, DriverAction, DriverManifest};
 use vk_contracts::syscalls::Ctx;
 use vk_driver::{ActOutcome, DriverHost, EvidenceCaps, HostError};
-use vk_kernel::drivers::{host_error_reason, DriverActPlan, DriverDirs, DriverRow, DriverState};
+use vk_kernel::drivers::{DriverActPlan, DriverDirs, DriverFailure, DriverRow, DriverState};
 use vk_kernel::now_ms;
 
 /// The memory cap on a driver's whole process tree: the harness's own.
@@ -185,9 +185,10 @@ impl DriverPool {
     /// refusals — read back after the action, with the driver alive and in
     /// step. After a timeout, a death, a protocol breach or a STOP the tree is
     /// already killed and the host is dropped, so the next `ensure` spawns a
-    /// fresh one. The `Err` is [`host_error_reason`] unaltered, or the pool's
-    /// own `driver would not start: …`: the kernel parses `evidence too
-    /// large: <name> …` out of it.
+    /// fresh one. The `Err` is the host's own error, typed
+    /// ([`DriverFailure::Host`]), or the pool's account of why the act had
+    /// no process ([`DriverFailure::WouldNotStart`]); the kernel words the
+    /// ledger from the variant alone.
     #[allow(clippy::too_many_arguments)]
     pub fn act(
         &self,
@@ -198,12 +199,12 @@ impl DriverPool {
         deadline: Duration,
         caps: EvidenceCaps,
         should_stop: &(dyn Fn() -> bool + Sync),
-    ) -> Result<ActOutcome, String> {
+    ) -> Result<ActOutcome, DriverFailure> {
         let name = row.manifest.name.as_str();
         let mut taken = None;
         for _ in 0..2 {
             self.ensure(row, dirs)
-                .map_err(|e| format!("driver would not start: {e:#}"))?;
+                .map_err(|e| DriverFailure::WouldNotStart(format!("{e:#}")))?;
             let mut map = self.map();
             match map.remove(name) {
                 Some(Slot::Idle { host, driver_id }) if driver_id == row.driver_id => {
@@ -224,26 +225,25 @@ impl DriverPool {
                 Some(Slot::Acting { pid, driver_id }) => {
                     let why = busy(name, &driver_id, &row.driver_id);
                     map.insert(name.to_string(), Slot::Acting { pid, driver_id });
-                    return Err(format!("driver would not start: {why}"));
+                    return Err(DriverFailure::WouldNotStart(why));
                 }
                 Some(Slot::Spawning) => {
                     map.insert(name.to_string(), Slot::Spawning);
-                    return Err(format!(
-                        "driver would not start: driver {name}'s process is starting"
-                    ));
+                    return Err(DriverFailure::WouldNotStart(format!(
+                        "driver {name}'s process is starting"
+                    )));
                 }
                 None => {
-                    return Err(format!(
-                        "driver would not start: no process is running for driver {name}"
-                    ))
+                    return Err(DriverFailure::WouldNotStart(format!(
+                        "no process is running for driver {name}"
+                    )))
                 }
             }
         }
         let Some((mut host, driver_id)) = taken else {
-            return Err(format!(
-                "driver would not start: driver {name}'s process was replaced by another \
-                 manifest's twice under this act"
-            ));
+            return Err(DriverFailure::WouldNotStart(format!(
+                "driver {name}'s process was replaced by another manifest's twice under this act"
+            )));
         };
         let pid = host.pid();
         let outcome = host.act(action, args, deadline, caps, should_stop);
@@ -269,7 +269,7 @@ impl DriverPool {
         };
         // Unlocked: dropping a host kills its tree and reaps it.
         drop(leftover);
-        outcome.map_err(|e| host_error_reason(&e))
+        outcome.map_err(DriverFailure::Host)
     }
 
     /// Forget `name`'s process and kill its tree, whatever it is doing; when
@@ -568,6 +568,11 @@ fn no_args() -> Value {
 /// `stopped`, and after the STOP is lifted the operator remounts. An unmount
 /// while the act runs kills the tree too (Ruling R13), and the settle is the
 /// kernel's stale path.
+///
+/// A failed act's detail — a path, a hash, an excerpt of the driver's own
+/// output — goes to this daemon's log and to the driver's `driver.log`
+/// ([`report_failure`]) before the settle, which records the closed word
+/// alone (Ruling 28, final review I1).
 pub(crate) fn act(kernel: &Shared, pool: &DriverPool, p: Value) -> Result<Value, RpcError> {
     let ActParams {
         token,
@@ -594,8 +599,11 @@ pub(crate) fn act(kernel: &Shared, pool: &DriverPool, p: Value) -> Result<Value,
     }));
     let outcome = acted.unwrap_or_else(|_| {
         pool.clear_acting(&plan.name);
-        Err("the driver act panicked".to_string())
+        Err(DriverFailure::Panicked)
     });
+    if let Err(failure) = &outcome {
+        report_failure(&plan, failure);
+    }
     let result = lock(kernel)?
         .driver_act_settle(&token, now_ms(), &plan, outcome)
         .map_err(kerr)?;
@@ -612,23 +620,20 @@ pub(crate) fn act(kernel: &Shared, pool: &DriverPool, p: Value) -> Result<Value,
 /// **before** the act's clock starts: the act gets the action's whole
 /// `max_action_ms`, and a spawn's time — a hello can take thirty seconds — is
 /// on top of it, not charged to it (minor 9). A host that cannot be had is
-/// the daemon's own reason, `driver would not start: …`.
+/// [`DriverFailure::WouldNotStart`], with the daemon's account of why.
 fn run_act(
     kernel: &Shared,
     pool: &DriverPool,
     plan: &DriverActPlan,
     should_stop: &(dyn Fn() -> bool + Sync),
-) -> Result<ActOutcome, String> {
+) -> Result<ActOutcome, DriverFailure> {
     let row = kernel
         .lock()
-        .map_err(|_| "driver would not start: kernel lock poisoned".to_string())?
+        .map_err(|_| DriverFailure::WouldNotStart("kernel lock poisoned".into()))?
         .driver(&plan.name)
-        .map_err(|e| format!("driver would not start: {e}"))?
+        .map_err(|e| DriverFailure::WouldNotStart(e.to_string()))?
         .ok_or_else(|| {
-            format!(
-                "driver would not start: driver {} is no longer mounted",
-                plan.name
-            )
+            DriverFailure::WouldNotStart(format!("driver {} is no longer mounted", plan.name))
         })?;
     // `deadline_ms` is `begun_ms + max_action_ms`: the action's whole budget,
     // counted from the act itself.
@@ -642,4 +647,37 @@ fn run_act(
         plan.caps,
         should_stop,
     )
+}
+
+/// Where a failed act's detail goes, since the ledger takes only its word
+/// (Ruling 28, final review I1): this daemon's log at `warn`, and a line in
+/// the driver's own `<work>/driver.log`, beside the driver's stderr and the
+/// host's stray-stdout notes, where an operator reading `vk driver show`'s
+/// degraded reason looks next. The log line is best effort: a work directory
+/// that cannot be written to is said in the daemon's log and changes nothing
+/// else — the settle still records the failure.
+fn report_failure(plan: &DriverActPlan, failure: &DriverFailure) {
+    let reason = failure.reason();
+    let detail = failure.detail();
+    tracing::warn!(
+        driver = %plan.name,
+        action = %plan.action.name,
+        task = %plan.task_id,
+        %reason,
+        %detail,
+        "driver act failed"
+    );
+    let path = plan.dirs.work.join("driver.log");
+    let line = format!(
+        "[daemon] act {} on task {} failed: {reason}: {detail}\n",
+        plan.action.name, plan.task_id
+    );
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut log| std::io::Write::write_all(&mut log, line.as_bytes()));
+    if let Err(e) = written {
+        tracing::warn!(path = %path.display(), error = %e, "a failed act's detail could not be appended to driver.log");
+    }
 }

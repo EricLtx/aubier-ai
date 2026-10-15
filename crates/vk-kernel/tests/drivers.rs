@@ -15,7 +15,8 @@
 //! `driver.acted`, the driver's own `host` refusal included; evidence counts
 //! toward the run's 16 MiB; a degraded driver whose manifest changed is
 //! remounted after an unmount; boot degrades a manifest that no longer
-//! validates.
+//! validates. The final fix wave: a failed act is recorded by a word of the
+//! closed vocabulary, never by the host's or the daemon's detail (I1).
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,10 +32,10 @@ use vk_contracts::principal::{Approval, ApprovalKind, HumanKey, Principal, Softw
 use vk_contracts::recipe::TaskRecipe;
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
 use vk_contracts::testing::KernelTestHooks;
-use vk_driver::{ActOutcome, EvidenceFile, HostError};
+use vk_driver::{ActOutcome, EvidenceFile, HostError, ProtocolFault};
 use vk_harness::launch::{ExitReason, HarnessRun};
 use vk_kernel::arch::{AdapterError, ArchAdapter, Completion, MountSpec};
-use vk_kernel::drivers::{host_error_reason, DriverActPlan, DriverRow, DriverState};
+use vk_kernel::drivers::{DriverActPlan, DriverFailure, DriverRow, DriverState};
 use vk_kernel::ns::{resolve, Entry};
 use vk_kernel::tasks::{
     HarnessLaunch, StepKind, StepStatus, Task, TaskStatus, HARNESS_MAX_FILE_BYTES,
@@ -724,7 +725,7 @@ fn settle_on_host_timeout_degrades_the_driver() {
         .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
         .unwrap();
     let err = k
-        .driver_act_settle(&l.token, 30, &plan, Err("timeout".into()))
+        .driver_act_settle(&l.token, 30, &plan, Err(HostError::Timeout.into()))
         .unwrap_err();
     assert!(matches!(err, KernelError::Gate(_)), "{err}");
     assert!(err.to_string().contains("timeout"), "{err}");
@@ -1536,9 +1537,14 @@ fn a_degraded_driver_can_be_remounted_after_umount() {
     let plan = k
         .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
         .unwrap();
-    let dead = "dead: exit code 1";
-    k.driver_act_settle(&l.token, 20, &plan, Err(dead.into()))
-        .unwrap_err();
+    let dead = "dead";
+    k.driver_act_settle(
+        &l.token,
+        20,
+        &plan,
+        Err(HostError::Dead("exit code 1".into()).into()),
+    )
+    .unwrap_err();
     let degraded = DriverState::Degraded {
         reason: dead.into(),
     };
@@ -1704,7 +1710,10 @@ fn hosts_seen_from_the_host_lands_on_driver_acted() {
 /// Ruling R12: every host-side failure degrades the driver — a process that
 /// would not start, printed no hello, timed out, died or broke protocol is
 /// not one to send the next request to. Only the kernel's own evidence
-/// refusals (the settle door) leave it `Ready`.
+/// refusals (the settle door) leave it `Ready`. And final review I1: a
+/// spawn failure's account names paths and hashes, so the record says
+/// `would not start` and nothing more — on `driver.acted`, on
+/// `driver.unmounted`, on the row and in the harness's refusal.
 #[test]
 fn settle_on_any_host_failure_degrades_the_driver() {
     let d = tempfile::tempdir().unwrap();
@@ -1715,12 +1724,26 @@ fn settle_on_any_host_failure_degrades_the_driver() {
     let plan = k
         .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
         .unwrap();
-    let reason = "driver would not start: spawn failed";
+    let account = "driver files hash sha256:1111 (of C:\\Users\\founder\\drivers\\maskai-recette) \
+                   is not the manifest's files_sha256 sha256:0000";
+    let reason = "would not start";
     let err = k
-        .driver_act_settle(&l.token, 30, &plan, Err(reason.into()))
+        .driver_act_settle(
+            &l.token,
+            30,
+            &plan,
+            Err(DriverFailure::WouldNotStart(account.into())),
+        )
         .unwrap_err();
     assert!(matches!(err, KernelError::Gate(_)), "{err}");
-    assert!(err.to_string().contains(reason), "{err}");
+    assert!(err.to_string().ends_with(reason), "{err}");
+    assert!(!err.to_string().contains("Users"), "{err}");
+    let acted = events_of(&k, "driver.acted");
+    assert_eq!(acted.len(), 1);
+    assert_eq!(
+        acted[0].payload_hash,
+        hash_canonical(&failed_acted(&t, &row, reason, 20))
+    );
     assert_eq!(
         k.driver("maskai-1").unwrap().unwrap().state,
         DriverState::Degraded {
@@ -1740,6 +1763,77 @@ fn settle_on_any_host_failure_degrades_the_driver() {
         .driver_act_begin(&l.token, 31, "maskai-1", "look", &serde_json::json!({}))
         .unwrap_err();
     assert!(err.to_string().contains("degraded"), "{err}");
+}
+
+/// Final review I1 (Ruling 28): a driver that answered without `ok` but with
+/// `result.answer` — third-party text — breaks protocol, and the host's error
+/// quotes the line. None of it reaches the append-only ledger: `driver.acted`
+/// and `driver.unmounted` carry the closed word `protocol: malformed
+/// response`, the row's degraded reason too, and the expected payload, hashed
+/// as the ledger hashed it, holds no byte of the site's words. The refusal the
+/// harness gets carries the word alone.
+#[test]
+fn a_malformed_response_never_puts_the_drivers_words_on_the_ledger() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let row = mount(&mut k);
+    let t = one_level(&mut k);
+    let l = launch(&mut k, &t.id);
+    let plan = k
+        .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    // 300 bytes no ledger payload can hold by accident: the snowman is not
+    // ASCII, and every payload here is.
+    let marker = "\u{2603}".repeat(100);
+    assert_eq!(marker.len(), 300);
+    let line = format!(r#"{{"id": 1, "result": {{"answer": "{marker}"}}}}"#);
+    let malformed = HostError::Protocol {
+        fault: ProtocolFault::MalformedResponse,
+        detail: format!("response 1 is unreadable (missing field `ok`): {line}"),
+    };
+    assert!(
+        malformed.to_string().contains(&marker[..30]),
+        "the detail quotes the line"
+    );
+
+    let err = k
+        .driver_act_settle(&l.token, 30, &plan, Err(DriverFailure::Host(malformed)))
+        .unwrap_err();
+    assert!(!err.to_string().contains('\u{2603}'), "{err}");
+    assert!(
+        err.to_string().contains("protocol: malformed response"),
+        "{err}"
+    );
+
+    let word = "protocol: malformed response";
+    let expected = failed_acted(&t, &row, word, 20);
+    let payload = serde_json::to_string(&expected).unwrap();
+    assert!(
+        payload.is_ascii() && !payload.contains('\u{2603}'),
+        "{payload}"
+    );
+    let acted = events_of(&k, "driver.acted");
+    assert_eq!(acted.len(), 1);
+    assert_eq!(
+        acted[0].payload_hash,
+        hash_canonical(&expected),
+        "the acted event is exactly the closed-word record"
+    );
+    let unmounted = events_of(&k, "driver.unmounted");
+    assert_eq!(unmounted.len(), 1);
+    assert_eq!(
+        unmounted[0].payload_hash,
+        hash_canonical(&DriverUnmounted {
+            driver_id: row.driver_id.clone(),
+            reason: word.into(),
+        })
+    );
+    assert_eq!(
+        k.driver("maskai-1").unwrap().unwrap().state,
+        DriverState::Degraded {
+            reason: word.into()
+        }
+    );
 }
 
 /// Reviewer minor 2: a judge whose completion is empty after `arch::raise`'s
@@ -1810,20 +1904,18 @@ fn a_host_evidence_refusal_does_not_degrade_and_the_run_fails_naming_the_file() 
     let plan = k
         .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
         .unwrap();
-    let reason = host_error_reason(&HostError::EvidenceTooLarge {
+    let too_large = HostError::EvidenceTooLarge {
         name: "note.txt".into(),
         len: HARNESS_MAX_FILE_BYTES + 1,
         cap: HARNESS_MAX_FILE_BYTES,
-    });
-    assert!(
-        reason.starts_with("evidence too large: note.txt is "),
-        "{reason}"
-    );
+    };
+    // The closed word, with the plain-token name and nothing more (I1).
+    let reason = "evidence too large: note.txt".to_string();
     let err = k
-        .driver_act_settle(&l.token, 30, &plan, Err(reason.clone()))
+        .driver_act_settle(&l.token, 30, &plan, Err(too_large.into()))
         .unwrap_err();
     assert!(matches!(err, KernelError::Gate(_)), "{err}");
-    assert!(err.to_string().contains(&reason), "{err}");
+    assert!(err.to_string().ends_with(&reason), "{err}");
 
     let after = k.driver("maskai-1").unwrap().unwrap();
     assert_eq!(
@@ -1872,18 +1964,27 @@ fn an_undeclared_evidence_refusal_from_the_host_does_not_degrade() {
     let row = mount(&mut k);
     let t = one_level(&mut k);
     let l = launch(&mut k, &t.id);
-    let reasons = [
-        "evidence note.txt is not a name the manifest allows for echo".to_string(),
-        host_error_reason(&HostError::EvidenceNotDeclared("x.png".into())),
+    // The host's own escape and undeclared refusals; the escaping path is the
+    // driver's words, and the record keeps only the closed word (I1).
+    let failures = [
+        (
+            HostError::EvidenceEscape("C:\\Users\\founder\\secret.txt".into()),
+            "evidence escape",
+        ),
+        (
+            HostError::EvidenceNotDeclared("x.png".into()),
+            "evidence not declared",
+        ),
     ];
-    for (i, reason) in reasons.iter().enumerate() {
+    for (i, (failure, reason)) in failures.into_iter().enumerate() {
         let begun = 10 + 10 * i as u64;
         let plan = k
             .driver_act_begin(&l.token, begun, "maskai-1", "echo", &echo_args())
             .unwrap();
         let err = k
-            .driver_act_settle(&l.token, begun + 5, &plan, Err(reason.clone()))
+            .driver_act_settle(&l.token, begun + 5, &plan, Err(failure.into()))
             .unwrap_err();
+        assert!(err.to_string().ends_with(reason), "{err}");
         assert!(matches!(err, KernelError::Gate(_)), "{err}");
         let after = k.driver("maskai-1").unwrap().unwrap();
         assert_eq!(after.state, DriverState::Ready, "{reason}");
@@ -1934,7 +2035,7 @@ fn a_stale_settle_after_a_remount_cannot_touch_the_new_row() {
 
     // A ends with a host failure: recorded, refused as stale, nothing moved.
     let err = k
-        .driver_act_settle(&l.token, 20, &plan_a, Err("timeout".into()))
+        .driver_act_settle(&l.token, 20, &plan_a, Err(HostError::Timeout.into()))
         .unwrap_err();
     assert!(matches!(err, KernelError::Gate(_)), "{err}");
     assert!(err.to_string().contains("stale act"), "{err}");

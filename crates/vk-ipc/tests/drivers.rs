@@ -130,6 +130,17 @@ for line in sys.stdin:
     say({"id": r["id"], "ok": True, "result": {"met": os.path.exists(other)}})
 "#;
 
+/// A driver whose one action, `babble`, answers under the request's id but
+/// without `ok`, its `result.answer` carrying `args.answer`: the site's words
+/// in a response the host cannot read.
+const BABBLE_DRIVER: &str = r#"import json, sys
+def say(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+say({"hello": {"protocol": 1, "driver": "babble", "version": "0", "actions": ["babble"]}})
+for line in sys.stdin:
+    r = json.loads(line)
+    say({"id": r["id"], "result": {"answer": r["args"]["answer"]}})
+"#;
+
 /// Is the process with this id still running? A zombie is not: it has
 /// exited and only waits for its parent to reap it ([`zombie`]).
 fn process_alive(pid: u32) -> bool {
@@ -568,10 +579,19 @@ async fn act_round_trip_through_the_daemon() {
         .unwrap_err();
     let e = call_error(&err);
     assert_eq!(e.code, vk_ipc::E_INVARIANT, "{err}");
-    assert!(e.message.contains("driver would not start"), "{err}");
-    assert!(e.message.contains("driver files hash"), "{err}");
+    // The closed word (final review I1); the daemon's account — a hash and
+    // a path — is in the driver's log, not in the refusal or the record.
+    assert!(e.message.ends_with("would not start"), "{err}");
+    assert!(!e.message.contains("driver files hash"), "{err}");
+    let log = std::fs::read_to_string(node.d.path().join("drivers/fake/work/driver.log"))
+        .expect("the driver's log");
+    assert!(
+        log.contains("failed: would not start: driver files hash"),
+        "{log}"
+    );
     assert!(!node.pool.has_host("fake"), "nothing was spawned");
     assert_eq!(node.state_of("fake").await["state"], "degraded");
+    assert_eq!(node.state_of("fake").await["reason"], "would not start");
 
     node.shutdown().await;
 }
@@ -633,6 +653,65 @@ async fn a_dead_driver_is_dropped_and_degraded_and_a_remount_brings_it_back() {
     let answer = node.c.call("driver.act", act("echo"), None).await.unwrap();
     assert_eq!(answer["ok"], true, "{answer}");
 
+    node.shutdown().await;
+}
+
+/// Final review I1 (Ruling 28), end to end: a driver whose response drops
+/// `ok` but carries the site's answer breaks protocol. The harness's refusal,
+/// the degraded row and the record carry `protocol: malformed response`
+/// alone; the line the host could not read — the answer with it — is in the
+/// driver's log, where an operator looks, and nowhere the kernel keeps.
+#[tokio::test]
+async fn a_malformed_response_is_recorded_by_its_word_and_detailed_in_the_log() {
+    if !python_available() {
+        return;
+    }
+    let drv = driver_dir_of(BABBLE_DRIVER);
+    let node = Node::start().await;
+    let mut params = mount_params(drv.path());
+    params["manifest"]["actions"] = json!([{
+        "name": "babble",
+        "reversible": true,
+        "args": {"type": "object"},
+        "evidence": [],
+        "to_register": false
+    }]);
+    node.mount_with(params).await;
+    let token = node.token().await;
+    let marker = "the-site-answered-this ".repeat(13);
+
+    let err = node
+        .c
+        .call(
+            "driver.act",
+            json!({"token": token, "driver": "fake", "action": "babble", "args": {"answer": marker}}),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let e = call_error(&err);
+    assert_eq!(e.code, vk_ipc::E_INVARIANT, "{err}");
+    assert!(e.message.ends_with("protocol: malformed response"), "{err}");
+    assert!(!e.message.contains("the-site-answered-this"), "{err}");
+
+    let state = node.state_of("fake").await;
+    assert_eq!(state["state"], "degraded", "{state}");
+    assert_eq!(state["reason"], "protocol: malformed response", "{state}");
+    assert_eq!(node.events("driver.acted"), 1);
+    assert_eq!(node.events("driver.unmounted"), 1);
+
+    let log = std::fs::read_to_string(node.d.path().join("drivers/fake/work/driver.log"))
+        .expect("the driver's log");
+    assert!(
+        log.contains(
+            "failed: protocol: malformed response: driver protocol: response 1 is unreadable"
+        ),
+        "{log}"
+    );
+    assert!(
+        log.contains("the-site-answered-this"),
+        "the detail is kept: {log}"
+    );
     node.shutdown().await;
 }
 
@@ -1122,7 +1201,7 @@ async fn an_orphan_still_acting_is_busy_by_its_identity_until_unmounted() {
     assert_eq!(call_error(&err).code, vk_ipc::E_NOT_FOUND, "{err}");
     let outcome = stale.join().expect("the stale act's thread");
     assert!(
-        outcome.as_ref().is_err_and(|why| why.starts_with("dead")),
+        outcome.as_ref().is_err_and(|why| why.reason() == "dead"),
         "{outcome:?}"
     );
     eventually("A's orphan is gone", || !process_alive(orphan)).await;

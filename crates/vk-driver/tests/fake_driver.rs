@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use vk_contracts::driver::{DriverAction, DriverManifest};
-use vk_driver::{DriverHost, EvidenceCaps, HostError, PROTOCOL};
+use vk_driver::{DriverHost, EvidenceCaps, HostError, ProtocolFault, PROTOCOL};
 use vk_harness::confine::NoopGovernor;
 
 /// The scripted driver of the task brief, verbatim.
@@ -91,6 +91,25 @@ for line in sys.stdin:
     code = "import urllib.request; urllib.request.urlopen(%r).read()" % r["args"]["url"]
     res = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True)
     say({"id": r["id"], "ok": res.returncode == 0, "result": {"rc": res.returncode, "err": res.stderr[-300:]}})
+"#;
+
+/// A driver that breaks protocol on request: `babble` answers under the
+/// request's id but without `ok`, its `result` carrying `args.answer` — the
+/// site's words, as a real driver's answer would; `stranger` answers under
+/// another request's id.
+const BABBLE_DRIVER: &str = r#"import json, sys
+def say(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+say({"hello": {"protocol": 1, "driver": "babble", "version": "0", "actions": ["babble", "stranger"]}})
+for line in sys.stdin:
+    r = json.loads(line)
+    if r["action"] == "babble": say({"id": r["id"], "result": {"answer": r["args"]["answer"]}})
+    else: say({"id": r["id"] + 100, "ok": True})
+"#;
+
+/// A driver whose first line is JSON but not a hello, and which then waits.
+const NO_HELLO_DRIVER: &str = r#"import sys, time
+sys.stdout.write('{"greeting": "hi"}\n'); sys.stdout.flush()
+time.sleep(30)
 "#;
 
 /// Caps wide enough that nothing in these tests trips them unless a test
@@ -766,6 +785,102 @@ fn the_environment_names_the_dirs_the_mode_and_the_hosts() {
     assert_eq!(out.result["VK_DRIVER_HEADLESS"], "1");
     assert_eq!(out.result["VK_DRIVER_CHANNEL"], "");
     assert_eq!(out.result["VK_DRIVER_HOSTS"], "example.invalid");
+}
+
+/// Final review I1: every protocol failure says which kind it is, so the
+/// kernel can word the ledger's `reason` from the kind alone; the detail —
+/// which may quote the driver's output, and the site's words with it — stays
+/// in the message, for the log. A response without `ok` is a malformed
+/// response, one under another id a foreign id, a program that is not there
+/// was not started, a first line that is not a hello is a bad hello.
+#[test]
+fn protocol_faults_are_typed_and_the_detail_stays_in_the_message() {
+    if !python_available() {
+        return;
+    }
+    let rig = Rig::new(BABBLE_DRIVER);
+    let actions = json!([
+        {"name": "babble", "reversible": true, "args": {"type": "object"}, "evidence": []},
+        {"name": "stranger", "reversible": true, "args": {"type": "object"}, "evidence": []},
+    ]);
+    let m = rig.manifest(rig.command(), actions.clone());
+    let marker = "words-from-the-site ".repeat(15);
+
+    let mut host = rig.spawn(&m);
+    let err = host
+        .act(
+            action(&m, "babble"),
+            &json!({"answer": marker}),
+            Duration::from_secs(10),
+            WIDE,
+            &never,
+        )
+        .expect_err("a response without `ok` is refused");
+    match &err {
+        HostError::Protocol {
+            fault: ProtocolFault::MalformedResponse,
+            detail,
+        } => assert!(detail.contains("words-from-the-site"), "{detail}"),
+        other => panic!("not a malformed response: {other}"),
+    }
+
+    let mut host = rig.spawn(&m);
+    let err = host
+        .act(
+            action(&m, "stranger"),
+            &json!({}),
+            Duration::from_secs(10),
+            WIDE,
+            &never,
+        )
+        .expect_err("a response under another id is refused");
+    assert!(
+        matches!(
+            err,
+            HostError::Protocol {
+                fault: ProtocolFault::ForeignId,
+                ..
+            }
+        ),
+        "{err}"
+    );
+
+    let refused = |rig: &Rig, m: &DriverManifest| match DriverHost::spawn(
+        m,
+        &rig.work,
+        &rig.profile,
+        &rig.evidence,
+        Box::new(NoopGovernor::new()),
+    ) {
+        Ok(_) => panic!("the spawn was accepted"),
+        Err(e) => e,
+    };
+    let missing = rig.manifest(vec!["vk-no-such-program".into()], actions.clone());
+    let err = refused(&rig, &missing);
+    assert!(
+        matches!(
+            err,
+            HostError::Protocol {
+                fault: ProtocolFault::NotStarted,
+                ..
+            }
+        ),
+        "{err}"
+    );
+
+    let silent = Rig::new(NO_HELLO_DRIVER);
+    let m = silent.manifest(silent.command(), actions);
+    let err = refused(&silent, &m);
+    assert!(
+        matches!(
+            err,
+            HostError::Protocol {
+                fault: ProtocolFault::BadHello,
+                ..
+            }
+        ),
+        "{err}"
+    );
 }
 
 /// On Windows the platform governor is a Job Object: the host contains the
