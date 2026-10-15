@@ -225,7 +225,7 @@ Attendu : la ligne 1 passe à `plan  done`.
 
 **8.2 Un niveau.** Répétez ce bloc dix fois, de N0 à N9 :
 ```powershell
-vk driver ls          # maskai-1 doit être "ready" ; sinon §11, ligne « driver dégradé »
+vk driver ls          # maskai-1 doit être "ready" ; sinon §11, ligne « Driver mort ou muet »
 vk harness run $t
 vk task show $t
 ```
@@ -299,7 +299,7 @@ Attendu : `judge  done`, puis `approve  pending` sur la ligne 13.
 Get-Content "$S\drivers\maskai-1\work\journal.jsonl" -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.verdict -eq 'KO' -and $_.nfr -contains 'securite' } | Select-Object case, evidence | Format-List
 ```
 
-> **Limite connue du pilote.** `vk` n'affiche pas le texte d'un artefact avant sa publication. `/artefacts/<hash>` ne rend que l'enveloppe. Vous signez donc `verdict.md`, puis `report.md`, sur la foi du journal ; leur texte ne se lit qu'après le pas 16, dans le dossier publié. Si le texte publié ne convient pas, on ne le copie pas dans le dépôt, et on relance les pas 12 à 16 dans une nouvelle tâche.
+> **Limite connue du pilote.** `vk` n'affiche pas le texte d'un artefact avant sa publication. `/artefacts/<hash>` ne rend que l'enveloppe. Vous signez donc `verdict.md`, puis `report.md`, sur la foi du journal ; leur texte ne se lit qu'après le pas 16, dans le dossier publié. Si le texte publié ne convient pas, on ne le copie pas dans le dépôt. On soumet de nouveau la recette : les dix niveaux sont rejoués depuis le journal sans toucher MaskAI (§12), puis le juge et la rédaction refont leur travail.
 
 ```powershell
 vk approve $t                   # 13 : verdict et KO sécurité
@@ -445,7 +445,7 @@ Pour finir : Ctrl+C sur ce `vkd`, et fermez la fenêtre de `serve.py`. Puis `Rem
   - les lignes `driver.acted` des dix niveaux ;
   - 2 `approval.recorded` ;
   - 1 `artefact.released`.
-- [ ] Les 37 cas de N0 à N9 ont chacun une ligne au journal, ou bien sont nommés NON TESTÉ dans le rapport avec la raison.
+- [ ] Les 34 cas de N0 à N9 (`cases.json`, hors banc d'essai) ont chacun une ligne au journal, ou bien sont nommés NON TESTÉ dans le rapport avec la raison.
 - [ ] Le rapport, le journal et les preuves expurgés sont sous `docs/use-cases/recettage-chat-ia/runs/<date>/`. S'il reste un KO sécurité non corrigé, ils sont gardés privés et la raison est notée.
 - [ ] Le delta avec `2026-10-13-maskai-benchmark.md` est écrit (notes par ENF, cinq défauts majeurs).
 - [ ] Le garde-dialogue s'est déclenché au moins une fois en test : `test_dialog_guard_reports_and_never_answers`, déjà vert.
