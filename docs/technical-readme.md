@@ -58,12 +58,14 @@ table or, with `--json`, as the daemon's own answer.
 |---|---|
 | `vk boot [--force]` | `init`: start `vkd` over a state directory and wait until it answers |
 | `vk status` | `uname`: what this node is, and what its boot sequence found |
-| `vk ls PATH` | the namespace: `/arches`, `/tasks`, `/artefacts`, `/devices`, `/ledger` as directories |
+| `vk ls PATH` | the namespace: `/arches`, `/drivers`, `/tasks`, `/artefacts`, `/devices`, `/ledger` as directories |
 | `vk ps`, `vk top [--calls]` | the scheduler: what every task is doing, and per arch where it runs, under whose law, whether this kernel governs it, its calls, tokens, measured tokens and cost — `--calls` adds one row per call, naming the step that spent it |
 | `vk mount mock NAME`, `vk mount claude-code`, `vk mount anthropic`, `vk mount bedrock`, `vk mount ollama --model TAG`, `vk umount ID` | drivers: an arch is a device this kernel drives — and, for `ollama`, a process it starts and caps |
 | `vk arch show ID` | one arch in full: its manifest, the identity tuple the arch id hashes, the clearance it may be handed, and what the next boot would make it from |
 | `vk secret set NAME` | the credential store: a secret this node's daemon reads, put in this account's OS keyring without ever being echoed or printed |
-| `vk task submit` / `step` / `show` | processes: a task is the unit of work, its register is its address space |
+| `vk task submit` / `step` / `show` | processes: a task is the unit of work, its register is its address space. `vk task submit --steps FILE` submits a **recipe**, a task whose steps a file lists, arches named by manifest name (pilot ruling R21) |
+| `vk mount driver --manifest FILE`, `vk driver ls\|show\|umount` | device drivers: a browser behind a Python process this kernel starts, caps and lets a harness step act through ([Drivers](#drivers-a-browser-this-kernel-controls)) |
+| `vk artefact cat HASH [--out FILE]` | `cat` of what a task attached, as a human act: signed with this node's device key and written to the ledger as an `artefact.released` event, destination `terminal:<device_id>` (pilot rulings R22, R24) |
 | `vk stop [SCOPE]`, `vk resume ID` | signals: a STOP halts a scope until a human lifts it |
 | `vk liveness renew --business ID [--until +30d\|RFC3339]` | the liveness lease (I4): a human opens or extends the window in which automatic runs are allowed (default `+7d`, at most thirty days). Signed with this node's device key like `vk approve` — refused with the remedy when this account has no enrolled key — and recorded on the ledger as one `liveness.renewed` event (`business`, `device_id`, `until_ms`, `previous_until_ms`, `scope: "automatic"`); `vk top` shows the expiry |
 | `vk approve ID [--passkey]` | the human ceremony: an approval of a kernel-minted challenge, signed by this node's device key or by a passkey in the browser (invariant I1). **The trust model:** the node's device key sits in this account's OS keyring, so every process running as this user can sign with it — every same-user process counts as "the human" for as long as the node key is enrolled. A passkey (Windows Hello, a phone) adds a **second** human key; it does not retire the first, and nothing revokes the node key yet — the revocation gap is stated in `contracts/tcb.md` (SP1a's stand-in, Rulings 17/20) |
@@ -264,6 +266,130 @@ an oversize prompt to `num_ctx / 2 + 3` tokens and answers `200 OK` with
 call from its own estimate, and after it from the server's `prompt_eval_count`.
 Nothing is billed, so there is no `COST`; what `vk top` shows is the tokens the
 server itself counted.
+
+### Drivers: a browser this kernel controls
+
+A **driver** is a Python process this kernel starts, caps and talks to, and
+through which a harness step can act on a browser. It is to a thing with a
+screen what an arch is to a model: the kernel holds the process, the harness
+holds a tool.
+
+The wire is JSON lines on the driver's stdin and stdout, protocol 1: a `hello`
+that names the driver, its version and its actions, then one request and one
+response per action, one in flight at a time. The harness never touches
+Chrome. Its only way in is the `vk_driver_act` tool, which `vk-mcp` routes to
+the `driver.act` syscall, and the kernel answers it with the driver's
+`result` — the evidence goes to the task's register, not back to the model.
+The harness fence is the one SP1b built, unchanged.
+
+```
+vk mount driver --manifest drivers/maskai-recette/manifest.json
+vk driver ls                       # NAME STATE GOVERNED ACTIONS WHY
+vk driver show maskai-1            # identity, state, hosts, actions, root
+vk ls /drivers                     # the names; /drivers/NAME is `vk driver show`
+vk driver umount maskai-1          # stop the process, whatever it is doing
+```
+
+Mounting is a human act, signed with this node's device key like the cloud
+arches' mounts, because it puts a browser — with whatever session its profile
+holds — under this node's control. The manifest (`driver_manifest`) names the
+driver, its program, the hosts it may navigate to, and every action with its
+argument schema, its evidence file names, whether it is reversible and
+whether its result goes to the register.
+
+`program.command` stays relative, and the mount carries a `root`: the
+directory of the manifest file, canonical (pilot ruling R6). The first
+`.py` element of the command must be a relative path without `..`, and
+`hash_dir` of its directory must equal the manifest's `files_sha256`. The
+check runs at mount and again before every spawn, so a file changed after the
+mount is refused rather than run. `hash_dir` skips `__pycache__`, `.venv`,
+`tests` and `fixture` at any depth and a top-level `manifest*.json` (pilot
+ruling R5), so the manifest can sit next to the files it hashes. The driver
+runs from its own `.venv` (pilot ruling R15): the manifest's command is
+`.venv/Scripts/python.exe -I driver.py`, and `drivers/maskai-recette/setup.ps1`
+makes that environment and checks both manifests' hash.
+
+The driver's process gets five variables from the host and nothing it was not
+given: `VK_DRIVER_PROFILE_DIR` (its browser profile, under the state
+directory), `VK_DRIVER_WORK_DIR` (its working directory, where `driver.log`
+is), `VK_DRIVER_HEADLESS` (`1` or `0`), `VK_DRIVER_CHANNEL` (the browser
+channel, or empty) and `VK_DRIVER_HOSTS` (the allow-list, comma-joined). Each
+action's request carries an absolute `evidence_dir` under
+`<state_dir>/drivers/<name>/evidence/`. On Windows the tree runs inside a Job
+Object, 2 GiB and kill-on-close, and `vk driver ls` says `GOVERNED` yes;
+elsewhere it says no.
+
+Three ledger kinds record a driver, each with its own schema:
+
+| kind | what it carries |
+|---|---|
+| `driver.mounted` | `driver_id`, `name`, `manifest_hash`, `profile_dir_hash`, `governed`, and `by`, the device key that signed the mount |
+| `driver.acted` | `task_id`, `step_index`, `driver_id`, `action`, `args_hash`, `result_hash`, `ok`, `reason` when it failed, `duration_ms`, `evidence` (the blob hashes), `evidence_bytes`, `hosts_seen` |
+| `driver.unmounted` | `driver_id` and the reason: the operator, or what degraded it |
+
+`driver.acted` carries hashes and sizes, never text (Ruling 28): what the
+harness asked, what the driver answered and what it captured are in the
+store, under their labels, and not in the record. `hosts_seen` is the egress
+sampled while the action ran: the whole tree under the Job on Windows, the
+driver's leader only when it is ungoverned (pilot ruling R8).
+
+Evidence is stored as artefacts, each kind being the evidence file's name
+(`answer.png`, `network.json`, `dom.html`, `timing.json`, `attach.png`). A
+human reads one with `vk artefact cat HASH`, which is a human act too (pilot
+rulings R22 and R24): the read signs with this node's device key, and the
+ledger records it as an `artefact.released` event with destination
+`terminal:<device_id>`, so reading what a task found is as visible as
+releasing it. `vk task show` lists a task's artefacts as `{hash, kind}` —
+metadata only (pilot ruling R23). Text goes to stdout; bytes that are not
+text need `--out FILE`.
+
+What the kernel enforces on each `driver.act`: the lease's step is running and
+names the driver; the driver is mounted and not degraded; the action is in
+the manifest and its arguments validate; the cadence and the step's action cap
+hold; no STOP covers the task; the register's label flows to the driver's
+clearance (I2). What it trusts the driver for is the host allow-list. The
+driver enforces it on **navigations** — a page that goes off the list is
+refused and the action answers `host` — while third-party sub-resource hosts
+(a CDN, an analytics endpoint) are recorded in `network.json`, never blocked
+(pilot rulings R16 and R19). The driver also services browser events between
+actions, without intercepting requests, so a sign-in popup works while the
+driver is idle.
+
+A driver degrades on every host-side failure except the evidence refusals: a
+deadline, a dead process, a protocol error, a STOP (pilot ruling R12). A
+degraded driver refuses every act with the remedy, which is to mount it again:
+`vk mount driver --manifest …` starts a fresh process and writes a new
+`driver.mounted`. `vk driver umount` kills the process even while an action is
+in flight, and that action's caller is told the act is stale (pilot ruling
+R13).
+
+A driver is identified by `files_sha256` and by `inputs_sha256`: the second
+covers the evaluator, the journal script, the cases, the oracles and the
+corpus the verdicts depend on, which `driver_id` does not. It is in the hello's
+`version` (`0.1.0+<12 hex>`) and on every line of the journal (pilot ruling
+R18), so two runs judged by different rules show it.
+
+A task that uses a driver is submitted from a recipe, not from flags:
+
+```
+vk task submit --steps recipes/recette-maskai.json
+```
+
+The recipe is a `task_recipe` — the goal, the artefact kind, the constraints,
+the evidence and the steps. A harness step lists the drivers it may use, and
+may cap `max_actions` and `timeout_s`. A recipe names its arches by manifest
+name, and `vk task submit --steps` resolves each to the one mounted arch of
+that name, refusing none or several (pilot ruling R21), because an arch id is
+a hash that differs by machine and by model version. `--steps` conflicts with
+the flag-built task (`--goal`, `--plan`, `--draft`, `--harness`, `--judge`,
+`--approve`, `--release`); a harness step is then run with `vk harness run
+TASK`, as before.
+
+The first use is the MaskAI recette, sixteen steps. The procedure for the
+founder, in French, from the first boot to the release, is
+[`docs/runbooks/recette-maskai.md`](runbooks/recette-maskai.md). The driver's
+tests run in CI (`driver-browser`) against a local fixture page in headless
+Chromium, with no network.
 
 ### The human ceremony: passkeys and kernel-minted challenges
 

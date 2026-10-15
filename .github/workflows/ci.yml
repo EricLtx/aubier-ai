@@ -193,6 +193,28 @@ jobs:
       - name: Stop the container
         if: always()
         run: docker rm -f vk-ollama
+  driver-browser:
+    # The MaskAI driver against its local fixture page, headless Chromium: the
+    # eleven actions, the dialog guard and the host allow-list, then the
+    # recette scripts (evaluator, journal). Every push, like `test`: the
+    # fixture tests take about 90 s, nothing here pulls a model or a container.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install the driver's requirements and Chromium
+        run: |
+          pip install -r drivers/maskai-recette/requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: The driver contract tests (hello, framing, hash_dir)
+        run: python -I -m unittest discover -s drivers -p "test_*.py" -t .
+      - name: The MaskAI driver against its fixture page
+        run: python -I -m unittest discover -s drivers/maskai-recette/tests -t .
+      - name: The recette scripts
+        run: python -I -m unittest discover -s scripts/recette -p "test_*.py"
   sign:
     # Signs the four release binaries for the SP1 gate (item 1: signed
     # binaries install without SmartScreen/Smart App Control prompts). Tries,

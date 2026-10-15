@@ -39,3 +39,4 @@ docs/superpowers/reviews/
 drivers/**/.venv/
 drivers/**/.venv
 drivers/**/__pycache__/
+scripts/**/__pycache__/
