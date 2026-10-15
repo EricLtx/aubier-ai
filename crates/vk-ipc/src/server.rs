@@ -2176,6 +2176,8 @@ fn api_adapter(
                 max_tokens: asked.max_tokens.unwrap_or(defaults.max_tokens),
                 timeout: timeout_of(asked.timeout_secs, defaults.timeout),
             };
+            // What the mount says, before the keyring is read (review M-2).
+            cfg.check()?;
             let key =
                 vk_arch_anthropic::load_key(&api.mistral_keys, vk_arch_mistral::KEYRING_USER)?;
             Ok(Box::new(MistralAdapter::with_config(key, cfg)?))
@@ -2193,6 +2195,8 @@ fn api_adapter(
                 max_tokens: asked.max_tokens.unwrap_or(defaults.max_tokens),
                 timeout: timeout_of(asked.timeout_secs, defaults.timeout),
             };
+            // What the mount says, before the keyring is read (review M-2).
+            cfg.check()?;
             let key = vk_arch_anthropic::load_key(&api.gemini_keys, vk_arch_gemini::KEYRING_USER)?;
             Ok(Box::new(GeminiAdapter::with_config(key, cfg)?))
         }

@@ -247,15 +247,25 @@ impl MistralConfig {
             context_window(&self.model)
         }
     }
+
+    /// Everything this config says that can be refused, checked without a
+    /// key: the origin and the answer bound. The daemon runs it **before** it
+    /// reads the keyring (review M-2) — a mount refused for what it says must
+    /// not have read a credential first — and the adapter runs it again.
+    pub fn check(&self) -> Result<()> {
+        vk_arch_openai_compat::check_base_url(&self.base_url)?;
+        vk_arch_openai_compat::check_max_tokens(self.max_tokens)
+    }
 }
 
 /// The `mistral` arch: the chat-completions wire under Mistral's manifest.
 pub struct MistralAdapter(ChatArch);
 
 impl MistralAdapter {
-    /// The arch, or the reason there is none: an origin this node will not
-    /// send a key to, or a TLS stack that will not start.
+    /// The arch, or the reason there is none: a config [`MistralConfig::check`]
+    /// refuses, or a TLS stack that will not start.
     pub fn with_config(key: SecretString, cfg: MistralConfig) -> Result<MistralAdapter> {
+        cfg.check()?;
         let manifest = Self::manifest_for(&cfg);
         let settings = ChatSettings {
             provider: "the Mistral API",

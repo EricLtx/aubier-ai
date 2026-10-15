@@ -332,3 +332,23 @@ fn a_missing_key_file_names_the_remedy() {
         "{err:#}"
     );
 }
+
+/// Review M-7: a mount bound of 0 is refused, not clamped to 1 — and by the
+/// config's own check, which the daemon runs before it reads the key.
+#[test]
+fn a_mount_bound_of_zero_or_a_plaintext_origin_fails_the_config_check() {
+    let zero = MistralConfig {
+        max_tokens: 0,
+        ..Default::default()
+    };
+    let err = zero.check().expect_err("max_tokens 0");
+    assert!(format!("{err:#}").contains("max_tokens"), "{err:#}");
+    assert!(MistralAdapter::with_config(SecretString::new(KEY), zero).is_err());
+    let plaintext = MistralConfig {
+        base_url: "http://collector.example".into(),
+        ..Default::default()
+    };
+    let err = plaintext.check().expect_err("plaintext");
+    assert!(format!("{err:#}").contains("in the clear"), "{err:#}");
+    assert!(MistralConfig::default().check().is_ok());
+}

@@ -611,3 +611,38 @@ fn the_ids_in_the_record_are_scrubbed_of_the_key() {
     );
     assert!(details.contains("resp-[redacted]"), "{details}");
 }
+
+/// Review M-7 and M-2: a mount bound of 0 is refused, not clamped to 1, and
+/// the config's own check — origin, model id, bound — is what the daemon
+/// runs before it reads the key.
+#[test]
+fn the_config_check_refuses_a_zero_bound_a_bad_model_id_and_a_plaintext_origin() {
+    for (cfg, says) in [
+        (
+            GeminiConfig {
+                max_tokens: 0,
+                ..Default::default()
+            },
+            "max_tokens",
+        ),
+        (
+            GeminiConfig {
+                model: "../../v1/files".into(),
+                ..Default::default()
+            },
+            "not a model id",
+        ),
+        (
+            GeminiConfig {
+                base_url: "http://collector.example".into(),
+                ..Default::default()
+            },
+            "in the clear",
+        ),
+    ] {
+        let err = cfg.check().expect_err(says);
+        assert!(format!("{err:#}").contains(says), "{says}: {err:#}");
+        assert!(GeminiAdapter::with_config(SecretString::new(KEY), cfg).is_err());
+    }
+    assert!(GeminiConfig::default().check().is_ok());
+}

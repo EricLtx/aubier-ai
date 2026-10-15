@@ -424,6 +424,17 @@ impl GeminiConfig {
     pub fn path(&self, method: &str) -> String {
         format!("/{API_VERSION}/models/{}:{method}", self.model)
     }
+
+    /// Everything this config says that can be refused, checked without a
+    /// key: the origin, the model id that goes in the path, and the answer
+    /// bound. The daemon runs it **before** it reads the keyring (review
+    /// M-2) — a mount refused for what it says must not have read a
+    /// credential first — and the adapter runs it again.
+    pub fn check(&self) -> Result<()> {
+        vk_arch_openai_compat::check_base_url(&self.base_url)?;
+        check_model_id(&self.model)?;
+        vk_arch_openai_compat::check_max_tokens(self.max_tokens)
+    }
 }
 
 // -------------------------------------------------------------- the adapter
@@ -445,12 +456,10 @@ const PROVIDER: &str = "the Gemini API";
 const ANSWERED: &[&str] = &["STOP", "MAX_TOKENS", "CONTINUATION"];
 
 impl GeminiAdapter {
-    /// The arch, or the reason there is none: an origin this node will not
-    /// send a key to, a model id that is not one, or a TLS stack that will
-    /// not start.
+    /// The arch, or the reason there is none: a config
+    /// [`GeminiConfig::check`] refuses, or a TLS stack that will not start.
     pub fn with_config(key: SecretString, cfg: GeminiConfig) -> Result<GeminiAdapter> {
-        vk_arch_openai_compat::check_base_url(&cfg.base_url)?;
-        check_model_id(&cfg.model)?;
+        cfg.check()?;
         let client = http::build_client("verticalai-vk-arch-gemini")?;
         Ok(GeminiAdapter {
             manifest: Self::manifest_for(&cfg),

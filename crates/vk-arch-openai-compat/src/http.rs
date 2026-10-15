@@ -227,9 +227,11 @@ pub fn usable(ceiling: u32) -> u32 {
 
 /// The bound on one answer: the smaller of what the caller asked for and the
 /// mount's cap — itself never past [`MAX_OUTPUT_TOKENS`] — and the cap when
-/// the caller says `0`, which means "no opinion".
+/// the caller says `0`, which means "no opinion". A mount cap of `0` is
+/// refused where the mount is checked ([`crate::check_max_tokens`]), not
+/// quietly raised to 1 here (review M-7).
 pub fn answer_tokens(mount_cap: u32, asked: u32) -> u32 {
-    let cap = mount_cap.clamp(1, MAX_OUTPUT_TOKENS);
+    let cap = mount_cap.min(MAX_OUTPUT_TOKENS);
     if asked == 0 {
         cap
     } else {

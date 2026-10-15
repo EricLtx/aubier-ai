@@ -60,7 +60,7 @@
 pub mod chat;
 pub mod http;
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use std::time::Duration;
 use vk_contracts::arch::{ArchIdentity, ArchManifest, Capability, Determinism, Locality};
 use vk_contracts::labels::{Clearance, Scope};
@@ -153,6 +153,7 @@ impl OpenAiCompatConfig {
              ({MAX_STATED_CONTEXT} is the most this node accepts)",
             self.context_ceiling
         );
+        check_max_tokens(self.max_tokens)?;
         check_jurisdiction(&self.jurisdiction, on_loopback(&self.base_url))
     }
 }
@@ -221,38 +222,55 @@ pub fn check_jurisdiction(j: &str, loopback: bool) -> Result<()> {
     Ok(())
 }
 
+/// A mount's answer bound, refused at `0` rather than clamped to 1 behind
+/// the operator's back (review M-7): a bound of nothing is a mistake to name,
+/// not a value to repair. Above [`MAX_OUTPUT_TOKENS`] it is capped, as on
+/// every API arch, and the flag's help says so.
+pub fn check_max_tokens(max_tokens: u32) -> Result<()> {
+    ensure!(
+        max_tokens > 0,
+        "max_tokens 0 would bound every answer to nothing: give at least 1 (at most \
+         {MAX_OUTPUT_TOKENS} is used)"
+    );
+    Ok(())
+}
+
 /// This arch's key, if it has one.
 ///
 /// Off loopback the key is required and every failure names `vk secret set
-/// openai-compat`. On a loopback address a keyring with **no entry** — or no
-/// keyring at all, which is a headless node's ordinary state — means no key
-/// and no `Authorization` header; a key that is there is used, and a file the
-/// operator named (`vkd --openai-compat-key-file`) must be readable, since
-/// naming one says a key is wanted.
+/// openai-compat`. On a loopback address the keyring is read **once**, and
+/// only **no entry** means no key and no `Authorization` header (review
+/// M-3); any other answer — a locked keyring, a node with none, an empty
+/// entry — is refused with the remedy, rather than turned into a keyless
+/// call nobody chose. A file the operator named
+/// (`vkd --openai-compat-key-file`) must be readable, since naming one says a
+/// key is wanted; a node with no keyring that serves a keyless loopback
+/// server names a file instead.
 pub fn load_key_for(source: &KeySource, base_url: &str) -> Result<Option<SecretString>> {
     if !on_loopback(base_url) {
         return load_key(source, KEYRING_USER).map(Some);
     }
     match source {
         KeySource::File(_) => load_key(source, KEYRING_USER).map(Some),
-        KeySource::Keyring => {
-            let found = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
-                .and_then(|e| e.get_password())
-                // Wiped as soon as it is looked at: what is kept is the copy
-                // `load_key` makes, which wipes itself.
-                .map(zeroize::Zeroizing::new);
-            match found {
-                Ok(_) => load_key(source, KEYRING_USER).map(Some),
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "no {KEYRING_SERVICE}/{KEYRING_USER} key; a loopback server is called \
-                         without one"
-                    );
-                    Ok(None)
-                }
-            }
+        KeySource::Keyring => loopback_key(
+            keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).and_then(|e| e.get_password()),
+        ),
+    }
+}
+
+/// What the keyring's one answer means for a server on loopback.
+fn loopback_key(answer: keyring::Result<String>) -> Result<Option<SecretString>> {
+    let remedy = format!("set it with: vk secret set {KEYRING_USER}");
+    // Wrapped the moment it exists: the copy `SecretString` makes wipes
+    // itself, and this one is wiped when it goes.
+    match answer.map(zeroize::Zeroizing::new) {
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Ok(secret) if secret.trim().is_empty() => {
+            bail!("the keyring entry {KEYRING_SERVICE}/{KEYRING_USER} is empty; {remedy}")
         }
+        Ok(secret) => Ok(Some(SecretString::new(secret.trim()))),
+        Err(e) => Err(anyhow!(e))
+            .with_context(|| format!("cannot read {KEYRING_SERVICE}/{KEYRING_USER}; {remedy}")),
     }
 }
 
@@ -406,6 +424,35 @@ mod tests {
             format!("{err:#}").contains("(https://api.mammouth.ai)"),
             "say what to give instead: {err:#}"
         );
+    }
+
+    /// Review M-3: on loopback, only "no entry" means "no key". Every other
+    /// answer from the keyring — a locked one, an empty entry — is the
+    /// operator's to hear about, not a reason to call the server keyless.
+    #[test]
+    fn on_loopback_only_a_missing_entry_means_no_key() {
+        assert!(loopback_key(Err(keyring::Error::NoEntry))
+            .expect("no entry is no key")
+            .is_none());
+        let key = loopback_key(Ok(" sk-local 
+"
+        .to_string()))
+        .expect("read")
+        .expect("a key");
+        assert_eq!(key.scrub("sk-local"), "[redacted]");
+        for answer in [
+            Err(keyring::Error::PlatformFailure(
+                "the keyring is locked".into(),
+            )),
+            Err(keyring::Error::NoStorageAccess("no secret service".into())),
+            Ok("   ".to_string()),
+        ] {
+            let err = loopback_key(answer).expect_err("not a missing entry");
+            assert!(
+                format!("{err:#}").contains("vk secret set openai-compat"),
+                "{err:#}"
+            );
+        }
     }
 
     #[test]

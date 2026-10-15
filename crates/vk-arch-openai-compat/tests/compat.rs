@@ -529,3 +529,17 @@ fn the_ids_in_the_record_are_scrubbed_of_the_key() {
     );
     assert!(details.contains("id-[redacted]"), "{details}");
 }
+
+/// Review M-7: a mount bound of 0 would bound every answer to nothing. It is
+/// refused at the mount, not clamped to 1 behind the operator's back.
+#[test]
+fn a_mount_bound_of_zero_is_refused_rather_than_clamped() {
+    let cfg = OpenAiCompatConfig {
+        max_tokens: 0,
+        ..OpenAiCompatConfig::new("http://127.0.0.1:9", "m", 8_192, "local", 0)
+    };
+    let err = OpenAiCompatAdapter::with_config(None, cfg)
+        .err()
+        .expect("refused");
+    assert!(format!("{err:#}").contains("max_tokens"), "{err:#}");
+}

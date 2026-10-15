@@ -2311,3 +2311,69 @@ async fn a_daemon_without_the_server_or_the_key_says_what_gives_it_one() {
     drop(c);
     shutdown(server, k, d).await;
 }
+
+/// Review M-2: "a mount that would be refused for what it says must not have
+/// read a credential first". Every key source here is a file that is not
+/// there, so a mount that reached for its key would be refused naming `vk
+/// secret set`; each of these is refused for what it says instead — which it
+/// can only be if nothing reached for the key.
+#[tokio::test]
+async fn a_newer_api_mount_is_refused_for_what_it_says_before_any_key_is_read() {
+    let d = tempfile::tempdir().unwrap();
+    let missing = || vk_arch_anthropic::KeySource::File(d.path().join("not-there.key"));
+    let api = vk_ipc::server::ApiArches {
+        mistral_keys: missing(),
+        // Daemon configuration that slipped past `vkd`'s own check.
+        mistral_base_url: "http://collector.example".into(),
+        gemini_keys: missing(),
+        openai_compat_keys: missing(),
+        openai_compat_base_url: Some("https://api.mammouth.ai".into()),
+        ..vk_ipc::server::ApiArches::default()
+    };
+    let k = Arc::new(Mutex::new(kernel_with_api_arches(d.path(), &api)));
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        api_arches: api,
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    let mut compat_zero = api_mounts()[2].1.clone();
+    compat_zero["max_tokens"] = json!(0);
+    for (kind, config, says) in [
+        (
+            "gemini",
+            json!({"model": "../../v1/files"}),
+            "not a model id",
+        ),
+        ("gemini", json!({"max_tokens": 0}), "max_tokens"),
+        ("mistral", json!({}), "in the clear"),
+        ("openai-compat", compat_zero, "max_tokens"),
+    ] {
+        let proof = prove(&c, &device).await;
+        let err = c
+            .call(
+                "arch.mount",
+                json!({"kind": kind, "config": config}),
+                Some(proof),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(says), "{kind}/{says}: {text}");
+        assert!(
+            !text.contains("vk secret set"),
+            "{kind}/{says}: the key was reached for first: {text}"
+        );
+    }
+    assert_eq!(
+        c.call("boot.info", json!({}), None).await.unwrap()["arches"],
+        0
+    );
+    drop(c);
+    shutdown(server, k, d).await;
+}

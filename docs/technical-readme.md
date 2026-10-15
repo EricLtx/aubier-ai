@@ -307,7 +307,12 @@ All four are required and all four are in the arch id, so a corrected claim is
 a new arch. The base URL is the daemon's, without the trailing `/v1` an
 OpenAI SDK example carries — the adapter appends `/v1/chat/completions` and a
 `…/v1` base is refused at start with the fix in the message. A key is optional
-on a loopback **address** and required anywhere else. The window is only as
+on a loopback **address** and required anywhere else — and on loopback only a
+keyring with **no entry** counts as no key: a keyring that cannot be read, or
+an empty entry, refuses the mount with the remedy rather than calling the
+server keyless (a node with no keyring names `vkd --openai-compat-key-file`).
+Every mount is checked for what it says — origin, model id, claims, an answer
+bound of at least 1 — before any keyring is read. The window is only as
 good as `--ctx`: a server that silently truncates at a smaller window than the
 one stated cannot be caught by the post-check.
 

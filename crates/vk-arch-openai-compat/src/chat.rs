@@ -92,6 +92,7 @@ impl ChatArch {
         key: Option<SecretString>,
     ) -> Result<ChatArch> {
         vk_arch_anthropic::check_base_url(&settings.base_url)?;
+        crate::check_max_tokens(settings.max_tokens)?;
         let client = http::build_client(settings.user_agent)?;
         Ok(ChatArch {
             manifest,
