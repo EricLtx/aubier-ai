@@ -384,12 +384,23 @@ fn a_non_zero_exit_is_a_failure_even_with_a_well_formed_result_object() {
 /// not the plain failure a non-zero exit otherwise is (2026-10-15).
 #[test]
 fn a_usage_limit_reaches_the_kernel_as_a_rate_limit() {
+    // An hour from now: a reset the adapter believes (review I1 caps it at a
+    // day). Leaked, because the stand-in takes its reply as `&'static str`.
+    let reset = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs()
+        + 3_600;
+    let reply: &'static str = Box::leak(
+        format!(
+            r#"{{"type": "result", "subtype": "success", "is_error": true,
+                "result": "Claude AI usage limit reached|{reset}", "session_id": "s"}}"#
+        )
+        .into_boxed_str(),
+    );
     let fake = Standin::behaving(How {
         exit: 1,
-        reply: Some(
-            r#"{"type": "result", "subtype": "success", "is_error": true,
-                "result": "Claude AI usage limit reached|4102444800", "session_id": "s"}"#,
-        ),
+        reply: Some(reply),
         ..Default::default()
     });
     let adapter = ClaudeCodeAdapter::new(fake.config());
@@ -399,9 +410,8 @@ fn a_usage_limit_reaches_the_kernel_as_a_rate_limit() {
     assert!(
         matches!(
             err,
-            vk_kernel::arch::AdapterError::RateLimited {
-                retry_after: Some(_)
-            }
+            vk_kernel::arch::AdapterError::RateLimited { retry_after: Some(d) }
+                if (3_500..=3_600).contains(&d.as_secs())
         ),
         "{err:?}"
     );

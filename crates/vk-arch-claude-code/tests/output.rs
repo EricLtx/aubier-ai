@@ -191,6 +191,24 @@ fn a_usage_limit_is_a_rate_limit_until_the_reset_the_cli_printed() {
         output::provider_refusal(&past, now),
         Some(AdapterError::RateLimited { retry_after: None })
     ));
+    // Review I1: a reset is believed within a day ahead and no further. A
+    // figure in milliseconds, or a century out, is no figure at all — the
+    // kernel's 60 s — rather than a hold nobody can lift without a remount.
+    for absurd in ["|1760003600000", "|4102444800", "|1760086401"] {
+        let h = failed(&format!("Claude AI usage limit reached{absurd}"), None);
+        assert!(
+            matches!(
+                output::provider_refusal(&h, now),
+                Some(AdapterError::RateLimited { retry_after: None })
+            ),
+            "{absurd} is not a reset time"
+        );
+    }
+    let a_day = failed("Claude AI usage limit reached|1760086400", None);
+    assert!(matches!(
+        output::provider_refusal(&a_day, now),
+        Some(AdapterError::RateLimited { retry_after: Some(d) }) if d.as_secs() == 86_400
+    ));
     let status = failed("API Error: 429", Some("429"));
     assert!(matches!(
         output::provider_refusal(&status, now),
@@ -211,6 +229,20 @@ fn a_spent_balance_is_exhausted_a_missing_model_retired_and_the_rest_unchanged()
         output::provider_refusal(&gone, 0),
         Some(AdapterError::Retired { detail }) if detail.contains("claude-2.1")
     ));
+    // Review M4: the wording is recognised only where it opens the result.
+    // A failed run's result can be the model's own text — a run out of
+    // turns hands back its last message — and a draft that *mentions* a
+    // usage limit or a balance must not flip the arch's health.
+    for authored in [
+        "The policy says: once the usage limit reached, stop.",
+        "Note that you've hit your limit of three retries.",
+        "Explain why a credit balance is too low to trade.",
+    ] {
+        assert!(
+            output::provider_refusal(&failed(authored, None), 0).is_none(),
+            "model text is not a refusal: {authored}"
+        );
+    }
     // Not about the plan: an overloaded provider, a run out of turns.
     assert!(output::provider_refusal(&failed("Overloaded", Some("529")), 0).is_none());
     assert!(output::provider_refusal(&failed("max turns", None), 0).is_none());

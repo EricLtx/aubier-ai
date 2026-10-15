@@ -369,6 +369,23 @@ fn a_dropped_model_is_retired_and_a_429_is_a_rate_limit() {
         matches!(&err, AdapterError::Other(e) if format!("{e:#}").contains("out of memory")),
         "{err:?}"
     );
+
+    // Review M3: a server that answers with a page puts at most a line of it
+    // into the detail — which `vk arch show` prints and a failed step keeps.
+    let err = refused((
+        "404 Not Found",
+        serde_json::json!({"error": format!("model 'gemma3:1b' not found {}", "x".repeat(5_000))}),
+        None,
+    ));
+    let AdapterError::Retired { detail } = err else {
+        panic!("still a retired arch: {err:?}")
+    };
+    assert!(
+        detail.chars().count() < 400,
+        "{} characters",
+        detail.chars().count()
+    );
+    assert!(detail.ends_with('…'), "and it says it was cut: {detail}");
 }
 
 #[test]

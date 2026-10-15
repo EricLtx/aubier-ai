@@ -323,7 +323,10 @@ pub fn chat(
         .and_then(parse_retry_after);
     let text = r.text().unwrap_or_default();
     if !status.is_success() {
-        let said = format!("/api/chat: Ollama answered {status}: {}", text.trim());
+        // Cut like every other far-end text this node prints (review M3):
+        // a server that answers with a page must not put it in the detail a
+        // failed step keeps and `vk arch show` prints.
+        let said = format!("/api/chat: Ollama answered {status}: {}", head(&text, 300));
         return Err(match status.as_u16() {
             429 => AdapterError::RateLimited { retry_after },
             404 if text.contains("model") => AdapterError::Retired { detail: said },

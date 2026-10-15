@@ -147,13 +147,18 @@ pub fn parse_for_kernel(s: &str, now_unix_s: u64) -> std::result::Result<ClaudeJ
 ///
 /// Recognised, and only these, because a guess here would hold an arch back
 /// or fail a step for a reason the provider never gave:
-/// - `api_error_status` 429, or a result saying the subscription's usage
-///   limit is reached (`Claude AI usage limit reached|<unix seconds>`, `You've
-///   hit your limit`) → rate-limited, until the reset time when the CLI
-///   printed one after a `|`;
-/// - `api_error_status` 402, or a result saying the credit balance is too
-///   low (Claude Code on an API key) → exhausted;
+/// - `api_error_status` 429, or a result that **opens with** the usage-limit
+///   wording (`Claude AI usage limit reached|<unix seconds>`, `You've hit
+///   your limit`) → rate-limited, until the reset time when the CLI printed
+///   a plausible one after a `|`;
+/// - `api_error_status` 402, or a result that opens with `Credit balance is
+///   too low` (Claude Code on an API key) → exhausted;
 /// - `api_error_status` 404 → retired: the model is not served.
+///
+/// The wording counts only at the start of the result (review M4): a failed
+/// run's result can be the model's own text — a run out of turns hands back
+/// its last message — and a draft that mentions a usage limit must not flip
+/// the arch's health.
 ///
 /// `overloaded_error` (529) and `error_max_turns` are not here: neither is
 /// about the plan.
@@ -162,16 +167,14 @@ pub fn provider_refusal(j: &ClaudeJson, now_unix_s: u64) -> Option<AdapterError>
         return None;
     }
     let status = j.api_error_status.as_deref().unwrap_or("").trim();
-    let said = j.result.to_ascii_lowercase();
-    if status.starts_with("429")
-        || said.contains("usage limit reached")
-        || said.contains("hit your limit")
-    {
+    let said = j.result.trim_start().to_lowercase();
+    let opens_with = |wordings: &[&str]| wordings.iter().any(|w| said.starts_with(w));
+    if status.starts_with("429") || opens_with(USAGE_LIMIT) {
         return Some(AdapterError::RateLimited {
             retry_after: reset_after(&j.result, now_unix_s),
         });
     }
-    if status.starts_with("402") || said.contains("credit balance is too low") {
+    if status.starts_with("402") || opens_with(&["credit balance is too low"]) {
         return Some(AdapterError::Exhausted {
             detail: j.refusal().to_string(),
         });
@@ -184,11 +187,34 @@ pub fn provider_refusal(j: &ClaudeJson, now_unix_s: u64) -> Option<AdapterError>
     None
 }
 
+/// How a usage-limit result opens, lower-cased: the CLI's own words, with
+/// the apostrophe both ways it has been printed.
+const USAGE_LIMIT: &[&str] = &[
+    "claude ai usage limit reached",
+    "usage limit reached",
+    "you've hit your limit",
+    "you\u{2019}ve hit your limit",
+];
+
+/// How far back and ahead of now a printed reset is believed (review I1): an
+/// hour behind, for a clock a little off, and a day ahead, the longest wait
+/// the kernel believes from any provider.
+const RESET_BEHIND_S: u64 = 3_600;
+const RESET_AHEAD_S: u64 = 86_400;
+
 /// The wait until the reset a usage-limit message names as `…|<unix
-/// seconds>`; `None` when it names none, or one already past.
+/// seconds>`. `None` when it names none, one already past, or one outside
+/// `[now - 1 h, now + 24 h]` — a figure in milliseconds, or a date a century
+/// out, is not a reset time, and the kernel then waits its own 60 s rather
+/// than hold the arch until somebody remounts it.
 fn reset_after(result: &str, now_unix_s: u64) -> Option<Duration> {
     let (_, at) = result.rsplit_once('|')?;
     let at: u64 = at.trim().parse().ok()?;
+    let believable =
+        now_unix_s.saturating_sub(RESET_BEHIND_S)..=now_unix_s.saturating_add(RESET_AHEAD_S);
+    if !believable.contains(&at) {
+        return None;
+    }
     at.checked_sub(now_unix_s)
         .filter(|wait| *wait > 0)
         .map(Duration::from_secs)
