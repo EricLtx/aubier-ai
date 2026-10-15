@@ -520,10 +520,20 @@ class Browser:
     def _live_page(self):
         """The page to service Playwright through: the driver's own if it is still open, else
         another open page of the context (the founder may close a tab), else a new one.
-        Never a relaunch: that would close every window, the founder's included."""
+        Never a relaunch here: that would close every window, the founder's included. But a
+        context that cannot open a page any more has lost its browser — Playwright's node
+        process died, which no `close` event reports — so the browser is marked dead, and the
+        next action relaunches it rather than failing `internal` until a remount."""
         if self._page is None or self._page.is_closed() or self._page in self._broken:
             pages = [p for p in self.context.pages if not p.is_closed() and p not in self._broken]
-            self._page = pages[0] if pages else self.context.new_page()
+            if pages:
+                self._page = pages[0]
+            else:
+                try:
+                    self._page = self.context.new_page()
+                except PWError:
+                    self._dead = True
+                    raise
         return self._page
 
     def pump(self) -> None:
@@ -536,11 +546,11 @@ class Browser:
             page = self._live_page()
             page.wait_for_timeout(20)
         except PWError as e:
-            if self._dead:  # the context itself closed: `_on_close` said so
+            if self._dead:  # the context closed (`_on_close`), or lost its browser (`_live_page`)
                 return
             if self._page is not None and self._page not in self._broken:
                 log.info("page unusable between actions, serving through another: %s",
-                         str(e).splitlines()[0])
+                         one_line(str(e)))
                 self._broken.add(self._page)
             self._page = None
 
@@ -838,14 +848,17 @@ class Recette:
         if navs:
             raise self._host_refusal(navs[-1])
 
-    def _host_refusal(self, nav: dict, ev: Evidence | None = None) -> DriverRefusal:
+    def _host_refusal(self, nav: dict, ev: Evidence | None = None, page=None) -> DriverRefusal:
         """Défaire une navigation hors liste (retour à la page d'entrée) et la refuser ; le cas
-        en cours la porte dans son observation, comme un dialogue."""
+        en cours la porte dans son observation, comme un dialogue. L'onglet renvoyé à l'entrée
+        est `page` quand l'appelant le nomme (un onglet fermé depuis la navigation décale les
+        index), sinon celui de l'index relevé avec la navigation."""
         if self._case_in_hand:
             self.observations.setdefault(self._case_in_hand, {})["offlist"] = {
                 "host": nav["host"], "url": nav["url"], "t": now_iso()}
-        pages = self.browser.context.pages
-        page = pages[nav["page"]] if 0 <= nav.get("page", -1) < len(pages) else self.browser.page()
+        if page is None:
+            pages = self.browser.context.pages
+            page = pages[nav["page"]] if 0 <= nav.get("page", -1) < len(pages) else self.browser.page()
         self._back_to_entry(page)
         return DriverRefusal("host", f"navigation hors liste vers {nav['host']} : retour à la page d'entrée",
                              extra={"host": nav["host"], "url": nav["url"]},
@@ -1444,38 +1457,46 @@ class Recette:
                         out[turn["case"]].update(answer=one_line(obs["answer"], 300), total_s=obs["total_s"],
                                                  end=obs["end"], server_steps=obs["server_steps"])
                 out["gap_s"] = gap
-            # Both tabs' hosts, after the answers and before the journal: a tab that left the
-            # list (even after <END>) makes the line KO sécurité; `_after` then refuses `host`.
-            self.browser.drain(50)
-            off = sorted({n["host"] for n in self._offlist()})
-            ok = [o for k, o in out.items() if k != "gap_s" and o.get("answer") and not (o.get("end") or "").startswith("<ABORT>")]
-            verdict = "OK" if len(ok) == 2 and not off else "KO"
-            parts = [f"navigation hors périmètre : {', '.join(off)}"] if off else []
-            for c in cases:
-                o = out[c["id"]]
-                if o.get("attach", {}).get("state", "attached") != "attached":
-                    parts.append(f"{c['id']} : pièce jointe {o['attach']['state']} ({o['attach']['label']})")
-                elif o.get("timeout_s"):
-                    parts.append(f"{c['id']} : abandon à {o['timeout_s']:.0f} s")
-                elif o.get("end") == "<HORS PÉRIMÈTRE>":
-                    parts.append(f"{c['id']} : onglet sorti du périmètre avant la fin de la réponse")
-                else:
-                    parts.append(f"{c['id']} : {o.get('total_s')} s, {len(o.get('answer') or '')} car.")
-            if "gap_s" in out:
-                parts.append(f"écart d'envoi {out['gap_s']} s")
-            timing = max([o.get("total_s") or o.get("timeout_s") or 0 for k, o in out.items() if k != "gap_s"] or [0])
-            line = self._journal_add(cid, verdict, timing, " ; ".join(parts),
-                                     nfr_union(self._case(cid)["nfr"] if cid in self.cases else [],
-                                               ["disponibilite", "scalabilite"], ["securite"] if off else []))
-            self.observations["@concurrent"] = {**out, "case": cid, "verdict": verdict, "t": now_iso()}
-            ev.json("network.json", b.capture(mark), cap=NETWORK_CAP)
             ev.screenshot(second, "screen.png")
-            return {"case": cid, "a": out[a], "b": out[bb], "verdict": verdict, "replayed": False, "text": line}
         finally:
             try:
                 second.close()
             except PWError:
                 pass
+        # The journal comes last (Task 4 re-review 3): the screenshot, the second tab closed, a
+        # drain, the network summary, then both tabs' hosts. A tab that left the list — even
+        # after <END>, even during the screenshot — makes the line KO sécurité and the action a
+        # `host` refusal; journaled earlier, a navigation in that window was journaled OK, then
+        # refused, and a re-run replayed the OK.
+        b.drain(50)
+        ev.json("network.json", b.capture(mark), cap=NETWORK_CAP)
+        navs = self._offlist()
+        off = sorted({n["host"] for n in navs})
+        ok = [o for k, o in out.items() if k != "gap_s" and o.get("answer") and not (o.get("end") or "").startswith("<ABORT>")]
+        verdict = "OK" if len(ok) == 2 and not off else "KO"
+        parts = [f"navigation hors périmètre : {', '.join(off)}"] if off else []
+        for c in cases:
+            o = out[c["id"]]
+            if o.get("attach", {}).get("state", "attached") != "attached":
+                parts.append(f"{c['id']} : pièce jointe {o['attach']['state']} ({o['attach']['label']})")
+            elif o.get("timeout_s"):
+                parts.append(f"{c['id']} : abandon à {o['timeout_s']:.0f} s")
+            elif o.get("end") == "<HORS PÉRIMÈTRE>":
+                parts.append(f"{c['id']} : onglet sorti du périmètre avant la fin de la réponse")
+            else:
+                parts.append(f"{c['id']} : {o.get('total_s')} s, {len(o.get('answer') or '')} car.")
+        if "gap_s" in out:
+            parts.append(f"écart d'envoi {out['gap_s']} s")
+        timing = max([o.get("total_s") or o.get("timeout_s") or 0 for k, o in out.items() if k != "gap_s"] or [0])
+        line = self._journal_add(cid, verdict, timing, " ; ".join(parts),
+                                 nfr_union(self._case(cid)["nfr"] if cid in self.cases else [],
+                                           ["disponibilite", "scalabilite"], ["securite"] if off else []))
+        self.observations["@concurrent"] = {**out, "case": cid, "verdict": verdict, "t": now_iso()}
+        if navs:
+            # The driver's own tab goes back to the entry page: the navigation's tab index was
+            # recorded with the second tab open, and may name another tab now.
+            raise self._host_refusal(navs[-1], ev, page=b.page())
+        return {"case": cid, "a": out[a], "b": out[bb], "verdict": verdict, "replayed": False, "text": line}
 
     def capture_ecran(self, args: dict, ev: Evidence) -> dict:
         """Une capture de la partie visible de la page."""

@@ -53,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File drivers\maskai-recette\setup.ps1
 ```
 Attendu, en dernières lignes :
 ```
-files_sha256 : sha256:c973188ee5dc12e1bdf289c54ee2340476dbba29ea0e403b5572b1dc867d8a2f
+files_sha256 : sha256:e1b78006939a8371a0827ce18ecf1acf7665b4ac67b58aabd6baafb2b860c0a5
 manifest.json : à jour
 manifest-fixture.json : à jour
 ```

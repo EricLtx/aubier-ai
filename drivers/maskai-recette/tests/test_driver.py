@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -94,6 +95,30 @@ class CasesTest(unittest.TestCase):
         with self.assertRaises(ValueError) as refused:
             drv.load_cases(drv.Path(path))
         self.assertIn("securité", str(refused.exception))
+
+
+class PumpTest(unittest.TestCase):
+    """The idle pump over stand-in objects (no browser needed)."""
+
+    def test_an_error_without_a_message_does_not_break_the_pump(self):
+        drv = load_driver()
+
+        class Page:
+            def is_closed(self):
+                return False
+
+            def wait_for_timeout(self, ms):
+                raise drv.PWError("")
+
+        class Context:
+            pages = []
+
+        b = drv.Browser("profile", None, True, ["127.0.0.1"])
+        page = Page()
+        b.context, b._page = Context(), page
+        b.pump()  # an empty message once broke the log line (IndexError)
+        self.assertIn(page, b._broken)
+        self.assertIsNone(b._page)
 
 
 @unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
@@ -359,6 +384,72 @@ class DriverOnFixture(unittest.TestCase):
         self.assertEqual((line["case"], line["verdict"]), ("charge_concurrente : fixture-away-c + fixture-case-2", "KO"))
         self.assertIn("securite", line["nfr"])
         self.assertIn("navigation hors périmètre : localhost", line["evidence"])
+
+    def test_charge_concurrente_journals_after_its_last_look(self):
+        """Task 4 re-review 3: the line is journaled only after the screenshot, the second tab's
+        close and a last drain. A navigation off the list in that window makes it KO sécurité,
+        never an OK the refusal then contradicts (and a re-run would replay); and the refusal
+        sends the driver's own tab back to the entry page, not whichever tab now holds the
+        index the navigation was recorded under."""
+        drv, recette, A = self.make()
+        recette.open()
+        b = recette.browser
+        away = f"http://localhost:{self.port}/elsewhere"
+        real = drv.Evidence.screenshot
+        opened = []
+
+        def screenshot(ev, page, name):  # the window: a tab opens, the second tab leaves the list
+            opened.append(b.context.new_page())
+            page.evaluate(f"() => location.assign({away!r})")
+            page.wait_for_url(away, timeout=10_000)
+            real(ev, page, name)
+
+        drv.Evidence.screenshot = screenshot
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "charge_concurrente", {"cases": ["fixture-case-1", "fixture-case-2"]})
+        self.assertEqual(refused.exception.reason, "host")
+        self.assertEqual({e["name"] for e in refused.exception.evidence}, {"network.json", "screen.png"})
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual(line["verdict"], "KO", line)
+        self.assertIn("securite", line["nfr"])
+        self.assertIn("navigation hors périmètre : localhost", line["evidence"])
+        self.assertEqual(b.page().url, recette.entry, "the driver's own tab is back on the entry page")
+        self.assertEqual(opened[0].url, "about:blank", "the other tab was left alone")
+        drv.Evidence.screenshot = real
+        res, _ = self.act(A, "charge_concurrente", {"cases": ["fixture-case-1", "fixture-case-2"]})
+        self.assertTrue(res["replayed"])
+        self.assertEqual(json.loads(res["text"])["verdict"], "KO")
+
+    def test_a_lost_playwright_connection_heals_at_the_next_action(self):
+        """Task 4 re-review 3: Playwright's node process dies (killed, crashed) while the driver
+        idles. No context `close` event comes: the page fails, then every `new_page` does. That
+        failing `new_page` marks the browser dead, and the next action relaunches it, rather
+        than every action failing `internal` until a remount."""
+        drv, recette, A = self.make()
+        recette.open()
+        b = recette.browser
+        old = b.context
+        connection = getattr(getattr(b.pw, "_impl_obj", None), "_connection", None)
+        proc = getattr(getattr(connection, "_transport", None), "_proc", None)
+        if proc is None:
+            self.skipTest("this Playwright does not expose its node process (the pinned 1.64.0 does)")
+        os.kill(proc.pid, signal.SIGTERM)
+
+        def idle():  # what serve's idle loop does: pump, and log what escapes it
+            time.sleep(0.1)
+            try:
+                b.pump()
+            except Exception:  # noqa: BLE001 — serve logs it and goes on
+                pass
+
+        deadline = time.monotonic() + 10
+        while b.started() and time.monotonic() < deadline:
+            idle()
+        self.assertFalse(b.started(), "the lost connection was never noticed")
+        self.act(A, "nouvelle_conversation")
+        res, _ = self.act(A, "capture_ecran")
+        self.assertIn("127.0.0.1", res["text"])
+        self.assertIsNot(b.context, old, "the browser was relaunched")
 
     def test_an_unreachable_redirect_is_a_host_refusal(self):
         drv, recette, A = self.make()
