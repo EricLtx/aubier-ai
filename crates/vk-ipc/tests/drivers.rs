@@ -1007,6 +1007,115 @@ async fn a_different_manifest_under_the_same_name_never_adopts_the_old_process()
     node.shutdown().await;
 }
 
+/// Task 7 review, minor 1: an orphan of an unmounted manifest that is still
+/// acting — a stale act whose late `ensure` spawned it — is never taken for
+/// another manifest's process. A mount of a different manifest under the
+/// same name is refused as busy, naming the old identity and the remedy;
+/// `vk driver umount` kills the orphan's act (Ruling R13) even with no row
+/// left to remove; the new manifest then mounts on a fresh process and acts
+/// there.
+#[tokio::test]
+async fn an_orphan_still_acting_is_busy_by_its_identity_until_unmounted() {
+    if !python_available() {
+        return;
+    }
+    let a = driver_dir_of(&tagged("A"));
+    let b = driver_dir_of(&tagged("B"));
+    let node = Node::start().await;
+    node.mount(a.path()).await;
+    let (row_a, dirs) = {
+        let k = node.k.lock().unwrap();
+        (k.driver("fake").unwrap().unwrap(), k.driver_dirs("fake"))
+    };
+    node.c
+        .call("driver.unmount", json!({"name": "fake"}), None)
+        .await
+        .unwrap();
+    assert!(!node.pool.has_host("fake"));
+
+    // The stale act of a run that read A's row before the unmount: its
+    // `ensure` spawns A again, and its thirty-second action runs there.
+    let stale = {
+        let (pool, row, dirs) = (node.pool.clone(), row_a.clone(), dirs.clone());
+        std::thread::spawn(move || {
+            let slow = row.manifest.action("slow").expect("slow").clone();
+            let caps = vk_driver::EvidenceCaps {
+                per_file: 1 << 20,
+                per_action: 4 << 20,
+            };
+            let never = || false;
+            pool.act(
+                &row,
+                &dirs,
+                &slow,
+                &json!({}),
+                Duration::from_secs(60),
+                caps,
+                &never,
+            )
+        })
+    };
+    eventually("the stale act never started", || {
+        std::fs::read_dir(&dirs.evidence).is_ok_and(|mut d| d.next().is_some())
+    })
+    .await;
+    let orphan = node.pool.pid("fake").expect("A's orphan, acting");
+
+    let proof = node.proof().await;
+    let err = node
+        .c
+        .call("driver.mount", mount_params(b.path()), Some(proof))
+        .await
+        .unwrap_err();
+    let e = call_error(&err);
+    assert_eq!(e.code, vk_ipc::E_BAD_PARAMS, "{err}");
+    assert!(
+        e.message.contains(&format!(
+            "busy with an act of another manifest ({})",
+            row_a.driver_id
+        )),
+        "{err}"
+    );
+    assert!(e.message.contains("vk driver umount fake"), "{err}");
+    assert_eq!(node.events("driver.mounted"), 1, "B is not mounted");
+
+    // The remedy: no row is left, so the unmount answers not-found, and it
+    // kills the orphan's act all the same.
+    let err = node
+        .c
+        .call("driver.unmount", json!({"name": "fake"}), None)
+        .await
+        .unwrap_err();
+    assert_eq!(call_error(&err).code, vk_ipc::E_NOT_FOUND, "{err}");
+    let outcome = stale.join().expect("the stale act's thread");
+    assert!(
+        outcome.as_ref().is_err_and(|why| why.starts_with("dead")),
+        "{outcome:?}"
+    );
+    eventually("A's orphan is gone", || !process_alive(orphan)).await;
+    assert!(!node.pool.has_host("fake"));
+
+    node.mount(b.path()).await;
+    let token = node.token().await;
+    let answer = node
+        .c
+        .call(
+            "driver.act",
+            json!({"token": token, "driver": "fake", "action": "echo", "args": {"case": "y"}}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer["result"]["tag"], "B", "{answer}");
+    let starts = std::fs::read_to_string(dirs.work.join("starts.txt")).unwrap();
+    assert_eq!(
+        starts.lines().collect::<Vec<_>>(),
+        ["A", "A", "B"],
+        "A at its mount, A's orphan, then B"
+    );
+    node.shutdown().await;
+}
+
 /// Reviewer Important 1: the script the manifest names lives under the root
 /// it is mounted from. A `..` path would hash one directory and run another,
 /// and an absolute one would ignore the root and bind the manifest to one

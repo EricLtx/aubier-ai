@@ -420,6 +420,37 @@ class DriverOnFixture(unittest.TestCase):
         self.assertTrue(res["replayed"])
         self.assertEqual(json.loads(res["text"])["verdict"], "KO")
 
+    def test_charge_concurrente_journals_a_dialog_of_its_last_look(self):
+        """Task 7 review, minor 4: a dialog that opens in the driver's tab during the last look
+        (here, the screenshot) makes the concurrent line KO sécurité with the dialog's text, as
+        verdict_oracle words it, and the action a `dialog` refusal; never an OK line the
+        refusal then contradicts."""
+        drv, recette, A = self.make()
+        recette.open()
+        b = recette.browser
+        real = drv.Evidence.screenshot
+
+        def screenshot(ev, page, name):  # the window: the driver's own tab opens a dialog
+            b.page().evaluate("() => { setTimeout(() => confirm('pendant la capture'), 0); }")
+            deadline = time.monotonic() + 10
+            while not b.pending() and time.monotonic() < deadline:
+                page.wait_for_timeout(50)
+            real(ev, page, name)
+
+        drv.Evidence.screenshot = screenshot
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "charge_concurrente", {"cases": ["fixture-case-1", "fixture-case-2"]})
+        self.assertEqual(refused.exception.reason, "dialog")
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual(line["verdict"], "KO", line)
+        self.assertIn("securite", line["nfr"])
+        self.assertIn("dialogue inattendu (confirm) : pendant la capture", line["evidence"])
+        b.pending()["dialog"].dismiss()  # the founder closes it
+        drv.Evidence.screenshot = real
+        res, _ = self.act(A, "charge_concurrente", {"cases": ["fixture-case-1", "fixture-case-2"]})
+        self.assertTrue(res["replayed"])
+        self.assertEqual(json.loads(res["text"])["verdict"], "KO")
+
     def test_a_lost_playwright_connection_heals_at_the_next_action(self):
         """Task 4 re-review 3: Playwright's node process dies (killed, crashed) while the driver
         idles. No context `close` event comes: the page fails, then every `new_page` does. That

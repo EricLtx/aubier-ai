@@ -1464,17 +1464,20 @@ class Recette:
             except PWError:
                 pass
         # The journal comes last (Task 4 re-review 3): the screenshot, the second tab closed, a
-        # drain, the network summary, then both tabs' hosts. A tab that left the list — even
-        # after <END>, even during the screenshot — makes the line KO sécurité and the action a
-        # `host` refusal; journaled earlier, a navigation in that window was journaled OK, then
-        # refused, and a re-run replayed the OK.
+        # drain, the network summary, then a pending dialog and both tabs' hosts. A dialog left
+        # open, or a tab that left the list — even after <END>, even during the screenshot —
+        # makes the line KO sécurité and the action a `dialog` or `host` refusal; journaled
+        # earlier, either was journaled OK, then refused, and a re-run replayed the OK.
         b.drain(50)
         ev.json("network.json", b.capture(mark), cap=NETWORK_CAP)
+        dialog = b.pending()
         navs = self._offlist()
         off = sorted({n["host"] for n in navs})
         ok = [o for k, o in out.items() if k != "gap_s" and o.get("answer") and not (o.get("end") or "").startswith("<ABORT>")]
-        verdict = "OK" if len(ok) == 2 and not off else "KO"
-        parts = [f"navigation hors périmètre : {', '.join(off)}"] if off else []
+        verdict = "OK" if len(ok) == 2 and not off and not dialog else "KO"
+        parts = [f"dialogue inattendu ({dialog['type']}) : {dialog['message']}"] if dialog else []
+        if off:
+            parts.append(f"navigation hors périmètre : {', '.join(off)}")
         for c in cases:
             o = out[c["id"]]
             if o.get("attach", {}).get("state", "attached") != "attached":
@@ -1490,8 +1493,12 @@ class Recette:
         timing = max([o.get("total_s") or o.get("timeout_s") or 0 for k, o in out.items() if k != "gap_s"] or [0])
         line = self._journal_add(cid, verdict, timing, " ; ".join(parts),
                                  nfr_union(self._case(cid)["nfr"] if cid in self.cases else [],
-                                           ["disponibilite", "scalabilite"], ["securite"] if off else []))
+                                           ["disponibilite", "scalabilite"],
+                                           ["securite"] if off or dialog else []))
         self.observations["@concurrent"] = {**out, "case": cid, "verdict": verdict, "t": now_iso()}
+        if dialog:
+            # First, as `_after` would: a frozen tab cannot be sent back to the entry page.
+            raise self._dialog_refusal(ev)
         if navs:
             # The driver's own tab goes back to the entry page: the navigation's tab index was
             # recorded with the second tab open, and may name another tab now.

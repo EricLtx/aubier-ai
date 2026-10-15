@@ -548,12 +548,13 @@ fn stop_kills_the_tree() {
     );
 }
 
-/// Task 1 re-review: the tree is signalled once, by whatever saw the driver
-/// die first — a deadline kill, the reap after a driver exited, a `try_wait`
-/// that saw it gone — and never again. Once the leader is reaped its id is
-/// free for reuse, so a later sweep (the drop's, or a second act's on a dead
-/// host) could signal some other group (the harness's M18 rule); the host
-/// remembers it swept and `shutdown`/`Drop` send nothing more.
+/// Task 1 re-review (and its review round 1): the tree is signalled once, by
+/// whatever saw the driver die first — a deadline kill, the reap after a
+/// driver exited, a `try_wait` that saw it gone — and never again. Once the
+/// leader is reaped its id is free for reuse, so a later signal (the drop's,
+/// or a second act's on a dead host) could reach some other group (the
+/// harness's M18 rule). The host's tree-signal count, read after the drop,
+/// is the proof: one for the kill or the sweep, nothing more.
 #[test]
 fn a_tree_is_swept_once_and_never_signalled_again() {
     if !python_available() {
@@ -562,8 +563,9 @@ fn a_tree_is_swept_once_and_never_signalled_again() {
     let rig = Rig::new(FAKE_DRIVER);
     let m = rig.fake_manifest();
 
-    // A deadline kill.
+    // A deadline kill: one signal, and none from a second act or the drop.
     let mut host = rig.spawn(&m);
+    let signals = host.tree_signals();
     host.act(
         action(&m, "echo"),
         &json!({}),
@@ -573,6 +575,7 @@ fn a_tree_is_swept_once_and_never_signalled_again() {
     )
     .expect("a live driver answers");
     assert!(!host.swept(), "a driver still running has not been swept");
+    assert_eq!(signals.count(), 0, "nothing has signalled a live driver");
     let err = host
         .act(
             action(&m, "slow"),
@@ -584,6 +587,11 @@ fn a_tree_is_swept_once_and_never_signalled_again() {
         .expect_err("a 30 s sleep does not answer in 1 s");
     assert!(matches!(err, HostError::Timeout), "{err}");
     assert!(host.swept(), "the deadline kill swept the tree");
+    assert_eq!(
+        signals.count(),
+        1,
+        "the deadline kill signalled the tree once"
+    );
     let again = host
         .act(
             action(&m, "echo"),
@@ -594,10 +602,20 @@ fn a_tree_is_swept_once_and_never_signalled_again() {
         )
         .expect_err("nothing answers a dead driver");
     assert!(matches!(again, HostError::Dead(_)), "{again}");
+    assert_eq!(
+        signals.count(),
+        1,
+        "a second act on the dead host signals nothing"
+    );
     drop(host);
+    assert_eq!(signals.count(), 1, "dropping a swept host signals nothing");
 
-    // A driver that exits on its own under an act: the reap sweeps.
+    // A driver that exits on its own under an act: the reap sweeps, once. The
+    // sweep signals on Unix, and on Windows only an ungoverned tree (the
+    // rig's Noop governor); a governed one is the Job Object's.
     let mut host = rig.spawn(&m);
+    let signals = host.tree_signals();
+    let sweeps = u32::from(cfg!(unix) || !host.governed());
     let err = host
         .act(
             action(&m, "die"),
@@ -609,10 +627,17 @@ fn a_tree_is_swept_once_and_never_signalled_again() {
         .expect_err("a driver that exits answers nothing");
     assert!(matches!(err, HostError::Dead(_)), "{err}");
     assert!(host.swept(), "the reap swept the tree");
+    assert_eq!(signals.count(), sweeps, "the reap swept once");
     drop(host);
+    assert_eq!(
+        signals.count(),
+        sweeps,
+        "dropping a swept host signals nothing"
+    );
 
-    // A driver killed while idle: the `try_wait` that sees it gone sweeps.
+    // A driver killed while idle: the `try_wait` that sees it gone sweeps, once.
     let mut host = rig.spawn(&m);
+    let signals = host.tree_signals();
     vk_driver::kill_pid_tree(host.pid());
     let until = Instant::now() + kill_bound();
     while host.try_wait().expect("try_wait").is_none() {
@@ -622,6 +647,14 @@ fn a_tree_is_swept_once_and_never_signalled_again() {
     assert!(
         host.swept(),
         "the try_wait that saw the exit swept the tree"
+    );
+    assert_eq!(signals.count(), sweeps, "the try_wait swept once");
+    assert!(host.try_wait().expect("try_wait").is_some());
+    drop(host);
+    assert_eq!(
+        signals.count(),
+        sweeps,
+        "dropping a swept host signals nothing"
     );
 }
 

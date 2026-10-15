@@ -41,7 +41,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vk_contracts::driver::{DriverAction, DriverManifest};
 use vk_harness::confine::Governor;
@@ -143,6 +145,9 @@ pub struct DriverHost {
     /// leader's id is free for reuse, and a group signal sent later could
     /// reach someone else's group (the harness's M18 rule).
     swept: bool,
+    /// Every time the host signals the driver's tree ([`signal_tree`]),
+    /// counted; shared with [`TreeSignals`] so a test reads it after the drop.
+    signals: Arc<AtomicU32>,
     next_id: u64,
     hello: Hello,
     evidence_root: PathBuf,
@@ -150,6 +155,19 @@ pub struct DriverHost {
     /// its own handle, and the host appends the stray stdout lines it ignores.
     log: File,
     log_path: PathBuf,
+}
+
+/// How many times a host has signalled its driver's tree — a kill, or a sweep
+/// that sent a signal — readable after the host is dropped. A test seam: the
+/// proof that a tree is signalled once and never again (M18).
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct TreeSignals(Arc<AtomicU32>);
+
+impl TreeSignals {
+    pub fn count(&self) -> u32 {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 /// The response to one request, with what the wait recorded alongside it.
@@ -262,6 +280,7 @@ impl DriverHost {
 
         // Immediately after spawn, before the child can do much: contain the
         // tree, and remember whether the OS confirmed it.
+        let signals = Arc::new(AtomicU32::new(0));
         let governed = match governor.contain(&child) {
             Ok(()) => governor.governed(),
             Err(e) => {
@@ -269,7 +288,7 @@ impl DriverHost {
                     // Fail closed: the platform has a governor and it refused,
                     // so the driver does not run at all.
                     tracing::error!(error = %format!("{e:#}"), "driver not contained: killed before it ran");
-                    kill_tree(&mut child);
+                    signal_tree(&mut child, &signals);
                     let _ = child.wait();
                     return Err(HostError::Protocol(format!("not contained: {e:#}")));
                 }
@@ -282,14 +301,21 @@ impl DriverHost {
         let stdout = child.stdout.take().expect("stdout was piped");
         let lines = read_lines(stdout);
 
-        let hello = match await_hello(&lines, &mut child, hello_timeout, manifest, governed) {
+        let hello = match await_hello(
+            &lines,
+            &mut child,
+            hello_timeout,
+            manifest,
+            governed,
+            &signals,
+        ) {
             Ok(hello) => hello,
             Err(e) => {
                 tracing::warn!(error = %e, "driver refused at hello; tree killed");
-                // A driver that died before its hello was reaped, and its tree
-                // swept, by `await_hello`: its id is not signalled again.
+                // A driver that died before its hello was swept, then reaped,
+                // by `await_hello`: its id is not signalled again.
                 if !matches!(e, HostError::Dead(_)) {
-                    kill_tree(&mut child);
+                    signal_tree(&mut child, &signals);
                 }
                 let _ = child.wait();
                 return Err(e);
@@ -309,6 +335,7 @@ impl DriverHost {
             governor,
             governed,
             swept: false,
+            signals,
             next_id: 1,
             hello,
             evidence_root,
@@ -331,6 +358,13 @@ impl DriverHost {
         self.swept
     }
 
+    /// The count of the times this host has signalled its driver's tree,
+    /// still readable once the host is dropped. A test's read-back only.
+    #[doc(hidden)]
+    pub fn tree_signals(&self) -> TreeSignals {
+        TreeSignals(Arc::clone(&self.signals))
+    }
+
     /// What the driver said first.
     pub fn hello(&self) -> &Hello {
         &self.hello
@@ -348,17 +382,20 @@ impl DriverHost {
     /// and `None` while it runs. The read-back the daemon puts in a
     /// `driver.unmounted` reason, and a test's proof that a kill killed.
     ///
-    /// The first call to see a driver gone that nothing had swept yet — one
-    /// killed from outside while idle — sweeps what it left behind there and
-    /// then ([`sweep`]), right after the reap this call just made, and never
-    /// later: `shutdown` and `Drop` send nothing to a reaped leader's id.
+    /// A driver gone that nothing had swept yet — one killed from outside
+    /// while idle — is settled here in M18's order: its exit observed without
+    /// reaping it ([`exited`]), what it left behind swept ([`sweep`]), then
+    /// the reap. `shutdown` and `Drop` send nothing more to its id.
     pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        let status = self.child.try_wait()?;
-        if status.is_some() && !self.swept {
-            sweep(&mut self.child, self.governed);
-            self.swept = true;
+        if self.swept {
+            return self.child.try_wait();
         }
-        Ok(status)
+        if !exited(&mut self.child)? {
+            return Ok(None);
+        }
+        sweep(&mut self.child, self.governed, &self.signals);
+        self.swept = true;
+        self.child.wait().map(Some)
     }
 
     /// One act. Creates `<evidence_root>/<id>/`, writes the request line, and
@@ -624,10 +661,11 @@ impl DriverHost {
         }
     }
 
-    /// Kill the driver tree now and reap the child.
+    /// Kill the driver tree now and reap the child: the signal first, while
+    /// the leader still pins its id, then the reap.
     fn kill(&mut self, why: &str) {
         tracing::warn!(pid = self.child.id(), why, "driver tree killed");
-        kill_tree(&mut self.child);
+        signal_tree(&mut self.child, &self.signals);
         // `kill_tree` ends with this too; said again here so a `taskkill` that
         // failed cannot leave the wait below open-ended.
         let _ = self.child.kill();
@@ -636,8 +674,8 @@ impl DriverHost {
     }
 
     /// The driver closed its stdout: its exit, worded for a `Dead` message.
-    /// The first time, [`reap`] settles it and sweeps the tree; a leader
-    /// already reaped and swept — a second act on a dead host — is only read
+    /// The first time, [`reap`] sweeps the tree and settles it; a leader
+    /// already swept and reaped — a second act on a dead host — is only read
     /// back, its id never signalled again.
     fn settle_dead(&mut self) -> String {
         if self.swept {
@@ -647,7 +685,7 @@ impl DriverHost {
                 Err(e) => format!("exit unreadable: {e}"),
             };
         }
-        let exit = reap(&mut self.child, self.governed);
+        let exit = reap(&mut self.child, self.governed, &self.signals);
         self.swept = true;
         exit
     }
@@ -656,16 +694,20 @@ impl DriverHost {
     /// may both run it. A tree already swept — killed at a deadline or a
     /// STOP, reaped after it closed its stdout, seen gone by `try_wait` — is
     /// left as it is: its leader is reaped and its id may name another group
-    /// by now. A leader whose exit this call's own `try_wait` has just seen
-    /// gets its tree swept where no governor will ([`sweep`]); under the Job
-    /// Object the drop of the governor, right after this, does that.
+    /// by now. Otherwise in M18's order: a leader seen exited — observed
+    /// without reaping it ([`exited`]) — has what it left behind swept where
+    /// no governor will ([`sweep`]), a leader still running (or whose exit
+    /// cannot be observed) has its tree killed, and only then is it reaped.
+    /// Under the Job Object the drop of the governor, right after this, ends
+    /// what is left.
     fn terminate(&mut self) {
         if !self.swept {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                sweep(&mut self.child, self.governed);
-            } else {
-                kill_tree(&mut self.child);
-                let _ = self.child.kill();
+            match exited(&mut self.child) {
+                Ok(true) => sweep(&mut self.child, self.governed, &self.signals),
+                Ok(false) | Err(_) => {
+                    signal_tree(&mut self.child, &self.signals);
+                    let _ = self.child.kill();
+                }
             }
             self.swept = true;
         }
@@ -723,13 +765,15 @@ pub fn kill_pid_tree(pid: u32) {
 }
 
 /// The driver's first line, within `timeout`: a hello of this protocol whose
-/// actions cover the manifest's. The caller kills the tree on an `Err`.
+/// actions cover the manifest's. The caller kills the tree on an `Err` other
+/// than `Dead`, which [`reap`] has already settled.
 fn await_hello(
     lines: &Receiver<String>,
     child: &mut Child,
     timeout: Duration,
     manifest: &DriverManifest,
     governed: bool,
+    signals: &AtomicU32,
 ) -> Result<Hello, HostError> {
     let line = match lines.recv_timeout(timeout) {
         Ok(line) => line,
@@ -737,7 +781,7 @@ fn await_hello(
         Err(RecvTimeoutError::Disconnected) => {
             return Err(HostError::Dead(format!(
                 "{} before any hello",
-                reap(child, governed)
+                reap(child, governed, signals)
             )));
         }
     };
@@ -817,23 +861,32 @@ fn read_lines(stdout: impl Read + Send + 'static) -> Receiver<String> {
 
 /// The driver closed its stdout. An exiting process closes its pipes a moment
 /// before it is gone, so it gets [`EXIT_GRACE`] to finish on its own and
-/// report its true exit; what is still running after that is killed. Either
-/// way, what the leader may have left behind is then swept where no governor
-/// will ([`sweep`]). The answer is the exit, worded for a `Dead` message.
-fn reap(child: &mut Child, governed: bool) -> String {
+/// report its true exit. In M18's order: its exit is observed without reaping
+/// it ([`exited`]), what it may have left behind is swept ([`sweep`]), and
+/// only then is it reaped. One still running after the grace, or whose exit
+/// cannot be observed, has its tree killed and is then reaped; nothing is
+/// signalled after a reap. The answer is the exit, worded for a `Dead`
+/// message.
+fn reap(child: &mut Child, governed: bool, signals: &AtomicU32) -> String {
     let until = Instant::now() + EXIT_GRACE;
-    let exit = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break exit_label(status),
-            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
-            Ok(None) => {
+    loop {
+        match exited(child) {
+            Ok(true) => {
+                sweep(child, governed, signals);
+                return match child.wait() {
+                    Ok(status) => exit_label(status),
+                    Err(e) => format!("exit unreadable: {e}"),
+                };
+            }
+            Ok(false) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
+            Ok(false) => {
                 tracing::warn!(
                     pid = child.id(),
                     "driver closed its stdout but kept running; tree killed"
                 );
-                kill_tree(child);
+                signal_tree(child, signals);
                 let _ = child.kill();
-                break match child.wait() {
+                return match child.wait() {
                     Ok(status) => format!(
                         "stdout closed while running; killed ({})",
                         exit_label(status)
@@ -843,23 +896,58 @@ fn reap(child: &mut Child, governed: bool) -> String {
                     }
                 };
             }
-            Err(e) => break format!("exit unreadable: {e}"),
+            Err(e) => {
+                // Not observable without reaping: killed first, while the
+                // leader — alive or a zombie — still pins its id, then reaped.
+                tracing::warn!(pid = child.id(), error = %e, "driver exit not observable; tree killed");
+                signal_tree(child, signals);
+                let _ = child.kill();
+                return match child.wait() {
+                    Ok(status) => {
+                        format!("exit not observable ({e}); killed ({})", exit_label(status))
+                    }
+                    Err(e2) => format!("exit unreadable: {e}; {e2}"),
+                };
+            }
         }
-    };
-    sweep(child, governed);
-    exit
+    }
 }
 
-/// Sweep what a leader that is gone may have left behind, where no governor
-/// will: on Unix `kill_tree` signals the leader's own process group — called
-/// right after the reap that saw the exit, and once (the host's `swept`), so
-/// the id has had no time to name another group; on Windows an ungoverned
-/// tree gets `taskkill /T` as a best effort (it finds children by parent pid,
-/// and nothing once the parent is gone), while a governed tree is left to the
+/// Has the leader exited? On Unix observed **without reaping it**
+/// (`vk_harness::launch::exited_unreaped`, `waitid` with `WNOWAIT`): the
+/// zombie still pins its process group's id while the group is signalled
+/// (M18). On Windows there is no process group, and `try_wait` is the
+/// observation; the host's handle keeps the id from being reused anyway.
+fn exited(child: &mut Child) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        vk_harness::launch::exited_unreaped(child)
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait().map(|status| status.is_some())
+    }
+}
+
+/// Signal the driver's whole tree — `taskkill /T /F` on Windows, `SIGKILL`
+/// to the process group it leads on Unix — and count it. Every caller does
+/// this before the leader is reaped.
+fn signal_tree(child: &mut Child, signals: &AtomicU32) {
+    signals.fetch_add(1, Ordering::SeqCst);
+    kill_tree(child);
+}
+
+/// Sweep what a leader that has exited may have left behind, where no
+/// governor will. Called once per host (`swept`), between the observation of
+/// the exit ([`exited`]) and the reap: on Unix the leader is then an unreaped
+/// zombie, which pins its process group's id, so the group signal cannot
+/// reach another group (M18); on Windows an ungoverned tree gets
+/// `taskkill /T` as a best effort (it finds children by parent pid, and
+/// nothing once the parent is gone), while a governed tree is left to the
 /// Job Object, which terminates every member when the governor drops.
-fn sweep(child: &mut Child, governed: bool) {
+fn sweep(child: &mut Child, governed: bool, signals: &AtomicU32) {
     if cfg!(unix) || !governed {
-        kill_tree(child);
+        signal_tree(child, signals);
     }
 }
 

@@ -14,10 +14,13 @@
   - Jeton interactif (LogonType Interactive, RunLevel Limited) : la tâche ne tourne que session
     ouverte, sur le bureau, sans élévation. Chrome doit s'ouvrir sur le bureau, ce qu'un service
     en session 0 ne peut pas faire (P7).
-  - Relance : si la tâche échoue, nouvel essai chaque minute, trois fois au plus.
+  - Relance : si la tâche échoue, nouvel essai chaque minute, trois fois au plus. Windows
+    documente cette relance pour une tâche qui ne démarre pas ; qu'il relance aussi un vkd
+    qui s'arrête en erreur reste à vérifier sur le nœud.
   - Pas de limite de durée (le défaut de Windows arrêterait le démon au bout de 72 heures), et
     la tâche démarre et continue sur batterie.
-  - Idempotent : une tâche du même nom est désinscrite avant l'inscription.
+  - Idempotent : une tâche du même nom est arrêtée (son vkd avec elle), puis désinscrite,
+    avant l'inscription : il ne reste jamais un vkd de l'ancienne tâche à côté du nouveau.
 
   À lancer par le fondateur, depuis son propre compte, dans un PowerShell élevé (« Exécuter en
   tant qu'administrateur »). vkd.exe et vk-mcp.exe doivent être côte à côte (runbook §2).
@@ -26,7 +29,7 @@
   Le chemin de vkd.exe. Par défaut, la sortie du build du runbook §2.
 
 .PARAMETER Remove
-  Désinscrit la tâche, et rien d'autre.
+  Arrête la tâche si elle tourne, la désinscrit, et rien d'autre.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\vkd-logon-task.ps1
@@ -46,6 +49,7 @@ $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
 if ($Remove) {
   if ($existing) {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
     Write-Output "tâche « $TaskName » désinscrite"
   } else {
@@ -74,8 +78,10 @@ $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-T
   -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
   -MultipleInstances IgnoreNew -ErrorAction Stop
 
-# 3. Idempotent : l'ancienne tâche s'en va, la nouvelle prend sa place.
+# 3. Idempotent : l'ancienne tâche s'arrête (son vkd avec elle) et s'en va, la nouvelle prend sa
+#    place.
 if ($existing) {
+  Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
 }
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal `
@@ -85,4 +91,4 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Pr
 Write-Output "tâche « $TaskName » inscrite pour $user"
 Write-Output "  à l'ouverture de session : `"$Vkd`" $Arguments"
 Write-Output "  dossier de travail : $repo"
-Write-Output "  relance : chaque minute, 3 fois au plus ; pas de limite de durée"
+Write-Output "  relance si elle échoue : chaque minute, 3 fois au plus ; pas de limite de durée"

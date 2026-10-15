@@ -52,8 +52,10 @@ enum Slot {
     /// Taken out by an act, which puts it back when it returns unless the
     /// slot is no longer this marker by then. `pid` is the driver's: what an
     /// unmount kills while the act holds the host (Ruling R13), and how the
-    /// act knows the marker is still its own.
-    Acting { pid: u32 },
+    /// act knows the marker is still its own. `driver_id` is the identity the
+    /// process was spawned for: an `ensure` or an act for another identity is
+    /// refused as busy, naming it (Task 7 review).
+    Acting { pid: u32, driver_id: String },
 }
 
 /// The driver processes this daemon owns, by mounted name. Shared by every
@@ -101,7 +103,7 @@ impl DriverPool {
     pub fn pid(&self, name: &str) -> Option<u32> {
         match self.map().get(name) {
             Some(Slot::Idle { host, .. }) => Some(host.pid()),
-            Some(Slot::Acting { pid }) => Some(*pid),
+            Some(Slot::Acting { pid, .. }) => Some(*pid),
             Some(Slot::Spawning) | None => None,
         }
     }
@@ -111,8 +113,10 @@ impl DriverPool {
     ///
     /// A live idle host spawned for this row's `driver_id` is kept and its
     /// `governed` returned: a repeat mount does not restart the browser. An
-    /// acting one is the host the row describes — the kernel admits one act
-    /// per driver — so the row's `governed` is returned. A spawn under way is
+    /// acting one of this identity is the host the row describes — the kernel
+    /// admits one act per driver — so the row's `governed` is returned; one
+    /// acting for another identity (an orphan of a manifest unmounted since)
+    /// is refused as busy, naming that identity. A spawn under way is
     /// waited for. Otherwise — no host, one that died idle (reviewer minor 2),
     /// or an idle one spawned for another identity: a manifest unmounted
     /// since, whose process an act's late `ensure` left behind (Task 3
@@ -128,7 +132,12 @@ impl DriverPool {
                     map = self.wait(map);
                     continue;
                 }
-                Some(Slot::Acting { .. }) => return Ok(row.manifest.governed),
+                Some(Slot::Acting { driver_id, .. }) => {
+                    if *driver_id == row.driver_id {
+                        return Ok(row.manifest.governed);
+                    }
+                    return Err(anyhow!(busy(name, driver_id, &row.driver_id)));
+                }
                 Some(Slot::Idle { host, driver_id }) if *driver_id == row.driver_id => {
                     match host.try_wait() {
                         Ok(None) => Some(host.governed()),
@@ -160,36 +169,67 @@ impl DriverPool {
         Ok(governed)
     }
 
-    /// Run one act; the pool's mutex is held for this driver only to take the
-    /// host out and to put it back, never for the duration of the act.
+    /// Run one act for `row`'s driver, on a process of `row`'s identity only.
+    ///
+    /// [`ensure`](Self::ensure) runs first — it keeps a live host of this
+    /// identity, re-spawns one that died idle or belongs to another identity,
+    /// and refuses while another identity's act holds the slot — then the
+    /// host is taken out for the act. The pool's mutex is held only to take
+    /// the host out and to put it back, never for the duration of the act.
+    /// An idle host of another identity found at that moment was put there
+    /// since this `ensure` (another act's late one): it is left for the next
+    /// `ensure` to replace, and the act goes round once more. A slot another
+    /// act holds is refused as busy, naming the identity it acts for.
     ///
     /// The host goes back after an answer and after the host's own evidence
     /// refusals — read back after the action, with the driver alive and in
     /// step. After a timeout, a death, a protocol breach or a STOP the tree is
     /// already killed and the host is dropped, so the next `ensure` spawns a
-    /// fresh one. The `Err` is [`host_error_reason`] unaltered: the kernel
-    /// parses `evidence too large: <name> …` out of it.
+    /// fresh one. The `Err` is [`host_error_reason`] unaltered, or the pool's
+    /// own `driver would not start: …`: the kernel parses `evidence too
+    /// large: <name> …` out of it.
+    #[allow(clippy::too_many_arguments)]
     pub fn act(
         &self,
-        name: &str,
+        row: &DriverRow,
+        dirs: &DriverDirs,
         action: &DriverAction,
         args: &Value,
         deadline: Duration,
         caps: EvidenceCaps,
         should_stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<ActOutcome, String> {
-        let (mut host, driver_id) = {
+        let name = row.manifest.name.as_str();
+        let mut taken = None;
+        for _ in 0..2 {
+            self.ensure(row, dirs)
+                .map_err(|e| format!("driver would not start: {e:#}"))?;
             let mut map = self.map();
             match map.remove(name) {
-                Some(Slot::Idle { host, driver_id }) => {
-                    map.insert(name.to_string(), Slot::Acting { pid: host.pid() });
-                    (host, driver_id)
+                Some(Slot::Idle { host, driver_id }) if driver_id == row.driver_id => {
+                    let pid = host.pid();
+                    map.insert(
+                        name.to_string(),
+                        Slot::Acting {
+                            pid,
+                            driver_id: driver_id.clone(),
+                        },
+                    );
+                    taken = Some((host, driver_id));
+                    break;
                 }
-                Some(other) => {
-                    map.insert(name.to_string(), other);
+                Some(idle @ Slot::Idle { .. }) => {
+                    map.insert(name.to_string(), idle);
+                }
+                Some(Slot::Acting { pid, driver_id }) => {
+                    let why = busy(name, &driver_id, &row.driver_id);
+                    map.insert(name.to_string(), Slot::Acting { pid, driver_id });
+                    return Err(format!("driver would not start: {why}"));
+                }
+                Some(Slot::Spawning) => {
+                    map.insert(name.to_string(), Slot::Spawning);
                     return Err(format!(
-                        "driver would not start: driver {name}'s process is starting or busy \
-                         with another act"
+                        "driver would not start: driver {name}'s process is starting"
                     ));
                 }
                 None => {
@@ -198,6 +238,12 @@ impl DriverPool {
                     ))
                 }
             }
+        }
+        let Some((mut host, driver_id)) = taken else {
+            return Err(format!(
+                "driver would not start: driver {name}'s process was replaced by another \
+                 manifest's twice under this act"
+            ));
         };
         let pid = host.pid();
         let outcome = host.act(action, args, deadline, caps, should_stop);
@@ -210,7 +256,7 @@ impl DriverPool {
         );
         let leftover = {
             let mut map = self.map();
-            let ours = matches!(map.get(name), Some(Slot::Acting { pid: p }) if *p == pid);
+            let ours = matches!(map.get(name), Some(Slot::Acting { pid: p, .. }) if *p == pid);
             if ours && keep {
                 map.insert(name.to_string(), Slot::Idle { host, driver_id });
                 None
@@ -242,7 +288,7 @@ impl DriverPool {
         loop {
             match map.get(name) {
                 Some(Slot::Spawning) => map = self.wait(map),
-                Some(Slot::Acting { pid }) => {
+                Some(Slot::Acting { pid, .. }) => {
                     let pid = *pid;
                     map.remove(name);
                     vk_driver::kill_pid_tree(pid);
@@ -265,6 +311,20 @@ impl DriverPool {
         if matches!(map.get(name), Some(Slot::Acting { .. })) {
             map.remove(name);
         }
+    }
+}
+
+/// The refusal for a slot another act holds: busy, and when that act is for
+/// another identity — an orphan of a manifest unmounted since — which one,
+/// and the remedy (`vk driver umount` kills an acting process, Ruling R13).
+fn busy(name: &str, acting: &str, wanted: &str) -> String {
+    if acting == wanted {
+        format!("driver {name}'s process is busy with another act")
+    } else {
+        format!(
+            "driver {name}'s process is busy with an act of another manifest ({acting}); wait \
+             for it to end, or run `vk driver umount {name}` to kill it"
+        )
     }
 }
 
@@ -544,14 +604,15 @@ pub(crate) fn act(kernel: &Shared, pool: &DriverPool, p: Value) -> Result<Value,
 
 /// Phase two of `driver.act`: a host for the driver, then the act itself.
 ///
-/// `ensure` runs every time, on the row read under a short lock: it keeps a
-/// live host, re-spawns one that died idle rather than letting the act find it
-/// dead and degrade a driver that could simply be started again (reviewer
-/// minor 2), and fills a restarted daemon's empty pool. It runs **before** the
-/// act's clock starts: the act gets the action's whole `max_action_ms`, and a
-/// spawn's time — a hello can take thirty seconds — is on top of it, not
-/// charged to it (minor 9). A host that cannot be had is the daemon's own
-/// reason, `driver would not start: …`.
+/// [`DriverPool::act`] runs `ensure` every time, on the row read here under a
+/// short lock: it keeps a live host of the row's identity, re-spawns one that
+/// died idle rather than letting the act find it dead and degrade a driver
+/// that could simply be started again (reviewer minor 2), replaces one of
+/// another identity, and fills a restarted daemon's empty pool. It runs
+/// **before** the act's clock starts: the act gets the action's whole
+/// `max_action_ms`, and a spawn's time — a hello can take thirty seconds — is
+/// on top of it, not charged to it (minor 9). A host that cannot be had is
+/// the daemon's own reason, `driver would not start: …`.
 fn run_act(
     kernel: &Shared,
     pool: &DriverPool,
@@ -569,13 +630,12 @@ fn run_act(
                 plan.name
             )
         })?;
-    pool.ensure(&row, &plan.dirs)
-        .map_err(|e| format!("driver would not start: {e:#}"))?;
     // `deadline_ms` is `begun_ms + max_action_ms`: the action's whole budget,
-    // counted from now.
+    // counted from the act itself.
     let budget = Duration::from_millis(plan.deadline_ms.saturating_sub(plan.begun_ms));
     pool.act(
-        &plan.name,
+        &row,
+        &plan.dirs,
         &plan.action,
         &plan.args,
         budget,

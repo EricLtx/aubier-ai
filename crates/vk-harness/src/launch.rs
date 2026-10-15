@@ -747,7 +747,7 @@ pub fn launch_claude_code(
         // the id cannot be reused underneath the signal (Task 4 review,
         // M18); then it is reaped, and what is left gets its grace.
         #[cfg(unix)]
-        if exited_unreaped(pid).context("wait for claude")? {
+        if pid_exited_unreaped(pid).context("wait for claude")? {
             let status =
                 settle_and_reap(&mut child, || ()).context("settle claude's group and reap it")?;
             break reason_from(status);
@@ -894,12 +894,23 @@ pub fn kill_tree(child: &mut Child) {
 #[doc(hidden)]
 pub const GROUP_GRACE: Duration = Duration::from_secs(2);
 
+/// Has `child` exited, **without reaping it**? The observation M18 asks for
+/// before a process group is signalled: the zombie leader pins the group's
+/// id until `Child::wait` collects it. Public for `vk-driver`, whose host
+/// observes, sweeps, then reaps a driver the same way. Unix only: on Windows
+/// there is no process group, and `Child::try_wait` is the observation.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn exited_unreaped(child: &Child) -> std::io::Result<bool> {
+    pid_exited_unreaped(child.id())
+}
+
 /// Has the child exited, **without reaping it**? `waitid` with `WNOWAIT`
 /// leaves it a zombie for `Child::wait` to collect; `WNOHANG` makes this a
 /// poll. A zombie leader still pins its pgid (Task 4 review, M18), which is
 /// what lets the group be signalled before the id can be reused.
 #[cfg(unix)]
-fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
+fn pid_exited_unreaped(pid: u32) -> std::io::Result<bool> {
     // SAFETY: `info` is a zeroed `siginfo_t` the call fills in; the flags
     // ask about this one child, without hanging and without reaping it.
     unsafe {
@@ -980,7 +991,7 @@ pub fn settle_and_reap(
     between_signal_and_reap: impl FnOnce(),
 ) -> std::io::Result<std::process::ExitStatus> {
     let pid = child.id();
-    while !exited_unreaped(pid)? {
+    while !pid_exited_unreaped(pid)? {
         std::thread::sleep(Duration::from_millis(10));
     }
     term_group(pid);

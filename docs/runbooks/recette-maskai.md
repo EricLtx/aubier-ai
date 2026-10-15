@@ -53,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File drivers\maskai-recette\setup.ps1
 ```
 Attendu, en dernières lignes :
 ```
-files_sha256 : sha256:e1b78006939a8371a0827ce18ecf1acf7665b4ac67b58aabd6baafb2b860c0a5
+files_sha256 : sha256:aac9f78802f462317a793f1197dd0bbe47312176b7e2098253dfceac621823ee
 manifest.json : à jour
 manifest-fixture.json : à jour
 ```
@@ -107,7 +107,7 @@ Le démon tourne en mode interactif, dans son propre terminal (P7) : Chrome doit
 ```powershell
 Get-Process vkd -ErrorAction SilentlyContinue | Stop-Process
 ```
-Si la tâche planifiée du §3.3 est inscrite, arrêtez plutôt la tâche : un `Stop-Process` pourrait être lu comme un échec, et la tâche relancerait le démon une minute plus tard.
+Si la tâche planifiée du §3.3 est inscrite, arrêtez plutôt la tâche. Qu'un `Stop-Process` soit lu comme un échec, et le démon relancé une minute plus tard, reste à vérifier sur le nœud ; `Stop-ScheduledTask` ne laisse pas ce doute.
 ```powershell
 Stop-ScheduledTask -TaskName "Aubier vkd"
 ```
@@ -126,7 +126,7 @@ Pourquoi `vkd` et pas `vk boot` ? `vk boot` ne transmet pas `--harness-timeout-s
 
 Fermer ce terminal, c'est couper l'alimentation : le driver et son Chrome meurent avec le démon. C'est voulu (Job Object, kill-on-close).
 
-**3.3 Mode quotidien, facultatif : la tâche planifiée « Aubier vkd ».** Pour le pilote, la façon documentée reste le terminal du §3.2. Pour un usage de tous les jours (spec P7, condition (b)), `scripts\vkd-logon-task.ps1` inscrit une tâche planifiée qui lance la même ligne, `vkd --auto-enroll-node --harness-timeout-secs 2700`, à l'ouverture de votre session. Elle tourne dans votre session interactive, sans élévation, pour que Chrome s'ouvre sur votre bureau. Si elle échoue, Windows la relance chaque minute, trois fois au plus. Elle n'a pas de limite de durée et tourne aussi sur batterie.
+**3.3 Mode quotidien, facultatif : la tâche planifiée « Aubier vkd ».** Pour le pilote, la façon documentée reste le terminal du §3.2. Pour un usage de tous les jours (spec P7, condition (b)), `scripts\vkd-logon-task.ps1` inscrit une tâche planifiée qui lance la même ligne, `vkd --auto-enroll-node --harness-timeout-secs 2700`, à l'ouverture de votre session. Elle tourne dans votre session interactive, sans élévation, pour que Chrome s'ouvre sur votre bureau. Si elle ne démarre pas, Windows réessaie chaque minute, trois fois au plus ; qu'il relance aussi un `vkd` qui s'arrête en erreur reste à vérifier sur le nœud. Elle n'a pas de limite de durée et tourne aussi sur batterie.
 
 Une fois, après le build du §2, dans un PowerShell élevé (« Exécuter en tant qu'administrateur ») ouvert depuis votre propre compte, à la racine du dépôt :
 ```powershell
@@ -138,7 +138,7 @@ Pour l'essayer sans attendre la prochaine session :
 ```powershell
 Start-ScheduledTask -TaskName "Aubier vkd"
 ```
-Attendu : la fenêtre console de `vkd` s'ouvre, avec les traces du §3.2. La fermer arrête le démon, comme au §3.2. Avec la tâche, sautez le §3.2.
+Attendu : la fenêtre console de `vkd` s'ouvre, avec les traces du §3.2. La fermer arrête le démon, comme au §3.2. Que Windows le relance ensuite reste à vérifier sur le nœud : sa relance documentée vise une tâche qui ne démarre pas, pas une action qui se termine en erreur. Pour un arrêt franc, `Stop-ScheduledTask` (§3.1). Avec la tâche, sautez le §3.2.
 
 Pour la retirer :
 ```powershell
