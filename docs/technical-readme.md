@@ -327,7 +327,10 @@ non-packaged children — Playwright's node and Chrome — outside its job, so
 outside this Job: they escape the cap, kill-on-close and the Job's process
 list, and only the kill by process tree reaches them. Build the driver's
 `.venv` on a python.org (or other non-packaged) Python for the Job to hold
-the browser.
+the browser: `drivers/maskai-recette/setup.ps1` refuses a base interpreter
+under `WindowsApps`, refuses an existing `.venv` whose `pyvenv.cfg` names
+one, and without `-Python` takes the standalone CPython 3.13 that `uv`
+manages (pilot ruling R27).
 
 Three ledger kinds record a driver, each with its own schema:
 
