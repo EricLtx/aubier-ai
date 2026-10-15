@@ -430,16 +430,22 @@ class Browser:
     """Le navigateur du driver : un contexte persistant Playwright sur le profil dédié, la
     garde des navigations, le garde-dialogue, et la capture réseau et console (résumés).
     Aucune requête n'est routée : le routage Playwright couperait le cache HTTP et ferait
-    passer chaque requête par Python, deux biais sur les mesures (Ruling R16)."""
+    passer chaque requête par Python, deux biais sur les mesures (Ruling R16). Entre deux
+    actions, `pump` lit les événements de Playwright une dizaine de fois par seconde : un
+    client qui cesse de les lire bloque le démarrage des fenêtres et workers nouveaux de la
+    page, la fenêtre de connexion comprise (Ruling R19)."""
 
     def __init__(self, profile_dir: str, channel: str | None, headless: bool, hosts: list):
         self.profile_dir, self.channel, self.headless, self.hosts = profile_dir, channel, headless, hosts
         self.pw = self.context = self._page = None
         self._dead = False
         self.dialogs = []      # dialogues JavaScript en attente : jamais acceptés ni refusés ici
+        self.dialog_log = []   # tous les dialogues vus, fermés ou non
         self.network = []      # résumés de requêtes, toutes pages
         self.third_party = []  # requêtes et WebSockets vers des hôtes hors liste : relevés, pas bloqués
         self.offlist = []      # navigations du cadre principal vers un hôte hors liste
+        self.failed_navs = []  # navigations du cadre principal en échec (hôte injoignable)
+        self._error_seen = 0   # seq of the last error-page commit already accounted for
         self.console = []
         self.posts = []        # corps envoyés au flux de réponse (`sent`)
         self.seq = 0
@@ -499,8 +505,27 @@ class Browser:
 
     def drain(self, ms: int = 20) -> None:
         """Laisser Playwright livrer les événements en attente (dialogues, navigations,
-        requêtes) : entre deux actions, Python ne les lit pas."""
+        requêtes)."""
         self.page().wait_for_timeout(ms)
+
+    def settle(self, max_ms: int = 1000) -> None:
+        """Livrer tout ce qui attend, jusqu'à un tour sans événement nouveau (au plus
+        max_ms) : ce qui s'est passé avant une action ne doit pas lui être compté."""
+        deadline = time.monotonic() + max_ms / 1000
+        while True:
+            before = self.seq
+            self.drain()
+            if self.seq == before or time.monotonic() >= deadline:
+                return
+
+    def pump(self) -> None:
+        """Entre deux actions (le crochet `idle` du protocole) : servir Playwright."""
+        if self.started() and self._page is not None and not self._page.is_closed():
+            try:
+                self._page.wait_for_timeout(20)
+            except PWError as e:  # a crashed page: say it once, the next action relaunches
+                log.warning("browser unusable between actions, relaunched at the next one: %s", e)
+                self._dead = True
 
     # -- appels dans la page, bornés ---------------------------------------------------
     def call(self, fn_src: str, arg=None, timeout_ms: int = 5000, page=None):
@@ -539,11 +564,34 @@ class Browser:
         page.on("websocket", lambda ws: self._on_websocket(page, ws))
 
     def _on_navigated(self, page, frame) -> None:
-        if frame.parent_frame is not None or self.allowed(frame.url):
+        if frame.parent_frame is not None:
             return
-        self._push(self.offlist, {"url": short_url(frame.url), "host": urlsplit(frame.url).hostname or "",
-                                  "page": self._index(page)})
-        log.warning("main frame left the host list: %s", short_url(frame.url))
+        if frame.url.startswith("chrome-error://"):
+            # An error page committed: the navigation failed. Off the list if the failed
+            # request was (an off-list redirect to an unreachable host), or if unknown.
+            nav = self.offlist_failure(self._error_seen)
+            self._error_seen = self.seq
+            if nav is None:
+                return
+            self._push(self.offlist, {**nav, "page": self._index(page)})
+        elif self.allowed(frame.url):
+            return
+        else:
+            self._push(self.offlist, {"url": short_url(frame.url), "host": urlsplit(frame.url).hostname or "",
+                                      "page": self._index(page)})
+        log.warning("main frame left the host list: %s", self.offlist[-1]["url"])
+
+    def offlist_failure(self, since: int) -> dict | None:
+        """La navigation en échec (après `since`) qui a mené à une page d'erreur : hors liste
+        si sa requête l'était ; « unreachable » si elle n'est pas connue ; None si son hôte
+        est de la liste (l'application injoignable n'est pas une sortie de périmètre)."""
+        failed = self.since(self.failed_navs, since)
+        if not failed:
+            return {"url": "chrome-error://chromewebdata/", "host": "unreachable"}
+        url = failed[-1]["url"]
+        if self.allowed(url):
+            return None
+        return {"url": short_url(url), "host": urlsplit(url).hostname or "unreachable"}
 
     def _on_websocket(self, page, ws) -> None:
         if not self.allowed(ws.url):
@@ -569,8 +617,10 @@ class Browser:
     # -- garde-dialogue -----------------------------------------------------------------
     def _on_dialog(self, dialog) -> None:
         """Relever le dialogue et le laisser ouvert : seul un humain y répond."""
-        self.dialogs.append({"type": dialog.type, "message": (dialog.message or "")[:200], "t": now_iso(),
-                             "dialog": dialog})
+        self.seq += 1
+        record = {"seq": self.seq, "type": dialog.type, "message": (dialog.message or "")[:200], "t": now_iso()}
+        self.dialogs.append({**record, "dialog": dialog})
+        self.dialog_log.append(record)  # kept after the dialog is closed, for the verdict
         log.warning("dialog left pending: %s %r", dialog.type, (dialog.message or "")[:200])
 
     def _on_dialog_closed(self, dialog) -> None:
@@ -607,6 +657,11 @@ class Browser:
     def _on_failed(self, request) -> None:
         e, _ = self._open.pop(request, ({}, 0))
         e["failure"] = request.failure
+        try:
+            if request.is_navigation_request() and request.frame.parent_frame is None:
+                self._push(self.failed_navs, {"url": request.url, "failure": request.failure})
+        except Exception:  # noqa: BLE001 — a detached frame
+            pass
 
     def _on_console(self, msg) -> None:
         self._push(self.console, {"type": msg.type, "text": (msg.text or "")[:300]})
@@ -664,6 +719,7 @@ class Recette:
         self.flux = {"ev": 0, "mark": 0}
         self._case_in_hand = None
         self._mark = None  # where the action in hand began, in the browser's event sequence
+        self._last_asked = None  # {"case", "mark"} of the last poser_question
 
     def actions(self) -> dict:
         browser = ["mesurer_chargement", "nouvelle_conversation", "joindre_document", "poser_question",
@@ -716,7 +772,7 @@ class Recette:
         inconnue ; une modale connue est fermée par son bouton."""
         b = self.browser
         page = b.page()
-        b.drain()
+        b.settle()  # all of the waiting period's events land before the action's mark
         if b.pending():
             if b.responsive():
                 log.info("pending dialog gone (closed in Chrome): guard cleared")
@@ -753,7 +809,11 @@ class Recette:
             raise self._host_refusal(navs[-1])
 
     def _host_refusal(self, nav: dict, ev: Evidence | None = None) -> DriverRefusal:
-        """Défaire une navigation hors liste (retour à la page d'entrée) et la refuser."""
+        """Défaire une navigation hors liste (retour à la page d'entrée) et la refuser ; le cas
+        en cours la porte dans son observation, comme un dialogue."""
+        if self._case_in_hand:
+            self.observations.setdefault(self._case_in_hand, {})["offlist"] = {
+                "host": nav["host"], "url": nav["url"], "t": now_iso()}
         pages = self.browser.context.pages
         page = pages[nav["page"]] if 0 <= nav.get("page", -1) < len(pages) else self.browser.page()
         self._back_to_entry(page)
@@ -804,7 +864,22 @@ class Recette:
             host = urlsplit(url).hostname or ""
             raise DriverRefusal("host", f"navigation hors liste refusée : {host}",
                                 extra={"host": host, "url": short_url(url)})
-        page.goto(url, wait_until="load", timeout=60_000)
+        before = self.browser.mark()
+        try:
+            page.goto(url, wait_until="load", timeout=60_000)
+        except PWError:
+            if not check:
+                raise
+            # A redirect followed to an unreachable host fails (and then commits an error
+            # page, chrome-error://, which is no http URL): name the host from the failed
+            # request; a failure of a listed host (the app itself down) is not a host refusal.
+            navs = self.browser.since(self.browser.offlist, before)
+            failed = self.browser.since(self.browser.failed_navs, before)
+            nav = navs[-1] if navs else (self.browser.offlist_failure(before)
+                                         if failed or page.url.startswith("chrome-error://") else None)
+            if nav is None:
+                raise
+            raise self._host_refusal({**nav, "page": self.browser._index(page)}) from None
         if check and not self.browser.allowed(page.url):
             nav = {"host": urlsplit(page.url).hostname or "", "url": short_url(page.url),
                    "page": self.browser._index(page)}
@@ -963,7 +1038,9 @@ class Recette:
             t.why = (f"abandon à {t.seconds:.0f} s ("
                      + ("échéance de l'action" if capped else f"3 × budget {budget_s:g} s") + ")")
             raise
-        return self._collect(turn)
+        obs = self._collect(turn)
+        self._check_host()  # a page that left after <END> is not the answer
+        return obs
 
     def _answer_evidence(self, ev: Evidence, obs: dict, mark: int) -> None:
         page = self.browser.page()
@@ -1032,6 +1109,7 @@ class Recette:
         b.call("() => {" + INTERCEPTOR_JS + " window.__ev = []; return true; }")
         self.conv = self._fresh_conversation()
         self.flux["ev"] = 0
+        self._last_asked = None
         how = "bouton" if clicked else "retour à la page d'entrée"
         return {"conversation": page.url, "text": f"nouvelle conversation ({how}) : {short_url(page.url)}"}
 
@@ -1101,6 +1179,7 @@ class Recette:
         attach = (self.observations.get(cid) or {}).get("attach")
         self.observations[cid] = {"attach": attach} if attach else {}
         mark = self.browser.mark()
+        self._last_asked = {"case": cid, "mark": mark}  # what happens from here on is this case's
         budget = case.get("budget_s") or DEFAULT_BUDGET_S
         try:
             obs = self._ask(case["question"], budget)
@@ -1155,11 +1234,31 @@ class Recette:
                          f"{len(failed)} requêtes en échec, {len(third)} hôtes tiers"
                          + (f" ({', '.join(h['host'] for h in third[:5])})" if third else ""))}
 
+    def _late_events(self) -> None:
+        """Un dialogue ou une sortie de périmètre survenus après la fin de poser_question
+        appartiennent encore au dernier cas posé : les livrer, puis les porter dans son
+        observation avant tout jugement (verdict_oracle, exporter_journal)."""
+        b, last = self.browser, self._last_asked
+        if not last or not b.started():
+            return
+        try:
+            b.settle()
+        except PWError as e:
+            log.warning("late events not delivered: %s", e)
+        obs = self.observations.setdefault(last["case"], {})
+        late = [d for d in b.dialog_log if d["seq"] > last["mark"]]
+        if late and "dialog" not in obs:
+            obs["dialog"] = {"type": late[0]["type"], "message": late[0]["message"], "t": late[0]["t"]}
+        navs = b.since(b.offlist, last["mark"])
+        if navs and "offlist" not in obs:
+            obs["offlist"] = {"host": navs[0]["host"], "url": navs[0]["url"], "t": navs[0]["t"]}
+
     def verdict_oracle(self, args: dict, ev: Evidence) -> dict:
         """evaluer.py sur la dernière observation du cas, puis une ligne au journal (annexe C).
         Un cas déjà journalisé rend son verdict (replayed) et n'ajoute rien."""
         cid = args["case"]
         case = self._case(cid)
+        self._late_events()
         done = self._journaled(cid)
         if done is not None:
             r = (self.observations.get(cid) or {}).get("verdict") or {}
@@ -1172,11 +1271,12 @@ class Recette:
         asked = "answer" in obs
         attach = obs.get("attach") or {}
         dialog = obs.get("dialog")
+        offlist = obs.get("offlist")
         nfr = case["nfr"]
-        if not asked and not dialog and attach and attach.get("state") != "attached":
+        if not asked and not dialog and not offlist and attach and attach.get("state") != "attached":
             r = {"verdict": "KO", "notes": [f"pièce jointe en échec ({attach.get('label') or 'sans puce'})"]}
             nfr = nfr_union(nfr, ["disponibilite"])
-        elif not asked and not dialog:
+        elif not asked and not dialog and not offlist:
             hint = {"load": "mesurer_chargement", "list": "lister_conversations",
                     "concurrent": "charge_concurrente"}.get(case["kind"], "poser_question")
             raise DriverRefusal("precondition", f"aucune observation pour {cid} : {hint} d'abord")
@@ -1186,7 +1286,7 @@ class Recette:
             if obs.get("sent_to_model") is not None:
                 seen["sent"] = obs["sent_to_model"]
             r = evaluer.evaluate_case(oracle, seen, case.get("budget_s"))
-            if r["verdict"] == "NON TESTÉ" and not dialog:  # réponse vide après un envoi : échec silencieux
+            if r["verdict"] == "NON TESTÉ" and not dialog and not offlist:  # échec silencieux
                 r["verdict"] = "KO"
                 r["notes"].append("réponse vide : échec silencieux")
                 nfr = nfr_union(nfr, ["disponibilite"])
@@ -1194,6 +1294,10 @@ class Recette:
             r = {"verdict": "KO", "notes": []}
         for key_ in ("missing", "forbidden", "leaks", "span_issues", "notes"):
             r.setdefault(key_, [])
+        if offlist:  # la page a quitté le périmètre pendant le cas : KO sécurité
+            r["verdict"] = "KO"
+            r["notes"].insert(0, f"navigation hors périmètre : {offlist['host']}")
+            nfr = nfr_union(nfr, ["securite"])
         if dialog:  # un dialogue inattendu pendant le cas est un KO sécurité, réponse ou pas
             r["verdict"] = "KO"
             r["notes"].insert(0, f"dialogue inattendu ({dialog['type']}) : {dialog['message']}")
@@ -1313,6 +1417,7 @@ class Recette:
     def exporter_journal(self, args: dict, ev: Evidence) -> dict:
         """Les lignes du journal ajoutées depuis l'export précédent (curseur dans
         journal.cursor), en preuve et en texte pour le registre."""
+        self._late_events()
         lines = []
         if self.journal_path.exists():
             lines = [x for x in self.journal_path.read_text(encoding="utf-8").splitlines() if x.strip()]
@@ -1341,7 +1446,7 @@ def main() -> int:
         log.error("not started: %s", e)
         return 2
     try:
-        serve(NAME, recette.version, recette.actions(), on_ready=recette.open)
+        serve(NAME, recette.version, recette.actions(), on_ready=recette.open, idle=recette.browser.pump)
     finally:
         recette.browser.close()
     return 0

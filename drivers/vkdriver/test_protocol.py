@@ -94,6 +94,32 @@ class ProtocolTest(unittest.TestCase):
         self.assertIn("SystemExit", out[1]["detail"])
         self.assertEqual((out[2]["id"], out[2]["ok"]), (2, True))
 
+    def test_idle_runs_between_requests(self):
+        script = (
+            "import sys\nsys.path.insert(0, sys.argv[1])\n"
+            "from vkdriver.protocol import serve\n"
+            "ticks = [0]\n"
+            "def idle(): ticks[0] += 1\n"
+            "serve('t', '0', {'ticks': lambda a, e: ({'n': ticks[0], 'text': 't'}, [])}, idle=idle)\n")
+        p = subprocess.Popen([sys.executable, "-I", "-c", script, DRIVERS],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            p.stdout.readline()  # hello
+
+            def ticks(rid):
+                p.stdin.write((json.dumps({"id": rid, "action": "ticks", "args": {}, "evidence_dir": ""})
+                               + "\n").encode())
+                p.stdin.flush()
+                return json.loads(p.stdout.readline())["result"]["n"]
+
+            first = ticks(1)
+            __import__("time").sleep(0.8)
+            self.assertGreaterEqual(ticks(2) - first, 4, "about ten idle calls a second")
+        finally:
+            p.stdin.close()
+            p.wait(timeout=30)
+            p.stdout.close()
+
     def test_nothing_but_protocol_lines_reach_stdout(self):
         out, err, _ = self.run_driver([("noisy", {}), ("echo", {})])
         self.assertEqual([o.get("id") for o in out[1:]], [1, 2])

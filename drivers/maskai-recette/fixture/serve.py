@@ -11,7 +11,13 @@ names the attachments the page declared. Trigger words in the request body:
                   (a third-party host, recorded and not blocked);
   TRIGGER_DIALOG  the page opens a confirm() after the answer (dialog guard);
   NAVIGATE_AWAY   the page then navigates to http://localhost:<port>/away, a
-                  host outside a 127.0.0.1-only list (navigation guard).
+                  host outside a 127.0.0.1-only list (navigation guard);
+  LATE_DIALOG     the page opens a confirm() 2 s after the answer, once the
+                  action is over (the verdict must still see it).
+
+Other paths: /busy (requests, then a popup after 3 s; /stats says when the popup
+was announced and when its request arrived), /redirect-unreachable (a 302 to an
+unreachable host).
 
 Usage: python -I serve.py [port]     (default 8765; 0 picks a free port)
 The first line on stdout is `listening <port>`.
@@ -27,23 +33,53 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PORT = 8765
 GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
+# A busy page, as a signed-in app is between two actions: five requests a second, then
+# after 3 s a popup (an SSO window, say). The server notes when the page announced the
+# popup and when the popup's own request arrived: Chromium holds a new target until
+# Playwright resumes it, so a driver that stops servicing Playwright delays the second.
+BUSY_PAGE = b"""<!doctype html><html><body><p>busy</p><script>
+setInterval(() => fetch('/ping?' + Math.random()), 200);
+setTimeout(async () => { await fetch('/popup-created'); window.open('/popup'); }, 3000);
+</script></body></html>"""
+STATS = {"created_ms": None, "popup_ms": None}
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002 — the base class's name
         pass
 
-    def do_GET(self):
-        if self.path.startswith("/favicon"):
-            self.send_response(204)
-            self.end_headers()
-            return
-        with open(os.path.join(HERE, "index.html"), "rb") as f:
-            page = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(page)))
+    def reply(self, status: int, body: bytes = b"", ctype: str = "text/html; charset=utf-8", headers=()):
+        self.send_response(status)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(page)
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path.startswith("/favicon") or path == "/ping":
+            self.reply(204)
+        elif path == "/busy":
+            self.reply(200, BUSY_PAGE)
+        elif path == "/popup-created":
+            STATS.update(created_ms=now_ms(), popup_ms=None)
+            self.reply(204)
+        elif path == "/popup":
+            STATS["popup_ms"] = now_ms()
+            self.reply(200, b"<p>popup</p>")
+        elif path == "/stats":
+            self.reply(200, json.dumps(STATS).encode(), "application/json")
+        elif path == "/redirect-unreachable":
+            self.reply(302, headers=[("Location", "http://unreachable.invalid/")])
+        else:
+            with open(os.path.join(HERE, "index.html"), "rb") as f:
+                self.reply(200, f.read())
 
     def do_POST(self):
         if not self.path.startswith("/chat/stream"):

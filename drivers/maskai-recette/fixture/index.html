@@ -148,6 +148,7 @@ async function send() {
   $("stop").hidden = true;
   // The unexpected dialog: true only if someone accepts it.
   if (/TRIGGER_DIALOG/.test(text)) window.__dialog_answered = confirm("unexpected");
+  if (/LATE_DIALOG/.test(text)) setTimeout(() => { window.__dialog_answered = confirm("late"); }, 2000);
   // The page leaves for another host (the driver's list holds 127.0.0.1 only).
   if (/NAVIGATE_AWAY/.test(text)) location.assign(location.protocol + "//localhost:" + location.port + "/away");
 }

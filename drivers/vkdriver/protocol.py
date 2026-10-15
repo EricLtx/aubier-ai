@@ -22,7 +22,9 @@ The harness only reads `result`, so a refusal also says itself there:
 """
 import json
 import os
+import queue
 import sys
+import threading
 import time
 import traceback
 
@@ -69,6 +71,38 @@ def _protocol_stdout():
     return os.fdopen(fd, "w", encoding="utf-8", errors="replace", newline="\n")
 
 
+def _requests(idle):
+    """The request lines, decoded. With `idle`, stdin is read on a thread and
+    `idle()` runs about ten times a second while no request is waiting: a driver
+    keeps its peripheral serviced between requests (a Playwright client that
+    stops reading its events stalls the browser's new pages and workers)."""
+    stdin = sys.stdin.buffer
+    if idle is None:
+        for raw in stdin:
+            yield raw.decode("utf-8", "replace")
+        return
+    lines: queue.Queue = queue.Queue()
+
+    def reader():
+        for raw in stdin:
+            lines.put(raw.decode("utf-8", "replace"))
+        lines.put(None)
+
+    threading.Thread(target=reader, name="stdin", daemon=True).start()
+    while True:
+        try:
+            line = lines.get(timeout=0.1)
+        except queue.Empty:
+            try:
+                idle()
+            except Exception:  # noqa: BLE001 — idle work must never end the loop
+                _log("idle: " + traceback.format_exc())
+            continue
+        if line is None:
+            return
+        yield line
+
+
 def _refusal(rid, reason: str, detail: str, extra: dict | None = None,
              evidence: list | None = None) -> dict:
     detail = detail[:200]
@@ -78,11 +112,12 @@ def _refusal(rid, reason: str, detail: str, extra: dict | None = None,
             "evidence": evidence or []}
 
 
-def serve(name: str, version: str, actions: dict, on_ready=None) -> None:
+def serve(name: str, version: str, actions: dict, on_ready=None, idle=None) -> None:
     """Run the loop until stdin closes.
 
     actions: {name: fn(args: dict, evidence_dir: str) -> (result: dict, evidence: list[dict])};
-    fn may raise DriverRefusal. on_ready() runs once, right after the hello."""
+    fn may raise DriverRefusal. on_ready() runs once, right after the hello;
+    idle() runs between requests (see `_requests`)."""
     global _deadline_at
     out = _protocol_stdout()
 
@@ -101,8 +136,8 @@ def serve(name: str, version: str, actions: dict, on_ready=None) -> None:
             on_ready()
         except Exception:  # noqa: BLE001 — the driver stays up; each action reports
             _log("on_ready: " + traceback.format_exc())
-    for raw in sys.stdin.buffer:
-        line = raw.decode("utf-8", "replace").strip()
+    for line in _requests(idle):
+        line = line.strip()
         if not line:
             continue
         try:
