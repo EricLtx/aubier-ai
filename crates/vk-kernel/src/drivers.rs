@@ -478,7 +478,9 @@ impl RealKernel {
     /// the one `in_flight` holds for the driver, or this is the settle of an
     /// act begun before an unmount and remount, arriving up to `max_action_ms`
     /// later (review round 2). A stale settle still logs `driver.acted` — the
-    /// site was acted on — and then returns `Gate("stale act: …")` without
+    /// site was acted on, and the record's reason starts `stale act: ` either
+    /// way, so a host failure there is not read as one nothing degraded after
+    /// (Ruling R12) — and then returns `Gate("stale act: …")` without
     /// touching the new row, its clock, its state, or the flag the live act
     /// holds. A live settle frees the driver before anything can fail.
     /// Then, on `Ok(outcome)`: each evidence
@@ -536,10 +538,11 @@ impl RealKernel {
         if !live {
             // The act this settle closes was begun before the driver was
             // unmounted and mounted again. The site was acted on, so the record
-            // says so — with the host's reason, or with the staleness when
-            // there was an outcome nothing is left to receive — and nothing
-            // else moves: the row, its clock, its state and the flag belong to
-            // the act that is live now.
+            // says so — with the staleness when there was an outcome nothing is
+            // left to receive, or the host's reason behind `stale act: ` (bare,
+            // a host failure would read on the ledger as one nothing degraded
+            // after, Ruling R12) — and nothing else moves: the row, its clock,
+            // its state and the flag belong to the act that is live now.
             let stale = "stale act: the driver was remounted since";
             let record = match &outcome {
                 Ok(o) => DriverActed {
@@ -550,7 +553,7 @@ impl RealKernel {
                     ..base
                 },
                 Err(reason) => DriverActed {
-                    reason: Some(reason.clone()),
+                    reason: Some(format!("stale act: {reason}")),
                     ..base
                 },
             };

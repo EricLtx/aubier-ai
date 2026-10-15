@@ -10,7 +10,12 @@
 //! (constraints and evidence into the register, the step's instruction as the
 //! prompt, a judge that attaches `verdict.md`, a draft that returned nothing
 //! fails rather than waits); the table survives a restart; and `RecipeStep`
-//! is serde-identical to `StepKind`.
+//! is serde-identical to `StepKind`. The failure modes the fixture dry run
+//! did not exercise (Task 7): the egress the host saw lands on
+//! `driver.acted`, the driver's own `host` refusal included; evidence counts
+//! toward the run's 16 MiB; a degraded driver whose manifest changed is
+//! remounted after an unmount; boot degrades a manifest that no longer
+//! validates.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1037,9 +1042,28 @@ fn boot_rereads_the_drivers_table() {
     let mut k = open(d.path());
     let rows = k.drivers().unwrap();
     assert_eq!(rows, vec![row.clone()]);
+    k.boot().unwrap();
+    assert_eq!(
+        k.drivers().unwrap(),
+        vec![row],
+        "boot leaves a sound row as it is"
+    );
+    assert!(events_of(&k, "driver.unmounted").is_empty());
+}
 
-    // A stored manifest that no longer validates is degraded at boot, with
-    // the reason on the row and on the ledger; the sound one is untouched.
+/// A stored manifest that no longer validates — the contract tightened under
+/// it, or the row was edited behind the mount's back — is degraded at boot,
+/// with the reason on the row and on the ledger; the sound one is untouched;
+/// a second boot adds nothing; and the degrade holds: an act on it is
+/// refused, naming the reason and the remedy.
+#[test]
+fn boot_marks_a_manifest_that_no_longer_validates_degraded() {
+    let d = tempfile::tempdir().unwrap();
+    let row = {
+        let mut k = open(d.path());
+        mount(&mut k)
+    };
+    let mut k = open(d.path());
     let mut broken = row.clone();
     broken.manifest.name = "broken".into();
     broken.manifest.hosts.clear();
@@ -1065,6 +1089,20 @@ fn boot_rereads_the_drivers_table() {
     // A second boot has nothing left to degrade.
     k.boot().unwrap();
     assert_eq!(events_of(&k, "driver.unmounted").len(), 1);
+
+    let t = recette_task(&mut k, vec![harness_step(&["broken", "maskai-1"], None)]);
+    let l = launch(&mut k, &t.id);
+    let err = k
+        .driver_act_begin(&l.token, 10, "broken", "echo", &echo_args())
+        .unwrap_err();
+    assert!(matches!(err, KernelError::Gate(_)), "{err}");
+    assert!(
+        err.to_string()
+            .contains("driver broken is degraded: manifest invalid at boot; remount it"),
+        "{err}"
+    );
+    k.driver_act_begin(&l.token, 11, "maskai-1", "echo", &echo_args())
+        .unwrap();
 }
 
 #[test]
@@ -1324,11 +1362,15 @@ fn settle_refuses_a_file_over_the_per_file_cap_and_the_run_fails_naming_it() {
     }
 }
 
-/// Review round 1, finding 3 (iii): evidence that would take the run past its
-/// 16 MiB total is refused whole, recorded, and remembered so the run fails
-/// naming the file; what was attached before the breach stays.
+/// Review round 1, finding 3 (iii), extended in Task 7: a driver's evidence
+/// counts toward the run's 16 MiB (`bytes_attached`) — every accepted act's
+/// `driver.acted` names the bytes it added — and evidence that would take the
+/// run past the total is refused whole, recorded, and remembered so the run
+/// fails naming the file; what was attached before the breach stays. The
+/// counter is the run's, not the driver's: a file the harness attaches itself
+/// afterwards is refused against the same total.
 #[test]
-fn settle_refuses_evidence_past_the_run_total_and_the_run_fails_naming_it() {
+fn evidence_bytes_count_toward_the_run_cap_and_oversize_fails_settle() {
     let d = tempfile::tempdir().unwrap();
     let mut k = open(d.path());
     let row = mount(&mut k);
@@ -1344,17 +1386,29 @@ fn settle_refuses_evidence_past_the_run_total_and_the_run_fails_naming_it() {
         let plan = k
             .driver_act_begin(&l.token, now, "maskai-1", "echo", &echo_args())
             .unwrap();
-        k.driver_act_settle(
-            &l.token,
-            now,
-            &plan,
-            Ok(outcome_with(vec![note(vec![
-                i as u8;
-                HARNESS_MAX_FILE_BYTES
-                    as usize
-            ])])),
-        )
-        .unwrap();
+        let outcome = outcome_with(vec![note(vec![i as u8; HARNESS_MAX_FILE_BYTES as usize])]);
+        k.driver_act_settle(&l.token, now, &plan, Ok(outcome.clone()))
+            .unwrap();
+        let kept = k
+            .read_register(&machine(now), &t.register)
+            .unwrap()
+            .artefacts
+            .last()
+            .unwrap()
+            .hash
+            .clone();
+        assert_eq!(
+            events_of(&k, "driver.acted").last().unwrap().payload_hash,
+            hash_canonical(&DriverActed {
+                result_hash: hash_canonical(&outcome.result),
+                ok: true,
+                reason: None,
+                evidence: vec![kept],
+                evidence_bytes: HARNESS_MAX_FILE_BYTES,
+                ..refused_acted(&t, &row, &outcome, "")
+            }),
+            "act {i} names the bytes it added to the run"
+        );
     }
     let before = k
         .read_register(&machine(50), &t.register)
@@ -1390,6 +1444,21 @@ fn settle_refuses_evidence_past_the_run_total_and_the_run_fails_naming_it() {
         "nothing of the refused action is kept"
     );
     assert_eq!(k.driver("maskai-1").unwrap().unwrap().last_act_ms, 101);
+
+    // The harness's own file is held to the total the driver's evidence filled.
+    let ws = k.harness_workspace_dir(&t.id);
+    std::fs::create_dir_all(ws.join("OUT")).unwrap();
+    std::fs::write(ws.join("OUT").join("one.txt"), b"1").unwrap();
+    let err = k
+        .harness_attach_file(&l.token, 102, "proposal", "OUT/one.txt")
+        .unwrap_err();
+    assert!(matches!(err, KernelError::Gate(_)), "{err}");
+    assert!(
+        err.to_string().contains(&format!(
+            "OUT/one.txt (1 bytes) would take the run past the {HARNESS_MAX_RUN_BYTES}-byte limit"
+        )),
+        "{err}"
+    );
 
     let settled = k
         .harness_settle(
@@ -1449,6 +1518,186 @@ fn unmount_clears_an_act_left_in_flight_so_a_remount_can_act() {
     assert_eq!(back.state, DriverState::Ready);
     k.driver_act_begin(&l.token, 12, "maskai-1", "look", &serde_json::json!({}))
         .unwrap();
+}
+
+/// Task 7: the remedy for a degraded driver whose manifest also changed — the
+/// founder fixed a selector after a failure, so the files hash and with it
+/// the identity moved. Remounting the new manifest over the degraded row is
+/// refused with the unmount remedy; `vk driver umount` drops the degraded row
+/// (on the ledger); the new manifest then mounts `Ready` and acts.
+#[test]
+fn a_degraded_driver_can_be_remounted_after_umount() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let row = mount(&mut k);
+    let t = one_level(&mut k);
+    let l = launch(&mut k, &t.id);
+    let plan = k
+        .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    let dead = "dead: exit code 1";
+    k.driver_act_settle(&l.token, 20, &plan, Err(dead.into()))
+        .unwrap_err();
+    let degraded = DriverState::Degraded {
+        reason: dead.into(),
+    };
+    assert_eq!(k.driver("maskai-1").unwrap().unwrap().state, degraded);
+
+    let mut fixed = maskai_like();
+    fixed.program.files_sha256 = format!("sha256:{}", "1".repeat(64));
+    assert_ne!(fixed.driver_id(), row.driver_id);
+    let err = k
+        .mount_driver(&human(30), fixed.clone(), root(), true)
+        .unwrap_err();
+    assert!(matches!(err, KernelError::Gate(_)), "{err}");
+    assert!(
+        err.to_string()
+            .contains("run `vk driver umount maskai-1` first"),
+        "{err}"
+    );
+    assert_eq!(k.driver("maskai-1").unwrap().unwrap().state, degraded);
+
+    let gone = k
+        .unmount_driver("maskai-1", "operator")
+        .unwrap()
+        .expect("the degraded row was there");
+    assert_eq!(gone.state, degraded);
+    assert!(k.driver("maskai-1").unwrap().is_none());
+    let unmounted = events_of(&k, "driver.unmounted");
+    assert_eq!(
+        unmounted.len(),
+        2,
+        "the degrade, then the operator's unmount"
+    );
+    assert_eq!(
+        unmounted[1].payload_hash,
+        hash_canonical(&DriverUnmounted {
+            driver_id: row.driver_id.clone(),
+            reason: "operator".into(),
+        })
+    );
+
+    let back = k
+        .mount_driver(&human(40), fixed.clone(), root(), true)
+        .unwrap();
+    assert_eq!(back.state, DriverState::Ready);
+    assert_eq!(back.driver_id, fixed.driver_id());
+    assert_eq!(events_of(&k, "driver.mounted").len(), 2);
+    let plan = k
+        .driver_act_begin(&l.token, 41, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    assert_eq!(plan.driver_id, fixed.driver_id());
+    k.driver_act_settle(&l.token, 42, &plan, Ok(echo_outcome("back")))
+        .unwrap();
+    assert_eq!(
+        k.driver("maskai-1").unwrap().unwrap().state,
+        DriverState::Ready
+    );
+}
+
+/// Spec §3.3, the trust statement: the kernel trusts the driver for the host
+/// allow-list and detects after the fact. `driver.acted.hosts_seen` is the
+/// egress the host observed, carried exactly as the host handed it over —
+/// above all when the driver itself refused an off-list host (`ok: false,
+/// reason: "host"`): that answer is the driver's, not a host failure, so the
+/// driver stays `Ready` (Ruling R12), and the record still names every
+/// endpoint its processes were seen connected to while the action ran.
+#[test]
+fn hosts_seen_from_the_host_lands_on_driver_acted() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let row = mount(&mut k);
+    let t = one_level(&mut k);
+    let l = launch(&mut k, &t.id);
+    let seen: Vec<String> = vec![
+        "127.0.0.1:8765".into(),
+        "93.184.215.14:443".into(),
+        "[2606:2800:21f:cb07:6820:80da:af6b:8b2c]:443".into(),
+    ];
+    let refused = ActOutcome {
+        ok: false,
+        reason: Some("host".into()),
+        detail: Some("navigation hors liste vers example.com : retour à la page d'entrée".into()),
+        result: serde_json::json!({ "host": "example.com", "url": "https://example.com/" }),
+        evidence: vec![],
+        duration_ms: 40,
+        hosts_seen: seen.clone(),
+    };
+    let plan = k
+        .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    let result = k
+        .driver_act_settle(&l.token, 60, &plan, Ok(refused.clone()))
+        .unwrap();
+    assert_eq!(
+        result, refused.result,
+        "the harness reads the driver's refusal"
+    );
+    let acted = events_of(&k, "driver.acted");
+    assert_eq!(acted.len(), 1);
+    assert_eq!(
+        acted[0].payload_hash,
+        hash_canonical(&DriverActed {
+            task_id: t.id.clone(),
+            step_index: 0,
+            driver_id: row.driver_id.clone(),
+            action: "echo".into(),
+            args_hash: hash_canonical(&echo_args()),
+            result_hash: hash_canonical(&refused.result),
+            ok: false,
+            reason: Some("host".into()),
+            duration_ms: 40,
+            evidence: vec![],
+            evidence_bytes: 0,
+            hosts_seen: seen.clone(),
+        })
+    );
+    assert_eq!(
+        k.driver("maskai-1").unwrap().unwrap().state,
+        DriverState::Ready,
+        "the driver's own refusal is not a host failure"
+    );
+    assert!(events_of(&k, "driver.unmounted").is_empty());
+    assert!(
+        k.read_register(&machine(61), &t.register)
+            .unwrap()
+            .evidence
+            .iter()
+            .all(|e| e.origin != Origin::ThirdPartyInbound),
+        "a refused action feeds nothing to the register"
+    );
+
+    // A successful action carries its own endpoints, not the last one's.
+    let plan = k
+        .driver_act_begin(&l.token, 70, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    let ok = ActOutcome {
+        hosts_seen: vec!["10.0.0.7:443".into()],
+        ..echo_outcome("line")
+    };
+    k.driver_act_settle(&l.token, 80, &plan, Ok(ok.clone()))
+        .unwrap();
+    let art = k
+        .read_register(&machine(81), &t.register)
+        .unwrap()
+        .artefacts
+        .last()
+        .unwrap()
+        .hash
+        .clone();
+    assert_eq!(
+        events_of(&k, "driver.acted")[1].payload_hash,
+        hash_canonical(&DriverActed {
+            result_hash: hash_canonical(&ok.result),
+            ok: true,
+            reason: None,
+            duration_ms: ok.duration_ms,
+            evidence: vec![art],
+            evidence_bytes: b"hello from the site".len() as u64,
+            hosts_seen: vec!["10.0.0.7:443".into()],
+            ..failed_acted(&t, &row, "", 0)
+        })
+    );
 }
 
 /// Ruling R12: every host-side failure degrades the driver — a process that
@@ -1658,6 +1907,8 @@ fn an_undeclared_evidence_refusal_from_the_host_does_not_degrade() {
 /// settles late, up to `max_action_ms` later. Its settle is recorded — the
 /// site was acted on — and refused as stale; the remounted row, its clock, its
 /// state and the act that is live on it are untouched, whatever the outcome.
+/// A stale host failure is recorded as `stale act: <reason>` (Task 7): bare,
+/// it would read on the ledger as a failure nothing degraded after (R12).
 #[test]
 fn a_stale_settle_after_a_remount_cannot_touch_the_new_row() {
     let d = tempfile::tempdir().unwrap();
@@ -1701,7 +1952,7 @@ fn a_stale_settle_after_a_remount_cannot_touch_the_new_row() {
     assert_eq!(acted.len(), 1);
     assert_eq!(
         acted[0].payload_hash,
-        hash_canonical(&failed_acted(&t, &row, "timeout", 10))
+        hash_canonical(&failed_acted(&t, &row, "stale act: timeout", 10))
     );
     // B is still the live act.
     let err = k
