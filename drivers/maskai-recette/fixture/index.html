@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Banc d'essai maskai-recette</title>
+<style>
+  body { margin: 0; display: flex; font: 14px/1.4 system-ui, sans-serif; height: 100vh; }
+  aside { width: 220px; border-right: 1px solid #ccc; padding: 8px; }
+  main { flex: 1; display: flex; flex-direction: column; }
+  #messages { flex: 1; overflow: auto; padding: 8px; }
+  .message { margin: 6px 0; padding: 6px; border-radius: 6px; }
+  .message.user { background: #eef; }
+  .message.assistant { background: #efe; }
+  #composer { border-top: 1px solid #ccc; padding: 8px; display: flex; gap: 6px; align-items: flex-end; flex-wrap: wrap; }
+  #chips { width: 100%; }
+  .chip { display: inline-block; padding: 2px 6px; border: 1px solid #999; border-radius: 10px; }
+  .chip.failed { border-color: #c00; color: #c00; }
+  textarea { flex: 1; min-height: 40px; }
+  #cookies { position: fixed; bottom: 0; left: 0; right: 0; background: #333; color: #fff; padding: 12px; }
+</style>
+</head>
+<body>
+<!-- A stand-in for MaskAI's chat page: the textarea that only takes a value
+     through input events (annexe B), the hidden file input behind the paper
+     clip with its attachment chip, the streamed answer on /chat/stream
+     (annexe A), the conversation sidebar and one known modal (the cookie
+     banner). See serve.py for the server side and its trigger words. -->
+<aside>
+  <button id="new" aria-label="Nouvelle conversation">Nouvelle conversation</button>
+  <ul id="conversations"></ul>
+</aside>
+<main>
+  <div id="messages"></div>
+  <div id="composer">
+    <div id="chips"></div>
+    <button id="clip" aria-label="Joindre un fichier" title="Joindre un fichier">&#128206;</button>
+    <input type="file" id="file" hidden>
+    <textarea id="prompt" placeholder="Votre message"></textarea>
+    <button id="send" aria-label="Envoyer">Envoyer</button>
+    <button id="stop" aria-label="Stop generating" hidden>Stop</button>
+  </div>
+</main>
+<div id="cookies" role="dialog" hidden>Ce site utilise des cookies. <button id="accept">Accepter</button></div>
+<script>
+"use strict";
+const state = { text: "", attachments: [], conversation: null, count: 0 };
+const $ = (id) => document.getElementById(id);
+window.__dialog_answered = false;
+
+if (!localStorage.getItem("cookies-ok")) $("cookies").hidden = false;
+$("accept").onclick = () => { localStorage.setItem("cookies-ok", "1"); $("cookies").hidden = true; };
+
+// The editor's model is `state.text`, which only an input event updates: a
+// value set without one is not sent (annexe B).
+$("prompt").addEventListener("input", () => { state.text = $("prompt").value; });
+$("prompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("send").onclick = send;
+
+$("clip").onclick = () => $("file").click();
+$("file").addEventListener("change", (e) => {
+  for (const f of e.target.files) attach(f.name);
+  e.target.value = "";
+});
+
+function attach(name) {
+  const chip = document.createElement("span");
+  chip.className = "chip";
+  chip.textContent = name;
+  chip.setAttribute("aria-label", "Indexing: " + name);
+  $("chips").appendChild(chip);
+  setTimeout(() => {
+    if (/fail/i.test(name)) {
+      chip.setAttribute("aria-label", "Failed");
+      chip.classList.add("failed");
+    } else {
+      chip.setAttribute("aria-label", "Attached: " + name);
+      state.attachments.push(name);
+    }
+  }, 300);
+}
+
+$("new").onclick = () => {
+  state.conversation = null;
+  state.attachments = [];
+  state.text = "";
+  $("prompt").value = "";
+  $("messages").innerHTML = "";
+  $("chips").innerHTML = "";
+  history.pushState({}, "", "/");
+};
+
+function addMessage(role, html) {
+  const div = document.createElement("div");
+  div.className = "message " + role;
+  div.dataset.role = role;
+  div.innerHTML = html;
+  $("messages").appendChild(div);
+  return div;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function send() {
+  const text = state.text;
+  if (!text.trim()) return;
+  if (!state.conversation) {
+    state.conversation = "c" + (++state.count) + "-" + Date.now();
+    history.pushState({}, "", "/c/" + state.conversation);
+    const li = document.createElement("li");
+    li.textContent = text.trim().slice(0, 40);
+    $("conversations").prepend(li);
+  }
+  addMessage("user", escapeHtml(text));
+  $("prompt").value = "";
+  state.text = "";
+  const body = JSON.stringify({ conversation: state.conversation, message: text, attachments: state.attachments });
+  $("chips").innerHTML = "";
+  state.attachments = [];
+  $("stop").hidden = false;
+  const answer = addMessage("assistant", "");
+  let html = "";
+  try {
+    const res = await fetch("/chat/stream", { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const event = buf.slice(0, i).replace(/^data: /, "");
+        buf = buf.slice(i + 2);
+        try {
+          const o = JSON.parse(event);
+          if (o.delta !== undefined) { html += o.delta; answer.innerHTML = html; }
+        } catch (e) { /* not an answer chunk */ }
+      }
+    }
+  } catch (e) {
+    answer.textContent = "Erreur : " + e.message;
+  }
+  $("stop").hidden = true;
+  // The unexpected dialog: true only if someone accepts it.
+  if (/TRIGGER_DIALOG/.test(text)) window.__dialog_answered = confirm("unexpected");
+}
+</script>
+</body>
+</html>

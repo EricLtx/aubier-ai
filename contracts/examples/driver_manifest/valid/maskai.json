@@ -4,11 +4,11 @@
   "program": {
     "runtime": "python-playwright",
     "command": [
-      "python",
+      ".venv/Scripts/python.exe",
       "-I",
-      "drivers/maskai-recette/driver.py"
+      "driver.py"
     ],
-    "files_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "files_sha256": "sha256:a88aa7a62f8f2427dfc739bd84c3ae7543fee513ef7b4bd98c510084da1abe39",
     "browser_channel": "chrome",
     "headless": false
   },
@@ -31,7 +31,7 @@
     },
     {
       "name": "nouvelle_conversation",
-      "reversible": false,
+      "reversible": true,
       "args": {
         "type": "object",
         "additionalProperties": false
