@@ -3715,6 +3715,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vk-arch-gemini"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "vk-arch-openai-compat",
+ "vk-contracts",
+ "vk-kernel",
+]
+
+[[package]]
 name = "vk-arch-mistral"
 version = "0.1.0"
 dependencies = [
