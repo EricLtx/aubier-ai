@@ -33,7 +33,14 @@ def noisy(args, evidence_dir):
     subprocess.run([sys.executable, "-I", "-c", "print('child noise')"], check=True)
     return {"text": "noisy"}, []
 
-serve("t", "0", {"echo": echo, "refuse": refuse, "proof": proof, "noisy": noisy})
+def surrogate(args, evidence_dir):
+    return {"text": "a\ud83db"}, []  # half of a pair, as a JavaScript .slice() can leave
+
+def exits(args, evidence_dir):
+    raise SystemExit("ENF inconnue")  # what journal.add does on an unknown NFR
+
+serve("t", "0", {"echo": echo, "refuse": refuse, "proof": proof, "noisy": noisy,
+                 "surrogate": surrogate, "exits": exits})
 """
 
 
@@ -55,7 +62,8 @@ class ProtocolTest(unittest.TestCase):
     def test_hello_then_one_answer_per_request(self):
         out, _, _ = self.run_driver([("echo", {"x": "é"}), ("refuse", {}), ("nope", {})])
         self.assertEqual(out[0], {"hello": {"protocol": 1, "driver": "t", "version": "0",
-                                            "actions": ["echo", "noisy", "proof", "refuse"]}})
+                                            "actions": ["echo", "exits", "noisy", "proof", "refuse",
+                                                        "surrogate"]}})
         self.assertEqual(out[1], {"id": 1, "ok": True, "evidence": [],
                                   "result": {"echo": {"x": "é"}, "remaining_ok": True, "text": "echo"}})
         self.assertEqual(out[2]["id"], 2)
@@ -74,6 +82,17 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(out[1]["evidence"],
                          [{"name": "proof.txt", "mime": "text/plain",
                            "path": os.path.join(ev, "proof.txt")}])
+
+    def test_a_lone_surrogate_still_yields_a_parseable_answer(self):
+        out, _, _ = self.run_driver([("surrogate", {}), ("echo", {})])
+        self.assertEqual((out[1]["id"], out[1]["ok"], out[1]["result"]["text"]), (1, True, "a?b"))
+        self.assertEqual(out[2]["id"], 2)
+
+    def test_system_exit_is_answered_internal_and_the_loop_goes_on(self):
+        out, _, _ = self.run_driver([("exits", {}), ("echo", {})])
+        self.assertEqual((out[1]["id"], out[1]["ok"], out[1]["reason"]), (1, False, "internal"))
+        self.assertIn("SystemExit", out[1]["detail"])
+        self.assertEqual((out[2]["id"], out[2]["ok"]), (2, True))
 
     def test_nothing_but_protocol_lines_reach_stdout(self):
         out, err, _ = self.run_driver([("noisy", {}), ("echo", {})])

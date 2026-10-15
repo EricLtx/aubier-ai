@@ -33,7 +33,9 @@ def load(path: str) -> list[dict]:
         return []
 
 
-def add(path: str, args: argparse.Namespace) -> dict:
+def add(path: str, args: argparse.Namespace, extra: dict | None = None) -> dict:
+    """Ajoute un événement ; `extra` (facultatif) ajoute des champs à la ligne, par exemple
+    l'empreinte des entrées du verdict qu'écrit le driver maskai-recette."""
     event = {
         "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="minutes"),
         "step": args.step, "case": args.case, "verdict": args.verdict,
@@ -48,6 +50,7 @@ def add(path: str, args: argparse.Namespace) -> dict:
         event["nfr"] = args.nfr.split(",")
     if args.supersedes is not None:
         event["supersedes"] = args.supersedes
+    event.update(extra or {})
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
     return event

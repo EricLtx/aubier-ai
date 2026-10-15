@@ -83,6 +83,17 @@ class CasesTest(unittest.TestCase):
         for fid in ("fixture-case-1", "fixture-case-2"):
             self.assertTrue(cases[fid]["file"].startswith("fixture/corpus/"))
 
+    def test_an_unknown_nfr_is_refused_at_start(self):
+        drv = load_driver()
+        path = os.path.join(tempfile.mkdtemp(prefix="maskai-recette-"), "cases.json")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"cases": [{"id": "x", "level": "N1", "kind": "message", "question": "q",
+                                  "nfr": ["securité"], "budget_s": 1}]}, f)
+        with self.assertRaises(ValueError) as refused:
+            drv.load_cases(drv.Path(path))
+        self.assertIn("securité", str(refused.exception))
+
 
 @unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
 class DriverOnFixture(unittest.TestCase):
@@ -104,12 +115,13 @@ class DriverOnFixture(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, True)
         return d
 
-    def make(self, work=None, module=None):
+    def make(self, work=None, module=None, cases_path=None):
         drv = module or load_driver()
         recette = drv.Recette(env={
             "VK_DRIVER_WORK_DIR": work or self.tmp(), "VK_DRIVER_PROFILE_DIR": self.tmp(),
             "VK_DRIVER_HEADLESS": "1", "VK_DRIVER_CHANNEL": "", "VK_DRIVER_HOSTS": "127.0.0.1",
-            "MASKAI_ENTRY_URL": f"http://127.0.0.1:{self.port}/new"})
+            "MASKAI_ENTRY_URL": f"http://127.0.0.1:{self.port}/new"},
+            **({"cases_path": cases_path} if cases_path else {}))
         self.addCleanup(recette.browser.close)
         return drv, recette, recette.actions()
 
@@ -170,17 +182,78 @@ class DriverOnFixture(unittest.TestCase):
         self.act(A, "nouvelle_conversation")
         res, ev = self.act(A, "envoyer_message", {"text": "Montre une image EXTERNAL_IMG"})
         self.assertIn("EXTERNAL_IMG", res["answer"])
+        # A third-party sub-resource is recorded, not blocked (Ruling R16: no routing).
         flux, _ = self.act(A, "capturer_flux")
-        blocked = [b for b in flux["blocked"] if "example.invalid" in b["url"]]
-        self.assertTrue(blocked, flux["blocked"])
-        self.assertFalse(blocked[0]["navigation"])
+        self.assertIn("example.invalid", [h["host"] for h in flux["third_party_hosts"]], flux)
         with open(next(e["path"] for e in ev if e["name"] == "network.json"), encoding="utf-8") as f:
-            self.assertTrue(any("example.invalid" in b["url"] for b in json.load(f)["blocked"]))
-        # A navigation off the list is refused, not followed.
+            capture = json.load(f)
+        self.assertIn("example.invalid", [h["host"] for h in capture["third_party_hosts"]])
+        img = [r for r in capture["requests"] if "example.invalid" in r["url"]]
+        self.assertTrue(img, capture["requests"])
+        self.assertNotIn("BLOCKED", (img[0].get("failure") or "").upper(), "the browser tried it")
+        # A navigation to a host off the list is refused before it starts.
         recette.entry = "http://example.invalid/new"
         with self.assertRaises(drv.DriverRefusal) as refused:
             self.act(A, "mesurer_chargement")
         self.assertEqual(refused.exception.reason, "host")
+
+    def test_off_list_navigation_is_undone_and_refused(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "nouvelle_conversation")
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "envoyer_message", {"text": "Pars ailleurs NAVIGATE_AWAY"})
+        self.assertEqual(refused.exception.reason, "host")
+        self.assertIn("localhost", refused.exception.detail)
+        self.assertEqual(recette.browser.page().url, recette.entry, "back on the entry page")
+        res, _ = self.act(A, "capture_ecran")  # and the next action runs as usual
+        self.assertIn("127.0.0.1", res["text"])
+
+    def test_a_dialog_during_a_case_makes_it_ko_securite(self):
+        drv, recette, A = self.make()
+        recette.open()
+        recette.cases["fixture-dialog"] = {"id": "fixture-dialog", "level": "N8", "kind": "message",
+                                           "question": "Bonjour TRIGGER_DIALOG", "budget_s": 5,
+                                           "nfr": ["veracite"], "must": ["bonjour"], "must_not": [], "pii": []}
+        self.act(A, "nouvelle_conversation")
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "poser_question", {"case": "fixture-dialog"})
+        self.assertEqual(refused.exception.reason, "dialog")
+        recette.browser.pending()["dialog"].dismiss()  # the founder closes it
+        res, _ = self.act(A, "verdict_oracle", {"case": "fixture-dialog"})
+        self.assertEqual(res["verdict"], "KO")
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual((line["case"], line["verdict"]), ("fixture-dialog", "KO"))
+        self.assertIn("securite", line["nfr"])
+        self.assertIn("dialogue inattendu (confirm) : unexpected", line["evidence"])
+
+    def test_inputs_sha256_in_hello_and_journal(self):
+        drv, recette, A = self.make()
+        self.assertRegex(recette.version, r"^0\.1\.0\+[0-9a-f]{12}$")
+        self.assertTrue(recette.inputs_sha256.startswith("sha256:" + recette.version[6:]))
+        # The hello of the driver process carries it.
+        env = dict(os.environ, VK_DRIVER_WORK_DIR=self.tmp(), VK_DRIVER_PROFILE_DIR=self.tmp(),
+                   VK_DRIVER_HEADLESS="1", VK_DRIVER_CHANNEL="", VK_DRIVER_HOSTS="127.0.0.1",
+                   MASKAI_ENTRY_URL=f"http://127.0.0.1:{self.port}/new")
+        p = subprocess.run([sys.executable, "-I", os.path.join(DRIVER_DIR, "driver.py")], env=env,
+                           cwd=env["VK_DRIVER_WORK_DIR"], input=b"", capture_output=True, timeout=120)
+        hello = json.loads(p.stdout.decode("utf-8").splitlines()[0])["hello"]
+        self.assertEqual(hello["version"], recette.version)
+        # Every journal line the driver appends carries the full hash.
+        self.act(A, "mesurer_chargement")
+        self.act(A, "verdict_oracle", {"case": "N0-1"})
+        self.assertEqual(journal_lines(recette.work)[-1]["inputs_sha256"], recette.inputs_sha256)
+        recette.browser.close()  # one sync Playwright per thread
+        # One byte of cases.json changed: another hash, in the version and on the line.
+        changed = os.path.join(self.tmp(), "cases.json")
+        with open(os.path.join(DRIVER_DIR, "cases.json"), "rb") as src, open(changed, "wb") as dst:
+            dst.write(src.read() + b"\n")
+        drv2, recette2, A2 = self.make(module=load_driver(), cases_path=changed)
+        self.assertNotEqual(recette2.inputs_sha256, recette.inputs_sha256)
+        self.assertNotEqual(recette2.version, recette.version)
+        self.act(A2, "mesurer_chargement")
+        self.act(A2, "verdict_oracle", {"case": "N0-1"})
+        self.assertEqual(journal_lines(recette2.work)[-1]["inputs_sha256"], recette2.inputs_sha256)
 
     def test_timeout_journals_ko_disponibilite(self):
         drv, recette, A = self.make()

@@ -22,7 +22,8 @@ def _is_link(entry: os.DirEntry) -> bool:
     return entry.is_symlink() or (hasattr(entry, "is_junction") and entry.is_junction())
 
 
-def hash_dir(directory: str) -> str:
+def list_files(directory: str) -> list:
+    """`(relative path with /, path)` for every file `hash_dir` counts."""
     files = []
 
     def walk(path: str, rel: list) -> None:
@@ -40,15 +41,24 @@ def hash_dir(directory: str) -> str:
                         files.append(("/".join(parts), entry.path))
 
     walk(directory, [])
-    files.sort(key=lambda f: f[0].encode("utf-8"))
+    return files
+
+
+def hash_files(files) -> str:
+    """The framing `hash_dir` uses, over any `(relative path, path)` list: sorted
+    by relative path (UTF-8 bytes), then `relpath\\0bytes\\0` for each."""
     h = hashlib.sha256()
-    for rel, path in files:
+    for rel, path in sorted(files, key=lambda f: f[0].encode("utf-8")):
         h.update(rel.encode("utf-8"))
         h.update(b"\0")
         with open(path, "rb") as f:
             h.update(f.read())
         h.update(b"\0")
     return "sha256:" + h.hexdigest()
+
+
+def hash_dir(directory: str) -> str:
+    return hash_files(list_files(directory))
 
 
 if __name__ == "__main__":

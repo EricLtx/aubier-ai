@@ -8,15 +8,23 @@ va au journal append-only de la recette, chaque preuve sous le dossier que
 l'hôte donne pour l'action.
 
 Ce que le driver garantit :
-- la liste d'hôtes (`VK_DRIVER_HOSTS`) : toute requête vers un autre hôte est
-  refusée et listée comme bloquée ; une navigation hors liste rend `host` ;
+- la liste d'hôtes (`VK_DRIVER_HOSTS`) porte sur les navigations : une
+  navigation du cadre principal vers un autre hôte (redirection suivie
+  comprise) est défaite, retour à la page d'entrée, et l'action rend `host` ;
+  les requêtes de sous-ressources et les WebSockets vers d'autres hôtes ne sont
+  pas bloquées (le cache HTTP du navigateur reste actif, les mesures restent
+  justes) mais relevées dans `third_party_hosts` ;
 - le garde-dialogue : un dialogue JavaScript n'est jamais accepté ni refusé par
   le driver ; chaque action le signale (`dialog`) jusqu'à ce qu'un humain l'ait
   fermé dans Chrome ; une modale inconnue est signalée de même ; une modale
   connue (`KNOWN_MODALS`) est fermée par son bouton documenté ;
 - le délai d'abandon : 3 × le budget du cas, journalisé KO disponibilité ;
 - la reprise : observations et journal sur disque (`VK_DRIVER_WORK_DIR`) ; un
-  cas déjà journalisé rend son verdict sans rien ajouter.
+  cas déjà journalisé rend son verdict sans rien ajouter ;
+- la traçabilité du verdict : `inputs_sha256`, l'empreinte de ce qui fait le
+  verdict hors du dossier du driver (vkdriver, evaluer.py, journal.py,
+  cases.json, oracles, fichiers du corpus), est dans la version du hello et sur
+  chaque ligne de journal.
 
 Environnement (posé par l'hôte) : VK_DRIVER_PROFILE_DIR, VK_DRIVER_WORK_DIR,
 VK_DRIVER_HEADLESS, VK_DRIVER_CHANNEL, VK_DRIVER_HOSTS ; MASKAI_ENTRY_URL
@@ -42,6 +50,7 @@ RECETTE_DIR = REPO / "docs" / "use-cases" / "recettage-chat-ia"
 SCRIPTS_DIR = REPO / "scripts" / "recette"
 sys.path.insert(0, str(DRIVER_DIR.parent))
 
+from vkdriver.hash_dir import hash_files, list_files  # noqa: E402
 from vkdriver.protocol import DriverRefusal, remaining_s, serve  # noqa: E402
 
 try:
@@ -287,11 +296,28 @@ def nfr_union(*lists) -> list:
     return [n for n in NFR_ORDER if n in got]
 
 
+def clean(value):
+    """Les chaînes venues de la page, rendues écrivables en UTF-8 : une moitié de paire de
+    substitution (un .slice() JavaScript au milieu d'un émoji) devient U+FFFD."""
+    if isinstance(value, str):
+        return value.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    if isinstance(value, list):
+        return [clean(v) for v in value]
+    if isinstance(value, dict):
+        return {k: clean(v) for k, v in value.items()}
+    return value
+
+
+ORACLE_FILES = ("corpus-v2/oracles-v2.json", "corpus/oracles.json")
+CASES_REL = "drivers/maskai-recette/cases.json"
+
+
 def load_cases(path: Path = DRIVER_DIR / "cases.json") -> dict:
     """Les cas de la recette : ceux qui portent `oracle` prennent question, must, must_not et
-    pii dans les oracles du corpus (une seule source pour le verdict)."""
+    pii dans les oracles du corpus (une seule source pour le verdict). Une ENF que le journal
+    ne connaît pas est refusée ici, au démarrage, plutôt qu'au premier verdict."""
     oracles = {}
-    for rel in ("corpus-v2/oracles-v2.json", "corpus/oracles.json"):
+    for rel in ORACLE_FILES:
         p = RECETTE_DIR / rel
         if p.exists():
             for c in json.loads(p.read_text(encoding="utf-8"))["cases"]:
@@ -307,8 +333,41 @@ def load_cases(path: Path = DRIVER_DIR / "cases.json") -> dict:
                 c.setdefault(key, o.get(key, []))
         for key in ("must", "must_not", "pii", "nfr"):
             c.setdefault(key, [])
+        unknown = [n for n in c["nfr"] if n not in journal.NFR]
+        if unknown:
+            raise ValueError(f"case {c['id']}: unknown NFR {unknown}; the journal knows {journal.NFR}")
         cases[c["id"]] = c
     return cases
+
+
+def case_file(rel: str) -> Path | None:
+    """Le fichier d'un cas, sous le dossier du driver ou sous le dossier de la recette."""
+    for root in (DRIVER_DIR, RECETTE_DIR):
+        p = (root / rel).resolve()
+        if p.is_file() and root.resolve() in p.parents:
+            return p
+    return None
+
+
+def verdict_inputs(cases: dict, cases_path: Path) -> list:
+    """Ce qui fait un verdict sans être dans le dossier haché du driver (Ruling R18) :
+    drivers/vkdriver, evaluer.py, journal.py, cases.json, les oracles et les fichiers du corpus
+    que les cas joignent, en chemins relatifs à la racine du dépôt."""
+    files = {CASES_REL: cases_path}
+    for rel, path in list_files(str(DRIVER_DIR.parent / "vkdriver")):
+        files["drivers/vkdriver/" + rel] = path
+    for name in ("evaluer.py", "journal.py"):
+        files["scripts/recette/" + name] = SCRIPTS_DIR / name
+    for rel in ORACLE_FILES:
+        if (RECETTE_DIR / rel).exists():
+            files["docs/use-cases/recettage-chat-ia/" + rel] = RECETTE_DIR / rel
+    for c in cases.values():
+        if c.get("file"):
+            p = case_file(c["file"])
+            if p is None:
+                raise ValueError(f"case {c['id']}: file {c['file']} not found")
+            files[p.relative_to(REPO.resolve()).as_posix()] = p
+    return sorted(files.items())
 
 
 def entry_url(hosts: list, env) -> str:
@@ -346,18 +405,18 @@ class Evidence:
                            "path": path})
 
     def json(self, name: str, obj, cap: int | None = None) -> None:
-        data = json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")
+        data = json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8", "replace")
         if cap and len(data) > cap and isinstance(obj, dict):
             obj = dict(obj)
             while len(data) > cap and any(isinstance(v, list) and v for v in obj.values()):
                 key = max((k for k, v in obj.items() if isinstance(v, list)), key=lambda k: len(obj[k]))
                 obj[key] = obj[key][len(obj[key]) // 2:]
                 obj["truncated"] = True
-                data = json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")
+                data = json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8", "replace")
         self.add(name, data)
 
     def html(self, name: str, html: str) -> None:
-        data = html.encode("utf-8")
+        data = html.encode("utf-8", "replace")
         if len(data) > DOM_CAP:
             marker = f"\n<!-- maskai-recette : tronqué, {len(data)} octets au total -->\n".encode("utf-8")
             data = data[: DOM_CAP - len(marker)].decode("utf-8", "ignore").encode("utf-8") + marker
@@ -369,7 +428,9 @@ class Evidence:
 
 class Browser:
     """Le navigateur du driver : un contexte persistant Playwright sur le profil dédié, la
-    liste d'hôtes en routage, le garde-dialogue, et la capture réseau et console (résumés)."""
+    garde des navigations, le garde-dialogue, et la capture réseau et console (résumés).
+    Aucune requête n'est routée : le routage Playwright couperait le cache HTTP et ferait
+    passer chaque requête par Python, deux biais sur les mesures (Ruling R16)."""
 
     def __init__(self, profile_dir: str, channel: str | None, headless: bool, hosts: list):
         self.profile_dir, self.channel, self.headless, self.hosts = profile_dir, channel, headless, hosts
@@ -377,7 +438,8 @@ class Browser:
         self._dead = False
         self.dialogs = []      # dialogues JavaScript en attente : jamais acceptés ni refusés ici
         self.network = []      # résumés de requêtes, toutes pages
-        self.blocked = []      # requêtes refusées par la liste d'hôtes
+        self.third_party = []  # requêtes et WebSockets vers des hôtes hors liste : relevés, pas bloqués
+        self.offlist = []      # navigations du cadre principal vers un hôte hors liste
         self.console = []
         self.posts = []        # corps envoyés au flux de réponse (`sent`)
         self.seq = 0
@@ -397,7 +459,7 @@ class Browser:
         try:
             self.context = self.pw.chromium.launch_persistent_context(
                 user_data_dir=self.profile_dir, channel=self.channel or None, headless=self.headless,
-                accept_downloads=False, service_workers="block")
+                accept_downloads=False)
         except Exception:
             self.pw.stop()
             self.pw = None
@@ -405,8 +467,6 @@ class Browser:
         ctx = self.context
         ctx.set_default_timeout(10_000)
         ctx.add_init_script(INTERCEPTOR_JS)
-        ctx.route("**/*", self._route)
-        ctx.route_web_socket(lambda url: not self.allowed(url), self._refuse_socket)
         ctx.on("dialog", self._on_dialog)
         ctx.on("dialogclosed", self._on_dialog_closed)
         ctx.on("request", self._on_request)
@@ -414,6 +474,9 @@ class Browser:
         ctx.on("requestfailed", self._on_failed)
         ctx.on("console", self._on_console)
         ctx.on("close", self._on_close)
+        ctx.on("page", self._watch_page)
+        for p in ctx.pages:
+            self._watch_page(p)
         self._page = ctx.pages[0] if ctx.pages else ctx.new_page()
         log.info("browser up: channel=%s headless=%s hosts=%s", self.channel, self.headless, self.hosts)
 
@@ -434,15 +497,10 @@ class Browser:
         self._dead = False
         self.dialogs.clear()
 
-    def pump(self) -> None:
-        """Entre deux actions : laisser Playwright servir le routage et les événements, sans
-        quoi les requêtes de la page attendraient la prochaine action."""
-        if self.started() and self._page is not None and not self._page.is_closed():
-            try:
-                self._page.wait_for_timeout(20)
-            except PWError as e:  # a crashed page: say it once, the next action relaunches
-                log.warning("browser unusable between actions, relaunched at the next one: %s", e)
-                self._dead = True
+    def drain(self, ms: int = 20) -> None:
+        """Laisser Playwright livrer les événements en attente (dialogues, navigations,
+        requêtes) : entre deux actions, Python ne les lit pas."""
+        self.page().wait_for_timeout(ms)
 
     # -- appels dans la page, bornés ---------------------------------------------------
     def call(self, fn_src: str, arg=None, timeout_ms: int = 5000, page=None):
@@ -454,7 +512,7 @@ class Browser:
             "(a) => { const v = (" + fn_src + ")(a); return JSON.stringify(v === undefined ? null : v); }",
             arg=arg, timeout=timeout_ms, polling=100)
         try:
-            return json.loads(handle.json_value())
+            return clean(json.loads(handle.json_value()))
         finally:
             handle.dispose()
 
@@ -471,28 +529,42 @@ class Browser:
         except Exception:  # noqa: BLE001 — service worker, detached frame
             return -1
 
-    # -- liste d'hôtes ------------------------------------------------------------------
+    # -- liste d'hôtes : les navigations sont gardées, le reste est relevé ---------------
     def allowed(self, url: str) -> bool:
         p = urlsplit(url)
         return p.scheme not in ("http", "https", "ws", "wss") or (p.hostname or "") in self.hosts
 
-    def _route(self, route, request) -> None:
-        if self.allowed(request.url):
-            route.continue_()
-            return
-        navigation = False
-        try:
-            navigation = request.is_navigation_request() and request.frame.parent_frame is None
-        except Exception:  # noqa: BLE001
-            pass
-        self._push(self.blocked, {"url": short_url(request.url), "type": request.resource_type,
-                                  "navigation": navigation, "page": self.page_of(request)})
-        log.info("blocked (host not allowed): %s", short_url(request.url))
-        route.abort("blockedbyclient")
+    def _watch_page(self, page) -> None:
+        page.on("framenavigated", lambda frame: self._on_navigated(page, frame))
+        page.on("websocket", lambda ws: self._on_websocket(page, ws))
 
-    def _refuse_socket(self, ws) -> None:
-        self._push(self.blocked, {"url": short_url(ws.url), "type": "websocket", "navigation": False})
-        ws.close()
+    def _on_navigated(self, page, frame) -> None:
+        if frame.parent_frame is not None or self.allowed(frame.url):
+            return
+        self._push(self.offlist, {"url": short_url(frame.url), "host": urlsplit(frame.url).hostname or "",
+                                  "page": self._index(page)})
+        log.warning("main frame left the host list: %s", short_url(frame.url))
+
+    def _on_websocket(self, page, ws) -> None:
+        if not self.allowed(ws.url):
+            self._push(self.third_party, {"host": urlsplit(ws.url).hostname or "", "url": short_url(ws.url),
+                                          "type": "websocket", "page": self._index(page)})
+
+    def _index(self, page) -> int:
+        try:
+            return self.context.pages.index(page)
+        except Exception:  # noqa: BLE001 — a page already closed
+            return -1
+
+    def third_party_hosts(self, mark: int) -> list:
+        """Le résumé des hôtes hors liste vus depuis `mark` : hôte, nombre, types."""
+        hosts = {}
+        for e in self.since(self.third_party, mark):
+            h = hosts.setdefault(e["host"], {"host": e["host"], "requests": 0, "types": []})
+            h["requests"] += 1
+            if e["type"] not in h["types"]:
+                h["types"].append(e["type"])
+        return sorted(hosts.values(), key=lambda h: (-h["requests"], h["host"]))
 
     # -- garde-dialogue -----------------------------------------------------------------
     def _on_dialog(self, dialog) -> None:
@@ -521,6 +593,9 @@ class Browser:
         e = self._push(self.network, {"method": request.method, "url": short_url(request.url),
                                       "type": request.resource_type, "page": self.page_of(request)})
         self._open[request] = (e, time.monotonic())
+        if not self.allowed(request.url):
+            self._push(self.third_party, {"host": urlsplit(request.url).hostname or "", "url": e["url"],
+                                          "type": request.resource_type, "page": e["page"]})
         if request.method == "POST" and re.search(STREAM_PATTERN, request.url):
             self.posts.append({"seq": e["seq"], "page": e["page"], "body": (request.post_data or "")[:20_000]})
 
@@ -547,7 +622,9 @@ class Browser:
 
     def capture(self, mark: int) -> dict:
         return {"since": mark, "requests": self.since(self.network, mark),
-                "blocked": self.since(self.blocked, mark), "console": self.since(self.console, mark)}
+                "third_party_hosts": self.third_party_hosts(mark),
+                "offlist_navigations": self.since(self.offlist, mark),
+                "console": self.since(self.console, mark)}
 
 
 class AskTimeout(Exception):
@@ -560,7 +637,7 @@ class Recette:
     """L'état du driver entre deux actions : le navigateur, les cas, les observations par cas
     (persistées après chaque action) et le journal de la recette."""
 
-    def __init__(self, env=None):
+    def __init__(self, env=None, cases_path: Path | None = None):
         env = os.environ if env is None else env
         for key in ("VK_DRIVER_WORK_DIR", "VK_DRIVER_PROFILE_DIR"):
             if not env.get(key):
@@ -573,7 +650,11 @@ class Recette:
         self.work.mkdir(parents=True, exist_ok=True)
         self.browser = Browser(env["VK_DRIVER_PROFILE_DIR"], env.get("VK_DRIVER_CHANNEL") or None,
                                env.get("VK_DRIVER_HEADLESS") == "1", hosts)
-        self.cases = load_cases()
+        self.cases_path = Path(cases_path) if cases_path else DRIVER_DIR / "cases.json"
+        self.cases = load_cases(self.cases_path)
+        # Ruling R18: what the verdict depends on outside the hashed driver directory.
+        self.inputs_sha256 = hash_files(verdict_inputs(self.cases, self.cases_path))
+        self.version = f"{VERSION}+{self.inputs_sha256.removeprefix('sha256:')[:12]}"
         self.journal_path = self.work / "journal.jsonl"
         self.cursor_path = self.work / "journal.cursor"
         self.obs_path = self.work / "observations.json"
@@ -582,6 +663,7 @@ class Recette:
         self.conv = self._fresh_conversation()
         self.flux = {"ev": 0, "mark": 0}
         self._case_in_hand = None
+        self._mark = None  # where the action in hand began, in the browser's event sequence
 
     def actions(self) -> dict:
         browser = ["mesurer_chargement", "nouvelle_conversation", "joindre_document", "poser_question",
@@ -592,22 +674,25 @@ class Recette:
                 **{n: self._wrap(getattr(self, n), browser=False) for n in local}}
 
     def open(self) -> None:
-        """Au montage : ouvrir Chrome sur la page d'entrée, pour que l'opérateur s'y connecte."""
+        """Au montage : ouvrir Chrome sur la page d'entrée, pour que l'opérateur s'y connecte.
+        Pas de garde des navigations ici : la connexion peut passer par un autre hôte, et ce
+        que l'opérateur fait entre deux actions n'est pas un acte du driver."""
         page = self.browser.page()
-        self._goto(page, self.entry)
+        self._goto(page, self.entry, check=False)
 
     # -- l'enveloppe commune ---------------------------------------------------------------
     def _wrap(self, fn, browser: bool):
         def run(args: dict, evidence_dir: str):
             ev = Evidence(evidence_dir)
             self._case_in_hand = None
+            self._mark = None
             try:
-                mark = self.browser.mark()
                 if browser:
-                    self._guard()
+                    self._guard()  # delivers what happened between actions, before the mark
+                    self._mark = self.browser.mark()
                 result = fn(args, ev)
                 if browser:
-                    self._after(mark)
+                    self._after()
                 if ev.dropped:
                     result["evidence_dropped"] = ev.dropped
                 return result, ev.items
@@ -615,8 +700,11 @@ class Recette:
                 r.evidence = r.evidence or ev.items
                 raise
             except Exception as e:
-                if browser and self.browser.started() and self.browser.pending():
-                    raise self._dialog_refusal(ev) from e
+                if browser and self.browser.started():
+                    if self.browser.pending():
+                        raise self._dialog_refusal(ev) from e
+                    if self._offlist():  # the page left the list mid-action and broke a call
+                        raise self._host_refusal(self._offlist()[-1], ev) from e
                 raise
             finally:
                 self._save_observations()
@@ -628,7 +716,7 @@ class Recette:
         inconnue ; une modale connue est fermée par son bouton."""
         b = self.browser
         page = b.page()
-        b.pump()
+        b.drain()
         if b.pending():
             if b.responsive():
                 log.info("pending dialog gone (closed in Chrome): guard cleared")
@@ -648,14 +736,40 @@ class Recette:
         if modals["unknown"]:
             raise DriverRefusal("dialog", f"modale inconnue : {modals['unknown'][0]}")
 
-    def _after(self, mark: int) -> None:
+    def _after(self) -> None:
         b = self.browser
-        b.pump()
+        b.drain(50)
         if b.pending():
             raise self._dialog_refusal()
-        navs = [e for e in b.since(b.blocked, mark) if e.get("navigation")]
+        self._check_host()
+
+    def _offlist(self) -> list:
+        """Les navigations hors liste du cadre principal depuis le début de l'action."""
+        return [] if self._mark is None else self.browser.since(self.browser.offlist, self._mark)
+
+    def _check_host(self) -> None:
+        navs = self._offlist()
         if navs:
-            raise DriverRefusal("host", f"navigation hors liste refusée : {navs[-1]['url']}")
+            raise self._host_refusal(navs[-1])
+
+    def _host_refusal(self, nav: dict, ev: Evidence | None = None) -> DriverRefusal:
+        """Défaire une navigation hors liste (retour à la page d'entrée) et la refuser."""
+        pages = self.browser.context.pages
+        page = pages[nav["page"]] if 0 <= nav.get("page", -1) < len(pages) else self.browser.page()
+        self._back_to_entry(page)
+        return DriverRefusal("host", f"navigation hors liste vers {nav['host']} : retour à la page d'entrée",
+                             extra={"host": nav["host"], "url": nav["url"]},
+                             evidence=ev.items if ev else None)
+
+    def _back_to_entry(self, page) -> None:
+        try:
+            page.goto(self.entry, wait_until="load", timeout=30_000)
+        except PWError as e:
+            log.warning("could not return to the entry page: %s", e)
+        self._mark = self.browser.mark()  # the way back is not a second offence
+        if page is self.browser.page():
+            self.conv = self._fresh_conversation()
+            self.flux["ev"] = 0
 
     def _dialog_refusal(self, ev: Evidence | None = None) -> DriverRefusal:
         d = self.browser.pending()
@@ -678,21 +792,23 @@ class Recette:
 
     @staticmethod
     def _resolve(rel: str) -> Path:
-        for root in (DRIVER_DIR, RECETTE_DIR):
-            p = (root / rel).resolve()
-            if p.is_file() and root.resolve() in p.parents:
-                return p
-        raise DriverRefusal("precondition", f"fichier du cas introuvable : {rel}")
+        p = case_file(rel)
+        if p is None:
+            raise DriverRefusal("precondition", f"fichier du cas introuvable : {rel}")
+        return p
 
-    def _goto(self, page, url: str) -> None:
+    def _goto(self, page, url: str, check: bool = True) -> None:
+        """Naviguer vers une page de la liste ; une redirection suivie hors liste est défaite
+        (retour à la page d'entrée) et l'action rend `host`."""
         if not self.browser.allowed(url):
-            raise DriverRefusal("host", f"navigation hors liste refusée : {short_url(url)}")
-        try:
-            page.goto(url, wait_until="load", timeout=60_000)
-        except PWError as e:
-            if "ERR_BLOCKED_BY_CLIENT" in str(e):
-                raise DriverRefusal("host", f"navigation hors liste refusée : {short_url(url)}") from e
-            raise
+            host = urlsplit(url).hostname or ""
+            raise DriverRefusal("host", f"navigation hors liste refusée : {host}",
+                                extra={"host": host, "url": short_url(url)})
+        page.goto(url, wait_until="load", timeout=60_000)
+        if check and not self.browser.allowed(page.url):
+            nav = {"host": urlsplit(page.url).hostname or "", "url": short_url(page.url),
+                   "page": self.browser._index(page)}
+            raise self._host_refusal(nav)
         if page is self.browser.page():
             self.conv = self._fresh_conversation()
             self.flux["ev"] = 0
@@ -703,7 +819,8 @@ class Recette:
 
     def _save_observations(self) -> None:
         tmp = self.obs_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.observations, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.write_text(json.dumps(self.observations, ensure_ascii=False, indent=1), encoding="utf-8",
+                       errors="replace")
         os.replace(tmp, self.obs_path)
 
     def _deadline(self, wanted_s: float) -> tuple[float, bool]:
@@ -720,11 +837,12 @@ class Recette:
     def _journal_add(self, cid: str, verdict: str, timing_s, evidence: str, nfr: list,
                      pipeline_ms: dict | None = None) -> str:
         event = journal.add(str(self.journal_path), argparse.Namespace(
-            step="exec", case=cid, verdict=verdict,
+            step="exec", case=clean(cid), verdict=verdict,
             timing=round(timing_s, 1) if isinstance(timing_s, (int, float)) else None,
-            evidence=evidence[:600],
+            evidence=clean(evidence)[:600],
             pipeline=[f"{k}={int(v)}" for k, v in (pipeline_ms or {}).items()] or None,
-            nfr=",".join(nfr) or None, supersedes=None))
+            nfr=",".join(nfr) or None, supersedes=None),
+            extra={"inputs_sha256": self.inputs_sha256})
         return json.dumps(event, ensure_ascii=False)
 
     # -- envoyer un message et attendre la réponse -------------------------------------------
@@ -760,6 +878,7 @@ class Recette:
             t.update(done=False, events=[], saw_stop=False, stop_gone=None, stable=None, last_text=None)
         start = min(t["t_send"] for t in turns)
         while not all(t["done"] for t in turns):
+            self._check_host()  # the page left the list: no answer is coming here
             if time.monotonic() - start >= wait_s:
                 raise AskTimeout(time.monotonic() - start, "pas de fin de réponse")
             for t in (t for t in turns if not t["done"]):
@@ -1019,7 +1138,8 @@ class Recette:
 
     def capturer_flux(self, args: dict, ev: Evidence) -> dict:
         """Ce qui s'est passé depuis le dernier appel : lignes du flux (window.__ev), console,
-        requêtes en échec (statut ≥ 400 ou coupées), requêtes bloquées par la liste d'hôtes."""
+        requêtes en échec (statut ≥ 400 ou coupées), hôtes tiers contactés (relevés, pas
+        bloqués)."""
         b = self.browser
         all_ev = b.call("() => window.__ev || []")
         start = self.flux["ev"] if self.flux["ev"] <= len(all_ev) else 0
@@ -1027,11 +1147,13 @@ class Recette:
         mark, self.flux["mark"] = self.flux["mark"], b.mark()
         capture = b.capture(mark)
         failed = [e for e in capture["requests"] if (e.get("status") or 0) >= 400 or e.get("failure")]
+        third = capture["third_party_hosts"]
         ev.json("network.json", {**capture, "events": events, "failed": failed}, cap=NETWORK_CAP)
         return {"events": events[-200:], "console": capture["console"][-100:], "failed": failed[-100:],
-                "blocked": capture["blocked"][-100:],
+                "third_party_hosts": third,
                 "text": (f"{len(events)} lignes de flux, {len(capture['console'])} messages console, "
-                         f"{len(failed)} requêtes en échec, {len(capture['blocked'])} bloquées")}
+                         f"{len(failed)} requêtes en échec, {len(third)} hôtes tiers"
+                         + (f" ({', '.join(h['host'] for h in third[:5])})" if third else ""))}
 
     def verdict_oracle(self, args: dict, ev: Evidence) -> dict:
         """evaluer.py sur la dernière observation du cas, puis une ligne au journal (annexe C).
@@ -1049,34 +1171,39 @@ class Recette:
         obs = self.observations.get(key) or {}
         asked = "answer" in obs
         attach = obs.get("attach") or {}
+        dialog = obs.get("dialog")
         nfr = case["nfr"]
-        if obs.get("dialog") and not obs.get("answer"):
-            r = {"verdict": "KO", "notes": [f"dialogue inattendu ({obs['dialog']['type']}) : {obs['dialog']['message']}"]}
-        elif not asked and attach and attach.get("state") != "attached":
+        if not asked and not dialog and attach and attach.get("state") != "attached":
             r = {"verdict": "KO", "notes": [f"pièce jointe en échec ({attach.get('label') or 'sans puce'})"]}
             nfr = nfr_union(nfr, ["disponibilite"])
-        elif not asked:
+        elif not asked and not dialog:
             hint = {"load": "mesurer_chargement", "list": "lister_conversations",
                     "concurrent": "charge_concurrente"}.get(case["kind"], "poser_question")
             raise DriverRefusal("precondition", f"aucune observation pour {cid} : {hint} d'abord")
-        else:
+        elif asked:
             oracle = {"id": cid, "must": case["must"], "must_not": case["must_not"], "pii": case["pii"]}
             seen = {"answer": obs.get("answer"), "timing_s": obs.get("timing_s")}
             if obs.get("sent_to_model") is not None:
                 seen["sent"] = obs["sent_to_model"]
             r = evaluer.evaluate_case(oracle, seen, case.get("budget_s"))
-            if r["verdict"] == "NON TESTÉ":  # une réponse vide après un envoi : échec silencieux
+            if r["verdict"] == "NON TESTÉ" and not dialog:  # réponse vide après un envoi : échec silencieux
                 r["verdict"] = "KO"
                 r["notes"].append("réponse vide : échec silencieux")
                 nfr = nfr_union(nfr, ["disponibilite"])
+        else:
+            r = {"verdict": "KO", "notes": []}
         for key_ in ("missing", "forbidden", "leaks", "span_issues", "notes"):
             r.setdefault(key_, [])
+        if dialog:  # un dialogue inattendu pendant le cas est un KO sécurité, réponse ou pas
+            r["verdict"] = "KO"
+            r["notes"].insert(0, f"dialogue inattendu ({dialog['type']}) : {dialog['message']}")
+            nfr = nfr_union(nfr, ["securite"])
         line = self._journal_add(cid, r["verdict"], obs.get("timing_s"), self._summary(r, obs), nfr,
                                  obs.get("pipeline_ms"))
         self.observations.setdefault(key, obs)["verdict"] = {k: r[k] for k in ("verdict", "missing", "forbidden", "leaks", "span_issues", "notes")}
         if key != cid:
             self.observations[cid] = {"verdict": self.observations[key]["verdict"], "from": key}
-        ev.add("journal.jsonl", (line + "\n").encode("utf-8"))
+        ev.add("journal.jsonl", (line + "\n").encode("utf-8", "replace"))
         return {"case": cid, "verdict": r["verdict"], "missing": r["missing"], "forbidden": r["forbidden"],
                 "leaks": r["leaks"], "span_issues": r["span_issues"], "replayed": False, "text": line}
 
@@ -1214,7 +1341,7 @@ def main() -> int:
         log.error("not started: %s", e)
         return 2
     try:
-        serve(NAME, VERSION, recette.actions(), on_ready=recette.open, idle=recette.browser.pump)
+        serve(NAME, recette.version, recette.actions(), on_ready=recette.open)
     finally:
         recette.browser.close()
     return 0

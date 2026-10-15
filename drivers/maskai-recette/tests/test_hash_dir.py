@@ -80,6 +80,7 @@ class HashDirTest(unittest.TestCase):
         self.assertEqual(fixture["actions"], live["actions"])
         self.assertEqual((fixture["hosts"], fixture["program"]["headless"]), (["127.0.0.1"], True))
         self.assertEqual(live["hosts"], ["app.maskai.fr"])
+        self.assertEqual((live["max_action_ms"], fixture["max_action_ms"]), (240_000, 240_000))  # R17
         self.assertEqual(example, live, "the contract example is a copy of manifest.json")
 
     def test_the_command_line_prints_the_hash(self):

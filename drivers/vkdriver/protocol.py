@@ -12,16 +12,17 @@ action writes its files under `evidence_dir` and names them.
 Stdout belongs to the protocol. `serve` keeps a private copy of it and points
 file descriptor 1 at stderr, which the host appends to `driver.log`: a stray
 `print`, a library warning or a child process that inherits our stdout lands
-in the log instead of corrupting the protocol stream.
+in the log instead of corrupting the protocol stream. Every line is valid
+UTF-8: a lone surrogate (a JavaScript string cut in the middle of a pair)
+becomes `?` rather than an encoding error that would leave a request
+unanswered.
 
 The harness only reads `result`, so a refusal also says itself there:
 `{"refused": reason, "detail": detail, "text": "..."}`.
 """
 import json
 import os
-import queue
 import sys
-import threading
 import time
 import traceback
 
@@ -65,38 +66,7 @@ def _protocol_stdout():
     fd = os.dup(1)
     os.dup2(2, 1)
     sys.stdout = sys.stderr
-    return os.fdopen(fd, "w", encoding="utf-8", newline="\n")
-
-
-def _requests(idle):
-    """The request lines, decoded. With `idle`, stdin is read on a thread and
-    `idle()` runs about ten times a second while no request is waiting, so a
-    driver can keep its peripheral serviced between requests."""
-    stdin = sys.stdin.buffer
-    if idle is None:
-        for raw in stdin:
-            yield raw.decode("utf-8", "replace")
-        return
-    lines: queue.Queue = queue.Queue()
-
-    def reader():
-        for raw in stdin:
-            lines.put(raw.decode("utf-8", "replace"))
-        lines.put(None)
-
-    threading.Thread(target=reader, name="stdin", daemon=True).start()
-    while True:
-        try:
-            line = lines.get(timeout=0.1)
-        except queue.Empty:
-            try:
-                idle()
-            except Exception:  # noqa: BLE001 — idle work must never end the loop
-                _log("idle: " + traceback.format_exc())
-            continue
-        if line is None:
-            return
-        yield line
+    return os.fdopen(fd, "w", encoding="utf-8", errors="replace", newline="\n")
 
 
 def _refusal(rid, reason: str, detail: str, extra: dict | None = None,
@@ -108,17 +78,20 @@ def _refusal(rid, reason: str, detail: str, extra: dict | None = None,
             "evidence": evidence or []}
 
 
-def serve(name: str, version: str, actions: dict, on_ready=None, idle=None) -> None:
+def serve(name: str, version: str, actions: dict, on_ready=None) -> None:
     """Run the loop until stdin closes.
 
     actions: {name: fn(args: dict, evidence_dir: str) -> (result: dict, evidence: list[dict])};
-    fn may raise DriverRefusal. on_ready() runs once, right after the hello;
-    idle() runs between requests (see `_requests`)."""
+    fn may raise DriverRefusal. on_ready() runs once, right after the hello."""
     global _deadline_at
     out = _protocol_stdout()
 
     def say(obj) -> None:
-        out.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        line = json.dumps(obj, ensure_ascii=False)
+        try:
+            out.write(line + "\n")
+        except UnicodeEncodeError:  # belt and braces: the stream already replaces
+            out.write(line.encode("utf-8", "replace").decode("utf-8") + "\n")
         out.flush()
 
     say({"hello": {"protocol": PROTOCOL, "driver": name, "version": version,
@@ -128,8 +101,8 @@ def serve(name: str, version: str, actions: dict, on_ready=None, idle=None) -> N
             on_ready()
         except Exception:  # noqa: BLE001 — the driver stays up; each action reports
             _log("on_ready: " + traceback.format_exc())
-    for line in _requests(idle):
-        line = line.strip()
+    for raw in sys.stdin.buffer:
+        line = raw.decode("utf-8", "replace").strip()
         if not line:
             continue
         try:
@@ -151,7 +124,9 @@ def serve(name: str, version: str, actions: dict, on_ready=None, idle=None) -> N
             answer = {"id": rid, "ok": True, "result": result, "evidence": evidence}
         except DriverRefusal as r:
             answer = _refusal(rid, r.reason, r.detail, r.extra, r.evidence)
-        except Exception as e:  # noqa: BLE001 — the host must always get an answer
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:  # noqa: BLE001 — SystemExit included: the host must always get an answer
             _log(traceback.format_exc())
             answer = _refusal(rid, "internal", f"{type(e).__name__}: {e}")
         finally:

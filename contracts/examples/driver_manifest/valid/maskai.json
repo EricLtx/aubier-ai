@@ -8,7 +8,7 @@
       "-I",
       "driver.py"
     ],
-    "files_sha256": "sha256:a88aa7a62f8f2427dfc739bd84c3ae7543fee513ef7b4bd98c510084da1abe39",
+    "files_sha256": "sha256:b469a62f99302a645142f5db43e062977f502249368e61a731b33d2b6b08cf76",
     "browser_channel": "chrome",
     "headless": false
   },
@@ -212,7 +212,7 @@
     }
   ],
   "min_interval_ms": 2000,
-  "max_action_ms": 120000,
+  "max_action_ms": 240000,
   "clearance": {
     "max_scope": "business",
     "third_party_allowed": true

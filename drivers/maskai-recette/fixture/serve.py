@@ -8,8 +8,10 @@ names the attachments the page declared. Trigger words in the request body:
 
   SLOW            sleep 8 s before the first event (abandon deadline tests);
   EXTERNAL_IMG    append <img src="http://example.invalid/x"> to the answer
-                  (host allow-list tests);
-  TRIGGER_DIALOG  the page opens a confirm() after the answer (dialog guard).
+                  (a third-party host, recorded and not blocked);
+  TRIGGER_DIALOG  the page opens a confirm() after the answer (dialog guard);
+  NAVIGATE_AWAY   the page then navigates to http://localhost:<port>/away, a
+                  host outside a 127.0.0.1-only list (navigation guard).
 
 Usage: python -I serve.py [port]     (default 8765; 0 picks a free port)
 The first line on stdout is `listening <port>`.
