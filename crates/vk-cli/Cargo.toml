@@ -22,6 +22,8 @@ serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 hex.workspace = true
+# `vk artefact cat` (Ruling R22) decodes the bytes `artefact.read` carries.
+base64.workspace = true
 # `vk secret set` writes to this account's keyring, directly: no daemon is
 # involved, so the shell needs the same keyring this node's store uses.
 keyring.workspace = true

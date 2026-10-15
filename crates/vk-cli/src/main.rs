@@ -15,6 +15,7 @@ mod render;
 mod until;
 
 use anyhow::{anyhow, Context, Result};
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -104,6 +105,11 @@ enum Cmd {
     Driver {
         #[command(subcommand)]
         what: DriverCmd,
+    },
+    /// The artefacts a task attached: read one before you sign it.
+    Artefact {
+        #[command(subcommand)]
+        what: ArtefactCmd,
     },
     /// Submit, step and inspect tasks.
     Task {
@@ -426,6 +432,23 @@ enum DriverCmd {
     Show { name: String },
     /// Unmount a driver by name and stop its process.
     Umount { name: String },
+}
+
+#[derive(Subcommand)]
+enum ArtefactCmd {
+    /// Print an artefact's bytes: to stdout when they are UTF-8 text, to
+    /// `--out FILE` otherwise. Human: signed with this node's device key,
+    /// because it takes plaintext out of the encrypted store (Ruling R22).
+    /// `vk task show TASK --json` lists a task's artefacts, hash and kind;
+    /// the last one is what its approve step signs.
+    Cat {
+        /// The artefact's address: `sha256:` and 64 hex digits (the prefix
+        /// may be left out).
+        hash: String,
+        /// Write the bytes to this file instead of printing them.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -910,6 +933,9 @@ async fn call(cli: &Cli) -> Result<()> {
                 render::mounted_driver,
             )
         }
+        Cmd::Artefact {
+            what: ArtefactCmd::Cat { hash, out },
+        } => artefact_cat(cli, &c, hash, out.as_deref()).await,
         Cmd::Driver {
             what: DriverCmd::Ls,
         } => show(
@@ -1220,6 +1246,43 @@ async fn harness(cli: &Cli, c: &Client, what: &HarnessCmd) -> Result<()> {
     } else {
         show(cli, answer, render::harness_run)
     }
+}
+
+/// `vk artefact cat` (Ruling R22): the bytes of one artefact, read with a
+/// presence proof — the founder reads the verdict and the report before he
+/// signs them. Text goes to stdout as it is; anything else is refused unless
+/// `--out` names a file to hold it, because raw bytes on a terminal are
+/// neither readable nor safe. `--json` prints the daemon's answer (base64).
+async fn artefact_cat(cli: &Cli, c: &Client, hash: &str, out: Option<&Path>) -> Result<()> {
+    let proof = presence(c).await?;
+    let answer = c
+        .call("artefact.read", json!({ "hash": hash }), Some(proof))
+        .await?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&answer)?);
+        return Ok(());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(field(&answer, "bytes_base64")?)
+        .context("the daemon's bytes_base64 is not base64")?;
+    match out {
+        Some(file) => {
+            std::fs::write(file, &bytes).with_context(|| format!("write {}", file.display()))?;
+            println!("wrote {} bytes to {}", bytes.len(), file.display());
+        }
+        None => match std::str::from_utf8(&bytes) {
+            Ok(text) => {
+                use std::io::Write as _;
+                let mut stdout = std::io::stdout().lock();
+                // The bytes as they are, not a byte added: what is read
+                // here is what was signed.
+                stdout.write_all(text.as_bytes())?;
+                stdout.flush()?;
+            }
+            Err(_) => return Err(anyhow!("{} bytes, not text; use --out FILE", bytes.len())),
+        },
+    }
+    Ok(())
 }
 
 /// A task recipe file (pilot spec §5.1), read and checked on this end: a typo

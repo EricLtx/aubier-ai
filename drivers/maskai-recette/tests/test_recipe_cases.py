@@ -12,8 +12,11 @@ DRIVER = os.path.dirname(TESTS)
 REPO = os.path.dirname(os.path.dirname(DRIVER))
 
 # The three shapes of case id: the grid's (N4-2, N2-1a), the corpus-v2 oracles'
-# (V2-L1, V2-V5) and the fixture's (fixture-case-1).
-CASE_ID = re.compile(r"N\d-\d+[a-z]?|V2-[LV]\d|fixture-case-\d")
+# (V2-L1, V2-V5) and the fixture's (fixture-case-1) — whole tokens only, so
+# `V2-V12` is not read as `V2-V1` nor `xN1-1` as `N1-1`.
+CASE_ID = re.compile(r"(?<![\w-])(?:N\d-\d+[a-z]?|V2-[LV]\d|fixture-case-\d)(?!\w)")
+# The rules every harness step carries, from « Règles. » to the last forbidden tool.
+RULES = re.compile(r"Règles\. .*?vk_write_decision\. ", re.S)
 LEVEL = re.compile(r"^Niveau (N\d) ")
 
 
@@ -32,6 +35,26 @@ class RecipeCasesTest(unittest.TestCase):
         self.recipes = {
             name: load(REPO, "recipes", name) for name in ("recette-maskai.json", "recette-fixture.json")
         }
+
+    def test_the_case_pattern_reads_whole_ids_only(self):
+        self.assertEqual(
+            CASE_ID.findall("N2-1a, V2-V1 ; fixture-case-2 (N0-1) V2-V12 xN1-1 N1-1ab N1-12 -N3-1 V2-L3_"),
+            ["N2-1a", "V2-V1", "fixture-case-2", "N0-1", "N1-12"])
+
+    def test_the_rules_block_is_the_same_in_every_harness_step(self):
+        """One rules block, twelve copies: a correction made in one step and not
+        the others would leave levels that refuse, replay or stop differently."""
+        blocks = []
+        for name, recipe in self.recipes.items():
+            for i, step in enumerate(harness_steps(recipe)):
+                found = RULES.findall(step["instruction"])
+                self.assertEqual(len(found), 1, f"{name} harness step {i + 1}: one rules block")
+                blocks.append((f"{name} harness step {i + 1}", found[0]))
+        self.assertEqual(len(blocks), 12)
+        first = blocks[0][1]
+        for where, block in blocks[1:]:
+            self.assertEqual(block, first, f"{where} differs from {blocks[0][0]}")
+        self.assertIn("s'il refuse à son tour, passe au cas suivant sans rejouer le cas", first)
 
     def test_every_case_named_in_a_recipe_exists(self):
         for name, recipe in self.recipes.items():

@@ -2180,6 +2180,105 @@ fn the_committed_recipes_submit_by_name_against_mock_arches() {
     }
 }
 
+/// Ruling R22: the founder reads what he signs. `vk task show --json` lists the
+/// register's artefacts (hash, kind) and the human page names the latest —
+/// the one the approve step signs; `vk artefact cat` prints its text, signed
+/// with the node's key, or saves it with `--out`. The same syscall from a bare
+/// connection (a machine principal) is refused I1.
+#[test]
+fn vk_artefact_cat_prints_what_the_approval_signs() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key,
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Rédiger le verdict",
+            "--artefact",
+            "verdict.md",
+            "--plan",
+            &arch,
+            "--draft",
+            &arch,
+            "--approve",
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let waiting = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(waiting["status"], "waiting_human", "{waiting}");
+
+    // The list, and the latest on the human page.
+    let shown = sh.json(&["task", "show", &task, "--json"]);
+    let artefacts = shown["artefacts"].as_array().expect("artefacts").clone();
+    assert_eq!(artefacts.len(), 1, "{shown}");
+    assert_eq!(artefacts[0]["kind"], "verdict.md", "{shown}");
+    let hash = str_of(&artefacts[0], "hash").to_string();
+    let page = sh.ok(&["task", "show", &task]);
+    assert!(
+        page.contains(&format!("1, latest verdict.md {hash}")),
+        "{page}"
+    );
+
+    // Its text, exactly; the prefix may be left out; --out saves the bytes.
+    let printed = sh.ok(&["artefact", "cat", &hash]);
+    assert!(printed.starts_with("draft: DRAFT:"), "{printed}");
+    assert!(printed.contains("Rédiger le verdict"), "{printed}");
+    let bare = hash.trim_start_matches("sha256:");
+    assert_eq!(sh.ok(&["artefact", "cat", bare]), printed);
+    let saved = dir.path().join("verdict.md");
+    let wrote = sh.ok(&["artefact", "cat", &hash, "--out", &path_of(&saved)]);
+    assert!(
+        wrote.starts_with(&format!("wrote {} bytes to", printed.len())),
+        "{wrote}"
+    );
+    assert_eq!(std::fs::read(&saved).unwrap(), printed.as_bytes());
+    // What is read is what the approval signs.
+    let approved = sh.json(&["approve", &task, "--json"]);
+    assert_eq!(approved["subject_hash"], hash.as_str(), "{approved}");
+
+    // Not an address: refused, nothing printed.
+    let o = sh.run(&["artefact", "cat", "not-a-hash"]);
+    assert!(!o.status.success(), "a malformed hash is refused");
+    assert!(o.stdout.is_empty());
+
+    // A bare connection is a machine principal: refused I1.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let err = rt.block_on(async {
+        let c = vk_ipc::client::Client::connect(&vk_ipc::transport::Endpoint(endpoint.clone()))
+            .await
+            .unwrap();
+        c.call("artefact.read", serde_json::json!({ "hash": hash }), None)
+            .await
+            .unwrap_err()
+    });
+    let code = err
+        .downcast_ref::<vk_ipc::client::CallError>()
+        .map(|e| e.code);
+    assert_eq!(code, Some(vk_ipc::E_INVARIANT), "{err}");
+    assert!(err.to_string().contains("human act"), "{err}");
+}
+
 /// The scripted driver of Task 1's brief, verbatim (`crates/vk-driver/tests/
 /// fake_driver.rs`): copied, because one test binary does not import another.
 const FAKE_DRIVER: &str = r#"import json, os, sys, time

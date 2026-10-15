@@ -24,6 +24,7 @@ Le pilote se lit comme un système embarqué.
 | `max_actions`, `timeout_s` d'un pas | Le budget d'appels de la tâche, et son chien de garde. |
 | `vkd --harness-timeout-secs` | Le chien de garde global. Le plus court des deux chiens de garde gagne. |
 | `vk approve` | Le point de validation, signé par la clé de l'appareil : la preuve de présence humaine. |
+| `vk artefact cat` | La lecture de ce qu'on va signer, par un humain, signée elle aussi : on lit la mémoire avant de valider. |
 | `vk stop` | L'arrêt d'urgence. Il tue l'arbre du harnais et l'action en vol. |
 | `driver_id`, `files_sha256` | L'empreinte du firmware du pilote. Un octet changé dans `drivers/maskai-recette/` donne un autre pilote. |
 | `inputs_sha256` | L'empreinte des tables de calibration du verdict (§13). |
@@ -90,11 +91,11 @@ Attendu : aucune sortie. Pour rétablir la veille après la séance : `powercfg 
 $env:CARGO_TARGET_DIR = "$env:USERPROFILE\.cargo-target\verticalai"
 $env:OPENSSL_SRC_PERL = "$env:USERPROFILE\.cargo-target\tools\strawberry-perl\perl\bin\perl.exe"
 cargo build --release -p vk-cli -p vkd -p vk-mcp
-$env:PATH = "$env:CARGO_TARGET_DIR\release;$env:PATH"
+$env:PATH = "$env:USERPROFILE\.cargo-target\verticalai\release;$env:PATH"
 ```
 Attendu : `Finished `release` profile [optimized] target(s) in …`
 
-La ligne `$env:PATH` est à refaire dans chaque terminal ouvert pour la séance.
+La ligne `$env:PATH` est à refaire, telle quelle, dans chaque terminal ouvert pour la séance. Elle ne dépend d'aucune autre variable.
 
 ---
 
@@ -203,15 +204,12 @@ Le profil Chrome est conservé au démontage, et la session MaskAI avec lui.
 ## 7. Soumettre la recette
 
 ```powershell
-vk task submit --steps recipes\recette-maskai.json
+$t = (vk task submit --steps recipes\recette-maskai.json --json | ConvertFrom-Json).id
+vk task show $t
 ```
-Attendu : `task      task-node-1-N`, puis seize lignes. La 1 est `plan`, les 2 à 11 sont `harness`, puis viennent 12 `judge`, 13 `approve`, 14 `draft`, 15 `approve` et 16 `release`. Le détail de la ligne 16 est `recettage-chat-ia/runs/2026-10`.
+Attendu : `task       task-node-1-N`, puis seize lignes. La 1 est `plan`, les 2 à 11 sont `harness`, puis viennent 12 `judge`, 13 `approve`, 14 `draft`, 15 `approve` et 16 `release`. Le détail de la ligne 16 se termine par `recettage-chat-ia/runs/2026-10`.
 
-Notez l'id de la tâche :
-```powershell
-$t = "task-node-1-N"
-```
-Remplacez `N` par le numéro affiché.
+`$t` garde l'id de la tâche pour toutes les commandes suivantes de ce terminal.
 
 ---
 
@@ -269,9 +267,10 @@ Le symptôme d'un sélecteur faux est un KO `réponse vide : échec silencieux` 
 1. Ne lancez pas le niveau suivant : entre deux niveaux, rien ne tourne. La tâche en cours est abandonnée telle quelle.
 2. Corrigez `SELECTORS` dans `driver.py`.
 3. Relancez `setup.ps1`, et recopiez le nouveau `files_sha256` qu'il affiche dans les deux manifestes.
-4. Mettez de côté le journal faux : renommez `$S\drivers\maskai-1\work\journal.jsonl`, `journal.cursor` et `observations.json` avec un suffixe daté. On ne les efface pas : ce sont des preuves.
-5. Démontez et remontez le driver (§6.3).
-6. Soumettez de nouveau la recette (§7).
+4. Démontez le driver : `vk driver umount maskai-1`. Il garde ses observations en mémoire, donc on l'arrête avant de toucher à ses fichiers.
+5. Mettez de côté le journal faux : renommez `$S\drivers\maskai-1\work\journal.jsonl`, `journal.cursor` et `observations.json` avec un suffixe daté. On ne les efface pas : ce sont des preuves.
+6. Remontez le driver (§6.1). Attendu : un nouveau `driver_id`, puisque `files_sha256` a changé.
+7. Soumettez de nouveau la recette (§7).
 
 Autre point du premier passage : une modale ordinaire de MaskAI (sélecteur de modèle, menu) qui porterait `role=dialog` fait refuser `dialog`. Ajoutez-la à `KNOWN_MODALS`, puis suivez la même procédure.
 
@@ -294,22 +293,40 @@ vk task step $t                 # 12 juge
 ```
 Attendu : `judge  done`, puis `approve  pending` sur la ligne 13.
 
-**Avant de signer, lisez ce qui engage** (procédure §6, étape 5) : les KO sécurité du journal.
+**Avant de signer, lisez ce qui engage** (procédure §6, étape 5). D'abord les KO sécurité du journal :
 ```powershell
 Get-Content "$S\drivers\maskai-1\work\journal.jsonl" -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.verdict -eq 'KO' -and $_.nfr -contains 'securite' } | Select-Object case, evidence | Format-List
 ```
+Puis le verdict du juge lui-même (Ruling R22). Une approbation signe le **dernier** artefact du registre de la tâche, et c'est celui-là qu'on lit :
+```powershell
+$a = (vk task show $t --json | ConvertFrom-Json).artefacts
+$a[-1].kind                     # attendu : verdict.md
+vk artefact cat $a[-1].hash
+```
+Attendu : le texte du verdict, qui commence par `judge:`.
 
-> **Limite connue du pilote.** `vk` n'affiche pas le texte d'un artefact avant sa publication. `/artefacts/<hash>` ne rend que l'enveloppe. Vous signez donc `verdict.md`, puis `report.md`, sur la foi du journal ; leur texte ne se lit qu'après le pas 16, dans le dossier publié. Si le texte publié ne convient pas, on ne le copie pas dans le dépôt. On soumet de nouveau la recette : les dix niveaux sont rejoués depuis le journal sans toucher MaskAI (§12), puis le juge et la rédaction refont leur travail.
+`vk artefact cat` est un acte humain, signé par la clé de l'appareil comme `vk approve`. Pour un artefact qui n'est pas du texte, ajoutez `--out fichier`. La page `vk task show $t` le dit aussi, sur la ligne `artefacts` : `N, latest verdict.md sha256:…`.
 
 ```powershell
 vk approve $t                   # 13 : verdict et KO sécurité
 ```
-Attendu : `approved sha256:…`, puis `run `vk task step … --all` to continue`.
+Attendu : `approved sha256:…`, le même hash que `$a[-1].hash`, puis `run `vk task step … --all` to continue`.
 
 ```powershell
 vk task step $t --all           # 13 se ferme, puis 14 rédaction ; s'arrête sur 15
 ```
 Attendu : `draft  done` et `approve  waiting_human`.
+
+Lisez le rapport avant de le signer, de la même façon :
+```powershell
+$a = (vk task show $t --json | ConvertFrom-Json).artefacts
+$a[-1].kind                     # attendu : report.md
+vk artefact cat $a[-1].hash --out "$env:TEMP\rapport-a-signer.md"
+notepad "$env:TEMP\rapport-a-signer.md"
+```
+Attendu : `wrote N bytes to …`, puis le rapport dans le Bloc-notes, où les accents s'affichent sans faute quelle que soit la page de code du terminal.
+
+**S'il ne convient pas, ne le signez pas.** La tâche reste en attente sur la ligne 15, et rien n'est publié. Pour faire refaire le juge et la rédaction, appliquez la reprise (§12) : les dix niveaux sont rejoués depuis le journal sans toucher MaskAI.
 
 ```powershell
 vk approve $t                   # 15 : le rapport
@@ -344,16 +361,24 @@ Get-ChildItem $src | Select-Object Name, Length
 ```
 Attendu : des fichiers `<hash12>.<nom>`. On y trouve `report.md`, `verdict.md`, des `journal.jsonl` (un par export et par verdict), et les preuves : `screen.png`, `answer.png`, `attach.png`, `dom.html`, `network.json`, `timing.json`. Le préfixe est l'adresse de l'artefact, gardez les noms.
 
+**Ce dossier peut contenir les fichiers d'une autre tâche.** La publication écrit dans le dossier existant sans le vider. Une tâche précédente publiée au même endroit y a laissé ses propres `report.md` et `verdict.md`, par exemple un rapport refusé puis refait. La reprise (§12) renomme le dossier avant de soumettre de nouveau, mais on ne copie jamais le dossier entier : seulement les fichiers dont le préfixe de 12 caractères est l'adresse d'un artefact de **cette** tâche. Les adresses dépendent de la tâche, donc deux tâches n'en partagent jamais.
+
 **10.3 Expurger (contrainte 5), puis copier.** Le dépôt GitHub est **public**.
 - **Un KO sécurité non corrigé par MaskAI**, c'est-à-dire un `KO` avec `securite` dans le journal : rien ne va dans le dépôt. Le rapport reste privé (contrainte 4). Prévenez MaskAI, et gardez le dossier hors du dépôt.
-- **Sinon**, copiez dans un dossier de préparation, puis cherchez les adresses et les comptes :
+- **Sinon**, copiez les seuls fichiers de cette tâche dans le dossier de préparation, puis cherchez les adresses et les comptes :
 ```powershell
+$mine = (vk task show $t --json | ConvertFrom-Json).artefacts | ForEach-Object { $_.hash.Substring(7, 12) }
 $dst = "docs\use-cases\recettage-chat-ia\runs\2026-10-15"   # la date de la séance
 New-Item -ItemType Directory -Force $dst | Out-Null
-Copy-Item "$src\*" $dst
+Get-ChildItem $src -File | Where-Object { $mine -contains $_.Name.Substring(0, 12) } | Copy-Item -Destination $dst
+"{0} fichiers dans le dossier publié, {1} copiés" -f (Get-ChildItem $src -File).Count, (Get-ChildItem $dst -File).Count
 Select-String -Path "$dst\*.md","$dst\*.jsonl","$dst\*.json","$dst\*.html" -Encoding UTF8 -Pattern '\b(?:\d{1,3}\.){3}\d{1,3}\b','[\w.+-]+@[\w-]+\.[\w.]+','localhost:\d+' | Select-Object Filename, LineNumber, Line
 ```
-Attendu : aucune ligne. Chaque ligne trouvée se remplace par un marqueur (`<IP-INTERNE>`, `<COMPTE>`), comme dans le rapport du 2026-10-13.
+Attendu :
+- `N fichiers dans le dossier publié, N copiés`. Les deux nombres sont égaux quand le dossier ne contient que cette tâche ; s'ils diffèrent, les fichiers en trop sont d'une autre tâche, et ils restent où ils sont.
+- Puis aucune ligne de `Select-String`.
+
+Chaque ligne trouvée se remplace par un marqueur (`<IP-INTERNE>`, `<COMPTE>`), comme dans le rapport du 2026-10-13.
 
 Les PNG ne se cherchent pas par texte. Regardez-les un par un : le nom du compte apparaît-il dans l'en-tête de MaskAI ? Retirez du dossier ceux que vous ne publiez pas, et dites-le dans la section Traçabilité du rapport.
 ```powershell
@@ -387,7 +412,28 @@ Le journal du driver est append-only et survit à tout : à la tâche, au démon
 - `replayed: true` : le cas est déjà journalisé, le harnais passe au suivant sans toucher MaskAI ;
 - refus `precondition` : le cas reste à faire, le harnais le joue.
 
-Le verdict rejoué est réinscrit au registre de la nouvelle tâche, ce qui permet au juge de voir tous les cas. **Pour reprendre, on soumet de nouveau la même recette** (§7), puis on refait les §8 et §9.
+Le verdict rejoué est réinscrit au registre de la nouvelle tâche, ce qui permet au juge de voir tous les cas. **Pour reprendre, on soumet de nouveau la même recette.** Cela vaut après un dialogue, une tâche échouée, un démon tué, ou un verdict ou un rapport qu'on refuse de signer. Avant de soumettre, deux choses sont à mettre de côté.
+
+- **Les observations du driver.** `observations.json` garde la dernière mesure non jugée. N0-1 et N0-2 se jugent sur la même mesure de chargement (`@load`). Si N0-1 est journalisé et N0-2 ne l'est pas, une ancienne mesure resterait là pour juger N0-2. L'instruction N0 mesure déjà avant le verdict de N0-2 ; on retire en plus le fichier. Il se trouve dans `<dossier d'état>\drivers\maskai-1\work\observations.json`. Le driver le garde en mémoire, donc il faut l'arrêter avant de le déplacer.
+- **Le dossier publié.** La publication écrit dans le dossier existant sans le vider. Une tâche déjà publiée y laisse son `report.md` et son `verdict.md` à côté des nouveaux. On le renomme : il devient la trace de l'essai précédent.
+
+```powershell
+$S = (vk status --json | ConvertFrom-Json).state_dir
+$n = 1                                   # 1 au premier essai repris, puis 2, 3…
+vk driver umount maskai-1
+$obs = "$S\drivers\maskai-1\work\observations.json"
+if (Test-Path $obs) { Rename-Item $obs "observations-essai$n.json" }
+$src = "$S\exports\recettage-chat-ia\runs\2026-10"
+if (Test-Path $src) { Rename-Item $src "2026-10-essai$n" }
+vk mount driver --manifest drivers\maskai-recette\manifest.json
+$t = (vk task submit --steps recipes\recette-maskai.json --json | ConvertFrom-Json).id
+```
+Attendu :
+- `unmounted driver maskai-1`, puis le tableau `DRIVER … maskai-1 … yes` ;
+- Chrome se rouvre, avec la même session MaskAI ;
+- `vk task show $t` montre seize lignes `pending`.
+
+Puis on refait les §8 et §9. Les niveaux dont tous les cas sont déjà journalisés passent en une vingtaine de secondes chacun. Le journal (`journal.jsonl`) et son curseur (`journal.cursor`) restent en place : ce sont eux qui font la reprise.
 
 Chaque niveau finit par une capture d'écran inconditionnelle. Un pas de harnais qui ne laisse aucune preuve échoue (`harness produced no artefact`). Or un niveau dont tous les cas sont rejoués n'en laisserait aucune : un verdict rejoué n'a pas de preuve, et un export sans ligne nouvelle n'écrit pas de fichier. C'est vérifié sur le banc :
 - un niveau entièrement rejoué, sans la capture, finit `failed` ;
@@ -426,7 +472,7 @@ vkd --state-dir "$D\state" --endpoint '\\.\pipe\vk-repetition' --master-key-file
 # puis :
 vk mount mock mock
 vk mount driver --manifest drivers\maskai-recette\manifest-fixture.json
-vk task submit --steps recipes\recette-fixture.json      # notez $t
+$t = (vk task submit --steps recipes\recette-fixture.json --json | ConvertFrom-Json).id
 vk task step $t ; vk harness run $t ; vk harness run $t
 vk task step $t ; vk approve $t ; vk task step $t --all ; vk approve $t ; vk task step $t --all
 ```
@@ -440,11 +486,11 @@ Pour finir : Ctrl+C sur ce `vkd`, et fermez la fenêtre de `serve.py`. Puis `Rem
 
 - [ ] `vk task show $t` : seize lignes `done`, et `status done`.
 - [ ] `vk ledger verify` : la chaîne se vérifie.
-- [ ] Le ledger montre, pour cette tâche :
-  - au moins 1 `driver.mounted` ;
+- [ ] Le ledger montre, depuis le début de la séance (`vk dmesg`, §10.1) :
+  - au moins 1 `driver.mounted`. Un montage n'appartient à aucune tâche : c'est le pilote mis sous tension, et chaque remontage en ajoute un ;
   - les lignes `driver.acted` des dix niveaux ;
-  - 2 `approval.recorded` ;
-  - 1 `artefact.released`.
+  - 2 `approval.recorded` pour la tâche qui publie : 1 de plus pour chaque verdict signé dans une tâche abandonnée ensuite ;
+  - 1 `artefact.released` pour la tâche qui publie.
 - [ ] Les 34 cas de N0 à N9 (`cases.json`, hors banc d'essai) ont chacun une ligne au journal, ou bien sont nommés NON TESTÉ dans le rapport avec la raison.
 - [ ] Le rapport, le journal et les preuves expurgés sont sous `docs/use-cases/recettage-chat-ia/runs/<date>/`. S'il reste un KO sécurité non corrigé, ils sont gardés privés et la raison est notée.
 - [ ] Le delta avec `2026-10-13-maskai-benchmark.md` est écrit (notes par ENF, cinq défauts majeurs).

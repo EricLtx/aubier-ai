@@ -8,6 +8,7 @@ use crate::{
     E_NOT_FOUND, E_RETRY, E_STORE,
 };
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -676,6 +677,8 @@ fn takes_presence(method: &str) -> bool {
             // Putting a browser under this node's control is a human act: see
             // the refusal in `dispatch` (pilot spec §4.3, I1).
             | "driver.mount"
+            // Plaintext out of the encrypted store, to a terminal (R22).
+            | "artefact.read"
     )
 }
 
@@ -1363,12 +1366,53 @@ fn dispatch(
             let usage = k
                 .usage(&ctx, &vk_kernel::UsageFilter::Task(id.into()))
                 .map_err(kerr)?;
+            // The register's artefacts, by address and kind (Ruling R22):
+            // metadata only, never their bytes — which is what a human
+            // needs to name the one to read (`artefact.read`) before
+            // signing it, and to tell a task's released files from another
+            // task's in a shared export directory. The register read holds
+            // the caller to the register's label, as `task_decisions` does.
+            let artefacts = Kernel::read_register(&mut *k, &ctx, &task.register)
+                .map_err(kerr)?
+                .artefacts;
             let mut out = to_value(task)?;
             if let Some(o) = out.as_object_mut() {
                 o.insert("decisions".into(), to_value(decisions)?);
                 o.insert("usage".into(), to_value(usage)?);
+                o.insert("artefacts".into(), to_value(artefacts)?);
             }
             Ok(out)
+        }
+        // An artefact's bytes, to a human (Ruling R22): the founder reads the
+        // verdict and the report he is about to sign. A human act, because
+        // this is plaintext leaving the encrypted store for a terminal; the
+        // label must flow to the caller's clearance or `read_artefact`
+        // refuses with I2. Not logged: like `store.fsck`, a read changes
+        // nothing, and the approval that follows is what the record keeps.
+        // The answer carries no `kind`: the blob store does not index blobs
+        // by register, and finding the owner would mean reading every
+        // register — `task.show`'s `artefacts` gives the kind beside the hash.
+        "artefact.read" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            if !ctx.principal.is_human() {
+                return Err(invariant(
+                    "I1: reading an artefact's bytes is a human act; re-run it with a presence proof",
+                ));
+            }
+            let given = p["hash"].as_str().ok_or_else(|| bad("hash"))?;
+            let hex_part = given.strip_prefix("sha256:").unwrap_or(given);
+            if hex_part.len() != 64 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(bad(
+                    "hash: an artefact address, sha256: and 64 hex digits (vk task show --json lists them)",
+                ));
+            }
+            let hash = format!("sha256:{}", hex_part.to_ascii_lowercase());
+            let bytes = k.read_artefact(&ctx, &hash).map_err(kerr)?;
+            Ok(json!({
+                "hash": hash,
+                "len": bytes.len(),
+                "bytes_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            }))
         }
         "task.ls" => {
             let ctx = ctx_for(&k, presence, now)?;

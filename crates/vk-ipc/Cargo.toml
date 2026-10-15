@@ -35,6 +35,8 @@ directories.workspace = true
 rand.workspace = true
 hex.workspace = true
 uuid.workspace = true
+# `artefact.read` (Ruling R22) carries an artefact's bytes in the JSON answer.
+base64.workspace = true
 
 # `geteuid`, so the socket's directory is required to be this user's and not
 # only closed to others (SP1a review M6).

@@ -837,13 +837,31 @@ fn short(hash: &str) -> String {
 /// step shows the path its artefacts are written to, resolved under the
 /// kernel's export root by the caller (`release_paths`).
 pub fn task(v: &Value) -> String {
-    let head = fields(&[
+    let mut head = vec![
         ("task", text(&v["id"])),
         ("goal", text(&v["goal"])),
         ("artefact", text(&v["artefact_type"])),
         ("status", text(&v["status"])),
         ("register", text(&v["register"])),
-    ]);
+    ];
+    // How many artefacts the register holds, and the latest — the one an
+    // approve step signs, which `vk artefact cat` reads (Ruling R22). Only
+    // where the answer carries the list (`task.show`), not on `task.create`.
+    if let Some(list) = v["artefacts"].as_array() {
+        head.push((
+            "artefacts",
+            match list.last() {
+                Some(a) => format!(
+                    "{}, latest {} {}",
+                    list.len(),
+                    text(&a["kind"]),
+                    text(&a["hash"])
+                ),
+                None => "0".into(),
+            },
+        ));
+    }
+    let head = fields(&head);
     let steps = array(v, "steps");
     if steps.is_empty() {
         return head;
