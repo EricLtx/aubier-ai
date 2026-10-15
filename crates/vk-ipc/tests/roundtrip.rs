@@ -2009,3 +2009,305 @@ async fn a_forged_presence_proof_is_refused_before_the_keyring_is_touched() {
     drop(c);
     shutdown(server, k, d).await;
 }
+
+// ------------------------------- the newer API arches: Mistral, Gemini, compat
+
+/// A daemon's [`vk_ipc::server::ApiArches`] with every key in a file under
+/// `dir`, and the OpenAI-compatible server — when there is one — named.
+fn api_arches(dir: &std::path::Path, compat: Option<&str>) -> vk_ipc::server::ApiArches {
+    let file = |name: &str, key: &str| {
+        let path = dir.join(format!("{name}.key"));
+        std::fs::write(&path, format!("{key}\n")).unwrap();
+        vk_arch_anthropic::KeySource::File(path)
+    };
+    vk_ipc::server::ApiArches {
+        mistral_keys: file("mistral", MISTRAL_KEY),
+        gemini_keys: file("gemini", GEMINI_KEY),
+        openai_compat_keys: file("openai-compat", COMPAT_KEY),
+        openai_compat_base_url: compat.map(str::to_string),
+        ..vk_ipc::server::ApiArches::default()
+    }
+}
+
+const MISTRAL_KEY: &str = "mistral-ROUNDTRIPROUNDTRIPROUNDTRIP";
+const GEMINI_KEY: &str = "AIzaROUNDTRIPROUNDTRIPROUNDTRIP";
+const COMPAT_KEY: &str = "sk-compat-ROUNDTRIPROUNDTRIPROUNDTRIP";
+
+/// A kernel whose factory knows the daemon's `ApiArches`.
+fn kernel_with_api_arches(
+    dir: &std::path::Path,
+    api: &vk_ipc::server::ApiArches,
+) -> vk_kernel::RealKernel {
+    vk_contracts::testing::guard_state_dir(dir);
+    vk_kernel::RealKernel::open_with_factory(
+        dir,
+        vk_store::keys::KeySource::File(dir.join("m.key")),
+        "n1",
+        vk_ipc::server::adapter_factory_with(
+            dir.to_path_buf(),
+            vk_arch_anthropic::KeySource::Keyring,
+            vk_arch_anthropic::DEFAULT_BASE_URL.to_string(),
+            api.clone(),
+            std::path::PathBuf::from("claude"),
+        ),
+    )
+    .unwrap()
+}
+
+/// The three configs a person mounting the newer arches sends.
+fn api_mounts() -> [(&'static str, Value); 3] {
+    [
+        ("mistral", json!({"model": "mistral-small-2603"})),
+        ("gemini", json!({"model": "gemini-3.5-flash-lite"})),
+        (
+            "openai-compat",
+            json!({
+                "model": "mistral-medium-3",
+                "context_ceiling": 131_072,
+                "jurisdiction": "FR",
+                "retention_days": 30,
+            }),
+        ),
+    ]
+}
+
+/// Mounting Mistral, Gemini or an OpenAI-compatible server is a **human**
+/// act, the key comes from the daemon's own key source, and what is written
+/// down to re-create the arch carries the model and the claims — never a key,
+/// never an origin. Rebuilt from that record alone, each is the same arch.
+#[tokio::test]
+async fn the_newer_api_arches_mount_on_the_daemons_keys_and_their_specs_carry_none() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().to_path_buf();
+    let api = api_arches(&dir, Some("https://api.mammouth.ai"));
+
+    let k = Arc::new(Mutex::new(kernel_with_api_arches(&dir, &api)));
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        api_arches: api.clone(),
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    let mut mounted = Vec::new();
+    for (kind, config) in api_mounts() {
+        // Without a proof: a machine principal, refused with I1.
+        let err = c
+            .call(
+                "arch.mount",
+                json!({"kind": kind, "config": config.clone()}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{kind}: {err}");
+        assert!(err.to_string().contains("I1"), "{kind}: {err}");
+
+        let proof = prove(&c, &device).await;
+        let answer = c
+            .call(
+                "arch.mount",
+                json!({"kind": kind, "config": config}),
+                Some(proof),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{kind}: {e}"));
+        assert_eq!(answer["governed"], false, "{kind}");
+        assert!(
+            answer["name"].as_str().unwrap().starts_with(kind),
+            "{kind}: {answer}"
+        );
+        mounted.push((kind, answer["arch_id"].as_str().unwrap().to_string()));
+    }
+
+    drop(c);
+    server.abort();
+    let _ = server.await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The adapters own blocking HTTP clients, which may not be dropped from
+    // inside an async context: the rest happens on the blocking pool, as it
+    // does in `vkd`.
+    tokio::task::spawn_blocking(move || {
+        drop(k);
+        let k = kernel_with_api_arches(&dir, &api);
+        let pending = k.pending_mounts();
+        assert_eq!(pending.len(), 3, "three arches to re-create");
+        for (kind, arch_id) in &mounted {
+            let (_, spec) = pending
+                .iter()
+                .find(|(id, _)| id == arch_id)
+                .unwrap_or_else(|| panic!("{kind} was not recorded"));
+            assert_eq!(&spec.kind, kind);
+            let written = serde_json::to_string(&spec.config).unwrap();
+            for key in [MISTRAL_KEY, GEMINI_KEY, COMPAT_KEY] {
+                assert!(!written.contains(key), "{kind}: a key at rest: {written}");
+            }
+            assert!(
+                !written.contains("base_url") && !written.contains("http"),
+                "{kind}: the record names an endpoint: {written}"
+            );
+            assert!(spec.validate().is_ok(), "{spec:?}");
+
+            let adapter = (k.adapter_factory())(spec).expect("re-created");
+            let m = adapter.manifest();
+            assert_eq!(&m.arch_id(), arch_id, "{kind} came back another arch");
+            assert!(!m.governed);
+            let (jurisdiction, retention) = match *kind {
+                "mistral" => ("EU", 30),
+                "gemini" => ("US", 55),
+                _ => ("FR", 30),
+            };
+            assert_eq!(m.jurisdiction, jurisdiction, "{kind}");
+            assert_eq!(m.retention_days, Some(retention), "{kind}");
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// What a newer API mount may not do: name the origin its key is sent to,
+/// leave out a claim the `openai-compat` manifest must carry, make one that is
+/// no claim at all — or mount an OpenAI-compatible server on a daemon that
+/// was given none. Each is a bad request that says what to fix, and nothing is
+/// mounted by any of them.
+#[tokio::test]
+async fn a_newer_api_mount_may_not_name_its_origin_or_leave_out_a_claim() {
+    let d = tempfile::tempdir().unwrap();
+    let api = api_arches(d.path(), Some("http://127.0.0.1:9"));
+    let k = Arc::new(Mutex::new(kernel_with_api_arches(d.path(), &api)));
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        api_arches: api,
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    let claims = json!({"model": "m", "context_ceiling": 8192, "jurisdiction": "local", "retention_days": 0});
+    let without = |field: &str| {
+        let mut v = claims.clone();
+        v.as_object_mut().unwrap().remove(field);
+        v
+    };
+    let with = |field: &str, value: Value| {
+        let mut v = claims.clone();
+        v[field] = value;
+        v
+    };
+    for (kind, config, says) in [
+        (
+            "mistral",
+            json!({"base_url": "http://collector.example"}),
+            "base_url",
+        ),
+        (
+            "gemini",
+            json!({"endpoint": "http://collector.example"}),
+            "endpoint",
+        ),
+        (
+            "openai-compat",
+            with("base_url", json!("http://collector.example")),
+            "base_url",
+        ),
+        ("openai-compat", without("model"), "--model"),
+        ("openai-compat", without("context_ceiling"), "--ctx"),
+        ("openai-compat", without("jurisdiction"), "--jurisdiction"),
+        (
+            "openai-compat",
+            without("retention_days"),
+            "--retention-days",
+        ),
+        (
+            "openai-compat",
+            with("jurisdiction", json!("unknown")),
+            "not a claim",
+        ),
+        (
+            "openai-compat",
+            with("jurisdiction", json!("ZZ")),
+            "user-assigned",
+        ),
+        (
+            "gemini",
+            json!({"model": "../../v1/files"}),
+            "not a model id",
+        ),
+    ] {
+        let proof = prove(&c, &device).await;
+        let err = c
+            .call(
+                "arch.mount",
+                json!({"kind": kind, "config": config}),
+                Some(proof),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{kind}/{says}: {err}");
+        assert!(err.to_string().contains(says), "{kind}/{says}: {err}");
+    }
+    assert_eq!(
+        c.call("boot.info", json!({}), None).await.unwrap()["arches"],
+        0,
+        "nothing was mounted by any of them"
+    );
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// A daemon started without `--openai-compat-base-url` has no server to send
+/// an `openai-compat` arch's calls to, and says which flag gives it one; a
+/// daemon with no Mistral key says which verb sets it.
+#[tokio::test]
+async fn a_daemon_without_the_server_or_the_key_says_what_gives_it_one() {
+    let d = tempfile::tempdir().unwrap();
+    let api = vk_ipc::server::ApiArches {
+        mistral_keys: vk_arch_anthropic::KeySource::File(d.path().join("not-there.key")),
+        ..vk_ipc::server::ApiArches::default()
+    };
+    let k = Arc::new(Mutex::new(kernel_with_api_arches(d.path(), &api)));
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        api_arches: api,
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    for (kind, config, says) in [
+        (
+            "openai-compat",
+            api_mounts()[2].1.clone(),
+            "--openai-compat-base-url",
+        ),
+        ("mistral", json!({}), "vk secret set mistral"),
+    ] {
+        let proof = prove(&c, &device).await;
+        let err = c
+            .call(
+                "arch.mount",
+                json!({"kind": kind, "config": config}),
+                Some(proof),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(says), "{kind}: {err}");
+    }
+    assert_eq!(
+        c.call("boot.info", json!({}), None).await.unwrap()["arches"],
+        0
+    );
+    drop(c);
+    shutdown(server, k, d).await;
+}

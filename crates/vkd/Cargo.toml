@@ -29,6 +29,10 @@ vk-ipc = { path = "../vk-ipc", default-features = false }
 serde_json.workspace = true
 # The API arches key source (`--anthropic-key-file`), nothing more.
 vk-arch-anthropic = { path = "../vk-arch-anthropic", default-features = false }
+# The same, and the default origins, for the three newer API arches.
+vk-arch-openai-compat = { path = "../vk-arch-openai-compat" }
+vk-arch-mistral = { path = "../vk-arch-mistral" }
+vk-arch-gemini = { path = "../vk-arch-gemini" }
 # The passkey pages (SP1b Task 5), served on loopback beside the endpoint.
 vk-web = { path = "../vk-web" }
 tokio.workspace = true

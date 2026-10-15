@@ -61,6 +61,11 @@ pub struct ServerConfig {
     /// since the mount spec is replayed at every boot, and from a service
     /// account whose keyring that client cannot otherwise read at all.
     pub anthropic_base_url: String,
+    /// Where the three newer API arches — `mistral`, `gemini`,
+    /// `openai-compat` — read their keys and send their calls. Daemon
+    /// configuration, every field of it, for the reason `anthropic_base_url`
+    /// is.
+    pub api_arches: ApiArches,
     /// The Claude Code executable every `claude-code` arch runs — at mount,
     /// at every boot that re-creates one, at every call (founder decision
     /// 2026-10-13, after final review I-1; Rulings 41 and 43). Daemon
@@ -90,6 +95,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("web", &self.web.as_ref().map(|w| w.origin()))
             .field("anthropic_keys", &self.anthropic_keys)
             .field("anthropic_base_url", &self.anthropic_base_url)
+            .field("api_arches", &self.api_arches)
             .field("claude_bin", &self.claude_bin)
             .finish()
     }
@@ -105,8 +111,50 @@ impl ServerConfig {
             web: None,
             anthropic_keys: vk_arch_anthropic::KeySource::Keyring,
             anthropic_base_url: vk_arch_anthropic::DEFAULT_BASE_URL.to_string(),
+            api_arches: ApiArches::default(),
             claude_bin: PathBuf::from(DEFAULT_CLAUDE_BIN),
             drivers: crate::drivers::DriverPool::new(),
+        }
+    }
+}
+
+/// Where the `mistral`, `gemini` and `openai-compat` arches read their keys
+/// and send their calls.
+///
+/// **Never a request field**, any of it (the Anthropic arch's fix round 1,
+/// Critical 1, applied from the start): a client that could name an origin
+/// could name a collector, and this daemon would put a key from its own
+/// keyring on the wire to it — persistently, since the mount spec is replayed
+/// at every boot. Each origin is bounded where `vkd` reads it and again by
+/// the adapter itself: `https://`, or plaintext to a loopback address.
+#[derive(Debug, Clone)]
+pub struct ApiArches {
+    /// `vk`/`mistral` in this account's keyring, or `vkd --mistral-key-file`.
+    pub mistral_keys: vk_arch_anthropic::KeySource,
+    /// Mistral's EU origin unless `vkd --mistral-base-url` (tests) moves it.
+    pub mistral_base_url: String,
+    /// `vk`/`gemini`, or `vkd --gemini-key-file`.
+    pub gemini_keys: vk_arch_anthropic::KeySource,
+    /// Google's origin unless `vkd --gemini-base-url` (tests) moves it.
+    pub gemini_base_url: String,
+    /// `vk`/`openai-compat`, or `vkd --openai-compat-key-file` — optional
+    /// for a server on a loopback address, required anywhere else.
+    pub openai_compat_keys: vk_arch_anthropic::KeySource,
+    /// `vkd --openai-compat-base-url`. No default: there is no one server this
+    /// arch is for, so a daemon started without it refuses every
+    /// `openai-compat` mount and names the flag.
+    pub openai_compat_base_url: Option<String>,
+}
+
+impl Default for ApiArches {
+    fn default() -> ApiArches {
+        ApiArches {
+            mistral_keys: vk_arch_anthropic::KeySource::Keyring,
+            mistral_base_url: vk_arch_mistral::DEFAULT_BASE_URL.to_string(),
+            gemini_keys: vk_arch_anthropic::KeySource::Keyring,
+            gemini_base_url: vk_arch_gemini::DEFAULT_BASE_URL.to_string(),
+            openai_compat_keys: vk_arch_anthropic::KeySource::Keyring,
+            openai_compat_base_url: None,
         }
     }
 }
@@ -851,6 +899,13 @@ fn dispatch(
         .then(|| bedrock_adapter(&req.params["config"]))
         .transpose()
         .map_err(|e| bad(&format!("{e:#}")))?;
+    // The three newer API arches the same way, whole: their config is checked
+    // against its closed shape — and `openai-compat`'s claims against their
+    // rules — before the keyring is read, and the keyring before the lock.
+    let api_arch = (req.method == "arch.mount" && is_api_kind(mount_kind))
+        .then(|| api_adapter(mount_kind, &config.api_arches, &req.params["config"]))
+        .transpose()
+        .map_err(|e| bad(&format!("{e:#}")))?;
     // Handled before the general lock, and taking the kernel lock only in short
     // phases of its own: a harness run launches Claude Code and *waits* for it,
     // and the harness calls back over MCP (`harness.*`) while it runs — so a lock
@@ -1051,6 +1106,11 @@ fn dispatch(
                 // The EU one, already built above: its credentials were
                 // resolved before the lock.
                 "bedrock" => Arc::from(bedrock.ok_or_else(|| internal("no bedrock adapter"))?),
+                // Mistral, Gemini and any OpenAI-compatible server, already
+                // built above on a key this daemon read itself.
+                "mistral" | "gemini" | "openai-compat" => {
+                    Arc::from(api_arch.ok_or_else(|| internal("no api adapter"))?)
+                }
                 other => return Err(bad(&format!("no arch kind {other}"))),
             };
             // The list above is a list, and a list can be forgotten. The
@@ -1756,10 +1816,33 @@ fn claude_code_version(binary: &std::path::Path) -> anyhow::Result<String> {
 /// boot costs at worst one such timeout per arch. An error is an unavailable
 /// arch, never a boot that fails: an engine that is not running is not a
 /// reason for a node to stop serving everything else it has.
+///
+/// The `mistral`, `gemini` and `openai-compat` arches come back from this one
+/// on the default [`ApiArches`] — this account's keyring and the providers'
+/// own origins, and no OpenAI-compatible server at all. A daemon configured
+/// otherwise uses [`adapter_factory_with`].
 pub fn adapter_factory(
     state_dir: std::path::PathBuf,
     anthropic_keys: vk_arch_anthropic::KeySource,
     anthropic_base_url: String,
+    claude_bin: PathBuf,
+) -> vk_kernel::AdapterFactory {
+    adapter_factory_with(
+        state_dir,
+        anthropic_keys,
+        anthropic_base_url,
+        ApiArches::default(),
+        claude_bin,
+    )
+}
+
+/// [`adapter_factory`], with the daemon's own [`ApiArches`] — what `vkd`
+/// hands the kernel.
+pub fn adapter_factory_with(
+    state_dir: std::path::PathBuf,
+    anthropic_keys: vk_arch_anthropic::KeySource,
+    anthropic_base_url: String,
+    api_arches: ApiArches,
     claude_bin: PathBuf,
 ) -> vk_kernel::AdapterFactory {
     let mock = vk_kernel::mock_factory();
@@ -1793,6 +1876,12 @@ pub fn adapter_factory(
                 )?))
             }
             "bedrock" => bedrock_adapter(&spec.config),
+            // The same function the mount ran, so the arch that comes back is
+            // the arch that was mounted; the key is read again, here, for the
+            // reason the Anthropic one is.
+            kind @ ("mistral" | "gemini" | "openai-compat") => {
+                api_adapter(kind, &api_arches, &spec.config)
+            }
             other => anyhow::bail!("no arch kind {other}"),
         }
     })
@@ -1810,11 +1899,33 @@ const MAX_TIMEOUT_SECS: u32 = 3_600;
 /// `endpoint`, `host` or whatever a caller invents next is a `-32602` naming
 /// the field instead of a value this daemon quietly honours (fix round 1,
 /// Critical 1). What is *not* here is the whole point of it.
+///
+/// `mistral` and `gemini` take exactly this shape too: an arch with a model
+/// table says which model, and everything else — the window, the price, the
+/// jurisdiction — is the table's and the provider's.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnthropicMountConfig {
     model: Option<String>,
     context_ceiling: Option<u32>,
+    max_tokens: Option<u32>,
+    timeout_secs: Option<u32>,
+}
+
+/// Everything `arch.mount { kind: "openai-compat" }` may say, and nothing
+/// else. Four of these are **required** at mount — the model, the window, the
+/// jurisdiction and the retention window — because no table here can know
+/// them for a server it has never seen, and a manifest with a blank where a
+/// claim should be is not one I2 can read. Optional in the shape only so that
+/// a missing one is refused by name, saying which flag sets it. The origin is
+/// not here: it is the daemon's (`vkd --openai-compat-base-url`).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiCompatMountConfig {
+    model: Option<String>,
+    context_ceiling: Option<u32>,
+    jurisdiction: Option<String>,
+    retention_days: Option<u32>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u32>,
 }
@@ -2016,7 +2127,112 @@ fn bedrock_adapter(config: &Value) -> anyhow::Result<Box<dyn ArchAdapter>> {
 /// the adapter is built, so a kind missing from this list is caught rather
 /// than admitted.
 fn is_cloud_kind(kind: &str) -> bool {
-    matches!(kind, "anthropic" | "bedrock" | "claude-code")
+    // `openai-compat` is here even when its server is on loopback: the
+    // kernel did not start that server and cannot contain it, so pointing the
+    // node at it is a human act, as `ollama --external` is (Ruling 42 (4)).
+    matches!(kind, "anthropic" | "bedrock" | "claude-code") || is_api_kind(kind)
+}
+
+/// The three newer API arches, built whole by [`api_adapter`].
+fn is_api_kind(kind: &str) -> bool {
+    matches!(kind, "mistral" | "gemini" | "openai-compat")
+}
+
+/// One call's timeout: what the mount asked for, clamped to
+/// [`MAX_TIMEOUT_SECS`], or the adapter's default.
+fn timeout_of(asked: Option<u32>, default: Duration) -> Duration {
+    let default = u32::try_from(default.as_secs()).unwrap_or(MAX_TIMEOUT_SECS);
+    Duration::from_secs(u64::from(
+        asked.unwrap_or(default).clamp(1, MAX_TIMEOUT_SECS),
+    ))
+}
+
+/// Build the `mistral`, `gemini` or `openai-compat` arch a mount — or a boot
+/// replaying one — asks for: the config against its closed shape first, then
+/// the key out of the daemon's own key source, then the adapter. One function
+/// for both doors, so a re-created arch is the arch that was mounted.
+///
+/// Never from `config`: the key, which [`MountSpec::new`] would refuse in a
+/// spec anyway, and the origin, which is the daemon's. `context_ceiling` is
+/// clamped to the model's documented window on the two arches with a table,
+/// as it is on the Anthropic one; on `openai-compat` the window *is* the
+/// mount's claim, bounded by the adapter's own maximum.
+fn api_adapter(
+    kind: &str,
+    api: &ApiArches,
+    config: &Value,
+) -> anyhow::Result<Box<dyn ArchAdapter>> {
+    match kind {
+        "mistral" => {
+            use vk_arch_mistral::{MistralAdapter, MistralConfig};
+            let defaults = MistralConfig::default();
+            let asked: AnthropicMountConfig = mount_config("mistral", config)?;
+            let model = asked.model.unwrap_or_else(|| defaults.model.clone());
+            let window = vk_arch_mistral::context_window(&model);
+            let cfg = MistralConfig {
+                context_ceiling: asked.context_ceiling.unwrap_or(0).min(window),
+                model,
+                base_url: api.mistral_base_url.clone(),
+                max_tokens: asked.max_tokens.unwrap_or(defaults.max_tokens),
+                timeout: timeout_of(asked.timeout_secs, defaults.timeout),
+            };
+            let key =
+                vk_arch_anthropic::load_key(&api.mistral_keys, vk_arch_mistral::KEYRING_USER)?;
+            Ok(Box::new(MistralAdapter::with_config(key, cfg)?))
+        }
+        "gemini" => {
+            use vk_arch_gemini::{GeminiAdapter, GeminiConfig};
+            let defaults = GeminiConfig::default();
+            let asked: AnthropicMountConfig = mount_config("gemini", config)?;
+            let model = asked.model.unwrap_or_else(|| defaults.model.clone());
+            let window = vk_arch_gemini::context_window(&model);
+            let cfg = GeminiConfig {
+                context_ceiling: asked.context_ceiling.unwrap_or(0).min(window),
+                model,
+                base_url: api.gemini_base_url.clone(),
+                max_tokens: asked.max_tokens.unwrap_or(defaults.max_tokens),
+                timeout: timeout_of(asked.timeout_secs, defaults.timeout),
+            };
+            let key = vk_arch_anthropic::load_key(&api.gemini_keys, vk_arch_gemini::KEYRING_USER)?;
+            Ok(Box::new(GeminiAdapter::with_config(key, cfg)?))
+        }
+        "openai-compat" => {
+            use vk_arch_openai_compat::{OpenAiCompatAdapter, OpenAiCompatConfig};
+            let asked: OpenAiCompatMountConfig = mount_config("openai-compat", config)?;
+            let base_url = api.openai_compat_base_url.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "this daemon has no OpenAI-compatible server to send calls to: start vkd \
+                     with --openai-compat-base-url <https://… or http://127.0.0.1:PORT>"
+                )
+            })?;
+            let missing = |what: &str| {
+                anyhow::anyhow!("openai-compat: a mount must state {what}; no table here can")
+            };
+            let mut cfg = OpenAiCompatConfig::new(
+                &base_url,
+                &asked.model.ok_or_else(|| missing("the model id (--model)"))?,
+                asked
+                    .context_ceiling
+                    .ok_or_else(|| missing("the server's context window (--ctx)"))?,
+                &asked.jurisdiction.ok_or_else(|| {
+                    missing("where the server is (--jurisdiction FR, EU, US, … or local)")
+                })?,
+                asked.retention_days.ok_or_else(|| {
+                    missing("how many days the far end keeps what it is sent (--retention-days, 0 if nothing)")
+                })?,
+            );
+            if let Some(n) = asked.max_tokens {
+                cfg.max_tokens = n;
+            }
+            cfg.timeout = timeout_of(asked.timeout_secs, cfg.timeout);
+            // The claims before the keyring: a mount that would be refused
+            // for what it says must not have read a credential first.
+            cfg.check()?;
+            let key = vk_arch_openai_compat::load_key_for(&api.openai_compat_keys, &base_url)?;
+            Ok(Box::new(OpenAiCompatAdapter::with_config(key, cfg)?))
+        }
+        other => anyhow::bail!("no arch kind {other}"),
+    }
 }
 
 /// The spec `arch.mount` records for what it just mounted.
