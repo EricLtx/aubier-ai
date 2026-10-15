@@ -106,6 +106,21 @@ for line in sys.stdin:
     else: say({"id": r["id"] + 100, "ok": True})
 "#;
 
+/// A driver with two actions: `echo`, and `spawn_child`, which starts
+/// `cmd /c ping -n 30 127.0.0.1 >nul` — a child of its own that lives half a
+/// minute, its stdio not the driver's — and answers its pid.
+const CHILD_DRIVER: &str = r#"import json, subprocess, sys
+def say(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+say({"hello": {"protocol": 1, "driver": "child", "version": "0", "actions": ["echo", "spawn_child"]}})
+for line in sys.stdin:
+    r = json.loads(line)
+    if r["action"] == "echo":
+        say({"id": r["id"], "ok": True, "result": {"echo": r["args"]}})
+    else:
+        child = subprocess.Popen("cmd /c ping -n 30 127.0.0.1 >nul", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        say({"id": r["id"], "ok": True, "result": {"pid": child.pid}})
+"#;
+
 /// A driver whose first line is JSON but not a hello, and which then waits.
 const NO_HELLO_DRIVER: &str = r#"import sys, time
 sys.stdout.write('{"greeting": "hi"}\n'); sys.stdout.flush()
@@ -883,21 +898,63 @@ fn protocol_faults_are_typed_and_the_detail_stays_in_the_message() {
     );
 }
 
+/// Is the interpreter the fake drivers run under a packaged app — the
+/// Microsoft Store build of Python, whose `sys.executable` lives under
+/// `WindowsApps`? Windows starts such a process's non-packaged children
+/// outside its job, and outside any Job the host made.
+fn interpreter_is_packaged() -> bool {
+    Command::new(PYTHON)
+        .args(["-I", "-c", "import sys; print(sys.executable)"])
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("\\WindowsApps\\"))
+        .unwrap_or(false)
+}
+
+/// Is the Windows process `pid` running? `tasklist` filtered on the id, in
+/// CSV: a row names the id in quotes, and nothing else does.
+fn windows_process_alive(pid: u32) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+        .unwrap_or(false)
+}
+
 /// On Windows the platform governor is a Job Object: the host contains the
 /// driver tree in it and reads back that it did, so `governed()` is true, and
-/// the contained driver works as before.
-#[cfg(windows)]
+/// the contained driver works as before. Final review I5: the claim is the
+/// *tree*, so the driver starts a child of its own (`spawn_child`: `cmd /c
+/// ping -n 30 127.0.0.1 >nul`, half a minute of life) and the test holds the
+/// TCB to it — the child's id is in the Job's own process list while it
+/// runs, and the child is gone within ten seconds of the host's shutdown,
+/// long before its thirty seconds are up. Elsewhere there is no Job Object,
+/// and the test says so and returns. Under a Microsoft Store Python the
+/// child is *not* in the Job — Windows starts a packaged app's non-packaged
+/// children outside its job — so the membership is not asserted there: the
+/// test prints the gap, which the TCB states, and checks the kill alone.
 #[test]
 fn tree_is_contained_on_windows() {
+    if !cfg!(windows) {
+        eprintln!("no Job Object on this platform, so no tree to contain; skipping");
+        return;
+    }
     if !python_available() {
         return;
     }
     use vk_harness::confine::for_this_platform;
-    let rig = Rig::new(FAKE_DRIVER);
-    let m = rig.fake_manifest();
+    let rig = Rig::new(CHILD_DRIVER);
+    let m = rig.manifest(
+        rig.command(),
+        json!([
+            {"name": "echo", "reversible": true, "args": {"type": "object"}, "evidence": []},
+            {"name": "spawn_child", "reversible": true, "args": {"type": "object"}, "evidence": []},
+        ]),
+    );
     let governor = for_this_platform(1 << 30, None).expect("a Job Object governor");
     let mut host = DriverHost::spawn(&m, &rig.work, &rig.profile, &rig.evidence, governor)
-        .expect("the fake driver says hello under the job");
+        .expect("the child driver says hello under the job");
     assert!(
         host.governed(),
         "the OS read back that the driver is in the job"
@@ -922,7 +979,56 @@ fn tree_is_contained_on_windows() {
         "hosts_seen carries `ip:port` entries: {:?}",
         out.hosts_seen
     );
+
+    // A grandchild of the host: in the job while it runs.
+    let out = host
+        .act(
+            action(&m, "spawn_child"),
+            &json!({}),
+            Duration::from_secs(10),
+            WIDE,
+            &never,
+        )
+        .expect("spawn_child answers under the job");
+    let child = out.result["pid"]
+        .as_u64()
+        .and_then(|p| u32::try_from(p).ok())
+        .unwrap_or_else(|| panic!("the child's pid: {:?}", out.result));
+    assert!(windows_process_alive(child), "the child {child} runs");
+    let pids = host.tree_pids();
+    assert!(
+        pids.contains(&host.pid()),
+        "the driver is in the job: {pids:?}"
+    );
+    if interpreter_is_packaged() {
+        // Measured on the founder's node (final fix wave): a Microsoft Store
+        // Python is a packaged app, and Windows starts a packaged process's
+        // *non-packaged* children (cmd, ping — and Playwright's node and
+        // Chrome) outside its job, so outside this Job too. The containment
+        // claim does not hold there, the TCB says so, and only the
+        // parent-chain kill below is checked.
+        eprintln!(
+            "KNOWN GAP: {PYTHON} is the Microsoft Store build; its non-packaged child {child} \
+             is outside the Job ({pids:?}). The Job holds the tree only under a python.org \
+             interpreter (CI). Checking the parent-chain kill alone."
+        );
+    } else {
+        assert!(
+            pids.contains(&child),
+            "the child {child} is in the job's process list: {pids:?}"
+        );
+    }
+
+    // And gone with the tree, well inside its thirty seconds.
     host.shutdown();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while windows_process_alive(child) {
+        assert!(
+            Instant::now() < deadline,
+            "the child {child} outlived the host's shutdown by ten seconds"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// A link planted at the evidence name — a junction on Windows, a symlink

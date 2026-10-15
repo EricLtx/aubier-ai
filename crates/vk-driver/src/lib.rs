@@ -412,6 +412,16 @@ impl DriverHost {
         self.swept
     }
 
+    /// Every process the governor holds for this driver, as the governor
+    /// itself lists them — on Windows the Job Object's own process list, the
+    /// browser and anything it started included; empty when ungoverned. What
+    /// the egress sampler reads (Ruling R8). A test's read-back only: the
+    /// proof that a grandchild is in the tree (final review I5).
+    #[doc(hidden)]
+    pub fn tree_pids(&self) -> Vec<u32> {
+        self.governor.pids()
+    }
+
     /// The count of the times this host has signalled its driver's tree,
     /// still readable once the host is dropped. A test's read-back only.
     #[doc(hidden)]
