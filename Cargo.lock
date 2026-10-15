@@ -3730,6 +3730,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "vk-arch-openai-compat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "keyring",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "vk-arch-anthropic",
+ "vk-contracts",
+ "vk-kernel",
+ "zeroize",
+]
+
+[[package]]
 name = "vk-cli"
 version = "0.1.0"
 dependencies = [

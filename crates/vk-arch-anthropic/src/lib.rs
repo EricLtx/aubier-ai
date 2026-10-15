@@ -251,10 +251,40 @@ impl SecretString {
         SecretString(key.as_bytes().to_vec())
     }
 
-    /// The key itself. Private on purpose: the only caller is the header this
-    /// crate sets.
+    /// The key itself. Private on purpose: the only callers are the header
+    /// this crate sets and [`SecretString::authorize`].
     fn expose(&self) -> &str {
         std::str::from_utf8(&self.0).unwrap_or_default()
+    }
+
+    /// `request` with the key on header `name`, after `prefix` — `"Bearer "`
+    /// for an `Authorization` header, `""` for a bare one like
+    /// `x-goog-api-key` — and marked sensitive, so reqwest's own `Debug`
+    /// output does not print it either.
+    ///
+    /// The one way another crate puts the key on a wire. The other API arches
+    /// (`vk-arch-openai-compat`, `vk-arch-mistral`, `vk-arch-gemini`) share
+    /// this type rather than copy it, so the scrub, the redacted `Debug` and
+    /// the zeroing on drop cannot drift apart between them — and none of them
+    /// can read the key back out as a string.
+    pub fn authorize(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+        name: &str,
+        prefix: &str,
+    ) -> reqwest::blocking::RequestBuilder {
+        let value = zeroize::Zeroizing::new(format!("{prefix}{}", self.expose()));
+        match reqwest::header::HeaderValue::from_str(&value) {
+            Ok(mut header) => {
+                header.set_sensitive(true);
+                request.header(name, header)
+            }
+            // A byte no header may carry. Handed to the builder as it is, so
+            // the send fails with reqwest's own "failed to parse header
+            // value" — which names no value — rather than going out keyless
+            // and coming back a 401 that blames the key's owner.
+            Err(_) => request.header(name, value.as_str()),
+        }
     }
 
     /// `text` with every occurrence of the key replaced. Applied to every
