@@ -1583,7 +1583,7 @@ impl RealKernel {
             v.locality.insert(id.clone(), locality_name(m.locality));
             v.jurisdiction.insert(id.clone(), m.jurisdiction.clone());
             v.states.insert(id.clone(), state.name().into());
-            if let Some(h) = self.arch_health(&id) {
+            if let Some(h) = self.arch_health(&id, ctx.now_ms) {
                 v.health.insert(id.clone(), h);
             }
             if let Some(why) = state.reason() {

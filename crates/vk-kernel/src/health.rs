@@ -24,7 +24,7 @@
 //!             successful call
 //!   ┌──────────────────────────────────────────────┐
 //!   ▼                                              │
-//! healthy ──429──▶ rate_limited ── window passes ──▶ (next call is allowed and decides)
+//! healthy ──429──▶ rate_limited ── window passes ──▶ healthy (the next call goes out and decides)
 //!   │  ▲               │
 //!   │  └── remount ────┤
 //!   ├──402──▶ exhausted ── sticky: remount (or restart) clears it
@@ -39,6 +39,27 @@ use serde::{Deserialize, Serialize};
 /// How long the kernel holds back an arch whose provider rate-limited it
 /// without saying for how long. The figure the founder set (2026-10-15).
 pub const DEFAULT_RATE_LIMIT_BACKOFF_MS: u64 = 60_000;
+
+/// The longest wait a provider's own figure is believed for: a day (review
+/// I1). A `Retry-After` in milliseconds where seconds were meant, or a
+/// usage-limit reset a century out, would otherwise hold the arch until
+/// somebody remounted it. A figure past this is read as no figure at all —
+/// the 60 s default — never clipped to the cap, because a number that wrong
+/// says nothing about when the provider will answer again.
+pub const MAX_RATE_LIMIT_HOLD_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The words a rate-limit refusal names its wait with, followed by the
+/// seconds; [`retry_in_s_of`] reads them back. One constant, so the refusal
+/// and the client that waits on it cannot drift apart.
+pub const RETRY_IN: &str = "step it again in ";
+
+/// The wait a rate-limit refusal names, in seconds — what `vk task step
+/// --all` waits, once, before trying again. `None` for a refusal that names
+/// none (an arch still starting, a provider that asked for no wait at all).
+pub fn retry_in_s_of(refusal: &str) -> Option<u64> {
+    let (_, rest) = refusal.split_once(RETRY_IN)?;
+    rest.split(' ').next()?.parse().ok()
+}
 
 /// The longest a `last_error` is kept, in characters: it is printed on one
 /// line of `vk arch show` and under the `vk top` table.
@@ -76,6 +97,12 @@ pub struct ArchHealth {
     /// the adapter, cut to one line's worth. `None` while healthy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// A reading, not a record: the seconds until a rate-limited arch may be
+    /// called again, as of the moment a surface asked
+    /// ([`ArchHealth::as_seen_at`]). What `vk arch show` and `vk top` print
+    /// instead of a wall-clock instant (review M2). Never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_in_s: Option<u64>,
 }
 
 impl ArchHealth {
@@ -85,6 +112,7 @@ impl ArchHealth {
             state: HealthState::Healthy,
             since_ms: now_ms,
             last_error: None,
+            retry_in_s: None,
         }
     }
 
@@ -116,17 +144,41 @@ impl ArchHealth {
         }
     }
 
+    /// Has a rate limit's wait run out by `now_ms`? Never true of another
+    /// state: exhausted and retired have no window.
+    pub fn window_passed(&self, now_ms: u64) -> bool {
+        self.held_until_ms().is_some_and(|held| now_ms >= held)
+    }
+
+    /// This health as it stands at `now_ms` — what every surface prints
+    /// (review M1, M2). A rate limit still running carries the seconds left;
+    /// one whose window has passed reads `healthy` from the end of the
+    /// window, because the next call is then allowed and decides. Every other
+    /// state reads as it is.
+    pub fn as_seen_at(&self, now_ms: u64) -> ArchHealth {
+        match self.held_until_ms() {
+            Some(held) if now_ms >= held => ArchHealth::healthy(held),
+            Some(held) => ArchHealth {
+                retry_in_s: Some((held - now_ms).div_ceil(1000)),
+                ..self.clone()
+            },
+            None => self.clone(),
+        }
+    }
+
     /// The health a failed call leaves its arch in, observed at `now_ms`, or
     /// `None` for a failure that says nothing about the provider's plan — an
     /// I4′ refusal is about the prompt, and a machinery failure is about this
     /// node. Those leave the health exactly as it was.
     pub fn after_error(e: &AdapterError, now_ms: u64) -> Option<ArchHealth> {
         let state = match e {
+            // The provider's figure, if it is one this kernel believes:
+            // [`MAX_RATE_LIMIT_HOLD_MS`] at most. Past it, no figure.
             AdapterError::RateLimited { retry_after } => HealthState::RateLimited {
-                until_ms: retry_after.map(|d| {
-                    let wait = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-                    now_ms.saturating_add(wait)
-                }),
+                until_ms: retry_after
+                    .and_then(|d| u64::try_from(d.as_millis()).ok())
+                    .filter(|wait| *wait <= MAX_RATE_LIMIT_HOLD_MS)
+                    .map(|wait| now_ms.saturating_add(wait)),
             },
             AdapterError::Exhausted { .. } => HealthState::Exhausted,
             AdapterError::Retired { .. } => HealthState::Retired,
@@ -136,6 +188,7 @@ impl ArchHealth {
             state,
             since_ms: now_ms,
             last_error: Some(one_line(&e.to_string())),
+            retry_in_s: None,
         })
     }
 }
@@ -232,6 +285,81 @@ mod tests {
         assert_eq!(back, h);
         let fine = serde_json::to_value(ArchHealth::healthy(3)).unwrap();
         assert_eq!(fine, serde_json::json!({"state": "healthy", "since_ms": 3}));
+    }
+
+    /// Review I1: a provider's figure is believed up to a day and no
+    /// further. Past that it is read as no figure at all — the kernel's 60 s
+    /// — because a `Retry-After` in the wrong unit, or a reset time a century
+    /// out, would otherwise hold the arch until somebody remounts it.
+    #[test]
+    fn a_wait_past_a_day_is_not_a_figure_and_holds_sixty_seconds() {
+        let held = |secs: u64| {
+            ArchHealth::after_error(
+                &AdapterError::RateLimited {
+                    retry_after: Some(Duration::from_secs(secs)),
+                },
+                1_000,
+            )
+            .unwrap()
+        };
+        let day = held(86_400);
+        assert_eq!(day.held_until_ms(), Some(1_000 + MAX_RATE_LIMIT_HOLD_MS));
+        for absurd in [86_401, 3_153_600_000, u64::MAX / 1_000] {
+            let h = held(absurd);
+            assert_eq!(
+                h.state,
+                HealthState::RateLimited { until_ms: None },
+                "{absurd} s is not a figure"
+            );
+            assert_eq!(h.held_until_ms(), Some(61_000), "{absurd} s");
+        }
+        assert_eq!(MAX_RATE_LIMIT_HOLD_MS, 86_400_000);
+    }
+
+    /// Review M1, M2: what a surface prints is the health as it stands now —
+    /// the seconds left in a running window, and `healthy` once the window
+    /// has passed, because the next call is then allowed and decides.
+    #[test]
+    fn health_as_seen_counts_down_and_a_passed_window_reads_healthy() {
+        let h = ArchHealth::after_error(
+            &AdapterError::RateLimited {
+                retry_after: Some(Duration::from_secs(30)),
+            },
+            1_000,
+        )
+        .unwrap();
+        let running = h.as_seen_at(1_500);
+        assert_eq!(running.name(), "rate_limited");
+        assert_eq!(running.retry_in_s, Some(30), "29.5 s left reads as 30");
+        assert!(!h.window_passed(30_999));
+        assert!(h.window_passed(31_000));
+        let passed = h.as_seen_at(31_000);
+        assert_eq!(passed, ArchHealth::healthy(31_000));
+        // Sticky states and healthy ones read as they are.
+        let spent = ArchHealth::after_error(
+            &AdapterError::Exhausted {
+                detail: "no credit".into(),
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(spent.as_seen_at(u64::MAX), spent);
+        assert_eq!(ArchHealth::healthy(3).as_seen_at(9), ArchHealth::healthy(3));
+    }
+
+    /// Review M6: `vk task step --all` reads the wait back out of the
+    /// refusal, so the words that carry it are pinned here, beside the code
+    /// that reads them.
+    #[test]
+    fn the_wait_reads_back_out_of_a_refusal_and_a_refusal_without_one_has_none() {
+        assert_eq!(
+            retry_in_s_of(
+                "arch rate-limited: arch a: x; the step waits — step it again in 42 s (y)"
+            ),
+            Some(42)
+        );
+        assert_eq!(retry_in_s_of("arch a is starting; retry"), None);
+        assert_eq!(retry_in_s_of("arch a: x; step it again"), None);
     }
 
     #[test]

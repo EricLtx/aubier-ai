@@ -380,10 +380,11 @@ fn health_refusal(arch_id: &str, h: &health::ArchHealth, now_ms: u64) -> Option<
             let whose = if until_ms.is_some() {
                 "the provider's own figure"
             } else {
-                "the kernel's 60 s default; the provider named no wait"
+                "the kernel's 60 s default; the provider named no wait, or one past a day"
             };
             Some(KernelError::ArchRateLimited(format!(
-                "arch {arch_id}: {said}; the step waits — step it again in {} s ({whose})",
+                "arch {arch_id}: {said}; the step waits — {}{} s ({whose})",
+                health::RETRY_IN,
                 (held - now_ms).div_ceil(1000)
             )))
         }
@@ -1853,16 +1854,19 @@ impl RealKernel {
             .map(|u| ArchState::Unavailable(u.reason.clone()))
     }
 
-    /// What one mounted arch's provider last said about its plan; `None` for
-    /// an id this node has never mounted (2026-10-15). What `arch.show` and
-    /// `top` print beside the state: the state says whether the adapter is
-    /// there, this says whether the provider will answer it.
-    pub fn arch_health(&self, arch_id: &str) -> Option<health::ArchHealth> {
+    /// What one mounted arch's provider last said about its plan, as it
+    /// stands at `now_ms` on the caller's clock; `None` for an id this node
+    /// has never mounted (2026-10-15). What `arch.show` and `top` print
+    /// beside the state: the state says whether the adapter is there, this
+    /// says whether the provider will answer it. A rate limit reads with the
+    /// seconds it has left, and as `healthy` once its window has passed
+    /// (review M1, M2) — see [`health::ArchHealth::as_seen_at`].
+    pub fn arch_health(&self, arch_id: &str, now_ms: u64) -> Option<health::ArchHealth> {
         self.arch_state(arch_id)?;
         Some(
             self.health
                 .get(arch_id)
-                .cloned()
+                .map(|h| h.as_seen_at(now_ms))
                 .unwrap_or_else(|| health::ArchHealth::healthy(self.opened_ms)),
         )
     }
@@ -2798,12 +2802,22 @@ impl Kernel for RealKernel {
         // plan's account (2026-10-15): refused before the register is read or
         // anything is appended, so a step that never reached the provider
         // leaves no `infer` event claiming it did.
-        if let Some(refused) = self
-            .health
-            .get(arch_id)
-            .and_then(|h| health_refusal(arch_id, h, ctx.now_ms))
-        {
-            return Err(refused);
+        //
+        // A rate limit whose window has passed is cleared here, before the
+        // call goes out (review M1): the call is allowed, so the arch is not
+        // held, and a call that then fails for a reason that is not the plan
+        // must not leave it reading `rate_limited` with a wait already over.
+        // Whether it *was* unhealthy is kept, so the call that comes back can
+        // say on the record that it cleared the state.
+        let mut was_unhealthy = false;
+        if let Some(h) = self.health.get(arch_id).cloned() {
+            if let Some(refused) = health_refusal(arch_id, &h, ctx.now_ms) {
+                return Err(refused);
+            }
+            was_unhealthy = !h.is_healthy();
+            if h.window_passed(ctx.now_ms) {
+                self.health.insert(arch_id.into(), h.as_seen_at(ctx.now_ms));
+            }
         }
         let mut reg = self.read_register(ctx, reg_id)?;
         interceptors::i2_flow(&reg.label, adapter.manifest())?;
@@ -2873,8 +2887,10 @@ impl Kernel for RealKernel {
             Err(e) => return Err(self.call_failed(arch_id, reg_id, estimated, e, observed_ms)),
         };
         // A call that came back clears whatever the provider last said; the
-        // record says so only when there was something to clear.
-        let recovered = self.health.get(arch_id).is_some_and(|h| !h.is_healthy());
+        // record says so only when there was something to clear — as there
+        // was when the call went out, even if the window passing has already
+        // cleared it in memory.
+        let recovered = was_unhealthy;
         if recovered {
             self.health
                 .insert(arch_id.into(), health::ArchHealth::healthy(observed_ms));
@@ -6289,7 +6305,7 @@ mod tests {
             .submit_task(&machine(1), "a goal", Label::bottom())
             .unwrap();
         let fresh = k.read_register(&machine(1), &r).unwrap();
-        assert_eq!(k.arch_health(&id).unwrap().name(), "healthy");
+        assert_eq!(k.arch_health(&id, 1).unwrap().name(), "healthy");
 
         let before = k.ledger().events().len();
         let err = k
@@ -6314,7 +6330,7 @@ mod tests {
             new[1].payload_hash,
             infer_hash(&id, &fresh, "failed", Some("rate_limited"))
         );
-        let h = k.arch_health(&id).unwrap();
+        let h = k.arch_health(&id, 1_000).unwrap();
         assert_eq!(h.name(), "rate_limited");
         let held = h.held_until_ms().unwrap();
         assert!((31_000..31_100).contains(&held), "{held}");
@@ -6333,7 +6349,7 @@ mod tests {
         k.infer(&machine(32_000), &id, Capability::Plan, &r)
             .expect("the window has passed");
         assert_eq!(called(&calls), 2);
-        assert_eq!(k.arch_health(&id).unwrap().name(), "healthy");
+        assert_eq!(k.arch_health(&id, 32_000).unwrap().name(), "healthy");
         let completed = k
             .ledger()
             .events()
@@ -6439,7 +6455,7 @@ mod tests {
             .unwrap();
         assert!(again.already_mounted);
         assert_eq!(k.ledger().events().len(), events);
-        assert_eq!(k.arch_health(&id).unwrap().name(), "healthy");
+        assert_eq!(k.arch_health(&id, 86_400_001).unwrap().name(), "healthy");
         k.infer(&machine(86_400_001), &id, Capability::Plan, &r)
             .expect("paid and remounted");
         assert_eq!(called(&calls), 2, "the arch that was there answered");
@@ -6541,8 +6557,76 @@ mod tests {
             .unwrap();
         assert!(k.infer(&machine(2), &id, Capability::Plan, &r).is_err());
         assert!(k.infer(&machine(3), &id, Capability::Plan, &r).is_err());
-        assert_eq!(k.arch_health(&id).unwrap().name(), "healthy");
+        assert_eq!(k.arch_health(&id, 3).unwrap().name(), "healthy");
         drop(k.unmount(&id).unwrap());
-        assert_eq!(k.arch_health(&id), None);
+        assert_eq!(k.arch_health(&id, 4), None);
+    }
+
+    /// Review I1: a `Retry-After` past a day is not believed. The arch is
+    /// held for the kernel's 60 s, not for the century the far end named, and
+    /// the refusal says whose figure the wait is.
+    #[test]
+    fn an_absurd_retry_after_holds_the_arch_sixty_seconds_not_a_century() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let (id, calls) = queued(
+            &mut k,
+            "absurd",
+            vec![Err(arch::AdapterError::RateLimited {
+                retry_after: Some(std::time::Duration::from_secs(3_153_600_000)),
+            })],
+        );
+        let r = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        let err = k
+            .infer(&machine(1_000), &id, Capability::Plan, &r)
+            .unwrap_err();
+        let said = err.to_string();
+        assert_eq!(health::retry_in_s_of(&said), Some(60), "{said}");
+        assert!(said.contains("60 s default"), "{said}");
+        k.infer(&machine(61_100), &id, Capability::Plan, &r)
+            .expect("a minute later the arch is called again");
+        assert_eq!(called(&calls), 2);
+    }
+
+    /// Review M1: once the window has passed the arch is called again, and
+    /// it reads `healthy` — on every surface, and after a call that failed
+    /// for a reason that is not the provider's plan. A `rate_limited` with a
+    /// wait already over would say "held" about an arch that is being called.
+    #[test]
+    fn a_passed_window_reads_healthy_even_when_the_next_call_fails_otherwise() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let (id, calls) = queued(
+            &mut k,
+            "window",
+            vec![
+                Err(arch::AdapterError::RateLimited {
+                    retry_after: Some(std::time::Duration::from_secs(5)),
+                }),
+                Err(arch::AdapterError::Other(anyhow::anyhow!("engine died"))),
+            ],
+        );
+        let r = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        assert!(k.infer(&machine(1_000), &id, Capability::Plan, &r).is_err());
+        let held = k.arch_health(&id, 2_000).unwrap();
+        assert_eq!(held.name(), "rate_limited");
+        // Four seconds left, five if the scripted call took a millisecond.
+        assert!(matches!(held.retry_in_s, Some(4 | 5)), "{held:?}");
+        assert_eq!(k.arch_health(&id, 6_100).unwrap().name(), "healthy");
+
+        let err = k
+            .infer(&machine(7_000), &id, Capability::Plan, &r)
+            .unwrap_err();
+        assert!(matches!(err, KernelError::Store(_)), "{err}");
+        assert_eq!(called(&calls), 2, "the call went out");
+        assert_eq!(k.arch_health(&id, 7_001).unwrap().name(), "healthy");
+        assert_eq!(
+            k.top(&machine(7_002)).unwrap().health[&id].name(),
+            "healthy"
+        );
     }
 }

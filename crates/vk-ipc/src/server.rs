@@ -1140,7 +1140,7 @@ fn dispatch(
             // What the provider last said about its plan (2026-10-15): kernel
             // memory, not the manifest, and printed beside the quota the
             // manifest claims — the claim and the observation side by side.
-            let health = k.arch_health(&arch_id);
+            let health = k.arch_health(&arch_id, now);
             Ok(json!({
                 "arch_id": arch_id,
                 "manifest": manifest,
