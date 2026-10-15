@@ -121,6 +121,38 @@ class PumpTest(unittest.TestCase):
         self.assertIsNone(b._page)
 
 
+class EvidenceJsonTest(unittest.TestCase):
+    """Evidence.json under its cap, over plain values (no browser needed)."""
+
+    def test_halving_the_longest_list_keeps_json_when_it_suffices(self):
+        drv = load_driver()
+        with tempfile.TemporaryDirectory() as d:
+            ev = drv.Evidence(d)
+            ev.json("network.json", {"events": [f"e{i:04d}" for i in range(1000)], "n": 1}, cap=2000)
+            with open(os.path.join(d, "network.json"), "rb") as f:
+                data = f.read()
+            self.assertLessEqual(len(data), 2000)
+            obj = json.loads(data)
+            self.assertTrue(obj["truncated"])
+            self.assertLess(len(obj["events"]), 1000)
+            self.assertEqual(obj["events"][-1], "e0999", "the newest entries are kept")
+
+    def test_a_list_that_cannot_shrink_ends_in_a_hard_cut(self):
+        # Final review M2: the longest list of length 1 halves to itself, and
+        # the loop never ended. Now a round that shrank nothing stops it, and
+        # the text is cut under the cap with a marker.
+        drv = load_driver()
+        with tempfile.TemporaryDirectory() as d:
+            ev = drv.Evidence(d)
+            ev.json("network.json", {"events": ["x" * 5000], "n": 1}, cap=1000)
+            with open(os.path.join(d, "network.json"), "rb") as f:
+                data = f.read()
+            self.assertLessEqual(len(data), 1000)
+            self.assertIn("tronqué".encode("utf-8"), data)
+            self.assertEqual([i["name"] for i in ev.items], ["network.json"])
+            self.assertEqual(ev.dropped, [])
+
+
 @unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
 class DriverOnFixture(unittest.TestCase):
     @classmethod

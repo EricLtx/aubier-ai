@@ -405,14 +405,27 @@ class Evidence:
                            "path": path})
 
     def json(self, name: str, obj, cap: int | None = None) -> None:
+        """`obj` en JSON. Au-dessus de `cap`, la plus longue liste perd sa moitié la plus
+        ancienne, tour après tour. Un tour qui ne raccourcit rien (la plus longue liste n'a
+        plus qu'un élément) arrête la boucle : le texte est alors coupé sous `cap`, avec une
+        marque, et n'est plus du JSON valide."""
         data = json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8", "replace")
         if cap and len(data) > cap and isinstance(obj, dict):
             obj = dict(obj)
-            while len(data) > cap and any(isinstance(v, list) and v for v in obj.values()):
-                key = max((k for k, v in obj.items() if isinstance(v, list)), key=lambda k: len(obj[k]))
-                obj[key] = obj[key][len(obj[key]) // 2:]
+            while len(data) > cap:
+                lists = [k for k, v in obj.items() if isinstance(v, list) and v]
+                if not lists:
+                    break
+                key = max(lists, key=lambda k: len(obj[k]))
+                before = len(obj[key])
+                obj[key] = obj[key][before // 2:]
+                if len(obj[key]) == before:
+                    break
                 obj["truncated"] = True
                 data = json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8", "replace")
+        if cap and len(data) > cap:
+            marker = f"\n… maskai-recette : tronqué, {len(data)} octets au total\n".encode("utf-8")
+            data = data[: max(cap - len(marker), 0)].decode("utf-8", "ignore").encode("utf-8") + marker
         self.add(name, data)
 
     def html(self, name: str, html: str) -> None:
