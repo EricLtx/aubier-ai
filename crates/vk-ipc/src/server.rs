@@ -677,6 +677,9 @@ fn takes_presence(method: &str) -> bool {
             // Putting a browser under this node's control is a human act: see
             // the refusal in `dispatch` (pilot spec §4.3, I1).
             | "driver.mount"
+            // And so is ending the session it holds (Ruling R25): see the
+            // refusal in the `driver.unmount` arm.
+            | "driver.unmount"
             // Plaintext out of the encrypted store, to a terminal (R22).
             | "artefact.read"
     )
@@ -1227,12 +1230,23 @@ fn dispatch(
                 .ok_or_else(|| not_found(&format!("driver {name}")))
                 .and_then(to_value)
         }
-        // The row and its `driver.unmounted{reason: "operator"}` first, then
-        // the process, out from under the kernel lock: dropping a host is a
-        // tree kill, as dropping an Ollama arch is a `docker stop`.
+        // **Unmounting a driver is a human act** (Ruling R25), symmetric with
+        // mounting one: it ends a browser session this node controls, and it
+        // kills an act in flight (R13). Refused to a machine principal here,
+        // before anything is touched, and again by the kernel. Then the row
+        // and its `driver.unmounted{reason: "operator"}` first, then the
+        // process, out from under the kernel lock: dropping a host is a tree
+        // kill, as dropping an Ollama arch is a `docker stop`.
         "driver.unmount" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            if !ctx.principal.is_human() {
+                return Err(invariant(
+                    "I1: unmounting a driver ends a browser session this node controls, which \
+                     is a human act; re-run it with a presence proof",
+                ));
+            }
             let name = p["name"].as_str().ok_or_else(|| bad("name"))?;
-            let removed = k.unmount_driver(name, "operator").map_err(kerr)?;
+            let removed = k.unmount_driver(&ctx, name, "operator").map_err(kerr)?;
             drop(k);
             config.drivers.drop_host(name);
             let row = removed.ok_or_else(|| not_found(&format!("driver {name}")))?;
@@ -1368,11 +1382,11 @@ fn dispatch(
                 .map_err(kerr)?;
             // The register's artefacts, by address and kind (Rulings R22,
             // R23): metadata only, never their bytes, so Ruling 28 holds —
-            // which is what a human
-            // needs to name the one to read (`artefact.read`) before
-            // signing it, and to tell a task's released files from another
-            // task's in a shared export directory. The register read holds
-            // the caller to the register's label, as `task_decisions` does.
+            // which is what a human needs to name the one to read
+            // (`artefact.read`) before signing it, and to tell a task's
+            // released files from another task's in a shared export
+            // directory. The register read holds the caller to the
+            // register's label, as `task_decisions` does.
             let artefacts = Kernel::read_register(&mut *k, &ctx, &task.register)
                 .map_err(kerr)?
                 .artefacts;

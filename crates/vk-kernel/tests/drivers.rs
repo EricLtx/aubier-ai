@@ -1557,7 +1557,7 @@ fn unmount_clears_an_act_left_in_flight_so_a_remount_can_act() {
     assert!(err.to_string().contains("in flight"), "{err}");
 
     let gone = k
-        .unmount_driver("maskai-1", "operator")
+        .unmount_driver(&human(11), "maskai-1", "operator")
         .unwrap()
         .expect("the row was there");
     assert_eq!(gone.driver_id, row.driver_id);
@@ -1572,7 +1572,9 @@ fn unmount_clears_an_act_left_in_flight_so_a_remount_can_act() {
         })
     );
     assert!(
-        k.unmount_driver("maskai-1", "operator").unwrap().is_none(),
+        k.unmount_driver(&human(11), "maskai-1", "operator")
+            .unwrap()
+            .is_none(),
         "a second unmount finds nothing and logs nothing"
     );
     assert_eq!(events_of(&k, "driver.unmounted").len(), 1);
@@ -1581,6 +1583,94 @@ fn unmount_clears_an_act_left_in_flight_so_a_remount_can_act() {
     assert_eq!(back.state, DriverState::Ready);
     k.driver_act_begin(&l.token, 12, "maskai-1", "look", &serde_json::json!({}))
         .unwrap();
+}
+
+/// Ruling R25 (founder, 2026-10-15): unmounting a driver is a human act,
+/// symmetric with mounting — it ends a browser session this node controls.
+/// The kernel refuses a machine principal itself (I1), whatever the daemon
+/// checks first, and the refusal leaves everything as it was: the row, the
+/// act in flight, the record. A name that is not mounted is refused the same
+/// way to a machine: the principal is the first thing asked.
+#[test]
+fn unmounting_a_driver_is_a_human_act() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let row = mount(&mut k);
+    let t = one_level(&mut k);
+    let l = launch(&mut k, &t.id);
+    k.driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    let before = k.ledger().events().len();
+
+    for name in ["maskai-1", "not-mounted"] {
+        let err = k
+            .unmount_driver(&machine(12), name, "operator")
+            .unwrap_err();
+        assert!(matches!(err, KernelError::I1(_)), "{name}: {err}");
+        assert!(err.to_string().contains("human act"), "{name}: {err}");
+    }
+    assert_eq!(
+        k.ledger().events().len(),
+        before,
+        "a refusal records nothing"
+    );
+    assert_eq!(k.driver("maskai-1").unwrap().unwrap(), row, "the row stays");
+    let err = k
+        .driver_act_begin(&l.token, 13, "maskai-1", "look", &serde_json::json!({}))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("in flight"),
+        "the act is still guarded: {err}"
+    );
+
+    let gone = k
+        .unmount_driver(&human(14), "maskai-1", "operator")
+        .unwrap()
+        .expect("a human unmounts it");
+    assert_eq!(gone.driver_id, row.driver_id);
+    assert_eq!(events_of(&k, "driver.unmounted").len(), 1);
+}
+
+/// Task 5 review gap (Ruling R22): the kernel refuses a machine principal's
+/// read of an artefact's bytes itself (I1) — not only the daemon — and the
+/// refusal appends nothing; a human's read appends its `artefact.released`
+/// before the bytes come back (Ruling R24).
+#[test]
+fn a_machine_cannot_read_an_artefacts_bytes_and_its_refusal_records_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    mount(&mut k);
+    let t = one_level(&mut k);
+    let l = launch(&mut k, &t.id);
+    let plan = k
+        .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
+        .unwrap();
+    k.driver_act_settle(&l.token, 20, &plan, Ok(echo_outcome("x")))
+        .unwrap();
+    let hash = k
+        .read_register(&machine(21), &t.register)
+        .unwrap()
+        .artefacts
+        .last()
+        .expect("the act's evidence")
+        .hash
+        .clone();
+    let before = k.ledger().events().len();
+
+    let err = k.read_artefact_for_human(&machine(22), &hash).unwrap_err();
+    assert!(matches!(err, KernelError::I1(_)), "{err}");
+    assert!(err.to_string().contains("human act"), "{err}");
+    assert_eq!(
+        k.ledger().events().len(),
+        before,
+        "a refused read records nothing"
+    );
+    assert!(events_of(&k, "artefact.released").is_empty());
+
+    let bytes = k.read_artefact_for_human(&human(23), &hash).unwrap();
+    assert_eq!(bytes, b"hello from the site".to_vec());
+    assert_eq!(events_of(&k, "artefact.released").len(), 1);
+    assert_eq!(k.ledger().events().len(), before + 1);
 }
 
 /// Task 7: the remedy for a degraded driver whose manifest also changed — the
@@ -1626,7 +1716,7 @@ fn a_degraded_driver_can_be_remounted_after_umount() {
     assert_eq!(k.driver("maskai-1").unwrap().unwrap().state, degraded);
 
     let gone = k
-        .unmount_driver("maskai-1", "operator")
+        .unmount_driver(&human(11), "maskai-1", "operator")
         .unwrap()
         .expect("the degraded row was there");
     assert_eq!(gone.state, degraded);
@@ -2085,7 +2175,7 @@ fn a_stale_settle_after_a_remount_cannot_touch_the_new_row() {
     let plan_a = k
         .driver_act_begin(&l.token, 10, "maskai-1", "echo", &echo_args())
         .unwrap();
-    k.unmount_driver("maskai-1", "operator")
+    k.unmount_driver(&human(11), "maskai-1", "operator")
         .unwrap()
         .expect("mounted");
     let remounted = mount(&mut k);

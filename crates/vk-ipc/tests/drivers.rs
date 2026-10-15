@@ -335,6 +335,15 @@ impl Node {
             .expect("a human mounts the driver")
     }
 
+    /// `vk driver umount NAME`: a human act, signed like the mount (Ruling
+    /// R25).
+    async fn unmount(&self, name: &str) -> anyhow::Result<Value> {
+        let proof = self.proof().await;
+        self.c
+            .call("driver.unmount", json!({ "name": name }), Some(proof))
+            .await
+    }
+
     /// A recipe-shaped task whose first step is a harness step declaring the
     /// driver, created over the pipe, and the lease token the kernel mints
     /// when that step is launched — what `harness.run` hands `vk-mcp`.
@@ -857,8 +866,9 @@ async fn files_hash_mismatch_is_refused() {
     node.shutdown().await;
 }
 
-/// `driver.unmount` deletes the row, records why, and kills the driver: the
-/// pool holds no host for the name afterwards.
+/// `driver.unmount` is a human act (Ruling R25): refused to a machine
+/// principal with nothing touched; a human's deletes the row, records why,
+/// and kills the driver — the pool holds no host for the name afterwards.
 #[tokio::test]
 async fn unmount_drops_the_host() {
     if !python_available() {
@@ -877,11 +887,30 @@ async fn unmount_drops_the_host() {
         .unwrap();
     assert_eq!(shown["manifest"]["name"], "fake", "{shown}");
 
-    let gone = node
+    // Ruling R25: a machine principal may not end the session, and its
+    // refusal touches nothing — the row, the process, the record.
+    let err = node
         .c
         .call("driver.unmount", json!({"name": "fake"}), None)
         .await
-        .unwrap();
+        .unwrap_err();
+    let e = call_error(&err);
+    assert_eq!(e.code, vk_ipc::E_INVARIANT, "{err}");
+    assert!(
+        e.message.contains(
+            "I1: unmounting a driver ends a browser session this node controls, which is a \
+             human act; re-run it with a presence proof"
+        ),
+        "{err}"
+    );
+    assert!(
+        node.pool.has_host("fake"),
+        "a refused unmount kills nothing"
+    );
+    assert_eq!(node.events("driver.unmounted"), 0, "and records nothing");
+    assert_eq!(node.state_of("fake").await["state"], "ready");
+
+    let gone = node.unmount("fake").await.unwrap();
     assert_eq!(gone["name"], "fake", "{gone}");
     assert!(!node.pool.has_host("fake"), "the host went with the row");
     let listed = node.c.call("driver.ls", json!({}), None).await.unwrap();
@@ -933,11 +962,7 @@ async fn unmount_kills_an_act_in_flight() {
     })
     .await;
 
-    let gone = node
-        .c
-        .call("driver.unmount", json!({"name": "fake"}), None)
-        .await
-        .unwrap();
+    let gone = node.unmount("fake").await.unwrap();
     assert_eq!(gone["name"], "fake", "{gone}");
     let answer = tokio::time::timeout(Duration::from_secs(15), slow)
         .await
@@ -1062,10 +1087,7 @@ async fn a_dead_host_is_respawned_lazily_on_the_next_act() {
     assert!(call_error(&err).message.contains("remount it"), "{err}");
     assert!(!node.pool.has_host("fake"), "a refused act spawns nothing");
 
-    node.c
-        .call("driver.unmount", json!({"name": "fake"}), None)
-        .await
-        .unwrap();
+    node.unmount("fake").await.unwrap();
     let mounted = node.mount(drv.path()).await;
     assert_eq!(mounted["already_mounted"], false, "{mounted}");
     let answer = node.c.call("driver.act", echo("4"), None).await.unwrap();
@@ -1142,10 +1164,7 @@ async fn a_different_manifest_under_the_same_name_never_adopts_the_old_process()
         let k = node.k.lock().unwrap();
         (k.driver("fake").unwrap().unwrap(), k.driver_dirs("fake"))
     };
-    node.c
-        .call("driver.unmount", json!({"name": "fake"}), None)
-        .await
-        .unwrap();
+    node.unmount("fake").await.unwrap();
     assert!(!node.pool.has_host("fake"));
     // The late `ensure` of an act that read A's row before the unmount.
     node.pool.ensure(&row_a, &dirs).unwrap();
@@ -1190,10 +1209,7 @@ async fn an_orphan_still_acting_is_busy_by_its_identity_until_unmounted() {
         let k = node.k.lock().unwrap();
         (k.driver("fake").unwrap().unwrap(), k.driver_dirs("fake"))
     };
-    node.c
-        .call("driver.unmount", json!({"name": "fake"}), None)
-        .await
-        .unwrap();
+    node.unmount("fake").await.unwrap();
     assert!(!node.pool.has_host("fake"));
 
     // The stale act of a run that read A's row before the unmount: its
@@ -1244,11 +1260,7 @@ async fn an_orphan_still_acting_is_busy_by_its_identity_until_unmounted() {
 
     // The remedy: no row is left, so the unmount answers not-found, and it
     // kills the orphan's act all the same.
-    let err = node
-        .c
-        .call("driver.unmount", json!({"name": "fake"}), None)
-        .await
-        .unwrap_err();
+    let err = node.unmount("fake").await.unwrap_err();
     assert_eq!(call_error(&err).code, vk_ipc::E_NOT_FOUND, "{err}");
     let outcome = stale.join().expect("the stale act's thread");
     assert!(

@@ -430,7 +430,10 @@ enum DriverCmd {
     Ls,
     /// One driver in full: its identity, state, hosts and actions.
     Show { name: String },
-    /// Unmount a driver by name and stop its process.
+    /// Unmount a driver by name and stop its process, even mid-action.
+    ///
+    /// A human act, as the mount is: signed with this node's device key,
+    /// because it ends the browser session the driver holds.
     Umount { name: String },
 }
 
@@ -950,14 +953,19 @@ async fn call(cli: &Cli) -> Result<()> {
             c.call("driver.show", json!({ "name": name }), None).await?,
             render::driver,
         ),
+        // Ending the browser session a driver holds is a human act too
+        // (Ruling R25), signed with this node's device key like the mount.
         Cmd::Driver {
             what: DriverCmd::Umount { name },
-        } => show(
-            cli,
-            c.call("driver.unmount", json!({ "name": name }), None)
-                .await?,
-            render::unmounted_driver,
-        ),
+        } => {
+            let proof = presence(&c).await?;
+            show(
+                cli,
+                c.call("driver.unmount", json!({ "name": name }), Some(proof))
+                    .await?,
+                render::unmounted_driver,
+            )
+        }
         Cmd::Task { what } => task(cli, &c, what).await,
         Cmd::Harness { what } => harness(cli, &c, what).await,
         Cmd::Stop { scope } => {

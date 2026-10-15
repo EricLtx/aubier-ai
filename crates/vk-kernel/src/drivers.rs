@@ -349,6 +349,13 @@ impl RealKernel {
         Ok(row)
     }
 
+    /// Unmount a driver: a human act (I1, Ruling R25), as mounting one is —
+    /// it ends a browser session this node controls. A machine principal is
+    /// refused here, first, whatever the daemon checked before: the rule does
+    /// not rest on the daemon alone. The kernel's own degrade
+    /// ([`RealKernel::degrade_driver`]) is not an unmount and stays machine
+    /// side.
+    ///
     /// Drop a driver's row and log `driver.unmounted{reason}`. `None` for a
     /// name that is not mounted, with nothing logged. An act still in flight
     /// goes with the row (review round 1, finding 4): the daemon drops the
@@ -360,9 +367,15 @@ impl RealKernel {
     /// want back on the next mount, and the evidence files are already blobs.
     pub fn unmount_driver(
         &mut self,
+        ctx: &Ctx,
         name: &str,
         reason: &str,
     ) -> Result<Option<DriverRow>, KernelError> {
+        if !ctx.principal.is_human() {
+            return Err(KernelError::I1(
+                "unmounting a driver is a human act: run it from an enrolled device".into(),
+            ));
+        }
         let Some(row) = self.driver(name)? else {
             return Ok(None);
         };
