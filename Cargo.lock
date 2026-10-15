@@ -3765,6 +3765,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
  "vk-arch-anthropic",
  "vk-contracts",
  "vk-kernel",

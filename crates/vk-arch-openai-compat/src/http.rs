@@ -176,13 +176,16 @@ pub fn read_json(
     if !status.is_success() {
         let body = ErrorBody::of(&parsed);
         let class = classify_status(status.as_u16(), body.code.as_deref());
-        let kind = body.kind.as_deref().unwrap_or("error");
-        let message = body.message.unwrap_or_else(|| head(&text, 300));
+        // Both cut, like an unparsed body: a 400 or a 422 from vLLM or
+        // llama-server can echo the whole prompt back in its message, and
+        // this message reaches the client (review M-1).
+        let kind = head(body.kind.as_deref().unwrap_or("error"), 100);
+        let message = head(body.message.as_deref().unwrap_or(&text), 300);
         bail!(
             "http status {}: {}: {what}: {provider} answered {status} ({}): {}",
             status.as_u16(),
             class.as_str(),
-            scrub(key, kind),
+            scrub(key, &kind),
             scrub(key, &message)
         );
     }

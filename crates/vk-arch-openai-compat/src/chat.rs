@@ -69,6 +69,9 @@ pub struct ChatSettings {
 pub struct ChatArch {
     manifest: ArchManifest,
     settings: ChatSettings,
+    /// Whether this arch has already said that its server reports no
+    /// `usage` — once per arch, not once per call (review M-6).
+    said_no_usage: std::sync::atomic::AtomicBool,
     /// `None` only for a server that needs none — the caller decides when
     /// that is allowed (`openai-compat` on loopback, and nowhere else).
     key: Option<SecretString>,
@@ -95,6 +98,7 @@ impl ChatArch {
             settings,
             key,
             client,
+            said_no_usage: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -203,12 +207,28 @@ impl ArchAdapter for ChatArch {
         // I4′ again, from the server's own count of what it read, against the
         // **full** ceiling — the number the refusal then names, so an
         // operator can reconcile the two.
-        if let Some(read) = tokens_in {
-            if read >= self.manifest.context_ceiling {
+        match tokens_in {
+            Some(read) if read >= self.manifest.context_ceiling => {
                 return Err(AdapterError::I4Prime {
                     needed: read,
                     ceiling: self.manifest.context_ceiling,
                 });
+            }
+            Some(_) => {}
+            // Nothing to check against: a server that reports no `usage`
+            // leaves only the pre-check standing. Said once per arch, and the
+            // record says it for every call (review M-6).
+            None => {
+                if !self
+                    .said_no_usage
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        arch = %self.manifest.name,
+                        "{} reports no usage: the I4' post-check on the prompt it read is                          skipped for this arch, and only the estimate before the call stands",
+                        self.settings.provider
+                    );
+                }
             }
         }
 
@@ -254,8 +274,14 @@ impl ArchAdapter for ChatArch {
                 "prompt_tokens": tokens_in,
                 "completion_tokens": tokens_out,
                 "finish_reason": finish,
-                "id": answer["id"].as_str().unwrap_or("-"),
-                "model": answer["model"].as_str().unwrap_or(&self.settings.model),
+                // Strings off the far end, scrubbed like every other one
+                // (review M-5).
+                "id": http::scrub(self.key.as_ref(), answer["id"].as_str().unwrap_or("-")),
+                "model": http::scrub(
+                    self.key.as_ref(),
+                    answer["model"].as_str().unwrap_or(&self.settings.model),
+                ),
+                "usage_reported": tokens_in.is_some(),
                 // There is no count endpoint on this wire: the pre-check was
                 // the estimate, and an audit of an I4′ refusal should know it.
                 "prompt_counted_by_api": false,

@@ -681,8 +681,14 @@ impl ArchAdapter for GeminiAdapter {
                 "thoughts_tokens": thoughts_tokens,
                 "cached_tokens": http::count(&usage["cachedContentTokenCount"]),
                 "finish_reason": finish,
-                "response_id": answer["responseId"].as_str().unwrap_or("-"),
-                "model_version": answer["modelVersion"].as_str().unwrap_or(&self.cfg.model),
+                // Strings off the far end, scrubbed like every other one
+                // (review M-5).
+                "response_id": self
+                    .key
+                    .scrub(answer["responseId"].as_str().unwrap_or("-")),
+                "model_version": self
+                    .key
+                    .scrub(answer["modelVersion"].as_str().unwrap_or(&self.cfg.model)),
                 "thinking": thinking(&self.cfg.model).label(),
                 // What this call was actually sent, out of its bound.
                 "thinking_budget": thinking_budget,

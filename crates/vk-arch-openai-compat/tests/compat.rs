@@ -487,3 +487,93 @@ fn a_secret_never_prints_itself() {
     let key = SecretString::new(KEY);
     assert_eq!(format!("{key:?}"), "SecretString(redacted)");
 }
+
+// ------------------------------------------- what comes back off the wire
+
+/// Review M-1: a 400 or a 422 from vLLM or llama-server can echo the whole
+/// prompt back in its message, and the message reaches the client. It is cut
+/// to a few hundred characters, as an unparsed body already was.
+#[test]
+fn a_far_end_message_is_cut_before_it_is_repeated() {
+    let echoed = "the prompt, echoed back ".repeat(200);
+    let fake = Fake::start(&[(
+        CHAT_PATH,
+        Reply::json(
+            400,
+            &json!({"object": "error", "message": echoed, "type": "x".repeat(500)}),
+        ),
+    )]);
+    let text = other(adapter(&fake).complete("hi", 0).expect_err("400"));
+    assert!(text.starts_with("http status 400:"), "{text}");
+    assert!(text.contains('…'), "say that something was cut: {text}");
+    assert!(
+        text.chars().count() < 800,
+        "{} characters reached the client",
+        text.chars().count()
+    );
+}
+
+/// Review M-5: the provider's own ids are strings off the far end like any
+/// other, and go into the record scrubbed.
+#[test]
+fn the_ids_in_the_record_are_scrubbed_of_the_key() {
+    let mut body = answer(json!("fine"), 10, 2);
+    body["id"] = json!(format!("id-{KEY}"));
+    body["model"] = json!(format!("model-{KEY}"));
+    let fake = Fake::start(&[(CHAT_PATH, Reply::json(200, &body))]);
+    let done = adapter(&fake).complete("hi", 0).expect("answered");
+    let details = done.details.expect("details").to_string();
+    assert!(
+        !details.contains(KEY),
+        "the key is in the record: {details}"
+    );
+    assert!(details.contains("id-[redacted]"), "{details}");
+}
+
+/// Review M-6: a server that reports no `usage` leaves the I4′ post-check
+/// with nothing to check. That is said — once per arch, not once per call —
+/// and the record says it too.
+#[test]
+fn a_skipped_post_check_is_said_once_and_recorded() {
+    use std::io::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut body = answer(json!("fine"), 0, 0);
+    body.as_object_mut().unwrap().remove("usage");
+    let fake = Fake::start(&[(CHAT_PATH, Reply::json(200, &body))]);
+    let a = adapter(&fake);
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let details = tracing::subscriber::with_default(subscriber, || {
+        let first = a.complete("hi", 0).expect("answered");
+        a.complete("hi again", 0).expect("answered");
+        first.details.expect("details")
+    });
+    let mut log = captured.clone();
+    log.flush().unwrap();
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        log.matches("post-check").count(),
+        1,
+        "once per arch, not per call: {log}"
+    );
+    assert!(log.contains("WARN"), "{log}");
+    assert_eq!(details["usage_reported"], false);
+}

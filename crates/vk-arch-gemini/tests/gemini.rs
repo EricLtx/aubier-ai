@@ -594,3 +594,20 @@ fn a_missing_key_file_names_the_remedy() {
         "{err:#}"
     );
 }
+
+/// Review M-5: the response id and model version are strings off the far end
+/// like any other, and go into the record scrubbed of the key.
+#[test]
+fn the_ids_in_the_record_are_scrubbed_of_the_key() {
+    let mut body = ok_answer();
+    body["responseId"] = json!(format!("resp-{KEY}"));
+    body["modelVersion"] = json!(format!("model-{KEY}"));
+    let fake = server(Some(9), Reply::json(200, &body));
+    let done = adapter(&fake).complete("hi", 0).expect("answered");
+    let details = done.details.expect("details").to_string();
+    assert!(
+        !details.contains(KEY),
+        "the key is in the record: {details}"
+    );
+    assert!(details.contains("resp-[redacted]"), "{details}");
+}
