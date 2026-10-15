@@ -8,7 +8,7 @@
       "-I",
       "driver.py"
     ],
-    "files_sha256": "sha256:eb1178c8373416df1885f02deb573fb9b6ba849e1a3f967b309e4036e2be021c",
+    "files_sha256": "sha256:c973188ee5dc12e1bdf289c54ee2340476dbba29ea0e403b5572b1dc867d8a2f",
     "browser_channel": "chrome",
     "headless": false
   },

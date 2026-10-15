@@ -439,6 +439,7 @@ class Browser:
         self.profile_dir, self.channel, self.headless, self.hosts = profile_dir, channel, headless, hosts
         self.pw = self.context = self._page = None
         self._dead = False
+        self._broken = set()   # pages that failed a pump: never serviced through again
         self.dialogs = []      # dialogues JavaScript en attente : jamais acceptés ni refusés ici
         self.dialog_log = []   # tous les dialogues vus, fermés ou non
         self.network = []      # résumés de requêtes, toutes pages
@@ -488,10 +489,7 @@ class Browser:
 
     def page(self):
         self.start()
-        if self._page is None or self._page.is_closed():
-            pages = [p for p in self.context.pages if not p.is_closed()]
-            self._page = pages[0] if pages else self.context.new_page()
-        return self._page
+        return self._live_page()
 
     def close(self) -> None:
         for step in (lambda: self.context and self.context.close(), lambda: self.pw and self.pw.stop()):
@@ -501,6 +499,7 @@ class Browser:
                 pass
         self.pw = self.context = self._page = None
         self._dead = False
+        self._broken = set()
         self.dialogs.clear()
 
     def drain(self, ms: int = 20) -> None:
@@ -518,14 +517,32 @@ class Browser:
             if self.seq == before or time.monotonic() >= deadline:
                 return
 
+    def _live_page(self):
+        """The page to service Playwright through: the driver's own if it is still open, else
+        another open page of the context (the founder may close a tab), else a new one.
+        Never a relaunch: that would close every window, the founder's included."""
+        if self._page is None or self._page.is_closed() or self._page in self._broken:
+            pages = [p for p in self.context.pages if not p.is_closed() and p not in self._broken]
+            self._page = pages[0] if pages else self.context.new_page()
+        return self._page
+
     def pump(self) -> None:
-        """Entre deux actions (le crochet `idle` du protocole) : servir Playwright."""
-        if self.started() and self._page is not None and not self._page.is_closed():
-            try:
-                self._page.wait_for_timeout(20)
-            except PWError as e:  # a crashed page: say it once, the next action relaunches
-                log.warning("browser unusable between actions, relaunched at the next one: %s", e)
-                self._dead = True
+        """Entre deux actions (le crochet `idle` du protocole) : servir Playwright. Une page
+        fermée ou en panne ne l'arrête pas : la suivante prend le relais. Seule la fermeture
+        du contexte (Chrome quitté) arrête le service, et l'action suivante relance."""
+        if not self.started():
+            return
+        try:
+            page = self._live_page()
+            page.wait_for_timeout(20)
+        except PWError as e:
+            if self._dead:  # the context itself closed: `_on_close` said so
+                return
+            if self._page is not None and self._page not in self._broken:
+                log.info("page unusable between actions, serving through another: %s",
+                         str(e).splitlines()[0])
+                self._broken.add(self._page)
+            self._page = None
 
     # -- appels dans la page, bornés ---------------------------------------------------
     def call(self, fn_src: str, arg=None, timeout_ms: int = 5000, page=None):
@@ -562,6 +579,12 @@ class Browser:
     def _watch_page(self, page) -> None:
         page.on("framenavigated", lambda frame: self._on_navigated(page, frame))
         page.on("websocket", lambda ws: self._on_websocket(page, ws))
+        page.on("close", self._on_page_closed)
+
+    def _on_page_closed(self, page) -> None:
+        """A closed tab takes its pending dialogs with it (they stay in `dialog_log`)."""
+        self.dialogs = [d for d in self.dialogs if getattr(d["dialog"], "page", None) is not page]
+        self._broken.discard(page)
 
     def _on_navigated(self, page, frame) -> None:
         if frame.parent_frame is not None:
@@ -618,7 +641,8 @@ class Browser:
     def _on_dialog(self, dialog) -> None:
         """Relever le dialogue et le laisser ouvert : seul un humain y répond."""
         self.seq += 1
-        record = {"seq": self.seq, "type": dialog.type, "message": (dialog.message or "")[:200], "t": now_iso()}
+        record = {"seq": self.seq, "type": dialog.type, "message": (dialog.message or "")[:200], "t": now_iso(),
+                  "mono": time.monotonic()}
         self.dialogs.append({**record, "dialog": dialog})
         self.dialog_log.append(record)  # kept after the dialog is closed, for the verdict
         log.warning("dialog left pending: %s %r", dialog.type, (dialog.message or "")[:200])
@@ -633,7 +657,7 @@ class Browser:
     # -- capture ------------------------------------------------------------------------
     def _push(self, lst: list, entry: dict) -> dict:
         self.seq += 1
-        entry = {"seq": self.seq, "t": now_iso(), **entry}
+        entry = {"seq": self.seq, "t": now_iso(), "mono": time.monotonic(), **entry}
         lst.append(entry)
         if len(lst) > 20_000:
             del lst[:5_000]
@@ -732,7 +756,9 @@ class Recette:
     def open(self) -> None:
         """Au montage : ouvrir Chrome sur la page d'entrée, pour que l'opérateur s'y connecte.
         Pas de garde des navigations ici : la connexion peut passer par un autre hôte, et ce
-        que l'opérateur fait entre deux actions n'est pas un acte du driver."""
+        que l'opérateur fait entre deux actions n'est pas un acte du driver. Une navigation
+        hors liste après la fin d'une action n'est qu'une note sur le dernier cas posé, jamais
+        un KO (Ruling R20) ; seule celle qui survient pendant une action est refusée."""
         page = self.browser.page()
         self._goto(page, self.entry, check=False)
 
@@ -763,6 +789,10 @@ class Recette:
                         raise self._host_refusal(self._offlist()[-1], ev) from e
                 raise
             finally:
+                last = self._last_asked
+                if last and self._case_in_hand == last["case"] and "end" not in last:
+                    # where poser_question's action ended: what comes later is "after the answer"
+                    last.update(end=self.browser.mark(), end_mono=time.monotonic())
                 self._save_observations()
         run.__name__ = fn.__name__
         return run
@@ -945,15 +975,26 @@ class Recette:
         return {"from": start, "assistant": SELECTORS["assistant_message"],
                 "stop": SELECTORS["stop_button"], "stopText": SELECTORS["stop_text"]}
 
-    def _wait(self, turns: list, wait_s: float) -> None:
+    def _wait(self, turns: list, wait_s: float, check_host: bool = True) -> None:
         """Attendre chaque tour : <END> ou <ABORT> dans window.__ev, ou le bouton d'arrêt
-        disparu, ou (flux non vu) une réponse nouvelle stable 3 s. Lève AskTimeout au délai."""
+        disparu, ou (flux non vu) une réponse nouvelle stable 3 s. Lève AskTimeout au délai.
+        Un onglet qui quitte la liste : refus `host` (check_host), ou son tour finit sur
+        <HORS PÉRIMÈTRE> et l'appelant juge (charge_concurrente)."""
         b = self.browser
         for t in turns:
             t.update(done=False, events=[], saw_stop=False, stop_gone=None, stable=None, last_text=None)
         start = min(t["t_send"] for t in turns)
         while not all(t["done"] for t in turns):
-            self._check_host()  # the page left the list: no answer is coming here
+            if check_host:
+                self._check_host()  # the page left the list: no answer is coming here
+            else:
+                gone = {n["page"] for n in self._offlist()}
+                for t in turns:
+                    if not t["done"] and t["page_no"] in gone:
+                        t.update(done=True, end="<HORS PÉRIMÈTRE>",
+                                 total_s=round(time.monotonic() - t["t_send"], 2))
+                if all(t["done"] for t in turns):
+                    break
             if time.monotonic() - start >= wait_s:
                 raise AskTimeout(time.monotonic() - start, "pas de fin de réponse")
             for t in (t for t in turns if not t["done"]):
@@ -1235,23 +1276,39 @@ class Recette:
                          + (f" ({', '.join(h['host'] for h in third[:5])})" if third else ""))}
 
     def _late_events(self) -> None:
-        """Un dialogue ou une sortie de périmètre survenus après la fin de poser_question
-        appartiennent encore au dernier cas posé : les livrer, puis les porter dans son
-        observation avant tout jugement (verdict_oracle, exporter_journal)."""
+        """Ce qui survient depuis le dernier poser_question appartient encore à ce cas : le
+        livrer (si le navigateur tourne), puis le porter dans son observation avant tout
+        jugement (verdict_oracle, exporter_journal). Ruling R20 :
+        - un dialogue, pendant l'action ou après la réponse, rend le cas KO sécurité ; après
+          la réponse, il est noté « après la réponse, +N s » ;
+        - une navigation hors liste pendant l'action rend le cas KO sécurité ; après la fin
+          de l'action, ce n'est qu'une note (une reconnexion de l'opérateur n'est pas un
+          défaut du produit)."""
         b, last = self.browser, self._last_asked
-        if not last or not b.started():
+        if not last:
             return
-        try:
-            b.settle()
-        except PWError as e:
-            log.warning("late events not delivered: %s", e)
+        if b.started():
+            try:
+                b.settle()
+            except PWError as e:
+                log.warning("late events not delivered: %s", e)
         obs = self.observations.setdefault(last["case"], {})
-        late = [d for d in b.dialog_log if d["seq"] > last["mark"]]
-        if late and "dialog" not in obs:
-            obs["dialog"] = {"type": late[0]["type"], "message": late[0]["message"], "t": late[0]["t"]}
-        navs = b.since(b.offlist, last["mark"])
-        if navs and "offlist" not in obs:
-            obs["offlist"] = {"host": navs[0]["host"], "url": navs[0]["url"], "t": navs[0]["t"]}
+        end, end_mono = last.get("end"), last.get("end_mono")
+
+        def after(e) -> float | None:
+            return round(e["mono"] - end_mono, 1) if end is not None and e["seq"] > end else None
+
+        for d in b.dialog_log:
+            if d["seq"] > last["mark"] and "dialog" not in obs:
+                obs["dialog"] = {"type": d["type"], "message": d["message"], "t": d["t"]}
+                if after(d) is not None:
+                    obs["dialog"]["after_s"] = after(d)
+        for n in b.since(b.offlist, last["mark"]):
+            key = "offlist" if after(n) is None else "offlist_after"
+            if key not in obs:
+                obs[key] = {"host": n["host"], "url": n["url"], "t": n["t"]}
+                if key == "offlist_after":
+                    obs[key]["after_s"] = after(n)
 
     def verdict_oracle(self, args: dict, ev: Evidence) -> dict:
         """evaluer.py sur la dernière observation du cas, puis une ligne au journal (annexe C).
@@ -1294,14 +1351,18 @@ class Recette:
             r = {"verdict": "KO", "notes": []}
         for key_ in ("missing", "forbidden", "leaks", "span_issues", "notes"):
             r.setdefault(key_, [])
-        if offlist:  # la page a quitté le périmètre pendant le cas : KO sécurité
+        if offlist:  # la page a quitté le périmètre pendant l'action : KO sécurité
             r["verdict"] = "KO"
             r["notes"].insert(0, f"navigation hors périmètre : {offlist['host']}")
             nfr = nfr_union(nfr, ["securite"])
-        if dialog:  # un dialogue inattendu pendant le cas est un KO sécurité, réponse ou pas
+        if dialog:  # un dialogue inattendu (pendant l'action ou après la réponse) : KO sécurité
             r["verdict"] = "KO"
-            r["notes"].insert(0, f"dialogue inattendu ({dialog['type']}) : {dialog['message']}")
+            when = f" (après la réponse, +{dialog['after_s']:g} s)" if "after_s" in dialog else ""
+            r["notes"].insert(0, f"dialogue inattendu ({dialog['type']}) : {dialog['message']}{when}")
             nfr = nfr_union(nfr, ["securite"])
+        if obs.get("offlist_after"):  # après la fin de l'action : une note, pas un KO (R20)
+            o = obs["offlist_after"]
+            r["notes"].append(f"navigation hors périmètre après la réponse : {o['host']} (+{o['after_s']:g} s)")
         line = self._journal_add(cid, r["verdict"], obs.get("timing_s"), self._summary(r, obs), nfr,
                                  obs.get("pipeline_ms"))
         self.observations.setdefault(key, obs)["verdict"] = {k: r[k] for k in ("verdict", "missing", "forbidden", "leaks", "span_issues", "notes")}
@@ -1370,26 +1431,34 @@ class Recette:
                 budget = max(c.get("budget_s") or DEFAULT_BUDGET_S for c in cases)
                 wait_s, capped = self._deadline(3 * budget)
                 try:
-                    self._wait(turns, wait_s)
+                    self._wait(turns, wait_s, check_host=False)
                 except AskTimeout as t:
                     for turn in turns:
                         if not turn["done"]:
                             out[turn["case"]]["timeout_s"] = round(t.seconds, 1)
                 for turn in turns:
-                    if turn["done"]:
+                    if turn.get("end") == "<HORS PÉRIMÈTRE>":
+                        out[turn["case"]]["end"] = turn["end"]
+                    elif turn["done"]:
                         obs = self._collect(turn)
                         out[turn["case"]].update(answer=one_line(obs["answer"], 300), total_s=obs["total_s"],
                                                  end=obs["end"], server_steps=obs["server_steps"])
                 out["gap_s"] = gap
+            # Both tabs' hosts, after the answers and before the journal: a tab that left the
+            # list (even after <END>) makes the line KO sécurité; `_after` then refuses `host`.
+            self.browser.drain(50)
+            off = sorted({n["host"] for n in self._offlist()})
             ok = [o for k, o in out.items() if k != "gap_s" and o.get("answer") and not (o.get("end") or "").startswith("<ABORT>")]
-            verdict = "OK" if len(ok) == 2 else "KO"
-            parts = []
+            verdict = "OK" if len(ok) == 2 and not off else "KO"
+            parts = [f"navigation hors périmètre : {', '.join(off)}"] if off else []
             for c in cases:
                 o = out[c["id"]]
                 if o.get("attach", {}).get("state", "attached") != "attached":
                     parts.append(f"{c['id']} : pièce jointe {o['attach']['state']} ({o['attach']['label']})")
                 elif o.get("timeout_s"):
                     parts.append(f"{c['id']} : abandon à {o['timeout_s']:.0f} s")
+                elif o.get("end") == "<HORS PÉRIMÈTRE>":
+                    parts.append(f"{c['id']} : onglet sorti du périmètre avant la fin de la réponse")
                 else:
                     parts.append(f"{c['id']} : {o.get('total_s')} s, {len(o.get('answer') or '')} car.")
             if "gap_s" in out:
@@ -1397,7 +1466,7 @@ class Recette:
             timing = max([o.get("total_s") or o.get("timeout_s") or 0 for k, o in out.items() if k != "gap_s"] or [0])
             line = self._journal_add(cid, verdict, timing, " ; ".join(parts),
                                      nfr_union(self._case(cid)["nfr"] if cid in self.cases else [],
-                                               ["disponibilite", "scalabilite"]))
+                                               ["disponibilite", "scalabilite"], ["securite"] if off else []))
             self.observations["@concurrent"] = {**out, "case": cid, "verdict": verdict, "t": now_iso()}
             ev.json("network.json", b.capture(mark), cap=NETWORK_CAP)
             ev.screenshot(second, "screen.png")

@@ -120,6 +120,31 @@ class ProtocolTest(unittest.TestCase):
             p.wait(timeout=30)
             p.stdout.close()
 
+    def test_a_broken_stdin_ends_the_loop(self):
+        sys.path.insert(0, DRIVERS)
+        from vkdriver import protocol
+
+        class Broken:
+            def __iter__(self):
+                yield b'{"id": 1}\n'
+                raise OSError("the pipe broke")
+
+        fake = __import__("types").SimpleNamespace(buffer=Broken())
+        log = __import__("io").StringIO()
+        got = []
+        old, sys.stdin = (sys.stdin, sys.stderr), fake
+        sys.stderr = log
+        try:
+            t = __import__("threading").Thread(
+                target=lambda: got.extend(protocol._requests(idle=lambda: None)), daemon=True)
+            t.start()
+            t.join(5)
+        finally:
+            sys.stdin, sys.stderr = old
+        self.assertFalse(t.is_alive(), "serve would idle for ever on a broken stdin")
+        self.assertEqual(got, ['{"id": 1}\n'])
+        self.assertIn("the pipe broke", log.getvalue())
+
     def test_nothing_but_protocol_lines_reach_stdout(self):
         out, err, _ = self.run_driver([("noisy", {}), ("echo", {})])
         self.assertEqual([o.get("id") for o in out[1:]], [1, 2])

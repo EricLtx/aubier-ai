@@ -84,9 +84,13 @@ def _requests(idle):
     lines: queue.Queue = queue.Queue()
 
     def reader():
-        for raw in stdin:
-            lines.put(raw.decode("utf-8", "replace"))
-        lines.put(None)
+        try:
+            for raw in stdin:
+                lines.put(raw.decode("utf-8", "replace"))
+        except OSError as e:  # a broken pipe is an end of input, not a reason to idle for ever
+            _log(f"stdin: {e}")
+        finally:
+            lines.put(None)
 
     threading.Thread(target=reader, name="stdin", daemon=True).start()
     while True:

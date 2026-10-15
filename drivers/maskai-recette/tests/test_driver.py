@@ -126,6 +126,19 @@ class DriverOnFixture(unittest.TestCase):
         self.addCleanup(recette.browser.close)
         return drv, recette, recette.actions()
 
+    def stats(self) -> dict:
+        return json.load(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/stats"))
+
+    def popup_announced_after(self, t0_ms: int, wait, limit_s: float = 20) -> None:
+        """Wait (with `wait()` between looks) until the busy page announced its popup."""
+        deadline = time.monotonic() + limit_s
+        while (self.stats()["created_ms"] or 0) <= t0_ms and time.monotonic() < deadline:
+            wait()
+
+    def message_case(self, recette, cid: str, question: str) -> None:
+        recette.cases[cid] = {"id": cid, "level": "N8", "kind": "message", "question": question,
+                              "budget_s": 5, "nfr": ["veracite"], "must": ["bonjour"], "must_not": [], "pii": []}
+
     def act(self, actions, name, args=None):
         result, evidence = actions[name](args or {}, self.tmp())
         for e in evidence:
@@ -217,22 +230,20 @@ class DriverOnFixture(unittest.TestCase):
         env = dict(os.environ, VK_DRIVER_WORK_DIR=work, VK_DRIVER_PROFILE_DIR=self.tmp(),
                    VK_DRIVER_HEADLESS="1", VK_DRIVER_CHANNEL="", VK_DRIVER_HOSTS="127.0.0.1",
                    MASKAI_ENTRY_URL=f"http://127.0.0.1:{self.port}/busy")
+        t0 = int(time.time() * 1000)
         with open(os.path.join(work, "driver.log"), "wb") as log:
             p = subprocess.Popen([sys.executable, "-I", os.path.join(DRIVER_DIR, "driver.py")], env=env,
                                  cwd=work, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
             try:
                 self.assertIn("hello", json.loads(p.stdout.readline()))
-                stats = lambda: json.load(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/stats"))  # noqa: E731
-                deadline = time.monotonic() + 20
-                while stats()["created_ms"] is None and time.monotonic() < deadline:
-                    time.sleep(0.2)  # the driver sits idle: mounted, no request
+                self.popup_announced_after(t0, lambda: time.sleep(0.2))  # the driver idles meanwhile
                 time.sleep(1.5)
                 ev = self.tmp()
                 p.stdin.write((json.dumps({"id": 1, "action": "capture_ecran", "args": {},
                                            "deadline_ms": 60000, "evidence_dir": ev}) + "\n").encode())
                 p.stdin.flush()
                 self.assertTrue(json.loads(p.stdout.readline())["ok"])
-                s = stats()
+                s = self.stats()
                 self.assertIsNotNone(s["popup_ms"], "the popup never started")
                 self.assertLess(s["popup_ms"] - s["created_ms"], 1000, s)
             finally:
@@ -283,7 +294,71 @@ class DriverOnFixture(unittest.TestCase):
         self.assertEqual(res["verdict"], "KO")
         line = journal_lines(recette.work)[-1]
         self.assertIn("securite", line["nfr"])
-        self.assertIn("dialogue inattendu (confirm) : late", line["evidence"])
+        self.assertIn("dialogue inattendu (confirm) : late (après la réponse, +", line["evidence"])
+
+    def test_a_closed_tab_keeps_the_pump_and_chrome(self):
+        """The founder closes the frozen tab instead of answering its dialog, while the driver
+        idles: the pump goes on through another tab, Chrome is not relaunched (session kept),
+        and the dialog logged before the close still makes the verdict KO."""
+        drv, recette, A = self.make()
+        recette.open()
+        b = recette.browser
+        ctx = b.context
+        ctx.add_cookies([{"name": "session", "value": "kept", "url": f"http://127.0.0.1:{self.port}/"}])
+
+        def idle():  # what serve's idle hook does between requests
+            time.sleep(0.1)
+            b.pump()
+
+        self.message_case(recette, "fixture-late", "Bonjour LATE_DIALOG")
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "poser_question", {"case": "fixture-late"})
+        deadline = time.monotonic() + 5
+        while not b.dialog_log and time.monotonic() < deadline:
+            idle()
+        self.assertTrue(b.dialog_log, "the late dialog opened")
+        t0 = int(time.time() * 1000)
+        ctx.new_page().goto(f"http://127.0.0.1:{self.port}/busy")  # a second, busy tab
+        b.page().close(run_before_unload=True)  # closed in Chrome; the client learns it later
+        self.popup_announced_after(t0, idle)
+        for _ in range(15):
+            idle()
+        s = self.stats()
+        self.assertIsNotNone(s["popup_ms"], "the pump stopped: the popup never started")
+        self.assertLess(s["popup_ms"] - s["created_ms"], 1000, s)
+        res, _ = self.act(A, "verdict_oracle", {"case": "fixture-late"})
+        self.assertEqual(res["verdict"], "KO")
+        self.assertIn("dialogue inattendu (confirm) : late (après la réponse", journal_lines(recette.work)[-1]["evidence"])
+        self.act(A, "capture_ecran")
+        self.assertIs(b.context, ctx, "Chrome was relaunched")
+        self.assertIn("kept", [c["value"] for c in ctx.cookies()])
+
+    def test_an_off_list_navigation_after_the_answer_is_a_note_not_a_ko(self):
+        """Ruling R20: what the operator does between actions is not the product's fault."""
+        drv, recette, A = self.make()
+        recette.open()
+        self.message_case(recette, "fixture-after", "Bonjour")
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "poser_question", {"case": "fixture-after"})
+        recette.browser.page().evaluate(f"() => location.assign('http://localhost:{self.port}/idp')")
+        time.sleep(1.0)
+        res, _ = self.act(A, "verdict_oracle", {"case": "fixture-after"})
+        self.assertEqual(res["verdict"], "OK")
+        line = journal_lines(recette.work)[-1]
+        self.assertNotIn("securite", line.get("nfr", []))
+        self.assertIn("navigation hors périmètre après la réponse : localhost (+", line["evidence"])
+
+    def test_charge_concurrente_checks_both_hosts_before_journaling(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.message_case(recette, "fixture-away-c", "Bonjour NAVIGATE_AWAY")
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "charge_concurrente", {"cases": ["fixture-away-c", "fixture-case-2"]})
+        self.assertEqual(refused.exception.reason, "host")
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual((line["case"], line["verdict"]), ("charge_concurrente : fixture-away-c + fixture-case-2", "KO"))
+        self.assertIn("securite", line["nfr"])
+        self.assertIn("navigation hors périmètre : localhost", line["evidence"])
 
     def test_an_unreachable_redirect_is_a_host_refusal(self):
         drv, recette, A = self.make()
