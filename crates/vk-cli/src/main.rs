@@ -86,7 +86,7 @@ enum Cmd {
         #[arg(long)]
         calls: bool,
     },
-    /// Mount an arch.
+    /// Mount an arch, or a driver.
     Mount {
         #[command(subcommand)]
         what: MountCmd,
@@ -97,6 +97,12 @@ enum Cmd {
     Arch {
         #[command(subcommand)]
         what: ArchCmd,
+    },
+    /// The drivers this node has mounted: the browsers a harness step may act
+    /// through (`vk mount driver` mounts one).
+    Driver {
+        #[command(subcommand)]
+        what: DriverCmd,
     },
     /// Submit, step and inspect tasks.
     Task {
@@ -396,23 +402,51 @@ enum MountCmd {
         #[arg(long, default_value_t = 7)]
         seed: u64,
     },
+    /// A driver: a browser behind a process this kernel starts from a
+    /// manifest, caps, and lets a harness step act through.
+    ///
+    /// A human act: signed with this node's device key, because it puts a
+    /// browser under this node's control. The manifest's command is resolved
+    /// against the manifest file's own directory, whose files must hash to the
+    /// manifest's `files_sha256`. The process is started now; `vk driver ls`
+    /// says whether the kernel governs it.
+    Driver {
+        /// The driver manifest (JSON), next to the driver's files.
+        #[arg(long, value_name = "FILE")]
+        manifest: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum DriverCmd {
+    /// The mounted drivers: state, governance and actions.
+    Ls,
+    /// One driver in full: its identity, state, hosts and actions.
+    Show { name: String },
+    /// Unmount a driver by name and stop its process.
+    Umount { name: String },
 }
 
 #[derive(Subcommand)]
 enum TaskCmd {
     /// Submit a task: plan, then draft (or a harness), then optionally judge,
-    /// wait for a human and release.
+    /// wait for a human and release — or, with `--steps`, the task a recipe
+    /// file describes.
     Submit {
-        #[arg(long)]
-        goal: String,
+        #[arg(long, required_unless_present = "steps")]
+        goal: Option<String>,
         /// The kind of artefact the draft produces (its file extension on release).
         #[arg(long, default_value = "note")]
         artefact: String,
-        #[arg(long, value_name = "ARCH")]
-        plan: String,
+        #[arg(long, value_name = "ARCH", required_unless_present = "steps")]
+        plan: Option<String>,
         /// The arch that drafts the artefact. Either this or `--harness`: a
         /// task needs exactly one step that produces what is approved.
-        #[arg(long, value_name = "ARCH", required_unless_present = "harness")]
+        #[arg(
+            long,
+            value_name = "ARCH",
+            required_unless_present_any = ["harness", "steps"]
+        )]
         draft: Option<String>,
         /// Draft with a confined agent harness instead of an arch, by name
         /// (`claude-code`). The step is run by `vk harness run <TASK>`, not by
@@ -430,6 +464,17 @@ enum TaskCmd {
         /// Release the artefacts into this subpath of the kernel's export root.
         #[arg(long, value_name = "DIR")]
         release: Option<String>,
+        /// A task recipe (JSON: goal, artefact_kind, constraints, evidence,
+        /// steps), checked here and posted whole. The recipe is the whole
+        /// task, so no other submit flag may be given beside it.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = [
+                "goal", "artefact", "plan", "draft", "harness", "judge", "approve", "release"
+            ]
+        )]
+        steps: Option<PathBuf>,
     },
     /// Run the next step, or with --all until the task waits or finishes.
     Step {
@@ -843,6 +888,47 @@ async fn call(cli: &Cli) -> Result<()> {
                 .await?,
             render::arch_show,
         ),
+        // A browser under this node's control is a human act (I1): the
+        // manifest is read first, so a file that is not there spends no
+        // nonce, then the request carries a presence proof.
+        Cmd::Mount {
+            what: MountCmd::Driver { manifest },
+        } => {
+            let (manifest, root) = driver_manifest(manifest)?;
+            let proof = presence(&c).await?;
+            show(
+                cli,
+                c.call(
+                    "driver.mount",
+                    json!({ "manifest": manifest, "root": root }),
+                    Some(proof),
+                )
+                .await?,
+                render::mounted_driver,
+            )
+        }
+        Cmd::Driver {
+            what: DriverCmd::Ls,
+        } => show(
+            cli,
+            c.call("driver.ls", json!({}), None).await?,
+            render::drivers,
+        ),
+        Cmd::Driver {
+            what: DriverCmd::Show { name },
+        } => show(
+            cli,
+            c.call("driver.show", json!({ "name": name }), None).await?,
+            render::driver,
+        ),
+        Cmd::Driver {
+            what: DriverCmd::Umount { name },
+        } => show(
+            cli,
+            c.call("driver.unmount", json!({ "name": name }), None)
+                .await?,
+            render::unmounted_driver,
+        ),
         Cmd::Task { what } => task(cli, &c, what).await,
         Cmd::Harness { what } => harness(cli, &c, what).await,
         Cmd::Stop { scope } => {
@@ -968,6 +1054,28 @@ fn confirm_rebase() -> Result<()> {
 
 async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
     match what {
+        // The recipe is the whole task: what it says is what is posted, the
+        // constraints and evidence the kernel writes into the register
+        // included. Clap refuses every other submit flag beside it.
+        TaskCmd::Submit {
+            steps: Some(file), ..
+        } => {
+            let recipe = recipe(file)?;
+            let created = c
+                .call(
+                    "task.create",
+                    json!({
+                        "goal": recipe.goal,
+                        "artefact_type": recipe.artefact_kind,
+                        "constraints": recipe.constraints,
+                        "evidence": recipe.evidence,
+                        "steps": recipe.steps,
+                    }),
+                    None,
+                )
+                .await?;
+            show(cli, created, render::task)
+        }
         TaskCmd::Submit {
             goal,
             artefact,
@@ -977,7 +1085,16 @@ async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
             judge,
             approve,
             release,
+            steps: None,
         } => {
+            // Clap requires both without `--steps`; said again here, so a
+            // change to the flags cannot post a task with no goal.
+            let goal = goal
+                .as_deref()
+                .ok_or_else(|| anyhow!("give --goal, or a recipe with --steps"))?;
+            let plan = plan
+                .as_deref()
+                .ok_or_else(|| anyhow!("give --plan <ARCH>, or a recipe with --steps"))?;
             let mut steps = vec![json!({ "kind": "plan", "arch_id": plan })];
             // Exactly one of the two produces what is approved. Clap already
             // refuses both and refuses neither; this match is what turns the
@@ -1093,6 +1210,47 @@ async fn harness(cli: &Cli, c: &Client, what: &HarnessCmd) -> Result<()> {
     } else {
         show(cli, answer, render::harness_run)
     }
+}
+
+/// A task recipe file (pilot spec §5.1), read and checked on this end: a typo
+/// in it, or a recipe the kernel could only half run, is refused before
+/// anything is posted.
+fn recipe(file: &Path) -> Result<vk_contracts::recipe::TaskRecipe> {
+    let text = std::fs::read_to_string(file)
+        .with_context(|| format!("read the recipe {}", file.display()))?;
+    let recipe: vk_contracts::recipe::TaskRecipe = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not a task recipe", file.display()))?;
+    recipe
+        .validate()
+        .map_err(|e| anyhow!("{}: {e}", file.display()))?;
+    Ok(recipe)
+}
+
+/// `vk mount driver --manifest FILE`'s request: the manifest as written, and
+/// the root its relative command resolves against (Ruling R6) — the
+/// canonical directory of the manifest file, so the daemon, whose working
+/// directory is its own, is told where the driver's files are rather than
+/// where this shell stood. Spelled without Windows' verbatim `\\?\` prefix,
+/// so it reads back in `vk driver show` as a person would type it.
+fn driver_manifest(file: &Path) -> Result<(Value, String)> {
+    let text = std::fs::read_to_string(file)
+        .with_context(|| format!("read the driver manifest {}", file.display()))?;
+    let manifest: Value =
+        serde_json::from_str(&text).with_context(|| format!("{} is not JSON", file.display()))?;
+    let canonical =
+        std::fs::canonicalize(file).with_context(|| format!("resolve {}", file.display()))?;
+    let dir = canonical
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no directory", canonical.display()))?
+        .display()
+        .to_string();
+    #[cfg(windows)]
+    let dir = match (dir.strip_prefix(r"\\?\UNC\"), dir.strip_prefix(r"\\?\")) {
+        (Some(share), _) => format!(r"\\{share}"),
+        (None, Some(local)) => local.to_string(),
+        (None, None) => dir,
+    };
+    Ok((manifest, dir))
 }
 
 /// A task that will not move again without something else happening: a human,

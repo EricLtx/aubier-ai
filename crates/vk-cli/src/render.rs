@@ -295,8 +295,77 @@ pub fn ls(v: &Value) -> String {
         Some("arches") => arches(&v["arches"]),
         Some("ledger_tail") => dmesg(&v["events"]),
         Some("task") => task(v),
+        // `/drivers/<name>`; `/drivers` itself is a directory of names.
+        Some("driver") => driver(v),
         _ => serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
     }
+}
+
+/// `yes`, `no`, or a dash for a field that is not there.
+fn yes_no(v: &Value) -> String {
+    match v.as_bool() {
+        Some(true) => "yes".into(),
+        Some(false) => "no".into(),
+        None => "-".into(),
+    }
+}
+
+/// A driver row's action names, comma-separated.
+fn action_names(row: &Value) -> String {
+    let names: Vec<String> = array(&row["manifest"], "actions")
+        .iter()
+        .map(|a| text(&a["name"]))
+        .collect();
+    if names.is_empty() {
+        "-".into()
+    } else {
+        names.join(",")
+    }
+}
+
+/// `vk driver ls`: what this node has mounted, whether each would act now,
+/// and whether the kernel contains the process behind it. A degraded driver
+/// is on the screen with its reason, because it is the one an operator has to
+/// remount. No driver is the header alone.
+pub fn drivers(v: &Value) -> String {
+    let rows: Vec<Vec<String>> = v
+        .as_array()
+        .map_or(&[][..], |a| a.as_slice())
+        .iter()
+        .map(|d| {
+            vec![
+                text(&d["manifest"]["name"]),
+                text(&d["state"]["state"]),
+                yes_no(&d["manifest"]["governed"]),
+                action_names(d),
+                d["state"]["reason"].as_str().unwrap_or("-").to_string(),
+            ]
+        })
+        .collect();
+    table(&["NAME", "STATE", "GOVERNED", "ACTIONS", "WHY"], &rows)
+}
+
+/// One driver, as `vk driver show` and `vk ls /drivers/<name>` print it:
+/// what it is, whether it would act and why not, where it may go, what it may
+/// be asked, whether the kernel governs it, and where its command resolves.
+pub fn driver(v: &Value) -> String {
+    let m = &v["manifest"];
+    let mut rows = vec![
+        ("name", text(&m["name"])),
+        ("driver_id", text(&v["driver_id"])),
+        ("state", text(&v["state"]["state"])),
+    ];
+    if let Some(why) = v["state"]["reason"].as_str() {
+        rows.push(("why", why.to_string()));
+    }
+    let hosts: Vec<String> = array(m, "hosts").iter().map(text).collect();
+    rows.extend([
+        ("hosts", hosts.join(",")),
+        ("actions", action_names(v)),
+        ("governed", yes_no(&m["governed"])),
+        ("root", text(&v["root"])),
+    ]);
+    fields(&rows)
 }
 
 /// `/arches`: what this node has mounted, and which of them would answer a
@@ -1044,6 +1113,30 @@ pub fn ok(_: &Value) -> String {
 /// reader matching the answer to the argument they typed.
 pub fn unmounted(v: &Value) -> String {
     format!("unmounted {}", text(&v["arch_id"]))
+}
+
+/// `vk mount driver`: what was mounted, the id that names it, and whether the
+/// kernel governs the process behind it — the first thing the person who just
+/// put a browser under this node's control should see.
+pub fn mounted_driver(v: &Value) -> String {
+    let mut out = table(
+        &["DRIVER", "ID", "GOVERNED"],
+        &[vec![
+            text(&v["name"]),
+            text(&v["driver_id"]),
+            yes_no(&v["governed"]),
+        ]],
+    );
+    // As for an arch (Ruling 13): a repeat mount is a success, said so.
+    if v["already_mounted"] == Value::Bool(true) {
+        out.push_str("\nalready mounted; this driver was left exactly as it was");
+    }
+    out
+}
+
+/// `vk driver umount`: what was taken away, named back.
+pub fn unmounted_driver(v: &Value) -> String {
+    format!("unmounted driver {}", text(&v["name"]))
 }
 
 /// A `--dry-run` of `vk harness run`: the launch line and the `.mcp.json` it

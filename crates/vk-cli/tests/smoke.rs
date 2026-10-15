@@ -1914,6 +1914,211 @@ fn vk_task_submit_builds_judge_and_harness_steps() {
     assert_ne!(shown["status"], "failed", "{shown}");
 }
 
+/// `vk task submit --steps FILE` (pilot spec §5.1): the recipe is read and
+/// validated on this end and posted whole — goal, artefact kind, constraints,
+/// evidence and steps — so a `plan → approve → release` recipe is a
+/// three-step task that runs to its human. A submit flag beside `--steps` is
+/// a usage error and a recipe that does not validate is refused before
+/// anything is posted. And `vk driver ls` on a node with no driver mounted
+/// prints an empty table: the header, no row.
+#[test]
+fn task_submit_with_steps_posts_the_recipe() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let recipes = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+
+    let file = recipes.path().join("recette.json");
+    std::fs::write(
+        &file,
+        serde_json::json!({
+            "goal": "Run the recette",
+            "artefact_kind": "report",
+            "constraints": ["fictional data only"],
+            "evidence": ["cases: N0-1"],
+            "steps": [
+                {"kind": "plan", "arch_id": arch},
+                {"kind": "approve"},
+                {"kind": "release", "to_dir": "runs"}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let path = path_of(&file);
+    let created = sh.json(&["task", "submit", "--steps", &path, "--json"]);
+    let kinds: Vec<&str> = created["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .map(|s| str_of(&s["kind"], "kind"))
+        .collect();
+    assert_eq!(kinds, ["plan", "approve", "release"], "{created}");
+    assert_eq!(created["goal"], "Run the recette", "{created}");
+    assert_eq!(created["artefact_type"], "report", "{created}");
+    let task = str_of(&created, "id").to_string();
+    let waiting = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(waiting["status"], "waiting_human", "{waiting}");
+
+    // Every other submit flag is refused beside `--steps`: the recipe is the
+    // whole task, and a second source for any part of it is a usage error.
+    for extra in [["--plan", arch.as_str()], ["--goal", "another goal"]] {
+        let o = sh.run(&["task", "submit", "--steps", &path, extra[0], extra[1]]);
+        assert_eq!(o.status.code(), Some(2), "{extra:?} beside --steps");
+    }
+    // A recipe that does not validate never reaches the daemon.
+    let bad = recipes.path().join("approve-first.json");
+    std::fs::write(
+        &bad,
+        serde_json::json!({
+            "goal": "g",
+            "artefact_kind": "report",
+            "steps": [{"kind": "approve"}, {"kind": "plan", "arch_id": arch}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let o = sh.run(&["task", "submit", "--steps", &path_of(&bad)]);
+    assert!(!o.status.success(), "an invalid recipe is refused");
+    let why = String::from_utf8_lossy(&o.stderr);
+    assert!(why.contains("cannot come first"), "{why}");
+    let tasks = sh.json(&["ps", "--json"]);
+    assert_eq!(tasks.as_array().map(Vec::len), Some(1), "{tasks}");
+
+    let table = sh.ok(&["driver", "ls"]);
+    assert_eq!(table.trim_end().lines().count(), 1, "{table}");
+    assert!(table.starts_with("NAME"), "{table}");
+    assert_eq!(sh.json(&["driver", "ls", "--json"]), serde_json::json!([]));
+}
+
+/// The scripted driver of Task 1's brief, verbatim (`crates/vk-driver/tests/
+/// fake_driver.rs`): copied, because one test binary does not import another.
+const FAKE_DRIVER: &str = r#"import json, os, sys, time
+def say(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+say({"hello": {"protocol": 1, "driver": "fake", "version": "0", "actions": ["echo", "slow", "escape", "big", "noise", "die"]}})
+for line in sys.stdin:
+    r = json.loads(line); a = r["action"]; ev = r["evidence_dir"]
+    if a == "echo":
+        p = os.path.join(ev, "note.txt"); open(p, "w").write("hi")
+        say({"id": r["id"], "ok": True, "result": {"echo": r["args"]}, "evidence": [{"name": "note.txt", "mime": "text/plain", "path": p}]})
+    elif a == "slow": time.sleep(30)
+    elif a == "escape":
+        say({"id": r["id"], "ok": True, "result": {}, "evidence": [{"name": "note.txt", "mime": "text/plain", "path": os.path.join(ev, "..", "..", "secret.txt")}]})
+    elif a == "big":
+        p = os.path.join(ev, "big.bin"); open(p, "wb").write(b"x" * (3 * 1024 * 1024))
+        say({"id": r["id"], "ok": True, "result": {}, "evidence": [{"name": "big.bin", "mime": "application/octet-stream", "path": p}]})
+    elif a == "noise":
+        sys.stdout.write("Playwright warning: something\n"); sys.stdout.flush()
+        say({"id": r["id"], "ok": True, "result": {"after": "noise"}})
+    elif a == "die": sys.exit(3)
+"#;
+
+/// `vk mount driver --manifest FILE`, then `vk driver ls | show | umount` and
+/// `vk ls /drivers[/<name>]`, as a person would type them. The mount is
+/// signed with the node's key (I1), the manifest's relative command resolves
+/// against the manifest file's own directory — sent canonical, as the root
+/// the row keeps — and the driver is up and listed until it is unmounted.
+#[test]
+fn vk_mount_driver_lists_shows_and_unmounts_it() {
+    let python = Command::new("python")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !python.as_ref().is_ok_and(|s| s.success()) {
+        eprintln!("no python on PATH; skipping ({python:?})");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let drv = tempfile::tempdir().unwrap();
+    std::fs::write(drv.path().join("fake_driver.py"), FAKE_DRIVER).unwrap();
+    let hash = vk_contracts::driver::hash_dir(drv.path()).unwrap();
+    let manifest = drv.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        serde_json::json!({
+            "name": "fake",
+            "kind": "browser",
+            "program": {
+                "runtime": "python",
+                "command": ["python", "-I", "fake_driver.py"],
+                "files_sha256": hash,
+                "browser_channel": null,
+                "headless": true
+            },
+            "hosts": ["example.invalid"],
+            "actions": [{
+                "name": "echo",
+                "reversible": true,
+                "args": {"type": "object"},
+                "evidence": ["note.txt"],
+                "to_register": false
+            }],
+            "min_interval_ms": 0,
+            "max_action_ms": 60_000,
+            "clearance": {"max_scope": "business", "third_party_allowed": true},
+            "governed": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let mounted = sh.ok(&["mount", "driver", "--manifest", &path_of(&manifest)]);
+    assert!(mounted.starts_with("DRIVER"), "{mounted}");
+    assert!(mounted.contains("fake"), "{mounted}");
+
+    let listed = sh.ok(&["driver", "ls"]);
+    assert_eq!(listed.trim_end().lines().count(), 2, "{listed}");
+    assert!(
+        listed.contains("fake") && listed.contains("ready"),
+        "{listed}"
+    );
+    assert!(listed.contains("echo"), "the actions are listed: {listed}");
+
+    let shown = sh.json(&["driver", "show", "fake", "--json"]);
+    let canonical = std::fs::canonicalize(drv.path()).unwrap();
+    let canonical = canonical.to_str().unwrap();
+    let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(canonical);
+    assert_eq!(
+        shown["root"], canonical,
+        "the root is the manifest's directory"
+    );
+    let page = sh.ok(&["driver", "show", "fake"]);
+    for label in ["driver_id", "state", "hosts", "actions", "governed"] {
+        assert!(page.contains(label), "{label}: {page}");
+    }
+    assert_eq!(sh.ok(&["ls", "/drivers"]).trim_end(), "fake");
+    assert_eq!(sh.ok(&["ls", "/drivers/fake"]), page);
+
+    let gone = sh.ok(&["driver", "umount", "fake"]);
+    assert_eq!(gone.trim_end(), "unmounted driver fake");
+    assert_eq!(sh.ok(&["driver", "ls"]).trim_end().lines().count(), 1);
+}
+
 fn path_of(p: &std::path::Path) -> String {
     p.to_str().expect("utf-8 path").to_string()
 }

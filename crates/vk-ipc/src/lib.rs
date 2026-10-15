@@ -18,6 +18,7 @@
 //! carrying one with `-32602` (`"this method does not take a presence
 //! proof"`) — the nonce spent all the same.
 pub mod client;
+pub mod drivers;
 pub mod server;
 pub mod transport;
 

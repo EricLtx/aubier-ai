@@ -3815,6 +3815,7 @@ dependencies = [
  "vk-arch-claude-code",
  "vk-arch-ollama",
  "vk-contracts",
+ "vk-driver",
  "vk-harness",
  "vk-kernel",
  "vk-store",

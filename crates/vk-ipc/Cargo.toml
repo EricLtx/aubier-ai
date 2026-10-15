@@ -18,6 +18,9 @@ bedrock = ["vk-arch-anthropic/bedrock"]
 vk-contracts = { path = "../vk-contracts" }
 vk-kernel = { path = "../vk-kernel" }
 vk-harness = { path = "../vk-harness" }
+# The driver process host: the daemon's pool owns one per mounted driver and
+# acts on it with the kernel lock released (pilot spec §4.2).
+vk-driver = { path = "../vk-driver" }
 vk-arch-claude-code = { path = "../vk-arch-claude-code" }
 vk-arch-ollama = { path = "../vk-arch-ollama" }
 vk-arch-anthropic = { path = "../vk-arch-anthropic", default-features = false }
