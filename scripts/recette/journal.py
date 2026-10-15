@@ -9,6 +9,8 @@ Usage :
     python -I scripts/recette/journal.py JOURNAL.jsonl stats       # agrégats par étape et par ENF
 
 Chaque ligne : {"ts", "step", "case", "verdict", "timing_s", "pipeline_ms", "nfr", "evidence"}.
+Les lignes qu'écrit le driver maskai-recette portent en plus "inputs_sha256", l'empreinte de ce
+qui fait le verdict (evaluer.py, journal.py, cas, oracles, corpus) : deux journaux se comparent.
 Le journal est append-only : on n'édite jamais une ligne, on en ajoute une qui la corrige
 (step "correction", champ "supersedes" = index de la ligne corrigée). C'est le registre
 d'où le rapport se reconstruit ; rien ne dépend de la mémoire de l'agent.
@@ -33,7 +35,9 @@ def load(path: str) -> list[dict]:
         return []
 
 
-def add(path: str, args: argparse.Namespace) -> dict:
+def add(path: str, args: argparse.Namespace, extra: dict | None = None) -> dict:
+    """Ajoute un événement ; `extra` (facultatif) ajoute des champs à la ligne, par exemple
+    l'empreinte des entrées du verdict qu'écrit le driver maskai-recette."""
     event = {
         "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="minutes"),
         "step": args.step, "case": args.case, "verdict": args.verdict,
@@ -48,6 +52,7 @@ def add(path: str, args: argparse.Namespace) -> dict:
         event["nfr"] = args.nfr.split(",")
     if args.supersedes is not None:
         event["supersedes"] = args.supersedes
+    event.update(extra or {})
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
     return event

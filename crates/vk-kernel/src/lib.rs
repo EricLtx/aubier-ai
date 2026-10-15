@@ -1,11 +1,12 @@
 //! The real single-node kernel (spec §3): the stub's semantics over vk-store.
 pub mod arch;
+pub mod drivers;
 pub mod ns;
 pub mod presence;
 pub mod tasks;
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vk_contracts::arch::{ArchManifest, Capability};
@@ -481,6 +482,19 @@ pub struct RealKernel {
     /// The token itself is never stored, logged or put in a payload; the
     /// ledger and every principal carry the lease id.
     harness_tokens: BTreeMap<String, HarnessTokenState>,
+    /// The drivers with a `driver.act` in flight right now, by name, each
+    /// with the id of the act that holds it (pilot spec §4.3; review round
+    /// 2). Set by `driver_act_begin` under the lock; cleared by the settle
+    /// that presents the same id — the settle of an act begun before an
+    /// unmount and remount is stale and touches nothing — and by unmount:
+    /// one action per driver at a time, because the process behind it
+    /// answers one request at a time. In memory only — no driver process
+    /// outlives the daemon that holds its stdio, so nothing is in flight
+    /// after a restart.
+    in_flight: HashMap<String, u64>,
+    /// The last act id handed out; `driver_act_begin` takes the next. In
+    /// memory only, like the flags it identifies.
+    act_counter: u64,
     /// The approval challenges this kernel has minted and no approval has
     /// spent yet, keyed by nonce (SP1b Task 5, invariant I1). In memory only:
     /// a challenge is a moment's thing, bound to a task that is waiting *now*,
@@ -634,6 +648,17 @@ struct HarnessTokenState {
     task_id: String,
     bytes_attached: u64,
     oversize: Option<String>,
+    /// How many `driver.act` calls this run has begun (pilot spec §4.3,
+    /// refusal 5): counted at `driver_act_begin`, once the seven checks have
+    /// passed, against the step's `max_actions`. A refused begin counts for
+    /// nothing. Per token, so a relaunched step starts again from zero.
+    actions: u32,
+    /// Which step of the task this run is, so an act can find the step's
+    /// own ceilings in the row and prove the step is still `Running`.
+    step_index: usize,
+    /// The drivers that step declared (refusal 2), copied at launch from
+    /// the same row the step was read from.
+    drivers: Vec<String>,
 }
 
 /// Build an adapter with `factory`, turning a panic inside it into the error
@@ -742,6 +767,8 @@ impl RealKernel {
             infer_log: vec![],
             counter: 0,
             harness_tokens: BTreeMap::new(),
+            in_flight: HashMap::new(),
+            act_counter: 0,
             approval_challenges: BTreeMap::new(),
             usage_step: None,
         };
@@ -1050,6 +1077,13 @@ impl RealKernel {
         // swept here, so no stale token resolves and no projected plaintext
         // lingers (SP1b Task 4 review, I4).
         self.sweep_harness_state()?;
+        // Every driver row's manifest must still validate (pilot Task 2): a
+        // row whose manifest the rules no longer accept is degraded, with the
+        // reason on the row and on the ledger, never quietly served; a row
+        // that no longer reads as one at all is recorded and removed, never
+        // a boot that fails (final review I3). Nothing is spawned here — the
+        // daemon owns the processes.
+        self.degrade_invalid_drivers()?;
         // And the rows past their retention (Task 10 group C). The daemon
         // repeats this on its schedule for as long as it runs.
         let swept = self.sweep_retention(now_ms())?;
@@ -2210,12 +2244,35 @@ impl RealKernel {
         kind: &str,
         bytes: &[u8],
     ) -> Result<BlobEnvelope, KernelError> {
+        self.attach_artefact_labelled(ctx, reg_id, kind, bytes, None)
+    }
+
+    /// Attach `bytes` to a register as an artefact of `kind`, stored under
+    /// `label` — or, with `None`, under the register's own label, which is
+    /// what every attachment carried before drivers existed. A driver's
+    /// evidence is the one case that needs more: it is the register's label
+    /// *plus* `Origin::ThirdPartyInbound`, because the bytes came from the
+    /// site the driver drove, not from this node (pilot spec §4.3). The
+    /// label may only rise: the register's own is joined in before the blob
+    /// is written, so no caller can attach below the register.
+    fn attach_artefact_labelled(
+        &mut self,
+        ctx: &Ctx,
+        reg_id: &RegisterId,
+        kind: &str,
+        bytes: &[u8],
+        label: Option<Label>,
+    ) -> Result<BlobEnvelope, KernelError> {
         validate_artefact_kind(kind)?;
         let mut reg = self.read_register(ctx, reg_id)?;
+        let label = match label {
+            Some(l) => reg.label.join(&l),
+            None => reg.label.clone(),
+        };
         let env = self
             .store
             .blobs
-            .put(&format!("task:{}", reg.task_id), reg.label.clone(), bytes)
+            .put(&format!("task:{}", reg.task_id), label, bytes)
             .map_err(store_failed)?;
         reg.artefacts.push(ArtefactRef {
             hash: env.hash.clone(),
@@ -2266,13 +2323,19 @@ impl RealKernel {
 
     /// The map key a token is looked up by: its SHA-256, so the token itself
     /// is never held anywhere but in the run's `mcp.json`.
-    fn harness_token_key(token: &str) -> String {
+    pub(crate) fn harness_token_key(token: &str) -> String {
         vk_contracts::hash_bytes(token.as_bytes())
     }
 
     /// Mint a run's lease token: 32 random bytes, base64url (Ruling 21.2). A
     /// secret, returned once to the launcher and hashed into the token map.
-    fn mint_harness_token(&mut self, lease_id: &str, task_id: &str) -> String {
+    fn mint_harness_token(
+        &mut self,
+        lease_id: &str,
+        task_id: &str,
+        step_index: usize,
+        drivers: Vec<String>,
+    ) -> String {
         use base64::Engine;
         let bytes: [u8; 32] = rand::random();
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
@@ -2283,6 +2346,9 @@ impl RealKernel {
                 task_id: task_id.into(),
                 bytes_attached: 0,
                 oversize: None,
+                actions: 0,
+                step_index,
+                drivers,
             },
         );
         token
@@ -3213,7 +3279,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut k = open(d.path());
         let t = k
-            .create_task(&machine(1), "g", "note", Label::bottom(), vec![])
+            .create_task(&machine(1), "g", "note", Label::bottom(), &[], &[], vec![])
             .unwrap();
         assert!(k.task(&machine(2), &t.id).unwrap().is_some());
 
@@ -4549,6 +4615,8 @@ mod tests {
                 "draft a proposal",
                 "proposal",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Draft { arch_id: arch }, StepKind::Approve],
             )
             .unwrap()
@@ -4588,6 +4656,8 @@ mod tests {
                 "later",
                 "note",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![
                     crate::tasks::StepKind::Draft { arch_id: arch },
                     crate::tasks::StepKind::Approve,
@@ -5248,6 +5318,8 @@ mod tests {
                 "say something",
                 "note",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Plan {
                     arch_id: id.clone(),
                 }],
@@ -5414,6 +5486,8 @@ mod tests {
                 "say something",
                 "note",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![StepKind::Plan {
                     arch_id: id.clone(),
                 }],
@@ -5685,6 +5759,8 @@ mod tests {
                 "draft a proposal",
                 "note",
                 Label::bottom(),
+                &[],
+                &[],
                 vec![
                     tasks::StepKind::Plan {
                         arch_id: arch.clone(),
@@ -5737,6 +5813,8 @@ mod tests {
                 "a private goal",
                 "note",
                 secret,
+                &[],
+                &[],
                 vec![tasks::StepKind::Plan {
                     arch_id: arch.clone(),
                 }],

@@ -34,3 +34,9 @@ research_notes/
 docs/decisions/
 docs/status/
 docs/superpowers/reviews/
+
+# Python drivers: per-machine virtualenvs (a directory, or a junction made by setup.ps1) and bytecode
+drivers/**/.venv/
+drivers/**/.venv
+drivers/**/__pycache__/
+scripts/**/__pycache__/

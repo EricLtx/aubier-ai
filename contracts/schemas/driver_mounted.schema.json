@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DriverMounted",
+  "description": "Ledger payload of `driver.mounted`: the identity and what the host read back.",
+  "type": "object",
+  "properties": {
+    "by": {
+      "type": "string"
+    },
+    "driver_id": {
+      "type": "string"
+    },
+    "governed": {
+      "type": "boolean"
+    },
+    "manifest_hash": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "profile_dir_hash": {
+      "description": "SHA-256 (`sha256:` + hex) of the profile directory's **path** as the\nkernel composes it (`<state_dir>/drivers/<name>/profile`), not of its\ncontents (Ruling R11): a browser profile changes on every run and a\npopulated one is hundreds of MB with locked files, so a content hash\nwould be meaningless and could fail the remount a degraded driver's\nremedy asks for. It says which profile this mount drove.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "driver_id",
+    "name",
+    "manifest_hash",
+    "profile_dir_hash",
+    "governed",
+    "by"
+  ]
+}

@@ -33,6 +33,11 @@ pub const TABLES: &[&str] = &[
     // task the money went on. The key is `<ts>-<seq>`, so `list_json`'s
     // key order is the order the calls came back in.
     "usage",
+    // One row per mounted driver (pilot spec §4), keyed by the manifest's name:
+    // the manifest as mounted, its identity, the root its relative command
+    // resolves against, its state and when it last acted. The typed row is
+    // `vk_kernel::drivers::DriverRow`.
+    "drivers",
     "kv_test",
 ];
 

@@ -35,6 +35,22 @@ pub const SCHEMAS: &[(&str, &str)] = &[
         include_str!("../../../contracts/schemas/clearance.schema.json"),
     ),
     (
+        "driver_acted",
+        include_str!("../../../contracts/schemas/driver_acted.schema.json"),
+    ),
+    (
+        "driver_manifest",
+        include_str!("../../../contracts/schemas/driver_manifest.schema.json"),
+    ),
+    (
+        "driver_mounted",
+        include_str!("../../../contracts/schemas/driver_mounted.schema.json"),
+    ),
+    (
+        "driver_unmounted",
+        include_str!("../../../contracts/schemas/driver_unmounted.schema.json"),
+    ),
+    (
         "gate_verdict",
         include_str!("../../../contracts/schemas/gate_verdict.schema.json"),
     ),
@@ -85,6 +101,10 @@ pub const SCHEMAS: &[(&str, &str)] = &[
     (
         "syscall_ctx",
         include_str!("../../../contracts/schemas/syscall_ctx.schema.json"),
+    ),
+    (
+        "task_recipe",
+        include_str!("../../../contracts/schemas/task_recipe.schema.json"),
     ),
     (
         "tuf_root",

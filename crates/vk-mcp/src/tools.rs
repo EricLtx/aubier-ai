@@ -1,14 +1,15 @@
 //! The tools this façade exposes, and how each becomes a kernel syscall.
 //!
-//! Every tool maps to one `harness.*` IPC method, and the façade injects the
-//! lease token (`VK_LEASE_TOKEN`) into the call — the model never sees it. The
-//! server maps that token to the harness principal at the harness clearance and
-//! answers as if the harness itself had made the syscall.
+//! Every tool maps to one IPC method — a `harness.*` one, or `driver.act` for
+//! the browser — and the façade injects the lease token (`VK_LEASE_TOKEN`)
+//! into the call — the model never sees it. The server maps that token to the
+//! harness principal at the harness clearance and answers as if the harness
+//! itself had made the syscall.
 
 use serde_json::{json, Value};
 use vk_ipc::client::Client;
 
-/// The five tools, in the MCP `tools/list` shape. Names are `vk_*`; Claude Code
+/// The six tools, in the MCP `tools/list` shape. Names are `vk_*`; Claude Code
 /// exposes them as `mcp__vk__vk_*`, which `--allowedTools "mcp__vk__*"` admits.
 pub fn tool_list() -> Value {
     json!({
@@ -55,27 +56,53 @@ pub fn tool_list() -> Value {
                     "required": ["message"],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "vk_driver_act",
+                "description": "Act through a driver this task's step declared (a browser the kernel controls). Returns the action's result; evidence is attached to the register by the kernel.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "driver": { "type": "string" },
+                        "action": { "type": "string" },
+                        "args": { "type": "object" }
+                    },
+                    "required": ["driver", "action"],
+                    "additionalProperties": false
+                }
             }
         ]
     })
 }
 
-/// Run a tool: map it to a `harness.*` syscall carrying `token`, and render the
-/// answer as text. `Err(text)` is a tool error (an unknown tool, or a syscall
-/// the kernel refused); the caller turns it into an MCP `isError` result.
+/// Run a tool: map it to its syscall carrying `token` ([`request`]), and
+/// render the answer as text. `Err(text)` is a tool error (an unknown tool, or
+/// a syscall the kernel refused); the caller turns it into an MCP `isError`
+/// result.
 pub async fn call(
     client: &Client,
     token: &str,
     name: &str,
     args: &Value,
 ) -> Result<String, String> {
+    let (method, params) = request(token, name, args)?;
+    match client.call(method, params, None).await {
+        Ok(v) => Ok(render(name, &v)),
+        Err(e) => Err(format!("{name} refused by the kernel: {e}")),
+    }
+}
+
+/// The syscall a tool call becomes: its method, and its params with `token`
+/// injected. `vk_driver_act`'s `args` is an empty object when the model gives
+/// none, or gives `null`.
+fn request(token: &str, name: &str, args: &Value) -> Result<(&'static str, Value), String> {
     let str_arg = |key: &str| -> Result<String, String> {
         args.get(key)
             .and_then(Value::as_str)
             .map(str::to_owned)
             .ok_or_else(|| format!("{name} needs a string `{key}`"))
     };
-    let (method, params) = match name {
+    Ok(match name {
         "vk_read_register" => ("harness.read_register", json!({ "token": token })),
         "vk_write_decision" => (
             "harness.write_decision",
@@ -90,12 +117,21 @@ pub async fn call(
             "harness.log",
             json!({ "token": token, "message": str_arg("message")? }),
         ),
+        "vk_driver_act" => (
+            "driver.act",
+            json!({
+                "token": token,
+                "driver": str_arg("driver")?,
+                "action": str_arg("action")?,
+                "args": args
+                    .get("args")
+                    .filter(|a| a.is_object())
+                    .cloned()
+                    .unwrap_or(json!({})),
+            }),
+        ),
         other => return Err(format!("no such tool: {other}")),
-    };
-    match client.call(method, params, None).await {
-        Ok(v) => Ok(render(name, &v)),
-        Err(e) => Err(format!("{name} refused by the kernel: {e}")),
-    }
+    })
 }
 
 /// The text a tool's answer reads as for the model.
@@ -110,6 +146,84 @@ fn render(name: &str, v: &Value) -> String {
         "vk_write_decision" => "decision recorded".into(),
         "vk_request_approval" => "approval requested".into(),
         "vk_log" => "logged".into(),
+        // The action's result, as the driver gave it; the evidence went to
+        // the register, not to the model.
+        "vk_driver_act" => {
+            serde_json::to_string_pretty(&v["result"]).unwrap_or_else(|_| v["result"].to_string())
+        }
         _ => v.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The browser tool: `driver.act` carrying the lease token the model never
+    /// sees, the driver and the action by name, and `args` defaulting to an
+    /// empty object when the model gives none. The tool is listed with the
+    /// schema the brief fixes, and its answer reads as the action's result.
+    #[test]
+    fn vk_driver_act_maps_to_driver_act_with_the_token_and_default_args() {
+        let (method, params) = request(
+            "tok-1",
+            "vk_driver_act",
+            &json!({ "driver": "maskai-1", "action": "look" }),
+        )
+        .unwrap();
+        assert_eq!(method, "driver.act");
+        assert_eq!(
+            params,
+            json!({ "token": "tok-1", "driver": "maskai-1", "action": "look", "args": {} })
+        );
+
+        let (_, params) = request(
+            "tok-1",
+            "vk_driver_act",
+            &json!({ "driver": "maskai-1", "action": "send", "args": { "case": "N0-1" } }),
+        )
+        .unwrap();
+        assert_eq!(params["args"], json!({ "case": "N0-1" }));
+
+        // A model that sends `null` for no arguments gets the empty object
+        // too, not a `null` the action's schema would refuse.
+        let (_, params) = request(
+            "tok-1",
+            "vk_driver_act",
+            &json!({ "driver": "maskai-1", "action": "look", "args": null }),
+        )
+        .unwrap();
+        assert_eq!(params["args"], json!({}));
+
+        let err = request("tok-1", "vk_driver_act", &json!({ "action": "look" })).unwrap_err();
+        assert!(err.contains("driver"), "{err}");
+
+        let listed = tool_list();
+        let tool = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "vk_driver_act")
+            .expect("vk_driver_act is listed");
+        assert_eq!(
+            tool["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "driver": { "type": "string" },
+                    "action": { "type": "string" },
+                    "args": { "type": "object" }
+                },
+                "required": ["driver", "action"],
+                "additionalProperties": false
+            })
+        );
+        assert_eq!(
+            render(
+                "vk_driver_act",
+                &json!({ "ok": true, "result": { "text": "hi" } })
+            ),
+            "{\n  \"text\": \"hi\"\n}"
+        );
     }
 }

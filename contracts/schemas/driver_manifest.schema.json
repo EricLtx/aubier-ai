@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DriverManifest",
+  "description": "Unknown fields are refused at parse time: a stray `token` or a typo such as\n`to_registre` must fail loudly, not be dropped before `validate` can see it.",
+  "type": "object",
+  "properties": {
+    "actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DriverAction"
+      }
+    },
+    "clearance": {
+      "$ref": "#/$defs/Clearance"
+    },
+    "governed": {
+      "description": "Read back from the host at mount, never trusted from the file.",
+      "type": "boolean"
+    },
+    "hosts": {
+      "description": "Host names only (no scheme, no port, no path), lower-case.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "kind": {
+      "$ref": "#/$defs/DriverKind"
+    },
+    "max_action_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "min_interval_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "name": {
+      "type": "string"
+    },
+    "program": {
+      "$ref": "#/$defs/DriverProgram"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "kind",
+    "program",
+    "hosts",
+    "actions",
+    "min_interval_ms",
+    "max_action_ms",
+    "clearance",
+    "governed"
+  ],
+  "$defs": {
+    "Clearance": {
+      "type": "object",
+      "properties": {
+        "max_scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "third_party_allowed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_scope",
+        "third_party_allowed"
+      ]
+    },
+    "DriverAction": {
+      "description": "One action the driver implements, and the shape of what it may return.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "description": "A JSON Schema object the kernel validates `args` against."
+        },
+        "evidence": {
+          "description": "Evidence file names this action may return (anything else is refused).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "reversible": {
+          "type": "boolean"
+        },
+        "to_register": {
+          "description": "When true, `result.text` is appended to the register's evidence so a later\nJudge or Draft arch reads it (journal exports, oracle verdicts).",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "reversible",
+        "args",
+        "evidence"
+      ]
+    },
+    "DriverKind": {
+      "description": "What kind of peripheral the driver controls.",
+      "type": "string",
+      "enum": [
+        "browser"
+      ]
+    },
+    "DriverProgram": {
+      "description": "The process the host spawns for this driver.",
+      "type": "object",
+      "properties": {
+        "browser_channel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "description": "argv the host spawns. Relative paths are relative to the manifest\nfile's directory (the mount's `root`, pilot ruling R6), so the\nidentity does not vary per machine; the process runs in the driver's\nwork directory.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "files_sha256": {
+          "description": "`hash_dir` of the driver's directory (see [`hash_dir`]).",
+          "type": "string"
+        },
+        "headless": {
+          "type": "boolean"
+        },
+        "max_memory_bytes": {
+          "description": "The committed-memory cap on the driver's whole process tree, in bytes,\nat least 256 MiB (`MIN_DRIVER_MEMORY`). Absent, the daemon applies\nthe kind's default (6 GiB for a browser: a headed Chrome with two\ntabs, Node and Python). A browser starved by its cap fails\nallocations inside the page (\"Aw, Snap\") or dies; the remedy is a\nlarger value and a remount. Part of the identity when present; not\nserialised when absent, so a manifest that never named it keeps its\n`driver_id`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 268435456
+        },
+        "runtime": {
+          "description": "`python-playwright` for the pilot; informative, part of the identity.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "runtime",
+        "command",
+        "files_sha256",
+        "headless"
+      ]
+    },
+    "Scope": {
+      "description": "Ordered low → high. `Holdout` is the top: readable only by the rehearsal verifier role.",
+      "type": "string",
+      "enum": [
+        "public",
+        "vertical",
+        "business",
+        "personal",
+        "holdout"
+      ]
+    }
+  }
+}

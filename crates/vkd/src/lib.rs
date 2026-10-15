@@ -562,6 +562,9 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         anthropic_keys,
         anthropic_base_url,
         claude_bin,
+        // Empty at start: a mounted driver's process is spawned again by the
+        // first `driver.act` that needs it, from the row the kernel kept.
+        drivers: vk_ipc::drivers::DriverPool::new(),
     };
     vk_ipc::server::serve_on(kernel, listener, config).await
 }

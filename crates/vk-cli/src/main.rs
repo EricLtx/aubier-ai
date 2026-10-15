@@ -15,12 +15,14 @@ mod render;
 mod until;
 
 use anyhow::{anyhow, Context, Result};
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use vk_contracts::principal::{Approval, ApprovalKind, Challenge, HumanKey, Principal};
+use vk_contracts::recipe::RecipeStep;
 use vk_ipc::client::Client;
 use vk_ipc::transport::{default_endpoint, Endpoint};
 use vk_ipc::PresenceProof;
@@ -86,7 +88,7 @@ enum Cmd {
         #[arg(long)]
         calls: bool,
     },
-    /// Mount an arch.
+    /// Mount an arch, or a driver.
     Mount {
         #[command(subcommand)]
         what: MountCmd,
@@ -97,6 +99,17 @@ enum Cmd {
     Arch {
         #[command(subcommand)]
         what: ArchCmd,
+    },
+    /// The drivers this node has mounted: the browsers a harness step may act
+    /// through (`vk mount driver` mounts one).
+    Driver {
+        #[command(subcommand)]
+        what: DriverCmd,
+    },
+    /// The artefacts a task attached: read one before you sign it.
+    Artefact {
+        #[command(subcommand)]
+        what: ArtefactCmd,
     },
     /// Submit, step and inspect tasks.
     Task {
@@ -396,23 +409,71 @@ enum MountCmd {
         #[arg(long, default_value_t = 7)]
         seed: u64,
     },
+    /// A driver: a browser behind a process this kernel starts from a
+    /// manifest, caps, and lets a harness step act through.
+    ///
+    /// A human act: signed with this node's device key, because it puts a
+    /// browser under this node's control. The manifest's command is resolved
+    /// against the manifest file's own directory, whose files must hash to the
+    /// manifest's `files_sha256`. The process is started now; `vk driver ls`
+    /// says whether the kernel governs it.
+    Driver {
+        /// The driver manifest (JSON), next to the driver's files.
+        #[arg(long, value_name = "FILE")]
+        manifest: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum DriverCmd {
+    /// The mounted drivers: state, governance and actions.
+    Ls,
+    /// One driver in full: its identity, state, hosts and actions.
+    Show { name: String },
+    /// Unmount a driver by name and stop its process, even mid-action.
+    ///
+    /// A human act, as the mount is: signed with this node's device key,
+    /// because it ends the browser session the driver holds.
+    Umount { name: String },
+}
+
+#[derive(Subcommand)]
+enum ArtefactCmd {
+    /// Print an artefact's bytes: to stdout when they are UTF-8 text, to
+    /// `--out FILE` otherwise. Human: signed with this node's device key,
+    /// because it takes plaintext out of the encrypted store (Ruling R22).
+    /// `vk task show TASK --json` lists a task's artefacts, hash and kind;
+    /// the last one is what its approve step signs.
+    Cat {
+        /// The artefact's address: `sha256:` and 64 hex digits (the prefix
+        /// may be left out).
+        hash: String,
+        /// Write the bytes to this file instead of printing them.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
 enum TaskCmd {
     /// Submit a task: plan, then draft (or a harness), then optionally judge,
-    /// wait for a human and release.
+    /// wait for a human and release — or, with `--steps`, the task a recipe
+    /// file describes.
     Submit {
-        #[arg(long)]
-        goal: String,
+        #[arg(long, required_unless_present = "steps")]
+        goal: Option<String>,
         /// The kind of artefact the draft produces (its file extension on release).
         #[arg(long, default_value = "note")]
         artefact: String,
-        #[arg(long, value_name = "ARCH")]
-        plan: String,
+        #[arg(long, value_name = "ARCH", required_unless_present = "steps")]
+        plan: Option<String>,
         /// The arch that drafts the artefact. Either this or `--harness`: a
         /// task needs exactly one step that produces what is approved.
-        #[arg(long, value_name = "ARCH", required_unless_present = "harness")]
+        #[arg(
+            long,
+            value_name = "ARCH",
+            required_unless_present_any = ["harness", "steps"]
+        )]
         draft: Option<String>,
         /// Draft with a confined agent harness instead of an arch, by name
         /// (`claude-code`). The step is run by `vk harness run <TASK>`, not by
@@ -430,6 +491,19 @@ enum TaskCmd {
         /// Release the artefacts into this subpath of the kernel's export root.
         #[arg(long, value_name = "DIR")]
         release: Option<String>,
+        /// A task recipe (JSON: goal, artefact_kind, constraints, evidence,
+        /// steps), checked here and posted whole. The recipe is the whole
+        /// task, so no other submit flag may be given beside it. A step's
+        /// `arch_id` is an id (`sha256:…`) or the manifest name of a mounted
+        /// arch (`vk ls /arches`), resolved here to the one arch carrying it.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = [
+                "goal", "artefact", "plan", "draft", "harness", "judge", "approve", "release"
+            ]
+        )]
+        steps: Option<PathBuf>,
     },
     /// Run the next step, or with --all until the task waits or finishes.
     Step {
@@ -843,6 +917,55 @@ async fn call(cli: &Cli) -> Result<()> {
                 .await?,
             render::arch_show,
         ),
+        // A browser under this node's control is a human act (I1): the
+        // manifest is read first, so a file that is not there spends no
+        // nonce, then the request carries a presence proof.
+        Cmd::Mount {
+            what: MountCmd::Driver { manifest },
+        } => {
+            let (manifest, root) = driver_manifest(manifest)?;
+            let proof = presence(&c).await?;
+            show(
+                cli,
+                c.call(
+                    "driver.mount",
+                    json!({ "manifest": manifest, "root": root }),
+                    Some(proof),
+                )
+                .await?,
+                render::mounted_driver,
+            )
+        }
+        Cmd::Artefact {
+            what: ArtefactCmd::Cat { hash, out },
+        } => artefact_cat(cli, &c, hash, out.as_deref()).await,
+        Cmd::Driver {
+            what: DriverCmd::Ls,
+        } => show(
+            cli,
+            c.call("driver.ls", json!({}), None).await?,
+            render::drivers,
+        ),
+        Cmd::Driver {
+            what: DriverCmd::Show { name },
+        } => show(
+            cli,
+            c.call("driver.show", json!({ "name": name }), None).await?,
+            render::driver,
+        ),
+        // Ending the browser session a driver holds is a human act too
+        // (Ruling R25), signed with this node's device key like the mount.
+        Cmd::Driver {
+            what: DriverCmd::Umount { name },
+        } => {
+            let proof = presence(&c).await?;
+            show(
+                cli,
+                c.call("driver.unmount", json!({ "name": name }), Some(proof))
+                    .await?,
+                render::unmounted_driver,
+            )
+        }
         Cmd::Task { what } => task(cli, &c, what).await,
         Cmd::Harness { what } => harness(cli, &c, what).await,
         Cmd::Stop { scope } => {
@@ -968,6 +1091,35 @@ fn confirm_rebase() -> Result<()> {
 
 async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
     match what {
+        // The recipe is the whole task: what it says is what is posted, the
+        // constraints and evidence the kernel writes into the register
+        // included. Clap refuses every other submit flag beside it.
+        TaskCmd::Submit {
+            steps: Some(file), ..
+        } => {
+            let mut recipe = recipe(file)?;
+            // Ruling R21: arches by name. Asked for only when a step needs
+            // it, and resolved before anything is posted.
+            if recipe.steps.iter().any(names_an_arch) {
+                let arches = c.call("arch.ls", json!({}), None).await?;
+                resolve_arch_names(&mut recipe.steps, &arches)
+                    .map_err(|e| anyhow!("{}: {e}", file.display()))?;
+            }
+            let created = c
+                .call(
+                    "task.create",
+                    json!({
+                        "goal": recipe.goal,
+                        "artefact_type": recipe.artefact_kind,
+                        "constraints": recipe.constraints,
+                        "evidence": recipe.evidence,
+                        "steps": recipe.steps,
+                    }),
+                    None,
+                )
+                .await?;
+            show(cli, created, render::task)
+        }
         TaskCmd::Submit {
             goal,
             artefact,
@@ -977,7 +1129,16 @@ async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
             judge,
             approve,
             release,
+            steps: None,
         } => {
+            // Clap requires both without `--steps`; said again here, so a
+            // change to the flags cannot post a task with no goal.
+            let goal = goal
+                .as_deref()
+                .ok_or_else(|| anyhow!("give --goal, or a recipe with --steps"))?;
+            let plan = plan
+                .as_deref()
+                .ok_or_else(|| anyhow!("give --plan <ARCH>, or a recipe with --steps"))?;
             let mut steps = vec![json!({ "kind": "plan", "arch_id": plan })];
             // Exactly one of the two produces what is approved. Clap already
             // refuses both and refuses neither; this match is what turns the
@@ -1093,6 +1254,167 @@ async fn harness(cli: &Cli, c: &Client, what: &HarnessCmd) -> Result<()> {
     } else {
         show(cli, answer, render::harness_run)
     }
+}
+
+/// `vk artefact cat` (Ruling R22): the bytes of one artefact, read with a
+/// presence proof — the founder reads the verdict and the report before he
+/// signs them. Text goes to stdout as it is; anything else is refused unless
+/// `--out` names a file to hold it, because raw bytes on a terminal are
+/// neither readable nor safe. `--json` prints the daemon's answer (base64).
+async fn artefact_cat(cli: &Cli, c: &Client, hash: &str, out: Option<&Path>) -> Result<()> {
+    let proof = presence(c).await?;
+    let answer = c
+        .call("artefact.read", json!({ "hash": hash }), Some(proof))
+        .await?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&answer)?);
+        return Ok(());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(field(&answer, "bytes_base64")?)
+        .context("the daemon's bytes_base64 is not base64")?;
+    match out {
+        Some(file) => {
+            std::fs::write(file, &bytes).with_context(|| format!("write {}", file.display()))?;
+            println!("wrote {} bytes to {}", bytes.len(), file.display());
+        }
+        None => match std::str::from_utf8(&bytes) {
+            Ok(text) => {
+                use std::io::Write as _;
+                let mut stdout = std::io::stdout().lock();
+                // The bytes as they are, not a byte added: what is read
+                // here is what was signed.
+                stdout.write_all(text.as_bytes())?;
+                stdout.flush()?;
+            }
+            Err(_) => return Err(anyhow!("{} bytes, not text; use --out FILE", bytes.len())),
+        },
+    }
+    Ok(())
+}
+
+/// A task recipe file (pilot spec §5.1), read and checked on this end: a typo
+/// in it, or a recipe the kernel could only half run, is refused before
+/// anything is posted.
+fn recipe(file: &Path) -> Result<vk_contracts::recipe::TaskRecipe> {
+    let text = std::fs::read_to_string(file)
+        .with_context(|| format!("read the recipe {}", file.display()))?;
+    let recipe: vk_contracts::recipe::TaskRecipe = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not a task recipe", file.display()))?;
+    recipe
+        .validate()
+        .map_err(|e| anyhow!("{}: {e}", file.display()))?;
+    Ok(recipe)
+}
+
+/// The arch a plan, draft or judge step runs on, with its role; `None` for
+/// the steps that run on no arch.
+fn step_arch(step: &mut RecipeStep) -> Option<(&'static str, &mut String)> {
+    match step {
+        RecipeStep::Plan { arch_id } => Some(("plan", arch_id)),
+        RecipeStep::Draft { arch_id } => Some(("draft", arch_id)),
+        RecipeStep::Judge { arch_id } => Some(("judge", arch_id)),
+        RecipeStep::Harness { .. } | RecipeStep::Approve | RecipeStep::Release { .. } => None,
+    }
+}
+
+/// Does this step name its arch rather than give its id?
+fn names_an_arch(step: &RecipeStep) -> bool {
+    match step {
+        RecipeStep::Plan { arch_id }
+        | RecipeStep::Draft { arch_id }
+        | RecipeStep::Judge { arch_id } => !arch_id.starts_with("sha256:"),
+        RecipeStep::Harness { .. } | RecipeStep::Approve | RecipeStep::Release { .. } => false,
+    }
+}
+
+/// Ruling R21: a recipe may name an arch by its manifest name, because an
+/// arch id is a content hash that differs per machine and per Claude version,
+/// so a committed recipe cannot carry one. Every `arch_id` that is not a
+/// `sha256:` id is replaced by the id of the one arch `arches` (an `arch.ls`
+/// answer) lists under that name. No arch, or several, is a refusal naming
+/// the step, the name and — for several — every id that carries it, and
+/// pointing at `vk ls /arches`, where the names and ids are. An id is left as
+/// written: whether it is mounted is the kernel's to say when the step runs.
+fn resolve_arch_names(steps: &mut [RecipeStep], arches: &Value) -> Result<()> {
+    let rows = arches
+        .as_array()
+        .ok_or_else(|| anyhow!("arch.ls answered something other than a list: {arches}"))?;
+    for (i, step) in steps.iter_mut().enumerate() {
+        let Some((role, arch)) = step_arch(step) else {
+            continue;
+        };
+        if arch.starts_with("sha256:") {
+            continue;
+        }
+        let carrying: Vec<&Value> = rows
+            .iter()
+            .filter(|a| a["manifest"]["name"].as_str() == Some(arch.as_str()))
+            .collect();
+        match carrying.as_slice() {
+            [one] => {
+                *arch = one["arch_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("arch.ls listed `{arch}` without an id: {one}"))?
+                    .to_string();
+            }
+            [] => {
+                return Err(anyhow!(
+                    "step {} ({role}): no mounted arch is named `{arch}`; mount it, or write \
+                     its id instead (`vk ls /arches` lists the names and ids this node has)",
+                    i + 1
+                ))
+            }
+            many => {
+                let ids = many
+                    .iter()
+                    .map(|a| {
+                        format!(
+                            "{} ({})",
+                            a["arch_id"].as_str().unwrap_or("?"),
+                            a["state"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(anyhow!(
+                    "step {} ({role}): {} mounted arches are named `{arch}`: {ids}; unmount the \
+                     one you do not mean (`vk umount <ID>`) or write its id instead \
+                     (`vk ls /arches` lists them)",
+                    i + 1,
+                    many.len()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `vk mount driver --manifest FILE`'s request: the manifest as written, and
+/// the root its relative command resolves against (Ruling R6) — the
+/// canonical directory of the manifest file, so the daemon, whose working
+/// directory is its own, is told where the driver's files are rather than
+/// where this shell stood. Spelled without Windows' verbatim `\\?\` prefix,
+/// so it reads back in `vk driver show` as a person would type it.
+fn driver_manifest(file: &Path) -> Result<(Value, String)> {
+    let text = std::fs::read_to_string(file)
+        .with_context(|| format!("read the driver manifest {}", file.display()))?;
+    let manifest: Value =
+        serde_json::from_str(&text).with_context(|| format!("{} is not JSON", file.display()))?;
+    let canonical =
+        std::fs::canonicalize(file).with_context(|| format!("resolve {}", file.display()))?;
+    let dir = canonical
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no directory", canonical.display()))?
+        .display()
+        .to_string();
+    #[cfg(windows)]
+    let dir = match (dir.strip_prefix(r"\\?\UNC\"), dir.strip_prefix(r"\\?\")) {
+        (Some(share), _) => format!(r"\\{share}"),
+        (None, Some(local)) => local.to_string(),
+        (None, None) => dir,
+    };
+    Ok((manifest, dir))
 }
 
 /// A task that will not move again without something else happening: a human,
@@ -1680,5 +2002,85 @@ mod detach_tests {
             let ours = unsafe { libc::getpgrp() };
             assert_ne!(pgid, ours, "and it is not this process's group");
         }
+    }
+}
+
+#[cfg(test)]
+mod recipe_tests {
+    use super::{names_an_arch, resolve_arch_names, RecipeStep};
+    use serde_json::json;
+
+    fn listing() -> serde_json::Value {
+        json!([
+            {"arch_id": "sha256:aaa", "manifest": {"name": "claude-code/claude-sonnet-5"}, "state": "ready", "reason": null},
+            {"arch_id": "sha256:bbb", "manifest": {"name": "claude-code/claude-opus-5"}, "state": "ready", "reason": null},
+            {"arch_id": "sha256:c01", "manifest": {"name": "twice"}, "state": "ready", "reason": null},
+            {"arch_id": "sha256:c02", "manifest": {"name": "twice"}, "state": "unavailable", "reason": "gone"}
+        ])
+    }
+
+    fn plan(arch: &str) -> RecipeStep {
+        RecipeStep::Plan {
+            arch_id: arch.into(),
+        }
+    }
+
+    /// Ruling R21: names become the ids `arch.ls` lists under them, ids and
+    /// the steps that run on no arch are left exactly as written.
+    #[test]
+    fn a_name_resolves_to_the_one_arch_carrying_it_and_an_id_is_left_alone() {
+        let mut steps = vec![
+            plan("claude-code/claude-sonnet-5"),
+            RecipeStep::Harness {
+                name: "claude-code".into(),
+                drivers: vec!["maskai-1".into()],
+                instruction: None,
+                max_actions: None,
+                timeout_s: None,
+            },
+            RecipeStep::Judge {
+                arch_id: "claude-code/claude-opus-5".into(),
+            },
+            RecipeStep::Approve,
+            RecipeStep::Draft {
+                arch_id: "sha256:not-mounted".into(),
+            },
+            RecipeStep::Release {
+                to_dir: "runs".into(),
+            },
+        ];
+        assert!(steps.iter().any(names_an_arch));
+        let before = steps.clone();
+        resolve_arch_names(&mut steps, &listing()).unwrap();
+        assert_eq!(steps[0], plan("sha256:aaa"));
+        assert_eq!(
+            steps[2],
+            RecipeStep::Judge {
+                arch_id: "sha256:bbb".into()
+            }
+        );
+        for i in [1, 3, 4, 5] {
+            assert_eq!(steps[i], before[i], "step {i} untouched");
+        }
+        assert!(!steps.iter().any(names_an_arch));
+    }
+
+    #[test]
+    fn no_arch_or_several_under_a_name_is_refused_with_the_listing_named() {
+        let e = resolve_arch_names(&mut [RecipeStep::Approve, plan("nobody")], &listing())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("step 2 (plan)"), "{e}");
+        assert!(e.contains("`nobody`"), "{e}");
+        assert!(e.contains("vk ls /arches"), "{e}");
+
+        let e = resolve_arch_names(&mut [plan("twice")], &listing())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("2 mounted arches are named `twice`"), "{e}");
+        assert!(e.contains("sha256:c01 (ready)"), "{e}");
+        assert!(e.contains("sha256:c02 (unavailable)"), "{e}");
+        assert!(e.contains("vk umount"), "{e}");
+        assert!(e.contains("vk ls /arches"), "{e}");
     }
 }

@@ -3734,6 +3734,7 @@ name = "vk-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "hex",
  "keyring",
@@ -3761,8 +3762,23 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.20",
  "walkdir",
+]
+
+[[package]]
+name = "vk-driver"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "vk-contracts",
+ "vk-harness",
 ]
 
 [[package]]
@@ -3784,6 +3800,7 @@ name = "vk-ipc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "directories",
  "hex",
  "libc",
@@ -3800,6 +3817,7 @@ dependencies = [
  "vk-arch-claude-code",
  "vk-arch-ollama",
  "vk-contracts",
+ "vk-driver",
  "vk-harness",
  "vk-kernel",
  "vk-store",
@@ -3825,6 +3843,7 @@ dependencies = [
  "url",
  "uuid",
  "vk-contracts",
+ "vk-driver",
  "vk-harness",
  "vk-store",
  "zeroize",

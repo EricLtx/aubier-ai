@@ -1139,6 +1139,165 @@ async fn harness_run_refuses_a_request_that_names_the_binary_model_timeout_or_an
     shutdown(server, k, d).await;
 }
 
+/// Ruling R22: `artefact.read` hands an artefact's bytes to a **human** — a
+/// machine call is refused I1 before anything is read — and holds them to
+/// the label: a blob above the caller's clearance (`Holdout`, which flows to
+/// no clearance) is refused I2. `task.show` lists the register's artefacts by
+/// hash and kind, which is how the human names the one to read. Ruling R24:
+/// every read is a release on the ledger — `artefact.released`, the
+/// `ReleaseRecord` shape, `destination: terminal:<device>` — and a refused
+/// read appends nothing.
+#[tokio::test]
+async fn artefact_read_is_a_human_act_held_to_the_label() {
+    use base64::Engine as _;
+    use vk_contracts::labels::{DataClass, Label};
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    let task = c
+        .call(
+            "task.create",
+            json!({"goal": "g", "artefact_type": "note", "steps": []}),
+            None,
+        )
+        .await
+        .unwrap();
+    let id = task["id"].as_str().unwrap().to_string();
+    let text = "verdict : OK, accentué\n";
+    let (hash, holdout) = {
+        let mut kk = k.lock().unwrap();
+        let ctx = local_ctx();
+        let register = kk.task(&ctx, &id).unwrap().unwrap().register;
+        let hash = kk
+            .attach_artefact(&ctx, &register, "verdict.md", text.as_bytes())
+            .unwrap()
+            .hash;
+        let holdout = kk
+            .store()
+            .blobs
+            .put(
+                &format!("task:{id}"),
+                Label {
+                    scope: Scope::Holdout,
+                    data_class: DataClass::Own,
+                    origins: Default::default(),
+                },
+                b"held out",
+            )
+            .unwrap()
+            .hash;
+        (hash, holdout)
+    };
+
+    // The ledger's events, read through the kernel.
+    let events = |k: &Arc<Mutex<vk_kernel::RealKernel>>| {
+        let k = k.lock().unwrap();
+        vk_contracts::syscalls::Kernel::ledger(&*k)
+            .events()
+            .to_vec()
+    };
+    // What a read records: the owning task (read off the blob's partition),
+    // the address, and the human's device as the destination. The ledger
+    // commits to the payload's hash, so the expected payload is spelt out in
+    // the record's own field order.
+    let released = vk_contracts::hash_bytes(
+        format!(r#"{{"task_id":"{id}","hashes":["{hash}"],"destination":"terminal:laptop"}}"#)
+            .as_bytes(),
+    );
+
+    // `task.show` names it, by hash and kind.
+    let shown = c
+        .call("task.show", json!({"task_id": id}), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        shown["artefacts"],
+        json!([{"hash": hash, "kind": "verdict.md"}]),
+        "{shown}"
+    );
+
+    // A machine principal is refused, with the remedy, and nothing is recorded.
+    let before = events(&k).len();
+    let err = c
+        .call("artefact.read", json!({"hash": hash}), None)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(
+        err.to_string().contains(
+            "I1: reading an artefact's bytes is a human act; re-run it with a presence proof"
+        ),
+        "{err}"
+    );
+    assert_eq!(events(&k).len(), before, "a refused read records nothing");
+
+    // A human reads it, with or without the `sha256:` prefix — each read a
+    // release on the ledger.
+    for given in [hash.clone(), hash.trim_start_matches("sha256:").to_string()] {
+        let proof = prove(&c, &device).await;
+        let read = c
+            .call("artefact.read", json!({"hash": given}), Some(proof))
+            .await
+            .unwrap();
+        assert_eq!(read["hash"], json!(hash), "{read}");
+        assert_eq!(read["len"], json!(text.len()), "{read}");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(read["bytes_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(bytes, text.as_bytes());
+        let after = events(&k);
+        let last = after.last().unwrap();
+        assert_eq!(last.kind, "artefact.released");
+        assert_eq!(
+            last.payload_hash, released,
+            "task, hash and terminal:laptop"
+        );
+    }
+    let before = events(&k).len();
+
+    // Above the human's clearance: I2, and no bytes.
+    let proof = prove(&c, &device).await;
+    let err = c
+        .call("artefact.read", json!({"hash": holdout}), Some(proof))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(
+        err.to_string().contains("exceeds caller clearance"),
+        "{err}"
+    );
+
+    // Not an address, and an address nothing holds.
+    let proof = prove(&c, &device).await;
+    let err = c
+        .call("artefact.read", json!({"hash": "../../m.key"}), Some(proof))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{err}");
+    let proof = prove(&c, &device).await;
+    let err = c
+        .call(
+            "artefact.read",
+            json!({"hash": format!("sha256:{}", "0".repeat(64))}),
+            Some(proof),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_NOT_FOUND, "{err}");
+    assert_eq!(
+        events(&k).len(),
+        before,
+        "refused reads (I2, malformed, unknown) record nothing"
+    );
+
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
 /// A machine principal at the local endpoint's clearance, for a test that
 /// drives the kernel directly beside the transport.
 fn local_ctx() -> vk_contracts::syscalls::Ctx {

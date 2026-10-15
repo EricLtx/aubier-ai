@@ -8,6 +8,7 @@ use crate::{
     E_NOT_FOUND, E_RETRY, E_STORE,
 };
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -27,7 +28,7 @@ use vk_kernel::arch::{ArchAdapter, MockAdapter, MountSpec};
 use vk_kernel::tasks::StepKind;
 use vk_kernel::{now_ms, RealKernel, Remount};
 
-type Shared = Arc<Mutex<RealKernel>>;
+pub(crate) type Shared = Arc<Mutex<RealKernel>>;
 
 /// What the daemon was started with, beyond the kernel: the endpoint it serves
 /// on (a harness's `vk-mcp` dials back on it) and the harness settings — the
@@ -74,6 +75,11 @@ pub struct ServerConfig {
     /// rule was the service's (Ruling 43), which is why the transport no
     /// longer needs to know which mode it is in.
     pub claude_bin: PathBuf,
+    /// The driver processes this daemon owns (pilot spec §4.2): one host per
+    /// mounted driver, spawned at `driver.mount` or, after a restart, by the
+    /// first `driver.act` that needs it. The kernel owns the table of what is
+    /// mounted; this owns the processes.
+    pub drivers: Arc<crate::drivers::DriverPool>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -100,6 +106,7 @@ impl ServerConfig {
             anthropic_keys: vk_arch_anthropic::KeySource::Keyring,
             anthropic_base_url: vk_arch_anthropic::DEFAULT_BASE_URL.to_string(),
             claude_bin: PathBuf::from(DEFAULT_CLAUDE_BIN),
+            drivers: crate::drivers::DriverPool::new(),
         }
     }
 }
@@ -568,7 +575,7 @@ fn reply(id: u64, outcome: Result<Value, RpcError>) -> Response {
     }
 }
 
-fn kerr(e: KernelError) -> RpcError {
+pub(crate) fn kerr(e: KernelError) -> RpcError {
     let code = match e {
         KernelError::NotFound(_) => E_NOT_FOUND,
         // Not `E_NOT_FOUND`: the arch is there and the client can see it in
@@ -599,7 +606,7 @@ fn kerr(e: KernelError) -> RpcError {
     }
 }
 
-fn bad(msg: &str) -> RpcError {
+pub(crate) fn bad(msg: &str) -> RpcError {
     RpcError {
         code: E_BAD_PARAMS,
         message: msg.into(),
@@ -620,7 +627,7 @@ fn not_found(what: &str) -> RpcError {
     }
 }
 
-fn internal(msg: &str) -> RpcError {
+pub(crate) fn internal(msg: &str) -> RpcError {
     RpcError {
         code: E_INTERNAL,
         message: msg.into(),
@@ -629,7 +636,7 @@ fn internal(msg: &str) -> RpcError {
 
 /// A poisoned lock is reported, not unwrapped: one panicking dispatch must not
 /// take every later connection down with it.
-fn lock<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, RpcError> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, RpcError> {
     m.lock().map_err(|_| internal("kernel lock poisoned"))
 }
 
@@ -667,6 +674,14 @@ fn takes_presence(method: &str) -> bool {
             // Reading every blob on the node, and overriding its store's own
             // refusal, are human acts (SP1b Task 8).
             | "store.fsck"
+            // Putting a browser under this node's control is a human act: see
+            // the refusal in `dispatch` (pilot spec §4.3, I1).
+            | "driver.mount"
+            // And so is ending the session it holds (Ruling R25): see the
+            // refusal in the `driver.unmount` arm.
+            | "driver.unmount"
+            // Plaintext out of the encrypted store, to a terminal (R22).
+            | "artefact.read"
     )
 }
 
@@ -779,6 +794,24 @@ fn dispatch(
     } else {
         None
     };
+    // **Mounting a driver is a human act** (pilot spec §4.3, I1): it puts a
+    // browser under this node's control, durably. Verified here, as the cloud
+    // arch is, before any file is hashed or any process started; the mount
+    // then runs in phases of its own, because starting a driver waits for its
+    // hello with the kernel lock released.
+    if req.method == "driver.mount" {
+        let ctx = {
+            let k = lock(kernel)?;
+            ctx_for(&k, presence.take(), now)?
+        };
+        if !ctx.principal.is_human() {
+            return Err(invariant(
+                "I1: mounting a driver puts a browser under this node's control, which is a \
+                 human act; re-run it with a presence proof",
+            ));
+        }
+        return crate::drivers::mount(kernel, &config.drivers, ctx, req.params);
+    }
     // Mounting a Claude Code arch means running the binary to ask its version,
     // because the version is in the arch identity. That happens here, *before*
     // the kernel lock, so a binary that is slow — or missing, and about to be
@@ -825,6 +858,12 @@ fn dispatch(
     // (SP1b Task 4).
     if req.method == "harness.run" {
         return harness_run(kernel, config, req.params);
+    }
+    // The same for a driver action, which the harness makes from inside that
+    // wait (pilot spec §4.4): the browser takes seconds to minutes, and every
+    // other syscall — the harness's own included — is served meanwhile.
+    if req.method == "driver.act" {
+        return crate::drivers::act(kernel, &config.drivers, req.params);
     }
     let mut k = lock(kernel)?;
     let p = req.params;
@@ -1181,6 +1220,38 @@ fn dispatch(
             // argument they typed.
             Ok(json!({ "ok": true, "arch_id": id }))
         }
+        // The mounted drivers and one of them, as the `drivers` table holds
+        // them (pilot spec §4): manifest, identity, root, state.
+        "driver.ls" => k.drivers().map_err(kerr).and_then(to_value),
+        "driver.show" => {
+            let name = p["name"].as_str().ok_or_else(|| bad("name"))?;
+            k.driver(name)
+                .map_err(kerr)?
+                .ok_or_else(|| not_found(&format!("driver {name}")))
+                .and_then(to_value)
+        }
+        // **Unmounting a driver is a human act** (Ruling R25), symmetric with
+        // mounting one: it ends a browser session this node controls, and it
+        // kills an act in flight (R13). Refused to a machine principal here,
+        // before anything is touched, and again by the kernel. Then the row
+        // and its `driver.unmounted{reason: "operator"}` first, then the
+        // process, out from under the kernel lock: dropping a host is a tree
+        // kill, as dropping an Ollama arch is a `docker stop`.
+        "driver.unmount" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            if !ctx.principal.is_human() {
+                return Err(invariant(
+                    "I1: unmounting a driver ends a browser session this node controls, which \
+                     is a human act; re-run it with a presence proof",
+                ));
+            }
+            let name = p["name"].as_str().ok_or_else(|| bad("name"))?;
+            let removed = k.unmount_driver(&ctx, name, "operator").map_err(kerr)?;
+            drop(k);
+            config.drivers.drop_host(name);
+            let row = removed.ok_or_else(|| not_found(&format!("driver {name}")))?;
+            Ok(json!({ "ok": true, "name": name, "driver_id": row.driver_id }))
+        }
         // The harness's own syscalls (SP1b Task 4). Each carries the lease token
         // `vk-mcp` was launched with; the kernel maps it to the harness principal
         // at the harness clearance. No presence proof is accepted (they are not
@@ -1234,9 +1305,26 @@ fn dispatch(
             let artefact_type = p["artefact_type"].as_str().unwrap_or("note");
             let steps: Vec<StepKind> = serde_json::from_value(p["steps"].clone())
                 .map_err(|e| bad(&format!("steps: {e}")))?;
-            k.create_task(&ctx, goal, artefact_type, Label::bottom(), steps)
-                .map_err(kerr)
-                .and_then(to_value)
+            // A recipe's constraints and evidence (pilot spec §5.1), written
+            // into the register by the kernel; absent, there are none.
+            let lines = |key: &str| -> Result<Vec<String>, RpcError> {
+                match &p[key] {
+                    Value::Null => Ok(Vec::new()),
+                    v => serde_json::from_value(v.clone()).map_err(|e| bad(&format!("{key}: {e}"))),
+                }
+            };
+            let (constraints, evidence) = (lines("constraints")?, lines("evidence")?);
+            k.create_task(
+                &ctx,
+                goal,
+                artefact_type,
+                Label::bottom(),
+                &constraints,
+                &evidence,
+                steps,
+            )
+            .map_err(kerr)
+            .and_then(to_value)
         }
         "task.step" => {
             let ctx = ctx_for(&k, presence, now)?;
@@ -1292,12 +1380,56 @@ fn dispatch(
             let usage = k
                 .usage(&ctx, &vk_kernel::UsageFilter::Task(id.into()))
                 .map_err(kerr)?;
+            // The register's artefacts, by address and kind (Rulings R22,
+            // R23): metadata only, never their bytes, so Ruling 28 holds —
+            // which is what a human needs to name the one to read
+            // (`artefact.read`) before signing it, and to tell a task's
+            // released files from another task's in a shared export
+            // directory. The register read holds the caller to the
+            // register's label, as `task_decisions` does.
+            let artefacts = Kernel::read_register(&mut *k, &ctx, &task.register)
+                .map_err(kerr)?
+                .artefacts;
             let mut out = to_value(task)?;
             if let Some(o) = out.as_object_mut() {
                 o.insert("decisions".into(), to_value(decisions)?);
                 o.insert("usage".into(), to_value(usage)?);
+                o.insert("artefacts".into(), to_value(artefacts)?);
             }
             Ok(out)
+        }
+        // An artefact's bytes, to a human (Ruling R22): the founder reads the
+        // verdict and the report he is about to sign. A human act, because
+        // this is plaintext leaving the encrypted store for a terminal; the
+        // label must flow to the caller's clearance or the kernel refuses
+        // with I2. And a release (Ruling R24): the kernel appends
+        // `artefact.released` with `destination: terminal:<device>` before it
+        // reads the bytes (`read_artefact_for_human`); a refused read records
+        // nothing. The answer carries no `kind`: the blob store does not
+        // index blobs by register, and finding the owner would mean reading
+        // every register — `task.show`'s `artefacts` gives the kind beside
+        // the hash.
+        "artefact.read" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            if !ctx.principal.is_human() {
+                return Err(invariant(
+                    "I1: reading an artefact's bytes is a human act; re-run it with a presence proof",
+                ));
+            }
+            let given = p["hash"].as_str().ok_or_else(|| bad("hash"))?;
+            let hex_part = given.strip_prefix("sha256:").unwrap_or(given);
+            if hex_part.len() != 64 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(bad(
+                    "hash: an artefact address, sha256: and 64 hex digits (vk task show --json lists them)",
+                ));
+            }
+            let hash = format!("sha256:{}", hex_part.to_ascii_lowercase());
+            let bytes = k.read_artefact_for_human(&ctx, &hash).map_err(kerr)?;
+            Ok(json!({
+                "hash": hash,
+                "len": bytes.len(),
+                "bytes_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            }))
         }
         "task.ls" => {
             let ctx = ctx_for(&k, presence, now)?;
@@ -2253,7 +2385,12 @@ fn harness_run(kernel: &Shared, config: &ServerConfig, p: Value) -> Result<Value
     };
 
     // Phase two: launch and wait, lock released, so `harness.*` callbacks serve.
-    // A panic here is a run that did not start, not a step left `Running`.
+    // A panic here is a run that did not start, not a step left `Running`. The
+    // run's budget is the daemon's, or the step's own `timeout_s` when it asks
+    // for less (pilot spec §5.1): a step may shorten the leash, never lengthen it.
+    let timeout = launch_plan
+        .timeout_s
+        .map_or(timeout, |s| timeout.min(Duration::from_secs(s)));
     let cfg = HarnessConfig {
         binary,
         workspace: launch_plan.workspace.clone(),

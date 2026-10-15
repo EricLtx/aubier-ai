@@ -1,0 +1,51 @@
+{
+  "name": "maskai-1",
+  "kind": "browser",
+  "program": {
+    "runtime": "python-playwright",
+    "command": [
+      "python",
+      "-I",
+      "drivers/maskai-recette/driver.py"
+    ],
+    "files_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "browser_channel": "chrome",
+    "headless": false
+  },
+  "hosts": [
+    "app.maskai.fr"
+  ],
+  "actions": {
+    "capture_ecran": {
+      "name": "capture_ecran",
+      "reversible": true,
+      "args": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "evidence": [
+        "screen.png"
+      ],
+      "to_register": false
+    },
+    "capture_ecran ": {
+      "name": "capture_ecran",
+      "reversible": true,
+      "args": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "evidence": [
+        "screen.png"
+      ],
+      "to_register": false
+    }
+  },
+  "min_interval_ms": 2000,
+  "max_action_ms": 120000,
+  "clearance": {
+    "max_scope": "business",
+    "third_party_allowed": true
+  },
+  "governed": false
+}

@@ -15,7 +15,11 @@ sha2.workspace = true
 hex.workspace = true
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+# `DriverAction::validate_args` (pilot spec §4.3 item 3): the one place in the
+# workspace that knows the schema library. No default features: no HTTP
+# resolver, nothing that reaches out of the process.
+jsonschema = { version = "0.30", default-features = false }
 
 [dev-dependencies]
-jsonschema = { version = "0.30", default-features = false }
 walkdir = "2"
+tempfile = "3"

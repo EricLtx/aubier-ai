@@ -4,6 +4,7 @@
 //! `contracts/schemas/` and checked for drift in tests.
 
 pub mod arch;
+pub mod driver;
 pub mod federation;
 pub mod interceptors;
 pub mod labels;
@@ -11,6 +12,7 @@ pub mod ledger;
 pub mod locks;
 pub mod module;
 pub mod principal;
+pub mod recipe;
 pub mod register;
 pub mod stop;
 pub mod storage;
@@ -54,6 +56,20 @@ pub fn schema_registry() -> Vec<(&'static str, schemars::Schema)> {
         ("gate_verdict", schemars::schema_for!(module::GateVerdict)),
         ("syscall_ctx", schemars::schema_for!(syscalls::Ctx)),
         ("tuf_root", schemars::schema_for!(federation::SignedRoot)),
+        (
+            "driver_manifest",
+            schemars::schema_for!(driver::DriverManifest),
+        ),
+        (
+            "driver_mounted",
+            schemars::schema_for!(driver::DriverMounted),
+        ),
+        ("driver_acted", schemars::schema_for!(driver::DriverActed)),
+        (
+            "driver_unmounted",
+            schemars::schema_for!(driver::DriverUnmounted),
+        ),
+        ("task_recipe", schemars::schema_for!(recipe::TaskRecipe)),
     ]
 }
 

@@ -1914,6 +1914,596 @@ fn vk_task_submit_builds_judge_and_harness_steps() {
     assert_ne!(shown["status"], "failed", "{shown}");
 }
 
+/// `vk task submit --steps FILE` (pilot spec §5.1): the recipe is read and
+/// validated on this end and posted whole — goal, artefact kind, constraints,
+/// evidence and steps — so a `plan → approve → release` recipe is a
+/// three-step task that runs to its human. A submit flag beside `--steps` is
+/// a usage error and a recipe that does not validate is refused before
+/// anything is posted. And `vk driver ls` on a node with no driver mounted
+/// prints an empty table: the header, no row.
+#[test]
+fn task_submit_with_steps_posts_the_recipe() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let recipes = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+
+    let file = recipes.path().join("recette.json");
+    std::fs::write(
+        &file,
+        serde_json::json!({
+            "goal": "Run the recette",
+            "artefact_kind": "report",
+            "constraints": ["fictional data only"],
+            "evidence": ["cases: N0-1"],
+            "steps": [
+                {"kind": "plan", "arch_id": arch},
+                {"kind": "approve"},
+                {"kind": "release", "to_dir": "runs"}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let path = path_of(&file);
+    let created = sh.json(&["task", "submit", "--steps", &path, "--json"]);
+    let kinds: Vec<&str> = created["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .map(|s| str_of(&s["kind"], "kind"))
+        .collect();
+    assert_eq!(kinds, ["plan", "approve", "release"], "{created}");
+    assert_eq!(created["goal"], "Run the recette", "{created}");
+    assert_eq!(created["artefact_type"], "report", "{created}");
+    let task = str_of(&created, "id").to_string();
+    let waiting = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(waiting["status"], "waiting_human", "{waiting}");
+
+    // Every other submit flag is refused beside `--steps`: the recipe is the
+    // whole task, and a second source for any part of it is a usage error.
+    for extra in [["--plan", arch.as_str()], ["--goal", "another goal"]] {
+        let o = sh.run(&["task", "submit", "--steps", &path, extra[0], extra[1]]);
+        assert_eq!(o.status.code(), Some(2), "{extra:?} beside --steps");
+    }
+    // A recipe that does not validate never reaches the daemon.
+    let bad = recipes.path().join("approve-first.json");
+    std::fs::write(
+        &bad,
+        serde_json::json!({
+            "goal": "g",
+            "artefact_kind": "report",
+            "steps": [{"kind": "approve"}, {"kind": "plan", "arch_id": arch}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let o = sh.run(&["task", "submit", "--steps", &path_of(&bad)]);
+    assert!(!o.status.success(), "an invalid recipe is refused");
+    let why = String::from_utf8_lossy(&o.stderr);
+    assert!(why.contains("cannot come first"), "{why}");
+    let tasks = sh.json(&["ps", "--json"]);
+    assert_eq!(tasks.as_array().map(Vec::len), Some(1), "{tasks}");
+
+    let table = sh.ok(&["driver", "ls"]);
+    assert_eq!(table.trim_end().lines().count(), 1, "{table}");
+    assert!(table.starts_with("NAME"), "{table}");
+    assert_eq!(sh.json(&["driver", "ls", "--json"]), serde_json::json!([]));
+}
+
+/// The `kind` object of every step of a created task, in order.
+fn step_kinds(created: &Value) -> Vec<&Value> {
+    created["steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no steps in {created}"))
+        .iter()
+        .map(|s| &s["kind"])
+        .collect()
+}
+
+/// Ruling R21: a recipe names its arches by manifest name, because an arch id
+/// is a content hash that differs per machine and per Claude version and a
+/// committed recipe cannot carry one. `vk task submit --steps` resolves every
+/// `arch_id` that is not a `sha256:` id through `arch.ls`, and refuses a name
+/// no mounted arch carries — before anything is posted, pointing at the
+/// listing that has the names.
+#[test]
+fn task_submit_with_steps_resolves_arches_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let recipes = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+
+    let write = |name: &str, arch_name: &str| {
+        let file = recipes.path().join(name);
+        std::fs::write(
+            &file,
+            serde_json::json!({
+                "goal": "Run the recette",
+                "artefact_kind": "report",
+                "steps": [
+                    {"kind": "plan", "arch_id": arch_name},
+                    {"kind": "approve"},
+                    {"kind": "release", "to_dir": "runs"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        path_of(&file)
+    };
+
+    // By name: the task carries the id the name resolved to.
+    let created = sh.json(&[
+        "task",
+        "submit",
+        "--steps",
+        &write("named.json", "m1"),
+        "--json",
+    ]);
+    let kinds = step_kinds(&created);
+    assert_eq!(kinds[0]["arch_id"], arch.as_str(), "{created}");
+    let task = str_of(&created, "id").to_string();
+    let waiting = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(waiting["status"], "waiting_human", "{waiting}");
+
+    // An id is posted as written, mounted or not: the kernel judges it.
+    let created = sh.json(&[
+        "task",
+        "submit",
+        "--steps",
+        &write("by-id.json", &arch),
+        "--json",
+    ]);
+    assert_eq!(
+        step_kinds(&created)[0]["arch_id"],
+        arch.as_str(),
+        "{created}"
+    );
+
+    // A name nothing carries is refused here, naming it and the listing.
+    let o = sh.run(&[
+        "task",
+        "submit",
+        "--steps",
+        &write("unknown.json", "no-such-arch"),
+    ]);
+    assert!(!o.status.success(), "an unknown arch name is refused");
+    let why = String::from_utf8_lossy(&o.stderr);
+    assert!(why.contains("no-such-arch"), "{why}");
+    assert!(why.contains("vk ls /arches"), "{why}");
+    let tasks = sh.json(&["ps", "--json"]);
+    assert_eq!(tasks.as_array().map(Vec::len), Some(2), "{tasks}");
+}
+
+/// The two committed recipes (Task 5), exactly as they are in the repository,
+/// against a daemon whose arches are mocks mounted under the names the recipes
+/// use: the sixteen-step MaskAI recette (plan and draft on the claude-code
+/// draft arch's name, judge on the judge arch's) and the eight-step fixture
+/// dry run (the mock by name). Both validate, resolve and are created whole.
+#[test]
+fn the_committed_recipes_submit_by_name_against_mock_arches() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let mount =
+        |name: &str| str_of(&sh.json(&["mount", "mock", name, "--json"]), "arch_id").to_string();
+    let draft = mount("claude-code/claude-sonnet-5");
+    let judge = mount("claude-code/claude-opus-5");
+    let mock = mount("mock");
+
+    let recette = path_of(&repo.join("recipes/recette-maskai.json"));
+    let created = sh.json(&["task", "submit", "--steps", &recette, "--json"]);
+    let kinds = step_kinds(&created);
+    let names: Vec<&str> = kinds.iter().map(|k| str_of(k, "kind")).collect();
+    let mut expected = vec!["plan"];
+    expected.extend(["harness"; 10]);
+    expected.extend(["judge", "approve", "draft", "approve", "release"]);
+    assert_eq!(names, expected, "{created}");
+    assert_eq!(kinds[0]["arch_id"], draft.as_str(), "plan: {created}");
+    assert_eq!(kinds[11]["arch_id"], judge.as_str(), "judge: {created}");
+    assert_eq!(kinds[13]["arch_id"], draft.as_str(), "draft: {created}");
+    assert_eq!(
+        kinds[15]["to_dir"], "recettage-chat-ia/runs/2026-10",
+        "{created}"
+    );
+    for (level, k) in kinds[1..=10].iter().enumerate() {
+        assert_eq!(k["name"], "claude-code", "{k}");
+        assert_eq!(k["drivers"], serde_json::json!(["maskai-1"]), "{k}");
+        let instruction = str_of(k, "instruction");
+        assert!(
+            instruction.starts_with(&format!("Niveau N{level} ")),
+            "step {} is level N{level}: {instruction}",
+            level + 1
+        );
+        assert!(k["max_actions"].as_u64().is_some(), "{k}");
+        assert!(k["timeout_s"].as_u64().is_some(), "{k}");
+    }
+    assert_eq!(created["artefact_type"], "report.md", "{created}");
+    assert!(
+        str_of(&created, "goal").contains("https://app.maskai.fr/new"),
+        "the entry URL is in the goal: {created}"
+    );
+
+    let fixture = path_of(&repo.join("recipes/recette-fixture.json"));
+    let created = sh.json(&["task", "submit", "--steps", &fixture, "--json"]);
+    let kinds = step_kinds(&created);
+    let names: Vec<&str> = kinds.iter().map(|k| str_of(k, "kind")).collect();
+    assert_eq!(
+        names,
+        ["plan", "harness", "harness", "judge", "approve", "draft", "approve", "release"],
+        "{created}"
+    );
+    for i in [0, 3, 5] {
+        assert_eq!(
+            kinds[i]["arch_id"],
+            mock.as_str(),
+            "step {}: {created}",
+            i + 1
+        );
+    }
+    for k in &kinds[1..=2] {
+        assert_eq!(k["drivers"], serde_json::json!(["maskai-fixture"]), "{k}");
+    }
+}
+
+/// Ruling R22: the founder reads what he signs. `vk task show --json` lists the
+/// register's artefacts (hash, kind) and the human page names the latest —
+/// the one the approve step signs; `vk artefact cat` prints its text, signed
+/// with the node's key, or saves it with `--out`. The same syscall from a bare
+/// connection (a machine principal) is refused I1.
+#[test]
+fn vk_artefact_cat_prints_what_the_approval_signs() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key,
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Rédiger le verdict",
+            "--artefact",
+            "verdict.md",
+            "--plan",
+            &arch,
+            "--draft",
+            &arch,
+            "--approve",
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let waiting = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(waiting["status"], "waiting_human", "{waiting}");
+
+    // The list, and the latest on the human page.
+    let shown = sh.json(&["task", "show", &task, "--json"]);
+    let artefacts = shown["artefacts"].as_array().expect("artefacts").clone();
+    assert_eq!(artefacts.len(), 1, "{shown}");
+    assert_eq!(artefacts[0]["kind"], "verdict.md", "{shown}");
+    let hash = str_of(&artefacts[0], "hash").to_string();
+    let page = sh.ok(&["task", "show", &task]);
+    assert!(
+        page.contains(&format!("1, latest verdict.md {hash}")),
+        "{page}"
+    );
+
+    // Its text, exactly; the prefix may be left out; --out saves the bytes.
+    let printed = sh.ok(&["artefact", "cat", &hash]);
+    assert!(printed.starts_with("draft: DRAFT:"), "{printed}");
+    assert!(printed.contains("Rédiger le verdict"), "{printed}");
+    // Ruling R24: the read is a release, on the ledger before the bytes left:
+    // `artefact.released` whose payload names this task, this hash and the
+    // terminal of the node's device (the ledger keeps the payload's hash).
+    let last = sh.json(&["dmesg", "-n", "1", "--json"]);
+    assert_eq!(dmesg_kinds(&last), ["artefact.released"], "{last}");
+    let expected = vk_contracts::hash_bytes(
+        format!(
+            r#"{{"task_id":"{task}","hashes":["{hash}"],"destination":"terminal:node:node-1"}}"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(last[0]["payload_hash"], expected.as_str(), "{last}");
+    let bare = hash.trim_start_matches("sha256:");
+    assert_eq!(sh.ok(&["artefact", "cat", bare]), printed);
+    let saved = dir.path().join("verdict.md");
+    let wrote = sh.ok(&["artefact", "cat", &hash, "--out", &path_of(&saved)]);
+    assert!(
+        wrote.starts_with(&format!("wrote {} bytes to", printed.len())),
+        "{wrote}"
+    );
+    assert_eq!(std::fs::read(&saved).unwrap(), printed.as_bytes());
+    // What is read is what the approval signs.
+    let approved = sh.json(&["approve", &task, "--json"]);
+    assert_eq!(approved["subject_hash"], hash.as_str(), "{approved}");
+
+    // Not an address: refused, nothing printed, nothing recorded.
+    let ledger_len = |sh: &Shell| sh.json(&["status", "--json"])["ledger_len"].as_u64();
+    let before = ledger_len(&sh);
+    let o = sh.run(&["artefact", "cat", "not-a-hash"]);
+    assert!(!o.status.success(), "a malformed hash is refused");
+    assert!(o.stdout.is_empty());
+
+    // A bare connection is a machine principal: refused I1.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let err = rt.block_on(async {
+        let c = vk_ipc::client::Client::connect(&vk_ipc::transport::Endpoint(endpoint.clone()))
+            .await
+            .unwrap();
+        c.call("artefact.read", serde_json::json!({ "hash": hash }), None)
+            .await
+            .unwrap_err()
+    });
+    let code = err
+        .downcast_ref::<vk_ipc::client::CallError>()
+        .map(|e| e.code);
+    assert_eq!(code, Some(vk_ipc::E_INVARIANT), "{err}");
+    assert!(err.to_string().contains("human act"), "{err}");
+    assert_eq!(ledger_len(&sh), before, "refused reads record nothing");
+}
+
+/// `vk artefact cat` on bytes that are not text (a screenshot, say) prints
+/// nothing to the terminal and names the remedy; `--out FILE` saves them
+/// exactly. The binary artefact is attached the only way a smoke test can
+/// without a browser: with the daemon stopped, through the kernel opened on
+/// the same state directory and key, as a driver's evidence is attached.
+#[test]
+fn vk_artefact_cat_refuses_binary_on_the_terminal_and_saves_it_with_out() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let spawn = || {
+        Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        )
+    };
+    let daemon = spawn();
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key,
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+    let task = str_of(
+        &sh.json(&[
+            "task", "submit", "--goal", "g", "--plan", &arch, "--draft", &arch, "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    drop(daemon);
+    wait_until(&sh, false, "vkd did not stop");
+
+    // A PNG-like blob: the signature's first bytes, a NUL, and a byte that is
+    // not UTF-8.
+    let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\x00";
+    let hash = {
+        let mut k = vk_kernel::RealKernel::open(
+            dir.path(),
+            vk_store::keys::KeySource::File(dir.path().join("master.key")),
+            "node-1",
+        )
+        .expect("open the stopped node's kernel");
+        let ctx = vk_contracts::syscalls::Ctx {
+            principal: vk_contracts::principal::Principal::Machine {
+                node_id: "node-1".into(),
+                lease_id: "test".into(),
+            },
+            clearance: vk_contracts::labels::Clearance {
+                max_scope: vk_contracts::labels::Scope::Personal,
+                third_party_allowed: true,
+            },
+            partition: "local".into(),
+            now_ms: vk_kernel::now_ms(),
+        };
+        let register = k.task(&ctx, &task).unwrap().unwrap().register;
+        k.attach_artefact(&ctx, &register, "screen.png", png)
+            .unwrap()
+            .hash
+    };
+
+    let _daemon = spawn();
+    wait_until(&sh, true, "vkd did not answer again").expect("status");
+    let shown = sh.json(&["task", "show", &task, "--json"]);
+    assert_eq!(
+        shown["artefacts"].as_array().and_then(|a| a.last()),
+        Some(&serde_json::json!({"hash": hash, "kind": "screen.png"})),
+        "{shown}"
+    );
+
+    let o = sh.run(&["artefact", "cat", &hash]);
+    assert!(!o.status.success(), "binary on the terminal is refused");
+    assert!(o.stdout.is_empty(), "no byte reaches the terminal");
+    let why = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        why.contains(&format!("{} bytes, not text; use --out FILE", png.len())),
+        "{why}"
+    );
+
+    let saved = dir.path().join("screen.png");
+    let wrote = sh.ok(&["artefact", "cat", &hash, "--out", &path_of(&saved)]);
+    assert!(
+        wrote.starts_with(&format!("wrote {} bytes to", png.len())),
+        "{wrote}"
+    );
+    assert_eq!(std::fs::read(&saved).unwrap(), png, "the exact bytes");
+}
+
+/// The scripted driver of Task 1's brief, verbatim (`crates/vk-driver/tests/
+/// fake_driver.rs`): copied, because one test binary does not import another.
+const FAKE_DRIVER: &str = r#"import json, os, sys, time
+def say(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+say({"hello": {"protocol": 1, "driver": "fake", "version": "0", "actions": ["echo", "slow", "escape", "big", "noise", "die"]}})
+for line in sys.stdin:
+    r = json.loads(line); a = r["action"]; ev = r["evidence_dir"]
+    if a == "echo":
+        p = os.path.join(ev, "note.txt"); open(p, "w").write("hi")
+        say({"id": r["id"], "ok": True, "result": {"echo": r["args"]}, "evidence": [{"name": "note.txt", "mime": "text/plain", "path": p}]})
+    elif a == "slow": time.sleep(30)
+    elif a == "escape":
+        say({"id": r["id"], "ok": True, "result": {}, "evidence": [{"name": "note.txt", "mime": "text/plain", "path": os.path.join(ev, "..", "..", "secret.txt")}]})
+    elif a == "big":
+        p = os.path.join(ev, "big.bin"); open(p, "wb").write(b"x" * (3 * 1024 * 1024))
+        say({"id": r["id"], "ok": True, "result": {}, "evidence": [{"name": "big.bin", "mime": "application/octet-stream", "path": p}]})
+    elif a == "noise":
+        sys.stdout.write("Playwright warning: something\n"); sys.stdout.flush()
+        say({"id": r["id"], "ok": True, "result": {"after": "noise"}})
+    elif a == "die": sys.exit(3)
+"#;
+
+/// `vk mount driver --manifest FILE`, then `vk driver ls | show | umount` and
+/// `vk ls /drivers[/<name>]`, as a person would type them. The mount and the
+/// unmount are signed with the node's key (I1, Ruling R25), the manifest's
+/// relative command resolves against the manifest file's own directory —
+/// sent canonical, as the root
+/// the row keeps — and the driver is up and listed until it is unmounted.
+#[test]
+fn vk_mount_driver_lists_shows_and_unmounts_it() {
+    let python = Command::new("python")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !python.as_ref().is_ok_and(|s| s.success()) {
+        eprintln!("no python on PATH; skipping ({python:?})");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let drv = tempfile::tempdir().unwrap();
+    std::fs::write(drv.path().join("fake_driver.py"), FAKE_DRIVER).unwrap();
+    let hash = vk_contracts::driver::hash_dir(drv.path()).unwrap();
+    let manifest = drv.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        serde_json::json!({
+            "name": "fake",
+            "kind": "browser",
+            "program": {
+                "runtime": "python",
+                "command": ["python", "-I", "fake_driver.py"],
+                "files_sha256": hash,
+                "browser_channel": null,
+                "headless": true
+            },
+            "hosts": ["example.invalid"],
+            "actions": [{
+                "name": "echo",
+                "reversible": true,
+                "args": {"type": "object"},
+                "evidence": ["note.txt"],
+                "to_register": false
+            }],
+            "min_interval_ms": 0,
+            "max_action_ms": 60_000,
+            "clearance": {"max_scope": "business", "third_party_allowed": true},
+            "governed": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let mounted = sh.ok(&["mount", "driver", "--manifest", &path_of(&manifest)]);
+    assert!(mounted.starts_with("DRIVER"), "{mounted}");
+    assert!(mounted.contains("fake"), "{mounted}");
+
+    let listed = sh.ok(&["driver", "ls"]);
+    assert_eq!(listed.trim_end().lines().count(), 2, "{listed}");
+    assert!(
+        listed.contains("fake") && listed.contains("ready"),
+        "{listed}"
+    );
+    assert!(listed.contains("echo"), "the actions are listed: {listed}");
+
+    let shown = sh.json(&["driver", "show", "fake", "--json"]);
+    let canonical = std::fs::canonicalize(drv.path()).unwrap();
+    let canonical = canonical.to_str().unwrap();
+    let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(canonical);
+    assert_eq!(
+        shown["root"], canonical,
+        "the root is the manifest's directory"
+    );
+    let page = sh.ok(&["driver", "show", "fake"]);
+    for label in ["driver_id", "state", "hosts", "actions", "governed"] {
+        assert!(page.contains(label), "{label}: {page}");
+    }
+    assert_eq!(sh.ok(&["ls", "/drivers"]).trim_end(), "fake");
+    assert_eq!(sh.ok(&["ls", "/drivers/fake"]), page);
+
+    let gone = sh.ok(&["driver", "umount", "fake"]);
+    assert_eq!(gone.trim_end(), "unmounted driver fake");
+    assert_eq!(sh.ok(&["driver", "ls"]).trim_end().lines().count(), 1);
+}
+
 fn path_of(p: &std::path::Path) -> String {
     p.to_str().expect("utf-8 path").to_string()
 }
