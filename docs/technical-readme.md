@@ -282,11 +282,19 @@ field can say.
 "legacy" since its Interactions API became generally available in June 2026
 while keeping it "fully supported"; the API version is in the arch identity.
 The key goes on the `x-goog-api-key` header, never in a `?key=` query string,
-which every error and proxy log would repeat. Every current Gemini model
-thinks, and the answer bound counts the thinking, so the arch sends
-`thinkingLevel: "LOW"` to Gemini 3 and later and a 1 024-token
-`thinkingBudget` to the 2.5 models — an answer whose bound went entirely on
-thinking is refused with a message that says so. The retention figure is the
+which every error and proxy log would repeat. Nearly every current Gemini
+model thinks, and the answer bound — at most 1 024 tokens on every call the
+kernel makes — counts the thinking. So the thinking budget is derived from
+each call's bound: a `thinkingBudget` of a quarter of it (256 at the kernel's
+1 024), never more than 1 024, never less than the model's floor (128 for a
+model that cannot stop thinking, 0 for 2.5 Flash). It is sent to every
+listed model that thinks by default, Gemini 3 and later included — a
+`thinkingLevel` bounds nothing in tokens — and to none other: 2.5 Flash-Lite
+does not think unless asked, and an unlisted model is sent nothing. A bound
+the floor would take entirely is refused before anything is sent, and an
+answer whose bound still went on thinking is refused with a message that says
+so. The rule is in the arch identity; the budget each call was sent is in its
+record. The retention figure is the
 **paid** tier's: the unpaid tier lets Google use prompts to improve its
 products, so a customer node mounts it on a billing-enabled key (in the EEA,
 Google applies the paid-tier data terms to unpaid quota too).

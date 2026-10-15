@@ -120,11 +120,11 @@ fn complete_counts_then_generates_with_the_key_on_its_header_only() {
         sent.body["generationConfig"]["maxOutputTokens"],
         json!(MAX_OUTPUT_TOKENS)
     );
-    // Gemini 3 and later are sent a low thinking level, so the bound — which
-    // counts the thinking — is left for the answer.
+    // The thinking is given a quarter of the bound — which counts the
+    // thinking — so three quarters of it are left for the answer.
     assert_eq!(
         sent.body["generationConfig"]["thinkingConfig"],
-        json!({"thinkingLevel": "LOW"})
+        json!({"thinkingBudget": 1_024})
     );
     // Nothing Google has announced will become an error.
     for knob in ["temperature", "topP", "topK"] {
@@ -397,9 +397,10 @@ fn the_manifest_is_a_us_cloud_arch_kept_fifty_five_days_at_business_and_ungovern
     assert_eq!(m.determinism, Determinism::NonDeterministic);
     assert_eq!(m.context_ceiling, 1_048_576);
     assert_eq!(m.identity.engine_version, API_VERSION);
+    // The rule, which fixes the budget for every bound a call can have.
     assert_eq!(
         m.identity.sampling.get("thinking").map(String::as_str),
-        Some("level:LOW")
+        Some("budget:bound/4,min:128,max:1024")
     );
     assert_eq!(
         m.identity.sampling.get("base_url").map(String::as_str),
@@ -440,14 +441,114 @@ fn every_model_in_the_table_is_priced_has_a_window_and_a_thinking_rule() {
         );
         assert!(m.input_usd_per_mtok > 0.0, "{}", m.id);
         assert!(m.output_usd_per_mtok > m.input_usd_per_mtok, "{}", m.id);
-        // A level only from Gemini 3 on: the 2.5 generation 400s on it.
-        if m.id.starts_with("gemini-2.5") {
-            assert!(!matches!(m.thinking, Thinking::Level(_)), "{}", m.id);
-        } else {
-            assert_eq!(m.thinking, Thinking::Level("LOW"), "{}", m.id);
-        }
+        // A budget in tokens everywhere but 2.5 Flash-Lite, which does not
+        // think unless asked; 2.5 Flash alone may be sent a budget of 0.
+        let expected = match m.id {
+            "gemini-2.5-flash-lite" => Thinking::Default,
+            "gemini-2.5-flash" => Thinking::Budget { floor: 0 },
+            _ => Thinking::Budget { floor: 128 },
+        };
+        assert_eq!(m.thinking, expected, "{}", m.id);
     }
     assert!(vk_arch_gemini::model(DEFAULT_MODEL).is_some());
+}
+
+/// Review I-1: the kernel calls every arch with `max_tokens` at most 1 024
+/// (`budget.min(1024)`), and on Gemini that bound counts the thinking. A
+/// fixed 1 024-token thinking budget spent the whole of it, every call ended
+/// `MAX_TOKENS` with no text, and the arch mounted but never answered. At the
+/// kernel's real bound every listed model must leave most of it for the
+/// answer.
+#[test]
+fn at_the_kernel_s_real_bound_every_model_leaves_three_quarters_for_the_answer() {
+    for m in MODELS {
+        for (bound, expected) in [(1_024u32, 256u32), (4_096, 1_024), (512, 128)] {
+            let cfg = GeminiConfig {
+                model: m.id.into(),
+                ..Default::default()
+            };
+            let generation =
+                &GeminiAdapter::generate_request(&cfg, "hi", bound)["generationConfig"];
+            assert_eq!(generation["maxOutputTokens"], bound, "{} at {bound}", m.id);
+            match m.thinking {
+                Thinking::Default => assert!(
+                    generation.get("thinkingConfig").is_none(),
+                    "{} at {bound}",
+                    m.id
+                ),
+                Thinking::Budget { .. } => {
+                    let budget = generation["thinkingConfig"]["thinkingBudget"]
+                        .as_u64()
+                        .unwrap_or_else(|| panic!("{} at {bound}: no budget", m.id));
+                    assert_eq!(budget, u64::from(expected), "{} at {bound}", m.id);
+                    assert!(
+                        budget * 4 <= u64::from(bound),
+                        "{} at {bound}: thinking takes more than a quarter",
+                        m.id
+                    );
+                }
+            }
+            assert!(
+                generation.get("thinkingLevel").is_none()
+                    && generation["thinkingConfig"].get("thinkingLevel").is_none(),
+                "a level bounds nothing in tokens: {generation}"
+            );
+        }
+    }
+}
+
+/// The same at the wire, out of a real `complete` at the kernel's bound: the
+/// budget sent and the budget recorded are the quarter, and the call answers.
+#[test]
+fn a_call_at_the_kernel_s_bound_sends_and_records_a_quarter_for_thinking() {
+    let model = "gemini-2.5-pro";
+    let fake = Fake::start(&[
+        (
+            &count_path(model),
+            Reply::json(200, &json!({"totalTokens": 12})),
+        ),
+        (
+            &generate_path(model),
+            Reply::json(
+                200,
+                &answer(json!([{"text": "an answer"}]), "STOP", 12, 300, 256),
+            ),
+        ),
+    ]);
+    let done = adapter_with(
+        &fake,
+        GeminiConfig {
+            model: model.into(),
+            ..Default::default()
+        },
+    )
+    .complete("hello", 1_024)
+    .expect("answered");
+    assert_eq!(done.text, "an answer");
+    let generation = &fake.only(&generate_path(model)).body["generationConfig"];
+    assert_eq!(generation["maxOutputTokens"], 1_024);
+    assert_eq!(generation["thinkingConfig"], json!({"thinkingBudget": 256}));
+    assert_eq!(done.details.expect("details")["thinking_budget"], 256);
+}
+
+/// A bound no larger than the model's least thinking budget would leave the
+/// answer nothing: refused before anything — the count included — is sent.
+#[test]
+fn a_bound_the_least_thinking_budget_would_consume_is_refused_before_sending() {
+    let model = "gemini-2.5-pro";
+    let fake = Fake::start(&[]);
+    let err = adapter_with(
+        &fake,
+        GeminiConfig {
+            model: model.into(),
+            ..Default::default()
+        },
+    )
+    .complete("hello", 128)
+    .expect_err("nothing would be left for the answer");
+    let text = other(err);
+    assert!(text.contains("128") && text.contains("thinking"), "{text}");
+    assert!(fake.all().is_empty(), "something was sent");
 }
 
 #[test]

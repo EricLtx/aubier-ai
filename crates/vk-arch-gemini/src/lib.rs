@@ -59,15 +59,26 @@
 //! Every current Gemini model thinks, and `maxOutputTokens` bounds the
 //! thinking **and** the answer together ("the maximum number of tokens a
 //! response can generate, including thought tokens"); thinking is billed at
-//! the output rate. With one answer capped at [`MAX_OUTPUT_TOKENS`], a model
-//! left at its default — dynamic, and high on Gemini 3 — can spend the whole
-//! bound thinking and answer nothing. So each row of [`MODELS`] names the
-//! thinking it is sent: `thinkingLevel: "LOW"` on Gemini 3 and later (the
-//! API reference: "recommended for Gemini 3 or later models; use with earlier
-//! models results in an error"), a `thinkingBudget` of 1 024 on the 2.5
-//! models that think by default, nothing on 2.5 Flash-Lite, which does not —
-//! and on an unlisted model nothing, because a field the model may 400 on is
-//! not something to guess. The setting is in the arch identity.
+//! the output rate. The kernel calls every arch with an answer bound of at
+//! most 1 024 tokens, so a model left at its default — dynamic, and high on
+//! Gemini 3 — or given a fixed budget the size of that bound spends the whole
+//! of it thinking and answers nothing (review I-1: a fixed 1 024-token
+//! budget made every 2.5 Pro and 2.5 Flash call end `MAX_TOKENS` with no
+//! text).
+//!
+//! So the thinking budget is **derived from each call's bound**: a quarter of
+//! it, never past [`THINKING_MAX`], never under the model's floor — the
+//! least budget a model that cannot stop thinking accepts. Three quarters of
+//! the bound are always left for the answer, and a bound so small the floor
+//! would take all of it is refused before anything is sent. It goes as
+//! `thinkingBudget`, in tokens, on every listed model that thinks by default
+//! — Gemini 3 and later included, where Google keeps `thinkingBudget` "for
+//! backward compatibility" beside `thinkingLevel`, because a level bounds
+//! nothing in tokens and a budget does. Nothing is sent to 2.5 Flash-Lite,
+//! which does not think unless asked, nor to an unlisted model, because a
+//! field a model may 400 on is not something to guess. The rule is in the
+//! arch identity and fixes the budget for every bound; the budget a call was
+//! actually sent is in its `details`.
 
 use anyhow::{anyhow, ensure, Context, Result};
 use reqwest::blocking::Client;
@@ -109,32 +120,48 @@ pub const KEY_HEADER: &str = "x-goog-api-key";
 /// — and guessing low costs only a prompt projected further than it had to be.
 pub const FALLBACK_CONTEXT: u32 = 128_000;
 
+/// The share of a call's answer bound its thinking may take: one part in
+/// this many.
+pub const THINKING_SHARE: u32 = 4;
+
+/// The most thinking one call is ever given, in tokens, whatever its bound.
+pub const THINKING_MAX: u32 = 1_024;
+
 /// What a model is sent about thinking (see the crate documentation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Thinking {
-    /// `thinkingConfig.thinkingLevel` — Gemini 3 and later.
-    Level(&'static str),
-    /// `thinkingConfig.thinkingBudget`, in tokens — the 2.5 generation.
-    Budget(u32),
+    /// `thinkingConfig.thinkingBudget`, derived per call from the answer
+    /// bound: `bound / THINKING_SHARE`, at least `floor`, at most
+    /// [`THINKING_MAX`]. `floor` is the least budget the model accepts —
+    /// `0` only where thinking may be switched off.
+    Budget { floor: u32 },
     /// No `thinkingConfig` at all: the model's own default.
     Default,
 }
 
 impl Thinking {
-    /// The `thinkingConfig` this setting sends, if any.
-    pub fn config(self) -> Option<Value> {
+    /// The thinking budget a call bounded at `bound` is sent, if any.
+    pub fn budget(self, bound: u32) -> Option<u32> {
         match self {
-            Thinking::Level(level) => Some(json!({ "thinkingLevel": level })),
-            Thinking::Budget(n) => Some(json!({ "thinkingBudget": n })),
+            Thinking::Budget { floor } => {
+                Some((bound / THINKING_SHARE).max(floor).min(THINKING_MAX))
+            }
             Thinking::Default => None,
         }
     }
 
-    /// How the arch identity names it.
+    /// The `thinkingConfig` a call bounded at `bound` sends, if any.
+    pub fn config(self, bound: u32) -> Option<Value> {
+        self.budget(bound).map(|n| json!({ "thinkingBudget": n }))
+    }
+
+    /// How the arch identity names it: the rule, which fixes the budget for
+    /// every bound a call can have.
     pub fn label(self) -> String {
         match self {
-            Thinking::Level(level) => format!("level:{level}"),
-            Thinking::Budget(n) => format!("budget:{n}"),
+            Thinking::Budget { floor } => {
+                format!("budget:bound/{THINKING_SHARE},min:{floor},max:{THINKING_MAX}")
+            }
             Thinking::Default => "model-default".into(),
         }
     }
@@ -186,7 +213,9 @@ impl Model {
 }
 
 const ONE_MEBI_TOKENS: u32 = 1_048_576;
-const LEVEL_LOW: Thinking = Thinking::Level("LOW");
+/// A model that cannot stop thinking: its budget never goes under 128
+/// tokens, the least 2.5 Pro accepts, assumed of the generations after it.
+const THINKS: Thinking = Thinking::Budget { floor: 128 };
 
 /// Every model this node will price.
 ///
@@ -214,7 +243,7 @@ pub const MODELS: &[Model] = &[
         output_usd_per_mtok: 20.00,
         long: None,
         latency_ms_p50: 12_000,
-        thinking: LEVEL_LOW,
+        thinking: THINKS,
     },
     Model {
         id: "gemini-3.8-flash",
@@ -223,7 +252,7 @@ pub const MODELS: &[Model] = &[
         output_usd_per_mtok: 7.50,
         long: None,
         latency_ms_p50: 5_000,
-        thinking: LEVEL_LOW,
+        thinking: THINKS,
     },
     Model {
         id: "gemini-3.6-flash",
@@ -232,7 +261,7 @@ pub const MODELS: &[Model] = &[
         output_usd_per_mtok: 7.50,
         long: None,
         latency_ms_p50: 5_000,
-        thinking: LEVEL_LOW,
+        thinking: THINKS,
     },
     Model {
         id: "gemini-3.5-flash-lite",
@@ -241,7 +270,7 @@ pub const MODELS: &[Model] = &[
         output_usd_per_mtok: 2.50,
         long: None,
         latency_ms_p50: 3_000,
-        thinking: LEVEL_LOW,
+        thinking: THINKS,
     },
     Model {
         id: "gemini-3.1-pro-preview",
@@ -254,7 +283,7 @@ pub const MODELS: &[Model] = &[
             output_usd_per_mtok: 18.00,
         }),
         latency_ms_p50: 15_000,
-        thinking: LEVEL_LOW,
+        thinking: THINKS,
     },
     Model {
         id: "gemini-3.1-flash-lite",
@@ -263,7 +292,7 @@ pub const MODELS: &[Model] = &[
         output_usd_per_mtok: 1.50,
         long: None,
         latency_ms_p50: 3_000,
-        thinking: LEVEL_LOW,
+        thinking: THINKS,
     },
     Model {
         id: "gemini-3-flash-preview",
@@ -272,7 +301,7 @@ pub const MODELS: &[Model] = &[
         output_usd_per_mtok: 3.00,
         long: None,
         latency_ms_p50: 5_000,
-        thinking: LEVEL_LOW,
+        thinking: THINKS,
     },
     Model {
         id: "gemini-2.5-pro",
@@ -285,7 +314,7 @@ pub const MODELS: &[Model] = &[
             output_usd_per_mtok: 15.00,
         }),
         latency_ms_p50: 15_000,
-        thinking: Thinking::Budget(1_024),
+        thinking: THINKS,
     },
     Model {
         id: "gemini-2.5-flash",
@@ -294,7 +323,8 @@ pub const MODELS: &[Model] = &[
         output_usd_per_mtok: 2.50,
         long: None,
         latency_ms_p50: 5_000,
-        thinking: Thinking::Budget(1_024),
+        // 2.5 Flash alone may be sent 0: its thinking can be switched off.
+        thinking: Thinking::Budget { floor: 0 },
     },
     Model {
         id: "gemini-2.5-flash-lite",
@@ -472,14 +502,14 @@ impl GeminiAdapter {
 
     /// The `generateContent` request, and the only one this arch sends: one
     /// user turn, the bound on the answer — the smaller of the caller's and
-    /// the mount's, thinking included — and the model's thinking setting. No
-    /// `temperature`, `topP` or `topK`: Google ignores them on the newest
-    /// models and has announced they will become errors.
+    /// the mount's, thinking included — and the thinking budget derived from
+    /// that bound ([`Thinking::budget`]). No `temperature`, `topP` or `topK`:
+    /// Google ignores them on the newest models and has announced they will
+    /// become errors.
     pub fn generate_request(cfg: &GeminiConfig, prompt: &str, max_tokens: u32) -> Value {
-        let mut generation = json!({
-            "maxOutputTokens": answer_tokens(cfg.max_tokens, max_tokens),
-        });
-        if let Some(t) = thinking(&cfg.model).config() {
+        let bound = answer_tokens(cfg.max_tokens, max_tokens);
+        let mut generation = json!({ "maxOutputTokens": bound });
+        if let Some(t) = thinking(&cfg.model).config(bound) {
             generation["thinkingConfig"] = t;
         }
         json!({
@@ -549,6 +579,19 @@ impl ArchAdapter for GeminiAdapter {
     }
 
     fn complete(&self, prompt: &str, max_tokens: u32) -> Result<Completion, AdapterError> {
+        // A bound the model's least thinking budget would take all of leaves
+        // the answer nothing: refused before anything — the count included —
+        // goes on the wire, rather than paid for and answered with no text.
+        let bound = answer_tokens(self.cfg.max_tokens, max_tokens);
+        let thinking_budget = thinking(&self.cfg.model).budget(bound);
+        if let Some(t) = thinking_budget.filter(|t| *t >= bound) {
+            return Err(AdapterError::Other(anyhow!(
+                "an answer bound of {bound} tokens leaves nothing after {}'s least thinking \
+                 budget of {t} tokens; ask for more than {t}",
+                self.cfg.model
+            )));
+        }
+
         let ceiling = self.context_budget();
         let (needed, counted) = match self.api_count_tokens(prompt) {
             Ok(n) => (n, true),
@@ -637,6 +680,9 @@ impl ArchAdapter for GeminiAdapter {
                 "response_id": answer["responseId"].as_str().unwrap_or("-"),
                 "model_version": answer["modelVersion"].as_str().unwrap_or(&self.cfg.model),
                 "thinking": thinking(&self.cfg.model).label(),
+                // What this call was actually sent, out of its bound.
+                "thinking_budget": thinking_budget,
+                "answer_bound": bound,
                 // Whether the pre-check was Google's count or the estimate.
                 "prompt_counted_by_api": counted,
             })),
