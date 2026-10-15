@@ -290,8 +290,23 @@ hashes the identity tuple and, when one is declared, the quota — so a plan
 change is a new arch, and the counters, usage rows and health of a
 subscription and of a metered key on the same model never mix. A manifest with
 no quota hashes exactly as it did before the field existed, so no mounted arch
-changed id. No adapter on this branch declares a quota yet; `vk arch show`
-prints `none declared` for them.
+changed id. No adapter declares a quota yet; `vk arch show` prints `none
+declared` for them.
+
+**The migration is forward-only.** A kernel older than this field reads a
+manifest that carries a quota by dropping the field — `ArchManifest` does not
+refuse unknown fields — and so hashes it to **another arch id** (the identity
+alone) than the one it was mounted under. Do not hand a quota-bearing state
+directory back to an older daemon; a node that has to go back unmounts those
+arches first and mounts them again after.
+
+The same leniency cuts the other way: a misspelt field (`"quotas"`) in a
+manifest is dropped silently rather than refused, so an arch whose quota is
+misspelt reads as declaring none. `QuotaProfile` itself refuses unknown
+fields — a typo *inside* the quota is an error — but the manifest around it
+does not, and tightening it is a contract change kept for the founder (review
+M5). **Open item:** when an adapter exposes the quota in its mount config,
+refuse an unknown key there, at the door, since the manifest will not.
 
 **Health is an observation.** The kernel keeps, per mounted arch and in memory
 only, what the provider last said about the plan:
@@ -299,14 +314,18 @@ only, what the provider last said about the plan:
 | state | set by | what a step on that arch gets | cleared by |
 |---|---|---|---|
 | `healthy` | a mount; a call that came back | the call | — |
-| `rate_limited` | HTTP 429, a full usage window | **retryable** refusal (`arch rate-limited: …; step it again in N s`) until the provider's `Retry-After` — or 60 s when it named none — has passed; then the next call goes out and decides | the wait passing and a call coming back; a remount |
+| `rate_limited` | HTTP 429, a full usage window | **retryable** refusal (`arch rate-limited: …; step it again in N s`) until the provider's `Retry-After` has passed — believed up to a day; a figure past that, or none, holds 60 s | the wait passing (the arch reads `healthy` again and the next call decides); a remount |
 | `exhausted` | HTTP 402, "credit balance is too low" | **refusal that fails the step**: `arch … is exhausted: … — top up the plan and run vk mount for this arch again, which clears it, or choose another arch` | a remount (or a restart) |
 | `retired` | HTTP 404 on the model | **refusal that fails the step**: `arch … is retired: … — vk umount <id> and choose another arch` | a remount (or a restart) |
 
 A rate-limited step takes the path a step on a still-`starting` arch already
 takes: it goes back to `Pending`, the task to `Queued`, the client gets
 `E_RETRY` (`-32006`), and the next `vk task step` runs it — there is no step
-timeout to run out. An exhausted or retired arch arrives as `arch unavailable`
+timeout to run out. `vk task step --all` waits out one such refusal itself:
+it sleeps the seconds the refusal names, at most five minutes, steps once
+more, and if the arch is still held ends with that same `E_RETRY`. Once per
+command, never a loop; an arch still `starting` names no wait and is not
+waited on. An exhausted or retired arch arrives as `arch unavailable`
 (`E_STORE`), and the step and its task are `Failed` with that sentence as the
 reason; another task's step on the same arch is refused at once, before
 anything is sent, so the provider is not asked again for an answer it has
@@ -326,8 +345,12 @@ would not start — leaves health as it was and writes no `failed` event.
 
 ```
 quota   pay-as-you-go (50 requests/min, 30000 tokens/min)
-health  rate_limited until 1760000031000 ms (the provider's figure) since 1760000001000 ms: the provider is rate-limiting this arch; it asked for 30 s
+health  rate_limited, next call in 12 s (the provider's figure) since 1760000001000 ms: the provider is rate-limiting this arch; it asked for 30 s
 ```
+
+The seconds left are counted by the daemon when it answers, on the clock it
+holds the arch by, so the screen and the refusal a step meets name the same
+wait. A window that has passed reads `healthy`.
 
 and `vk top` has a `HEALTH` column after `GOVERNED`, with the provider's words
 under the table for every arch that is not healthy. The adapters map what they
@@ -336,9 +359,12 @@ see: the first-party Anthropic arch 429 → `rate_limited` (reading
 balance is too low → `exhausted`, 404 `not_found_error` on `model:` →
 `retired`; the Bedrock arch 429 → `rate_limited`, 404 → `retired`; the Ollama
 arch 429 → `rate_limited`, a 404 naming the model → `retired`; the Claude Code
-arch a usage-limit message or `api_error_status` 429 → `rate_limited`, 402 or
-a too-low credit balance → `exhausted`, 404 → `retired`. Anything else is the
-failure it always was.
+arch `api_error_status` 429, or a result that *opens with* the usage-limit
+wording → `rate_limited` (until the `|<unix seconds>` reset when it is within
+a day), 402 or a result opening with "Credit balance is too low" →
+`exhausted`, 404 → `retired` — the wording counts only at the start, so a
+model's own text that mentions a limit cannot flip the arch. Anything else is
+the failure it always was.
 
 ### Drivers: a browser this kernel controls
 

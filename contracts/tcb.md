@@ -11,7 +11,7 @@ Any object reachable by an unmediated channel is treated as projected to that ch
 
 ## Arch adapters (SP1b)
 
-**Quota and health (2026-10-15).** A manifest's `quota` is the provider plan's own claim and an arch's health is what this kernel observed in the provider's last answer (429, 402, a 404 on the model); neither is enforcement — nothing meters calls against the quota, nothing guarantees the provider honours it, and health only keeps the scheduler from sending a step to an arch whose provider has already refused it.
+**Quota and health (2026-10-15).** A manifest's `quota` is the provider plan's own claim and an arch's health is what this kernel observed in the provider's last answer (429, 402, a 404 on the model); neither is enforcement — nothing meters calls against the quota, nothing guarantees the provider honours it, and health only keeps the scheduler from sending a step to an arch whose provider has already refused it. A provider's wait is believed for a day at most, so a far end cannot hold an arch back indefinitely. `ArchManifest` does not refuse unknown fields: a misspelt `quota` is dropped, not refused, and an older kernel reading a quota-bearing manifest computes another arch id (forward-only).
 
 ### Claude Code adapter
 
