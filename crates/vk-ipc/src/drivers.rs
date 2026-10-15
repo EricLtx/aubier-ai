@@ -7,7 +7,9 @@
 //! act (`driver_act_begin` before it, `driver_act_settle` after); it owns no
 //! process. The processes are here: one [`DriverHost`] per mounted name,
 //! spawned by [`DriverPool::ensure`] under this platform's governor — a Job
-//! Object on Windows, 2 GiB, no CPU cap, failing closed as a harness does —
+//! Object on Windows, capped at the manifest's `program.max_memory_bytes`
+//! (6 GiB for a browser that names none), no CPU cap, failing closed as a
+//! harness does —
 //! and driven by [`DriverPool::act`] with neither the kernel lock nor the
 //! pool's map held across the action: an act takes its host out of the map,
 //! acts on the owned value and puts it back. That is the shape of
@@ -26,23 +28,40 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use vk_contracts::driver::{hash_dir, DriverAction, DriverManifest};
+use vk_contracts::driver::{hash_dir, DriverAction, DriverKind, DriverManifest};
 use vk_contracts::syscalls::Ctx;
 use vk_driver::{ActOutcome, DriverHost, EvidenceCaps, HostError};
 use vk_kernel::drivers::{DriverActPlan, DriverDirs, DriverFailure, DriverRow, DriverState};
 use vk_kernel::now_ms;
 
-/// The memory cap on a driver's whole process tree: the harness's own.
-const DRIVER_MAX_MEMORY: u64 = 2 * 1024 * 1024 * 1024;
+/// The memory cap on a browser driver's whole process tree when its manifest
+/// names none (final review I2): 6 GiB. Not the harness's 2 GiB — a headed
+/// Chrome with two tabs, Node and Python passes that, and the Job then fails
+/// allocations inside the page ("Aw, Snap") or kills the tree, which reads as
+/// a false KO or a dead driver mid-recette.
+const BROWSER_MAX_MEMORY: u64 = 6 * 1024 * 1024 * 1024;
+
+/// The memory cap a driver's tree is spawned under: the manifest's
+/// `program.max_memory_bytes`, or its kind's default.
+fn memory_cap_of(manifest: &DriverManifest) -> u64 {
+    manifest
+        .program
+        .max_memory_bytes
+        .unwrap_or(match manifest.kind {
+            DriverKind::Browser => BROWSER_MAX_MEMORY,
+        })
+}
 
 /// What the pool holds for one mounted name.
 enum Slot {
     /// Waiting for the next act, with the identity it was spawned for: an
     /// `ensure` adopts it for that `driver_id` only (Task 3 re-review). Boxed:
-    /// a host is a few hundred bytes, the two markers a few.
+    /// a host is a few hundred bytes, the two markers a few. `max_memory_bytes`
+    /// is the cap its governor was made with.
     Idle {
         host: Box<DriverHost>,
         driver_id: String,
+        max_memory_bytes: u64,
     },
     /// A spawn is under way with the map unlocked. The `ensure` that set it
     /// is the only one that clears it ([`Claim`]); every other caller waits
@@ -55,7 +74,11 @@ enum Slot {
     /// act knows the marker is still its own. `driver_id` is the identity the
     /// process was spawned for: an `ensure` or an act for another identity is
     /// refused as busy, naming it (Task 7 review).
-    Acting { pid: u32, driver_id: String },
+    Acting {
+        pid: u32,
+        driver_id: String,
+        max_memory_bytes: u64,
+    },
 }
 
 /// The driver processes this daemon owns, by mounted name. Shared by every
@@ -108,8 +131,26 @@ impl DriverPool {
         }
     }
 
+    /// The memory cap `name`'s process was spawned under, idle or acting:
+    /// the manifest's `program.max_memory_bytes`, or the kind's default
+    /// (final review I2). `None` while there is no process, or while it is
+    /// still starting. A test's read-back.
+    #[doc(hidden)]
+    pub fn memory_cap(&self, name: &str) -> Option<u64> {
+        match self.map().get(name) {
+            Some(Slot::Idle {
+                max_memory_bytes, ..
+            })
+            | Some(Slot::Acting {
+                max_memory_bytes, ..
+            }) => Some(*max_memory_bytes),
+            Some(Slot::Spawning) | None => None,
+        }
+    }
+
     /// Spawn (or re-spawn) the host for `row` with the platform governor
-    /// (2 GiB, no CPU cap); returns what the host observed (`governed`).
+    /// (the manifest's memory cap, no CPU cap); returns what the host
+    /// observed (`governed`).
     ///
     /// A live idle host spawned for this row's `driver_id` is kept and its
     /// `governed` returned: a repeat mount does not restart the browser. An
@@ -138,12 +179,12 @@ impl DriverPool {
                     }
                     return Err(anyhow!(busy(name, driver_id, &row.driver_id)));
                 }
-                Some(Slot::Idle { host, driver_id }) if *driver_id == row.driver_id => {
-                    match host.try_wait() {
-                        Ok(None) => Some(host.governed()),
-                        _ => None,
-                    }
-                }
+                Some(Slot::Idle {
+                    host, driver_id, ..
+                }) if *driver_id == row.driver_id => match host.try_wait() {
+                    Ok(None) => Some(host.governed()),
+                    _ => None,
+                },
                 Some(Slot::Idle { .. }) | None => None,
             };
             if let Some(governed) = alive {
@@ -156,13 +197,14 @@ impl DriverPool {
         // and its tree swept, with the map unlocked.
         drop(stale);
         let claim = Claim { pool: self, name };
-        let host = spawn_host(row, dirs)?;
+        let (host, max_memory_bytes) = spawn_host(row, dirs)?;
         let governed = host.governed();
         self.map().insert(
             name.clone(),
             Slot::Idle {
                 host,
                 driver_id: row.driver_id.clone(),
+                max_memory_bytes,
             },
         );
         drop(claim);
@@ -207,24 +249,40 @@ impl DriverPool {
                 .map_err(|e| DriverFailure::WouldNotStart(format!("{e:#}")))?;
             let mut map = self.map();
             match map.remove(name) {
-                Some(Slot::Idle { host, driver_id }) if driver_id == row.driver_id => {
+                Some(Slot::Idle {
+                    host,
+                    driver_id,
+                    max_memory_bytes,
+                }) if driver_id == row.driver_id => {
                     let pid = host.pid();
                     map.insert(
                         name.to_string(),
                         Slot::Acting {
                             pid,
                             driver_id: driver_id.clone(),
+                            max_memory_bytes,
                         },
                     );
-                    taken = Some((host, driver_id));
+                    taken = Some((host, driver_id, max_memory_bytes));
                     break;
                 }
                 Some(idle @ Slot::Idle { .. }) => {
                     map.insert(name.to_string(), idle);
                 }
-                Some(Slot::Acting { pid, driver_id }) => {
+                Some(Slot::Acting {
+                    pid,
+                    driver_id,
+                    max_memory_bytes,
+                }) => {
                     let why = busy(name, &driver_id, &row.driver_id);
-                    map.insert(name.to_string(), Slot::Acting { pid, driver_id });
+                    map.insert(
+                        name.to_string(),
+                        Slot::Acting {
+                            pid,
+                            driver_id,
+                            max_memory_bytes,
+                        },
+                    );
                     return Err(DriverFailure::WouldNotStart(why));
                 }
                 Some(Slot::Spawning) => {
@@ -240,7 +298,7 @@ impl DriverPool {
                 }
             }
         }
-        let Some((mut host, driver_id)) = taken else {
+        let Some((mut host, driver_id, max_memory_bytes)) = taken else {
             return Err(DriverFailure::WouldNotStart(format!(
                 "driver {name}'s process was replaced by another manifest's twice under this act"
             )));
@@ -258,7 +316,14 @@ impl DriverPool {
             let mut map = self.map();
             let ours = matches!(map.get(name), Some(Slot::Acting { pid: p, .. }) if *p == pid);
             if ours && keep {
-                map.insert(name.to_string(), Slot::Idle { host, driver_id });
+                map.insert(
+                    name.to_string(),
+                    Slot::Idle {
+                        host,
+                        driver_id,
+                        max_memory_bytes,
+                    },
+                );
                 None
             } else {
                 if ours {
@@ -352,16 +417,18 @@ impl Drop for Claim<'_> {
 /// ([`files_hold`]: a file changed since the mount is a new driver, never the
 /// old one re-spawned after a restart), the three directories made private
 /// before the process exists, the command resolved against `row.root`
-/// (Ruling R6, [`spawnable`]) and the platform governor made first — a
-/// governor the OS refuses is no spawn.
-fn spawn_host(row: &DriverRow, dirs: &DriverDirs) -> anyhow::Result<Box<DriverHost>> {
+/// (Ruling R6, [`spawnable`]) and the platform governor made first, capped at
+/// [`memory_cap_of`] the manifest — a governor the OS refuses is no spawn.
+/// The host comes back with the cap its governor was made with.
+fn spawn_host(row: &DriverRow, dirs: &DriverDirs) -> anyhow::Result<(Box<DriverHost>, u64)> {
     files_hold(&row.manifest, &row.root)?;
     for dir in [&dirs.profile, &dirs.work, &dirs.evidence] {
         vk_store::paths::private_dir(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     let manifest = spawnable(&row.manifest, &row.root);
+    let max_memory_bytes = memory_cap_of(&row.manifest);
     let governor =
-        vk_harness::confine::for_this_platform(DRIVER_MAX_MEMORY, None).context("governor")?;
+        vk_harness::confine::for_this_platform(max_memory_bytes, None).context("governor")?;
     DriverHost::spawn(
         &manifest,
         &dirs.work,
@@ -369,7 +436,7 @@ fn spawn_host(row: &DriverRow, dirs: &DriverDirs) -> anyhow::Result<Box<DriverHo
         &dirs.evidence,
         governor,
     )
-    .map(Box::new)
+    .map(|host| (Box::new(host), max_memory_bytes))
     .map_err(|e| anyhow!("{e}"))
 }
 

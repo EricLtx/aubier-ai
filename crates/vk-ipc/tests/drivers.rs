@@ -17,7 +17,10 @@
 //! manifest names is held to its root. Task 7: a process killed between two
 //! acts is re-spawned at the next, one killed under an act degrades the
 //! driver until umount + mount; two acts on two drivers overlap; and an idle
-//! process is adopted only for the manifest identity it was spawned for.
+//! process is adopted only for the manifest identity it was spawned for. The
+//! final fix wave: a malformed response is recorded by its closed word and
+//! detailed in `driver.log` (I1); the memory cap is the manifest's, or 6 GiB
+//! for a browser (I2).
 //!
 //! When no `python` is on PATH a test says so on stderr and returns; it never
 //! fails silently and never passes vacuously without saying why.
@@ -712,6 +715,54 @@ async fn a_malformed_response_is_recorded_by_its_word_and_detailed_in_the_log() 
         log.contains("the-site-answered-this"),
         "the detail is kept: {log}"
     );
+    node.shutdown().await;
+}
+
+/// Final review I2: the memory cap on a driver's tree is the manifest's
+/// `program.max_memory_bytes`, and 6 GiB for a browser whose manifest names
+/// none — not the harness's 2 GiB, under which a headed Chrome with two tabs
+/// fails its allocations. The cap is the pool's choice at every spawn: at the
+/// mount, and at the lazy re-spawn of an act after a restart.
+#[tokio::test]
+async fn the_memory_cap_is_the_manifests_or_six_gib_for_a_browser() {
+    if !python_available() {
+        return;
+    }
+    let drv = driver_dir();
+    let node = Node::start().await;
+    node.mount(drv.path()).await;
+    assert_eq!(
+        node.pool.memory_cap("fake"),
+        Some(6 << 30),
+        "the browser default"
+    );
+
+    let mut params = mount_params(drv.path());
+    params["manifest"]["name"] = json!("twin");
+    params["manifest"]["program"]["max_memory_bytes"] = json!(512u64 << 20);
+    node.mount_with(params).await;
+    assert_eq!(
+        node.pool.memory_cap("twin"),
+        Some(512 << 20),
+        "the manifest's"
+    );
+
+    // A restart's empty pool: the act re-spawns under the same cap.
+    node.pool.drop_host("twin");
+    assert_eq!(node.pool.memory_cap("twin"), None, "no process, no cap");
+    let token = node.token_for(&["twin"]).await;
+    let answer = node
+        .c
+        .call(
+            "driver.act",
+            json!({"token": token, "driver": "twin", "action": "echo", "args": {"case": "x"}}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(node.pool.memory_cap("twin"), Some(512 << 20));
+    node.pool.drop_host("twin");
     node.shutdown().await;
 }
 
