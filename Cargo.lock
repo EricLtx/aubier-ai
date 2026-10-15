@@ -3715,6 +3715,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vk-arch-mistral"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tempfile",
+ "vk-arch-openai-compat",
+ "vk-contracts",
+ "vk-kernel",
+]
+
+[[package]]
 name = "vk-arch-ollama"
 version = "0.1.0"
 dependencies = [
