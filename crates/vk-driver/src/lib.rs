@@ -137,6 +137,12 @@ pub struct DriverHost {
     /// Job Object closing terminates whatever the driver left running.
     governor: Box<dyn Governor>,
     governed: bool,
+    /// The tree has been signalled and the leader reaped — by a deadline or
+    /// STOP kill, the reap after the driver closed its stdout, or a
+    /// `try_wait` that saw it gone. Nothing signals it again: a reaped
+    /// leader's id is free for reuse, and a group signal sent later could
+    /// reach someone else's group (the harness's M18 rule).
+    swept: bool,
     next_id: u64,
     hello: Hello,
     evidence_root: PathBuf,
@@ -280,7 +286,11 @@ impl DriverHost {
             Ok(hello) => hello,
             Err(e) => {
                 tracing::warn!(error = %e, "driver refused at hello; tree killed");
-                kill_tree(&mut child);
+                // A driver that died before its hello was reaped, and its tree
+                // swept, by `await_hello`: its id is not signalled again.
+                if !matches!(e, HostError::Dead(_)) {
+                    kill_tree(&mut child);
+                }
                 let _ = child.wait();
                 return Err(e);
             }
@@ -298,6 +308,7 @@ impl DriverHost {
             lines,
             governor,
             governed,
+            swept: false,
             next_id: 1,
             hello,
             evidence_root,
@@ -311,6 +322,13 @@ impl DriverHost {
     /// Noop governor.
     pub fn governed(&self) -> bool {
         self.governed
+    }
+
+    /// Whether the tree has been signalled and the leader reaped, so nothing
+    /// will signal it again. A test's read-back only.
+    #[doc(hidden)]
+    pub fn swept(&self) -> bool {
+        self.swept
     }
 
     /// What the driver said first.
@@ -329,8 +347,18 @@ impl DriverHost {
     /// a deadline or STOP kill, a [`HostError::Dead`] outcome or `shutdown` —
     /// and `None` while it runs. The read-back the daemon puts in a
     /// `driver.unmounted` reason, and a test's proof that a kill killed.
+    ///
+    /// The first call to see a driver gone that nothing had swept yet — one
+    /// killed from outside while idle — sweeps what it left behind there and
+    /// then ([`sweep`]), right after the reap this call just made, and never
+    /// later: `shutdown` and `Drop` send nothing to a reaped leader's id.
     pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        let status = self.child.try_wait()?;
+        if status.is_some() && !self.swept {
+            sweep(&mut self.child, self.governed);
+            self.swept = true;
+        }
+        Ok(status)
     }
 
     /// One act. Creates `<evidence_root>/<id>/`, writes the request line, and
@@ -341,12 +369,14 @@ impl DriverHost {
     /// 250 ms and the driver's egress sampled every 500 ms into `hosts_seen`.
     /// On the deadline or a STOP the tree is killed and the answer is
     /// [`HostError::Timeout`] or [`HostError::Stopped`]; a driver that exits
-    /// first is [`HostError::Dead`] with its exit. Then each declared evidence
-    /// file is read once — opened, its real path checked to lie under the
-    /// evidence directory, its name checked against the action's declaration,
-    /// its size against `caps` — and `<evidence_root>/<id>/` is removed,
-    /// whatever happened. `duration_ms` is the time from the request written
-    /// to the response read: the driver's time, not the host's.
+    /// first is [`HostError::Dead`] with its exit. Then each evidence file the
+    /// response names is read once, by name (ruling R9): the name checked
+    /// against the action's declaration, `<evidence_root>/<id>/<name>` opened
+    /// without following a link and only if it is a regular file, the
+    /// driver's `path` held to that same file as a cross-check, the size held
+    /// to `caps` — and `<evidence_root>/<id>/` is removed, whatever happened.
+    /// `duration_ms` is the time from the request written to the response
+    /// read: the driver's time, not the host's.
     pub fn act(
         &mut self,
         action: &DriverAction,
@@ -419,7 +449,7 @@ impl DriverHost {
             .write_all(line.as_bytes())
             .and_then(|()| self.stdin.flush())
         {
-            let exit = reap(&mut self.child, self.governed);
+            let exit = self.settle_dead();
             return Err(HostError::Dead(format!(
                 "{exit} (the request could not be written: {e})"
             )));
@@ -472,7 +502,7 @@ impl DriverHost {
                 },
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(HostError::Dead(reap(&mut self.child, self.governed)));
+                    return Err(HostError::Dead(self.settle_dead()));
                 }
             }
         };
@@ -602,18 +632,42 @@ impl DriverHost {
         // failed cannot leave the wait below open-ended.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.swept = true;
+    }
+
+    /// The driver closed its stdout: its exit, worded for a `Dead` message.
+    /// The first time, [`reap`] settles it and sweeps the tree; a leader
+    /// already reaped and swept — a second act on a dead host — is only read
+    /// back, its id never signalled again.
+    fn settle_dead(&mut self) -> String {
+        if self.swept {
+            return match self.child.try_wait() {
+                Ok(Some(status)) => exit_label(status),
+                Ok(None) => "killed; exit not read".into(),
+                Err(e) => format!("exit unreadable: {e}"),
+            };
+        }
+        let exit = reap(&mut self.child, self.governed);
+        self.swept = true;
+        exit
     }
 
     /// Kill what still runs and reap; idempotent, so `shutdown` and `Drop`
-    /// may both run it. A leader already reaped still has its tree swept
-    /// where no governor will ([`sweep`]); under the Job Object the drop of
-    /// the governor, right after this, does that.
+    /// may both run it. A tree already swept — killed at a deadline or a
+    /// STOP, reaped after it closed its stdout, seen gone by `try_wait` — is
+    /// left as it is: its leader is reaped and its id may name another group
+    /// by now. A leader whose exit this call's own `try_wait` has just seen
+    /// gets its tree swept where no governor will ([`sweep`]); under the Job
+    /// Object the drop of the governor, right after this, does that.
     fn terminate(&mut self) {
-        if matches!(self.child.try_wait(), Ok(Some(_))) {
-            sweep(&mut self.child, self.governed);
-        } else {
-            kill_tree(&mut self.child);
-            let _ = self.child.kill();
+        if !self.swept {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                sweep(&mut self.child, self.governed);
+            } else {
+                kill_tree(&mut self.child);
+                let _ = self.child.kill();
+            }
+            self.swept = true;
         }
         let _ = self.child.wait();
     }
@@ -797,12 +851,12 @@ fn reap(child: &mut Child, governed: bool) -> String {
 }
 
 /// Sweep what a leader that is gone may have left behind, where no governor
-/// will: on Unix `kill_tree` signals the leader's own process group, exact and
-/// free even once the leader is reaped, so it always runs; on Windows an
-/// ungoverned tree gets `taskkill /T` as a best effort (it finds children by
-/// parent pid, and nothing once the parent is gone), while a governed tree is
-/// left to the Job Object, which terminates every member when the governor
-/// drops.
+/// will: on Unix `kill_tree` signals the leader's own process group — called
+/// right after the reap that saw the exit, and once (the host's `swept`), so
+/// the id has had no time to name another group; on Windows an ungoverned
+/// tree gets `taskkill /T` as a best effort (it finds children by parent pid,
+/// and nothing once the parent is gone), while a governed tree is left to the
+/// Job Object, which terminates every member when the governor drops.
 fn sweep(child: &mut Child, governed: bool) {
     if cfg!(unix) || !governed {
         kill_tree(child);
@@ -819,8 +873,11 @@ fn exit_label(status: ExitStatus) -> String {
 /// Open `path` for reading without following a link at it: on Windows
 /// `FILE_FLAG_OPEN_REPARSE_POINT` opens a reparse point (a symlink, a
 /// junction) as itself and never as its target; on Unix `O_NOFOLLOW` refuses
-/// a symlink at the final component. What the handle then is, its metadata
-/// says, and the caller refuses anything but a regular file.
+/// a symlink at the final component, and `O_NONBLOCK` keeps a FIFO planted
+/// at the name between the caller's check and this open from blocking the
+/// open for ever (a regular file reads the same with it). What the handle
+/// then is, its metadata says, and the caller refuses anything but a regular
+/// file.
 fn open_no_follow(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -833,7 +890,7 @@ fn open_no_follow(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     options.open(path)
 }

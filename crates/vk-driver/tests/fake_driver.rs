@@ -548,6 +548,83 @@ fn stop_kills_the_tree() {
     );
 }
 
+/// Task 1 re-review: the tree is signalled once, by whatever saw the driver
+/// die first — a deadline kill, the reap after a driver exited, a `try_wait`
+/// that saw it gone — and never again. Once the leader is reaped its id is
+/// free for reuse, so a later sweep (the drop's, or a second act's on a dead
+/// host) could signal some other group (the harness's M18 rule); the host
+/// remembers it swept and `shutdown`/`Drop` send nothing more.
+#[test]
+fn a_tree_is_swept_once_and_never_signalled_again() {
+    if !python_available() {
+        return;
+    }
+    let rig = Rig::new(FAKE_DRIVER);
+    let m = rig.fake_manifest();
+
+    // A deadline kill.
+    let mut host = rig.spawn(&m);
+    host.act(
+        action(&m, "echo"),
+        &json!({}),
+        Duration::from_secs(10),
+        WIDE,
+        &never,
+    )
+    .expect("a live driver answers");
+    assert!(!host.swept(), "a driver still running has not been swept");
+    let err = host
+        .act(
+            action(&m, "slow"),
+            &json!({}),
+            Duration::from_secs(1),
+            WIDE,
+            &never,
+        )
+        .expect_err("a 30 s sleep does not answer in 1 s");
+    assert!(matches!(err, HostError::Timeout), "{err}");
+    assert!(host.swept(), "the deadline kill swept the tree");
+    let again = host
+        .act(
+            action(&m, "echo"),
+            &json!({}),
+            Duration::from_secs(10),
+            WIDE,
+            &never,
+        )
+        .expect_err("nothing answers a dead driver");
+    assert!(matches!(again, HostError::Dead(_)), "{again}");
+    drop(host);
+
+    // A driver that exits on its own under an act: the reap sweeps.
+    let mut host = rig.spawn(&m);
+    let err = host
+        .act(
+            action(&m, "die"),
+            &json!({}),
+            Duration::from_secs(10),
+            WIDE,
+            &never,
+        )
+        .expect_err("a driver that exits answers nothing");
+    assert!(matches!(err, HostError::Dead(_)), "{err}");
+    assert!(host.swept(), "the reap swept the tree");
+    drop(host);
+
+    // A driver killed while idle: the `try_wait` that sees it gone sweeps.
+    let mut host = rig.spawn(&m);
+    vk_driver::kill_pid_tree(host.pid());
+    let until = Instant::now() + kill_bound();
+    while host.try_wait().expect("try_wait").is_none() {
+        assert!(Instant::now() < until, "the killed driver never exited");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        host.swept(),
+        "the try_wait that saw the exit swept the tree"
+    );
+}
+
 /// Ruling R13: the daemon kills the tree of a host an act holds, by the pid
 /// the host reports, from another thread — what an unmount does. The act
 /// comes back `Dead`, well within the thirty seconds `slow` sleeps, and the
