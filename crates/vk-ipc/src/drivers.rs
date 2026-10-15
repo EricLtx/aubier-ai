@@ -37,9 +37,13 @@ const DRIVER_MAX_MEMORY: u64 = 2 * 1024 * 1024 * 1024;
 
 /// What the pool holds for one mounted name.
 enum Slot {
-    /// Waiting for the next act. Boxed: a host is a few hundred bytes, the
-    /// two markers a few.
-    Idle(Box<DriverHost>),
+    /// Waiting for the next act, with the identity it was spawned for: an
+    /// `ensure` adopts it for that `driver_id` only (Task 3 re-review). Boxed:
+    /// a host is a few hundred bytes, the two markers a few.
+    Idle {
+        host: Box<DriverHost>,
+        driver_id: String,
+    },
     /// A spawn is under way with the map unlocked. The `ensure` that set it
     /// is the only one that clears it ([`Claim`]); every other caller waits
     /// on [`DriverPool::settled`], so a mount racing a lazy re-spawn starts
@@ -96,7 +100,7 @@ impl DriverPool {
     /// is none, or while it is still starting.
     pub fn pid(&self, name: &str) -> Option<u32> {
         match self.map().get(name) {
-            Some(Slot::Idle(host)) => Some(host.pid()),
+            Some(Slot::Idle { host, .. }) => Some(host.pid()),
             Some(Slot::Acting { pid }) => Some(*pid),
             Some(Slot::Spawning) | None => None,
         }
@@ -105,28 +109,33 @@ impl DriverPool {
     /// Spawn (or re-spawn) the host for `row` with the platform governor
     /// (2 GiB, no CPU cap); returns what the host observed (`governed`).
     ///
-    /// A live idle host is kept and its `governed` returned: a repeat mount
-    /// does not restart the browser. An acting one is the host the row
-    /// describes — the kernel admits one act per driver — so the row's
-    /// `governed` is returned. A spawn under way is waited for. Otherwise —
-    /// no host, or one that died idle (reviewer minor 2) — this caller marks
-    /// the slot `Spawning`, spawns with the map unlocked ([`spawn_host`]; a
-    /// hello can take thirty seconds) and puts the host in its place.
+    /// A live idle host spawned for this row's `driver_id` is kept and its
+    /// `governed` returned: a repeat mount does not restart the browser. An
+    /// acting one is the host the row describes — the kernel admits one act
+    /// per driver — so the row's `governed` is returned. A spawn under way is
+    /// waited for. Otherwise — no host, one that died idle (reviewer minor 2),
+    /// or an idle one spawned for another identity: a manifest unmounted
+    /// since, whose process an act's late `ensure` left behind (Task 3
+    /// re-review) — this caller marks the slot `Spawning`, drops what was
+    /// there, spawns with the map unlocked ([`spawn_host`]; a hello can take
+    /// thirty seconds) and puts the host in its place.
     pub fn ensure(&self, row: &DriverRow, dirs: &DriverDirs) -> anyhow::Result<bool> {
         let name = &row.manifest.name;
         let mut map = self.map();
-        let dead = loop {
+        let stale = loop {
             let alive = match map.get_mut(name) {
                 Some(Slot::Spawning) => {
                     map = self.wait(map);
                     continue;
                 }
                 Some(Slot::Acting { .. }) => return Ok(row.manifest.governed),
-                Some(Slot::Idle(host)) => match host.try_wait() {
-                    Ok(None) => Some(host.governed()),
-                    _ => None,
-                },
-                None => None,
+                Some(Slot::Idle { host, driver_id }) if *driver_id == row.driver_id => {
+                    match host.try_wait() {
+                        Ok(None) => Some(host.governed()),
+                        _ => None,
+                    }
+                }
+                Some(Slot::Idle { .. }) | None => None,
             };
             if let Some(governed) = alive {
                 return Ok(governed);
@@ -134,13 +143,19 @@ impl DriverPool {
             break map.insert(name.clone(), Slot::Spawning);
         };
         drop(map);
-        // A host that died idle: reaped, what is left of its tree killed,
-        // with the map unlocked.
-        drop(dead);
+        // A host that died idle, or one of another identity: killed, reaped
+        // and its tree swept, with the map unlocked.
+        drop(stale);
         let claim = Claim { pool: self, name };
         let host = spawn_host(row, dirs)?;
         let governed = host.governed();
-        self.map().insert(name.clone(), Slot::Idle(host));
+        self.map().insert(
+            name.clone(),
+            Slot::Idle {
+                host,
+                driver_id: row.driver_id.clone(),
+            },
+        );
         drop(claim);
         Ok(governed)
     }
@@ -163,12 +178,12 @@ impl DriverPool {
         caps: EvidenceCaps,
         should_stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<ActOutcome, String> {
-        let mut host = {
+        let (mut host, driver_id) = {
             let mut map = self.map();
             match map.remove(name) {
-                Some(Slot::Idle(host)) => {
+                Some(Slot::Idle { host, driver_id }) => {
                     map.insert(name.to_string(), Slot::Acting { pid: host.pid() });
-                    host
+                    (host, driver_id)
                 }
                 Some(other) => {
                     map.insert(name.to_string(), other);
@@ -197,7 +212,7 @@ impl DriverPool {
             let mut map = self.map();
             let ours = matches!(map.get(name), Some(Slot::Acting { pid: p }) if *p == pid);
             if ours && keep {
-                map.insert(name.to_string(), Slot::Idle(host));
+                map.insert(name.to_string(), Slot::Idle { host, driver_id });
                 None
             } else {
                 if ours {
@@ -233,7 +248,7 @@ impl DriverPool {
                     vk_driver::kill_pid_tree(pid);
                     return;
                 }
-                Some(Slot::Idle(_)) | None => break,
+                Some(Slot::Idle { .. }) | None => break,
             }
         }
         let gone = map.remove(name);
