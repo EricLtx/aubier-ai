@@ -287,12 +287,14 @@ vk mount driver --manifest drivers/maskai-recette/manifest.json
 vk driver ls                       # NAME STATE GOVERNED ACTIONS WHY
 vk driver show maskai-1            # identity, state, hosts, actions, root
 vk ls /drivers                     # the names; /drivers/NAME is `vk driver show`
-vk driver umount maskai-1          # stop the process, whatever it is doing
+vk driver umount maskai-1          # signed; stop the process, whatever it is doing
 ```
 
 Mounting is a human act, signed with this node's device key like the cloud
 arches' mounts, because it puts a browser — with whatever session its profile
-holds — under this node's control. The manifest (`driver_manifest`) names the
+holds — under this node's control. Unmounting is one too, for the same reason
+the other way round: it ends that session, and kills an action in flight
+(pilot ruling R25). The kernel refuses either to a machine principal. The manifest (`driver_manifest`) names the
 driver, its program, the hosts it may navigate to, and every action with its
 argument schema, its evidence file names, whether it is reversible and
 whether its result goes to the register.
@@ -316,22 +318,38 @@ is), `VK_DRIVER_HEADLESS` (`1` or `0`), `VK_DRIVER_CHANNEL` (the browser
 channel, or empty) and `VK_DRIVER_HOSTS` (the allow-list, comma-joined). Each
 action's request carries an absolute `evidence_dir` under
 `<state_dir>/drivers/<name>/evidence/`. On Windows the tree runs inside a Job
-Object, 2 GiB and kill-on-close, and `vk driver ls` says `GOVERNED` yes;
-elsewhere it says no.
+Object, kill-on-close and capped at the manifest's `program.max_memory_bytes`
+(at least 256 MiB; 6 GiB for a browser whose manifest names none — the
+harness's 2 GiB starves a headed Chrome), and `vk driver ls` says `GOVERNED`
+yes; elsewhere it says no. One exception, measured: under the Microsoft Store
+build of Python, a packaged app, Windows starts the interpreter's
+non-packaged children — Playwright's node and Chrome — outside its job, so
+outside this Job: they escape the cap, kill-on-close and the Job's process
+list, and only the kill by process tree reaches them. Build the driver's
+`.venv` on a python.org (or other non-packaged) Python for the Job to hold
+the browser.
 
 Three ledger kinds record a driver, each with its own schema:
 
 | kind | what it carries |
 |---|---|
 | `driver.mounted` | `driver_id`, `name`, `manifest_hash`, `profile_dir_hash`, `governed`, and `by`, the device key that signed the mount |
-| `driver.acted` | `task_id`, `step_index`, `driver_id`, `action`, `args_hash`, `result_hash`, `ok`, `reason` when it failed, `duration_ms`, `evidence` (the blob hashes), `evidence_bytes`, `hosts_seen` |
-| `driver.unmounted` | `driver_id` and the reason: the operator, or what degraded it |
+| `driver.acted` | `task_id`, `step_index`, `driver_id`, `action`, `args_hash`, `result_hash`, `ok`, `reason` when it failed — a word of a closed vocabulary (`timeout`, `dead`, `protocol: malformed response`, `would not start`, …) — `duration_ms`, `evidence` (the blob hashes), `evidence_bytes`, `hosts_seen` |
+| `driver.unmounted` | `driver_id` and the reason: the operator, what degraded it (a word of the same vocabulary), or `row unreadable at boot` |
 
 `driver.acted` carries hashes and sizes, never text (Ruling 28): what the
 harness asked, what the driver answered and what it captured are in the
-store, under their labels, and not in the record. `hosts_seen` is the egress
-sampled while the action ran: the whole tree under the Job on Windows, the
-driver's leader only when it is ungoverned (pilot ruling R8).
+store, under their labels, and not in the record. A failure's `reason` is
+one of a fixed list of words; its detail — a path, a hash, an excerpt of a
+response the host could not read — goes to the daemon's log and to the
+driver's `driver.log`, never to the ledger (final review I1).
+
+`hosts_seen` is the egress sampled while the action ran: the remote `ip:port`
+endpoints of the established TCP connections of every process in the Job on
+Windows, of the driver's leader alone when it is ungoverned, sampled every
+500 ms (pilot ruling R8). It is a lower bound, in addresses, not names: a
+connection that opens and closes between two samples is not seen, and an
+auditor resolves the addresses to hosts by hand.
 
 Evidence is stored as artefacts, each kind being the evidence file's name
 (`answer.png`, `network.json`, `dom.html`, `timing.json`, `attach.png`). A
@@ -357,11 +375,15 @@ driver is idle.
 
 A driver degrades on every host-side failure except the evidence refusals: a
 deadline, a dead process, a protocol error, a STOP (pilot ruling R12). A
-degraded driver refuses every act with the remedy, which is to mount it again:
+human STOP degrades it too, because the host kills the tree under the action
+it interrupts; the remedy is a remount once the STOP is lifted. A degraded
+driver refuses every act with the remedy, which is to mount it again:
 `vk mount driver --manifest …` starts a fresh process and writes a new
-`driver.mounted`. `vk driver umount` kills the process even while an action is
-in flight, and that action's caller is told the act is stale (pilot ruling
-R13).
+`driver.mounted`. `vk driver umount`, signed like the mount, kills the
+process even while an action is in flight, and that action's caller is told
+the act is stale (pilot ruling R13). A stored driver row this binary can no
+longer read — a field written by a newer one — is recorded and removed at
+boot rather than failing it; the driver is then mounted again.
 
 A driver is identified by `files_sha256` and by `inputs_sha256`: the second
 covers the evaluator, the journal script, the cases, the oracles and the

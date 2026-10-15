@@ -59,6 +59,8 @@ manifest-fixture.json : à jour
 ```
 Pourquoi un virtualenv à part ? Les chemins internes de Playwright dépassent la limite MAX_PATH de 260 caractères sous OneDrive. Le virtualenv vit donc sous `%LOCALAPPDATA%\vk\venvs\maskai-recette`, et `drivers\maskai-recette\.venv` est une jonction vers lui. `.venv` est exclu de l'empreinte.
 
+**Le Python de base compte.** Le virtualenv est construit sur le Python qui lance `setup.ps1`. Le Python du Microsoft Store (celui de ce nœud au 2026-10-15) est une application empaquetée : Windows démarre ses enfants non empaquetés, donc le nœud Playwright et Chrome, **hors du Job Object**. Chrome n'a alors ni le plafond mémoire, ni l'arrêt avec le démon, et `hosts_seen` ne voit pas ses connexions. L'arrêt par l'arbre des processus (échéance, STOP, démontage) l'atteint toujours. Pour que le confinement tienne, construisez le virtualenv sur un Python non empaqueté (python.org, ou `uv python install 3.13`).
+
 **1.3 Google Chrome**, parce que le manifeste dit `browser_channel: "chrome"`.
 ```powershell
 Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe"
@@ -212,13 +214,13 @@ vk driver ls
 ```
 Attendu : `maskai-1  ready  yes  mesurer_chargement,…,exporter_journal  -`
 
-`governed: yes` veut dire que le Job Object a confirmé le confinement : 2 Gio, et l'arbre est tué avec le démon.
+`governed: yes` veut dire que le Job Object a confirmé le confinement du processus du driver : le plafond mémoire du manifeste (`program.max_memory_bytes`, 6 Gio), et l'arbre est tué avec le démon. Avec un Python du Store, Chrome est hors du Job (§1.2).
 
 **6.3 Ajouter un hôte à `hosts`, seulement si nécessaire.** La liste ne porte que sur les navigations de la page principale. Les CDN, polices et analytics d'autres hôtes ne sont pas bloqués : ils sont relevés dans `third_party_hosts` (`capturer_flux`, `network.json`). La connexion au montage n'est pas gardée non plus, donc une redirection vers un fournisseur d'identité y fonctionne.
 
 Il faut ajouter un hôte quand une action rend `host` en nommant un hôte légitime. Cas typique : la session a expiré, et `/new` redirige vers l'identité pendant un pas.
 1. Ajoutez l'hôte dans `"hosts"` de `drivers\maskai-recette\manifest.json`.
-2. Démontez le driver : `vk driver umount maskai-1`. Attendu : `unmounted driver maskai-1`.
+2. Démontez le driver : `vk driver umount maskai-1`. Comme le montage, c'est un acte humain : la commande signe avec la clé de l'appareil (R25). Attendu : `unmounted driver maskai-1`.
 3. Remontez-le avec la commande du §6.1. Attendu : un **nouveau** `driver_id`, car le manifeste a changé. `files_sha256` est inchangé : les manifestes sont exclus de l'empreinte, rien n'est à régénérer.
 
 Le profil Chrome est conservé au démontage, et la session MaskAI avec lui.
@@ -291,7 +293,7 @@ Le symptôme d'un sélecteur faux est un KO `réponse vide : échec silencieux` 
 1. Ne lancez pas le niveau suivant : entre deux niveaux, rien ne tourne. La tâche en cours est abandonnée telle quelle.
 2. Corrigez `SELECTORS` dans `driver.py`.
 3. Relancez `setup.ps1`, et recopiez le nouveau `files_sha256` qu'il affiche dans les deux manifestes.
-4. Démontez le driver : `vk driver umount maskai-1`. Il garde ses observations en mémoire, donc on l'arrête avant de toucher à ses fichiers.
+4. Démontez le driver : `vk driver umount maskai-1` (signé avec la clé de l'appareil, comme le montage). Il garde ses observations en mémoire, donc on l'arrête avant de toucher à ses fichiers.
 5. Mettez de côté le journal faux : renommez `$S\drivers\maskai-1\work\journal.jsonl`, `journal.cursor` et `observations.json` avec un suffixe daté. On ne les efface pas : ce sont des preuves.
 6. Remontez le driver (§6.1). Attendu : un nouveau `driver_id`, puisque `files_sha256` a changé.
 7. Soumettez de nouveau la recette (§7).
@@ -426,7 +428,8 @@ Ce tableau décrit ce que fait le système **tel qu'il est construit**. Là où 
 |---|---|---|
 | Dialogue inattendu | Le cas est journalisé KO sécurité, le niveau s'arrête et se ferme en `done`. *La spec prévoyait `WaitingHuman` et la relance du même pas : ce n'est pas construit.* | Fermez par Annuler, passez au niveau suivant, puis reprise (§12). |
 | Délai d'action dépassé | Le driver abandonne à 3 × le budget du cas et journalise KO disponibilité. Le harnais passe au cas suivant. *La règle « trois de suite font échouer le pas » n'est pas construite.* | Si tout dépasse (MaskAI en panne) : `vk stop`, puis reprise plus tard. |
-| Driver mort ou muet | `vk_driver_act` est refusé par le noyau, et le driver est `degraded` (`driver.unmounted{reason}`). Le harnais s'arrête. Le pas finit `done` s'il avait déjà laissé une preuve, sinon `failed: harness produced no artefact`, et la tâche échoue. | **Avant chaque niveau**, `vk driver ls`. S'il est `degraded`, remontez avec la commande du §6.1 : c'est le remède. Si la tâche a échoué : reprise (§12). |
+| Driver mort ou muet | `vk_driver_act` est refusé par le noyau, et le driver est `degraded` (`driver.unmounted{reason}`). La raison est un mot fixe (`dead`, `timeout`, `protocol: malformed response`, `would not start`…) : le détail (chemin, empreinte, extrait de la réponse) n'est jamais au ledger, il est dans `$S\drivers\maskai-1\work\driver.log`, ligne `[daemon] act … failed`. Le harnais s'arrête. Le pas finit `done` s'il avait déjà laissé une preuve, sinon `failed: harness produced no artefact`, et la tâche échoue. | **Avant chaque niveau**, `vk driver ls`. S'il est `degraded`, lisez la fin de `driver.log`, puis remontez avec la commande du §6.1 : c'est le remède. Si la tâche a échoué : reprise (§12). |
+| Chrome affiche « Aw, Snap » (ou « Oh non ! »), ou le driver meurt `dead` sous une page lourde | Le plafond mémoire du Job (`program.max_memory_bytes`, 6 Gio) refuse les allocations de Chrome : faux KO disponibilité, ou driver dégradé. | Augmentez `max_memory_bytes` dans `manifest.json` (8589934592 pour 8 Gio), `vk driver umount maskai-1`, remontez (§6.1) : nouveau `driver_id`, `files_sha256` inchangé. Puis reprise (§12). |
 | Navigation hors liste | L'action rend `host`. La page revient à l'entrée, le cas est KO sécurité, et l'hôte est au ledger (`hosts_seen`). | Un signal de sécurité. Si l'hôte est légitime : §6.3. |
 | STOP humain | `vk stop` tue l'arbre du harnais et l'action en vol. Le driver est dégradé, et le pas finit `failed`, ce qui fait échouer la tâche. | `vk resume <stop_id>`, remontez le driver (§6.1), puis reprise (§12). |
 | Démon tué (veille, fermeture de session) | Le journal est sur disque et le ledger est intact. Au redémarrage, le pas qui tournait est marqué `failed: interrupted`, et la tâche échoue. Le driver reste monté : il relance Chrome à sa première action, avec le même profil et la même session. | Relancez `vkd` (§3.2). Pour vérifier la session dans Chrome tout de suite, refaites `vk mount driver …` (§6.1), qui relance le processus. Puis reprise (§12). |
@@ -450,7 +453,7 @@ Le verdict rejoué est réinscrit au registre de la nouvelle tâche, ce qui perm
 ```powershell
 $S = (vk status --json | ConvertFrom-Json).state_dir
 $n = 1                                   # 1 au premier essai repris, puis 2, 3…
-vk driver umount maskai-1
+vk driver umount maskai-1               # signé avec la clé de l'appareil, comme le montage
 $obs = "$S\drivers\maskai-1\work\observations.json"
 if (Test-Path $obs) { Rename-Item $obs "observations-essai$n.json" -ErrorAction Stop }
 $src = "$S\exports\recettage-chat-ia\runs\2026-10"
