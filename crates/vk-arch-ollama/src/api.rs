@@ -16,6 +16,7 @@ use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
+use vk_kernel::arch::{parse_retry_after, AdapterError};
 
 /// A version probe: the server is either listening or it is not.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -297,16 +298,43 @@ pub fn tokenize_available(client: &Client, base: &str, model: &str) -> bool {
     tokenize(client, base, model, "probe").is_ok()
 }
 
-pub fn chat(client: &Client, base: &str, req: &ChatRequest) -> Result<ChatResponse> {
+/// One completion — or the refusal the kernel is owed, typed where it is
+/// about the server's plan rather than the call (2026-10-15): a `429` is
+/// [`AdapterError::RateLimited`], with the `Retry-After` the server sent, and
+/// a `404` that names the model — Ollama's "model 'x' not found", a tag
+/// removed from the server since the mount — is [`AdapterError::Retired`].
+/// Everything else is the failure it always was, in the same words.
+pub fn chat(
+    client: &Client,
+    base: &str,
+    req: &ChatRequest,
+) -> std::result::Result<ChatResponse, AdapterError> {
     let r = client
         .post(url(base, "/api/chat"))
         .json(req)
         .timeout(CHAT_TIMEOUT)
         .send()
         .context("POST /api/chat")?;
-    let parsed: ChatResponse = parse("/api/chat", &body("/api/chat", r)?)?;
+    let status = r.status();
+    let retry_after = r
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_retry_after);
+    let text = r.text().unwrap_or_default();
+    if !status.is_success() {
+        let said = format!("/api/chat: Ollama answered {status}: {}", text.trim());
+        return Err(match status.as_u16() {
+            429 => AdapterError::RateLimited { retry_after },
+            404 if text.contains("model") => AdapterError::Retired { detail: said },
+            _ => AdapterError::Other(anyhow::anyhow!(said)),
+        });
+    }
+    let parsed: ChatResponse = parse("/api/chat", &text)?;
     if let Some(e) = &parsed.error {
-        bail!("Ollama refused the call: {e}");
+        return Err(AdapterError::Other(anyhow::anyhow!(
+            "Ollama refused the call: {e}"
+        )));
     }
     Ok(parsed)
 }

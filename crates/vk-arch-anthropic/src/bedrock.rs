@@ -202,7 +202,7 @@ mod client {
         ContentBlock, ConversationRole, ConverseOutput, InferenceConfiguration, Message,
     };
     use std::sync::Arc;
-    use vk_kernel::arch::{AdapterError, ArchAdapter, Completion};
+    use vk_kernel::arch::{parse_retry_after, AdapterError, ArchAdapter, Completion};
 
     pub struct BedrockAdapter {
         cfg: BedrockConfig,
@@ -355,11 +355,29 @@ mod client {
                 )
                 .send();
             let answer = block_on(&self.runtime, call).map_err(|e| {
-                AdapterError::Other(anyhow!(
+                let said = format!(
                     "Bedrock Converse refused the call in {}: {}",
                     self.cfg.region,
                     aws_message(&e)
-                ))
+                );
+                // The statuses that are about the plan rather than the call,
+                // read off the response the service sent (2026-10-15): 429 is
+                // `ThrottlingException`, 404 `ResourceNotFoundException` — a
+                // model this region does not serve (any more). Anything else,
+                // and every failure that never reached the service, is what
+                // it always was.
+                let aws_sdk_bedrockruntime::error::SdkError::ServiceError(inner) = &e else {
+                    return AdapterError::Other(anyhow!(said));
+                };
+                let raw = inner.raw();
+                match raw.status().as_u16() {
+                    429 => AdapterError::RateLimited {
+                        retry_after: raw.headers().get("retry-after").and_then(parse_retry_after),
+                    },
+                    402 => AdapterError::Exhausted { detail: said },
+                    404 => AdapterError::Retired { detail: said },
+                    _ => AdapterError::Other(anyhow!(said)),
+                }
             })?;
 
             let text = match answer.output() {

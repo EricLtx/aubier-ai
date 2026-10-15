@@ -326,6 +326,51 @@ fn usage_is_measured_not_guessed() {
     assert_eq!(details["done_reason"], "stop");
 }
 
+/// What the server says about its plan reaches the kernel typed (2026-10-15):
+/// a model removed from the server since the mount is a retired arch, a 429
+/// is a rate limit carrying the server's own wait, and any other refusal is
+/// the failure it always was.
+#[test]
+fn a_dropped_model_is_retired_and_a_429_is_a_rate_limit() {
+    let refused = |chat_error| {
+        let fake = Fake::start(Canned {
+            chat_error: Some(chat_error),
+            ..Default::default()
+        });
+        let adapter = OllamaAdapter::mount(config(&fake, "gemma3:1b", 8192)).expect("mount");
+        adapter.complete("say something", 64).expect_err("refused")
+    };
+    let err = refused((
+        "404 Not Found",
+        serde_json::json!({"error": "model 'gemma3:1b' not found"}),
+        None,
+    ));
+    let AdapterError::Retired { detail } = err else {
+        panic!("a dropped model is a retired arch: {err:?}")
+    };
+    assert!(detail.contains("gemma3:1b"), "{detail}");
+
+    let err = refused((
+        "429 Too Many Requests",
+        serde_json::json!({"error": "slow down"}),
+        Some("7"),
+    ));
+    assert!(
+        matches!(err, AdapterError::RateLimited { retry_after: Some(d) } if d.as_secs() == 7),
+        "{err:?}"
+    );
+
+    let err = refused((
+        "500 Internal Server Error",
+        serde_json::json!({"error": "out of memory"}),
+        None,
+    ));
+    assert!(
+        matches!(&err, AdapterError::Other(e) if format!("{e:#}").contains("out of memory")),
+        "{err:?}"
+    );
+}
+
 #[test]
 fn mount_pulls_a_model_the_server_does_not_have_and_leaves_one_it_does() {
     let fake = Fake::start(Canned::default());

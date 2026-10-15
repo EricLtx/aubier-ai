@@ -13,6 +13,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::time::Duration;
+use vk_kernel::arch::AdapterError;
 
 /// One `claude -p --output-format json` result object, as printed.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +124,74 @@ pub fn parse(s: &str) -> Result<ClaudeJson> {
         return Err(j.refusal());
     }
     Ok(j)
+}
+
+/// Parse, and refuse a failed run **typed** where the run says something
+/// about the provider's plan (2026-10-15): what `complete` hands the kernel.
+/// [`provider_refusal`] decides which; anything it does not recognise is the
+/// same refusal [`parse`] gives.
+pub fn parse_for_kernel(s: &str, now_unix_s: u64) -> std::result::Result<ClaudeJson, AdapterError> {
+    let j = parse_fields(s)?;
+    if j.failed() {
+        return Err(
+            provider_refusal(&j, now_unix_s).unwrap_or_else(|| AdapterError::Other(j.refusal()))
+        );
+    }
+    Ok(j)
+}
+
+/// What a failed run says about the provider's plan, when it says something
+/// the kernel keeps as the arch's health — `None` for a run that succeeded
+/// and for every failure it does not recognise, which stays the plain
+/// refusal it always was.
+///
+/// Recognised, and only these, because a guess here would hold an arch back
+/// or fail a step for a reason the provider never gave:
+/// - `api_error_status` 429, or a result saying the subscription's usage
+///   limit is reached (`Claude AI usage limit reached|<unix seconds>`, `You've
+///   hit your limit`) → rate-limited, until the reset time when the CLI
+///   printed one after a `|`;
+/// - `api_error_status` 402, or a result saying the credit balance is too
+///   low (Claude Code on an API key) → exhausted;
+/// - `api_error_status` 404 → retired: the model is not served.
+///
+/// `overloaded_error` (529) and `error_max_turns` are not here: neither is
+/// about the plan.
+pub fn provider_refusal(j: &ClaudeJson, now_unix_s: u64) -> Option<AdapterError> {
+    if !j.failed() {
+        return None;
+    }
+    let status = j.api_error_status.as_deref().unwrap_or("").trim();
+    let said = j.result.to_ascii_lowercase();
+    if status.starts_with("429")
+        || said.contains("usage limit reached")
+        || said.contains("hit your limit")
+    {
+        return Some(AdapterError::RateLimited {
+            retry_after: reset_after(&j.result, now_unix_s),
+        });
+    }
+    if status.starts_with("402") || said.contains("credit balance is too low") {
+        return Some(AdapterError::Exhausted {
+            detail: j.refusal().to_string(),
+        });
+    }
+    if status.starts_with("404") {
+        return Some(AdapterError::Retired {
+            detail: j.refusal().to_string(),
+        });
+    }
+    None
+}
+
+/// The wait until the reset a usage-limit message names as `…|<unix
+/// seconds>`; `None` when it names none, or one already past.
+fn reset_after(result: &str, now_unix_s: u64) -> Option<Duration> {
+    let (_, at) = result.rsplit_once('|')?;
+    let at: u64 = at.trim().parse().ok()?;
+    at.checked_sub(now_unix_s)
+        .filter(|wait| *wait > 0)
+        .map(Duration::from_secs)
 }
 
 /// A JSON scalar as text, with `null` and absence both meaning "not said".

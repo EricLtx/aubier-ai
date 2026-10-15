@@ -594,8 +594,7 @@ impl ArchAdapter for OllamaAdapter {
         }
 
         let req = Self::chat_request(&self.cfg, prompt, max_tokens);
-        let answer =
-            api::chat(&self.client, &self.cfg.base_url, &req).map_err(AdapterError::Other)?;
+        let answer = api::chat(&self.client, &self.cfg.base_url, &req)?;
 
         // I4′ again, from the server's own count. Ollama cuts an oversize
         // prompt to `num_ctx / 2 + 3` and reports success; reaching that line

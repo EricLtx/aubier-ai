@@ -55,6 +55,8 @@ struct How {
     slow: bool,
     /// Exit with this code after printing the (perfectly good) reply.
     exit: i32,
+    /// Print this instead of the canned reply.
+    reply: Option<&'static str>,
 }
 
 impl Standin {
@@ -63,7 +65,11 @@ impl Standin {
     }
 
     fn behaving(how: How) -> Standin {
-        let How { slow, exit } = how;
+        let How {
+            slow,
+            exit,
+            reply: printed,
+        } = how;
         let home = tempfile::tempdir().expect("temp dir");
         let at = |name: &str| home.path().join(name);
         let (bin, cwd) = (
@@ -80,7 +86,7 @@ impl Standin {
             at("reply.json"),
         );
         fs::create_dir_all(&cwd).expect("the arch's fixed working directory");
-        fs::write(&reply, REPLY).expect("write the canned reply");
+        fs::write(&reply, printed.unwrap_or(REPLY)).expect("write the canned reply");
 
         let p = |path: &Path| path.display().to_string();
         let script = if cfg!(windows) {
@@ -370,6 +376,34 @@ fn a_non_zero_exit_is_a_failure_even_with_a_well_formed_result_object() {
     assert!(
         msg.contains("the stand-in complains"),
         "and the tail of stderr, which is where the reason usually is: {msg}"
+    );
+}
+
+/// A subscription out of its usage window: the CLI prints the limit and exits
+/// 1, and the adapter hands the kernel a rate limit until the reset it named —
+/// not the plain failure a non-zero exit otherwise is (2026-10-15).
+#[test]
+fn a_usage_limit_reaches_the_kernel_as_a_rate_limit() {
+    let fake = Standin::behaving(How {
+        exit: 1,
+        reply: Some(
+            r#"{"type": "result", "subtype": "success", "is_error": true,
+                "result": "Claude AI usage limit reached|4102444800", "session_id": "s"}"#,
+        ),
+        ..Default::default()
+    });
+    let adapter = ClaudeCodeAdapter::new(fake.config());
+    let err = adapter
+        .complete("ROLE: draft\nGOAL: g\n", 256)
+        .expect_err("a usage limit is not a completion");
+    assert!(
+        matches!(
+            err,
+            vk_kernel::arch::AdapterError::RateLimited {
+                retry_after: Some(_)
+            }
+        ),
+        "{err:?}"
     );
 }
 

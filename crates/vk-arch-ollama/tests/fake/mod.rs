@@ -36,6 +36,10 @@ pub struct Canned {
     /// real count of what the fake tokenizer makes of it".
     pub prompt_eval_count: Option<u32>,
     pub reply: String,
+    /// Answer `/api/chat` with this status line and body instead, plus a
+    /// `retry-after` header when one is given — a server that has dropped the
+    /// model, or one that is shedding load.
+    pub chat_error: Option<(&'static str, Value, Option<&'static str>)>,
 }
 
 impl Default for Canned {
@@ -55,6 +59,7 @@ impl Default for Canned {
             tokenize: false,
             prompt_eval_count: None,
             reply: "ok".into(),
+            chat_error: None,
         }
     }
 }
@@ -213,6 +218,19 @@ fn serve(mut stream: TcpStream, canned: &Canned, log: &Log, pulled: &Arc<Mutex<V
                 &json!({ "tokens": (0..n).map(|i| i as i64).collect::<Vec<_>>() }),
             );
         }
+        "/api/chat" if canned.chat_error.is_some() => {
+            let (status, body, retry_after) = canned.chat_error.clone().expect("checked");
+            let extra = retry_after
+                .map(|r| format!("retry-after: {r}\r\n"))
+                .unwrap_or_default();
+            respond_with(
+                &mut stream,
+                status,
+                "application/json",
+                &body.to_string(),
+                &extra,
+            );
+        }
         "/api/chat" => {
             let prompt: String = parsed["messages"]
                 .as_array()
@@ -292,8 +310,13 @@ fn text(stream: &mut TcpStream, status: &str, body: &str) {
 }
 
 fn respond(stream: &mut TcpStream, status: &str, kind: &str, body: &str) {
+    respond_with(stream, status, kind, body, "");
+}
+
+/// `respond`, with header lines of its own (each ending `\r\n`).
+fn respond_with(stream: &mut TcpStream, status: &str, kind: &str, body: &str, extra: &str) {
     let head = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());

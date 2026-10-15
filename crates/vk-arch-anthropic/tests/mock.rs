@@ -43,6 +43,8 @@ struct Canned {
     count: Option<u32>,
     /// An error object to answer `/v1/messages` with instead, and its status.
     error: Option<(u16, Value)>,
+    /// A `retry-after` header to send with that error.
+    retry_after: Option<&'static str>,
     /// Answer `/v1/messages` with a redirect of this status to this origin
     /// instead. The adapter must **not** follow it: `x-api-key` is a custom
     /// header and reqwest's default policy would carry it across the hop.
@@ -66,6 +68,7 @@ impl Default for Canned {
             output_tokens: 56,
             count: Some(1234),
             error: None,
+            retry_after: None,
             redirect_to: None,
         }
     }
@@ -158,7 +161,14 @@ fn serve(mut stream: TcpStream, canned: &Canned, log: &Arc<Mutex<Vec<Seen>>>) {
         },
         "/v1/messages" => match (&canned.error, &canned.redirect_to) {
             (_, Some((status, to))) => redirect(&mut stream, *status, &format!("{to}/v1/messages")),
-            (Some((status, body)), _) => respond(&mut stream, *status, body),
+            (Some((status, body)), _) => {
+                let extra: Vec<(&str, &str)> = canned
+                    .retry_after
+                    .map(|r| ("retry-after", r))
+                    .into_iter()
+                    .collect();
+                respond_with(&mut stream, *status, body, &extra)
+            }
             (None, None) => respond(
                 &mut stream,
                 200,
@@ -229,9 +239,14 @@ fn redirect(stream: &mut TcpStream, status: u16, location: &str) {
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
+    respond_with(stream, status, body, &[]);
+}
+
+fn respond_with(stream: &mut TcpStream, status: u16, body: &Value, extra: &[(&str, &str)]) {
     let body = body.to_string();
+    let extra: String = extra.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
     let head = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());
@@ -804,6 +819,79 @@ fn the_post_checks_refusal_names_the_ceiling_it_actually_compared() {
         }
         other => panic!("expected an I4′ refusal after the call, got {other:?}"),
     }
+}
+
+// ------------------------------------------------- the plan's refusals (2026-10-15)
+
+fn refused_with(
+    status: u16,
+    kind: &str,
+    message: &str,
+    retry_after: Option<&'static str>,
+) -> AdapterError {
+    let fake = Fake::start(Canned {
+        error: Some((
+            status,
+            json!({"type": "error", "error": {"type": kind, "message": message}}),
+        )),
+        retry_after,
+        ..Default::default()
+    });
+    adapter(&fake)
+        .complete("hello", 0)
+        .expect_err("a refused call")
+}
+
+#[test]
+fn a_429_is_a_rate_limit_carrying_the_api_s_retry_after() {
+    let err = refused_with(
+        429,
+        "rate_limit_error",
+        "Number of request tokens has exceeded your per-minute rate limit",
+        Some("30"),
+    );
+    assert!(
+        matches!(err, AdapterError::RateLimited { retry_after: Some(d) } if d.as_secs() == 30),
+        "{err:?}"
+    );
+    // And without the header the wait is unknown — never zero.
+    let err = refused_with(429, "rate_limit_error", "slow down", None);
+    assert!(
+        matches!(err, AdapterError::RateLimited { retry_after: None }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_spent_plan_is_exhausted_whether_the_api_says_402_or_a_too_low_balance() {
+    let echoed = format!("There is an issue with your billing for {KEY}");
+    let err = refused_with(402, "billing_error", &echoed, None);
+    let AdapterError::Exhausted { detail } = err else {
+        panic!("402 is an exhausted plan: {err:?}")
+    };
+    assert!(detail.contains("billing_error"), "{detail}");
+    assert!(!detail.contains(KEY), "the key is in the detail: {detail}");
+    let err = refused_with(
+        400,
+        "invalid_request_error",
+        "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+        None,
+    );
+    assert!(matches!(err, AdapterError::Exhausted { .. }), "{err:?}");
+}
+
+#[test]
+fn a_404_on_the_model_is_a_retired_arch_and_a_404_on_anything_else_is_not() {
+    let err = refused_with(404, "not_found_error", "model: claude-2.1", None);
+    let AdapterError::Retired { detail } = err else {
+        panic!("a model the API no longer serves is retired: {err:?}")
+    };
+    assert!(detail.contains("model: claude-2.1"), "{detail}");
+    let err = refused_with(404, "not_found_error", "Not Found", None);
+    assert!(
+        matches!(err, AdapterError::Other(_)),
+        "a wrong path is not a retired model: {err:?}"
+    );
 }
 
 /// A hostile far end that echoes the key into `error.type` gets it scrubbed

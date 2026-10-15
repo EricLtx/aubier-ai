@@ -156,3 +156,65 @@ fn malformed_output_is_an_error_and_not_an_empty_completion() {
         }
     }
 }
+
+// ------------------------------------------------- the plan's refusals (2026-10-15)
+
+fn failed(result: &str, api_error_status: Option<&str>) -> output::ClaudeJson {
+    let status = api_error_status.map_or("null".to_string(), |s| format!("{s:?}"));
+    output::parse_fields(&format!(
+        r#"{{"type": "result", "subtype": "success", "is_error": true,
+             "result": {result:?}, "session_id": "s", "api_error_status": {status}}}"#
+    ))
+    .expect("a failed run still parses")
+}
+
+#[test]
+fn a_usage_limit_is_a_rate_limit_until_the_reset_the_cli_printed() {
+    use vk_kernel::arch::AdapterError;
+    let now = 1_760_000_000;
+    let limited = failed("Claude AI usage limit reached|1760003600", None);
+    assert!(
+        matches!(
+            output::provider_refusal(&limited, now),
+            Some(AdapterError::RateLimited { retry_after: Some(d) }) if d.as_secs() == 3_600
+        ),
+        "the reset time is the wait"
+    );
+    // No reset printed, or one already past: the wait is unknown, not zero.
+    let unknown = failed("You've hit your limit", None);
+    assert!(matches!(
+        output::provider_refusal(&unknown, now),
+        Some(AdapterError::RateLimited { retry_after: None })
+    ));
+    let past = failed("Claude AI usage limit reached|1700000000", None);
+    assert!(matches!(
+        output::provider_refusal(&past, now),
+        Some(AdapterError::RateLimited { retry_after: None })
+    ));
+    let status = failed("API Error: 429", Some("429"));
+    assert!(matches!(
+        output::provider_refusal(&status, now),
+        Some(AdapterError::RateLimited { .. })
+    ));
+}
+
+#[test]
+fn a_spent_balance_is_exhausted_a_missing_model_retired_and_the_rest_unchanged() {
+    use vk_kernel::arch::AdapterError;
+    let spent = failed("Credit balance is too low", None);
+    assert!(matches!(
+        output::provider_refusal(&spent, 0),
+        Some(AdapterError::Exhausted { .. })
+    ));
+    let gone = failed("model: claude-2.1", Some("404"));
+    assert!(matches!(
+        output::provider_refusal(&gone, 0),
+        Some(AdapterError::Retired { detail }) if detail.contains("claude-2.1")
+    ));
+    // Not about the plan: an overloaded provider, a run out of turns.
+    assert!(output::provider_refusal(&failed("Overloaded", Some("529")), 0).is_none());
+    assert!(output::provider_refusal(&failed("max turns", None), 0).is_none());
+    // And a run that succeeded is not a refusal of any kind.
+    let ok = output::parse(&success()).unwrap();
+    assert!(output::provider_refusal(&ok, 0).is_none());
+}

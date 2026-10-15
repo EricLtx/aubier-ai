@@ -242,7 +242,7 @@ impl ArchAdapter for ClaudeCodeAdapter {
 
         let argv = Self::launch_line(&self.cfg);
         let printed = run(&argv, &self.cfg.cwd, prompt, self.cfg.timeout)?;
-        let j = output::parse(&printed)?;
+        let j = output::parse_for_kernel(&printed, unix_now())?;
         // The provider counted the prompt; this node only estimated it.
         let measured = u32::try_from(j.tokens_in()).unwrap_or(u32::MAX);
         Ok(Completion {
@@ -374,7 +374,12 @@ fn spawn(program: &Path) -> Command {
 /// the largest a register will lower to. The wait is a poll rather than a
 /// blocking `wait`, because a `claude` that never answers has to be killed at
 /// the timeout rather than waited on forever.
-fn run(argv: &[String], cwd: &Path, prompt: &str, timeout: Duration) -> Result<String> {
+fn run(
+    argv: &[String],
+    cwd: &Path,
+    prompt: &str,
+    timeout: Duration,
+) -> std::result::Result<String, AdapterError> {
     let mut child = spawn(Path::new(&argv[0]))
         .args(&argv[1..])
         .current_dir(cwd)
@@ -430,9 +435,28 @@ fn run(argv: &[String], cwd: &Path, prompt: &str, timeout: Duration) -> Result<S
             || "and printed a result that claims success".into(),
             |e| e.to_string(),
         );
-        bail!("claude exited {how}: {why} [stderr: {tail}]");
+        // A run that failed on the provider's plan — a usage limit, a spent
+        // balance, a model not served — says so typed, so the kernel can keep
+        // it as the arch's health (2026-10-15). The CLI exits 1 for those.
+        if let Some(typed) = output::parse_fields(&printed)
+            .ok()
+            .and_then(|j| output::provider_refusal(&j, unix_now()))
+        {
+            return Err(typed);
+        }
+        return Err(AdapterError::Other(anyhow::anyhow!(
+            "claude exited {how}: {why} [stderr: {tail}]"
+        )));
     }
     Ok(printed)
+}
+
+/// Seconds since the Unix epoch, for reading a usage-limit reset time; `0`
+/// on a clock before 1970, which only makes every reset read as future.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The last `n` characters of `s`, marked when something was cut. Used on

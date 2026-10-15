@@ -57,7 +57,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use vk_contracts::arch::{ArchIdentity, ArchManifest, Capability, Determinism, Locality};
 use vk_contracts::labels::{Clearance, Scope};
-use vk_kernel::arch::{AdapterError, ArchAdapter, Completion};
+use vk_kernel::arch::{parse_retry_after, AdapterError, ArchAdapter, Completion};
 use zeroize::Zeroize;
 
 /// The API version header every request carries. It is in the arch identity:
@@ -605,8 +605,27 @@ impl AnthropicAdapter {
     /// A successful response's body as JSON, or a refusal carrying the API's
     /// own error — its `type` and its `message`, which is what the person
     /// reading the failure needs — and never the key.
-    fn read(&self, what: &str, r: Response) -> Result<serde_json::Value> {
+    ///
+    /// Three refusals are about the plan rather than the call, and come back
+    /// typed so the kernel can keep them as the arch's health (2026-10-15):
+    /// `429` is [`AdapterError::RateLimited`], with the `retry-after` the API
+    /// sent; `402 billing_error`, and the `400` whose message says the credit
+    /// balance is too low, are [`AdapterError::Exhausted`]; a `404
+    /// not_found_error` about the **model** (its message starts `model:`) is
+    /// [`AdapterError::Retired`]. A 404 about anything else — a wrong path —
+    /// is not a retired model and stays what it was.
+    fn read(
+        &self,
+        what: &str,
+        r: Response,
+    ) -> std::result::Result<serde_json::Value, AdapterError> {
         let status = r.status();
+        // Before the body: `text()` consumes the response, headers and all.
+        let retry_after = r
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
         let text = r.text().unwrap_or_default();
         let parsed: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
@@ -621,16 +640,27 @@ impl AnthropicAdapter {
                 .as_str()
                 .map(str::to_string)
                 .unwrap_or_else(|| head(&text, 300));
-            bail!(
+            let said = format!(
                 "{what}: the Anthropic API answered {status} ({kind}): {}",
                 self.key.scrub(&message)
             );
+            return Err(match status.as_u16() {
+                429 => AdapterError::RateLimited { retry_after },
+                402 => AdapterError::Exhausted { detail: said },
+                400 if message.to_ascii_lowercase().contains("credit balance") => {
+                    AdapterError::Exhausted { detail: said }
+                }
+                404 if kind == "not_found_error" && message.trim_start().starts_with("model:") => {
+                    AdapterError::Retired { detail: said }
+                }
+                _ => AdapterError::Other(anyhow!(said)),
+            });
         }
         if parsed.is_null() {
-            bail!(
+            return Err(AdapterError::Other(anyhow!(
                 "{what}: cannot read the API's answer: {}",
                 self.key.scrub(&head(&text, 300))
-            );
+            )));
         }
         Ok(parsed)
     }
@@ -797,8 +827,8 @@ impl ArchAdapter for AnthropicAdapter {
         let req = Self::messages_request(&self.cfg, prompt, max_tokens);
         let answer = self
             .post(client, "/v1/messages", &req, self.cfg.timeout)
-            .and_then(|r| self.read("/v1/messages", r))
-            .map_err(AdapterError::Other)?;
+            .map_err(AdapterError::Other)
+            .and_then(|r| self.read("/v1/messages", r))?;
 
         let usage = &answer["usage"];
         let tokens_in = usage["input_tokens"].as_u64().unwrap_or(0);
