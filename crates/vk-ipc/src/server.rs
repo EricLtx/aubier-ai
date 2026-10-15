@@ -1366,8 +1366,9 @@ fn dispatch(
             let usage = k
                 .usage(&ctx, &vk_kernel::UsageFilter::Task(id.into()))
                 .map_err(kerr)?;
-            // The register's artefacts, by address and kind (Ruling R22):
-            // metadata only, never their bytes — which is what a human
+            // The register's artefacts, by address and kind (Rulings R22,
+            // R23): metadata only, never their bytes, so Ruling 28 holds —
+            // which is what a human
             // needs to name the one to read (`artefact.read`) before
             // signing it, and to tell a task's released files from another
             // task's in a shared export directory. The register read holds
@@ -1386,12 +1387,14 @@ fn dispatch(
         // An artefact's bytes, to a human (Ruling R22): the founder reads the
         // verdict and the report he is about to sign. A human act, because
         // this is plaintext leaving the encrypted store for a terminal; the
-        // label must flow to the caller's clearance or `read_artefact`
-        // refuses with I2. Not logged: like `store.fsck`, a read changes
-        // nothing, and the approval that follows is what the record keeps.
-        // The answer carries no `kind`: the blob store does not index blobs
-        // by register, and finding the owner would mean reading every
-        // register — `task.show`'s `artefacts` gives the kind beside the hash.
+        // label must flow to the caller's clearance or the kernel refuses
+        // with I2. And a release (Ruling R24): the kernel appends
+        // `artefact.released` with `destination: terminal:<device>` before it
+        // reads the bytes (`read_artefact_for_human`); a refused read records
+        // nothing. The answer carries no `kind`: the blob store does not
+        // index blobs by register, and finding the owner would mean reading
+        // every register — `task.show`'s `artefacts` gives the kind beside
+        // the hash.
         "artefact.read" => {
             let ctx = ctx_for(&k, presence, now)?;
             if !ctx.principal.is_human() {
@@ -1407,7 +1410,7 @@ fn dispatch(
                 ));
             }
             let hash = format!("sha256:{}", hex_part.to_ascii_lowercase());
-            let bytes = k.read_artefact(&ctx, &hash).map_err(kerr)?;
+            let bytes = k.read_artefact_for_human(&ctx, &hash).map_err(kerr)?;
             Ok(json!({
                 "hash": hash,
                 "len": bytes.len(),

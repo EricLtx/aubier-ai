@@ -1143,7 +1143,10 @@ async fn harness_run_refuses_a_request_that_names_the_binary_model_timeout_or_an
 /// machine call is refused I1 before anything is read — and holds them to
 /// the label: a blob above the caller's clearance (`Holdout`, which flows to
 /// no clearance) is refused I2. `task.show` lists the register's artefacts by
-/// hash and kind, which is how the human names the one to read.
+/// hash and kind, which is how the human names the one to read. Ruling R24:
+/// every read is a release on the ledger — `artefact.released`, the
+/// `ReleaseRecord` shape, `destination: terminal:<device>` — and a refused
+/// read appends nothing.
 #[tokio::test]
 async fn artefact_read_is_a_human_act_held_to_the_label() {
     use base64::Engine as _;
@@ -1190,6 +1193,22 @@ async fn artefact_read_is_a_human_act_held_to_the_label() {
         (hash, holdout)
     };
 
+    // The ledger's events, read through the kernel.
+    let events = |k: &Arc<Mutex<vk_kernel::RealKernel>>| {
+        let k = k.lock().unwrap();
+        vk_contracts::syscalls::Kernel::ledger(&*k)
+            .events()
+            .to_vec()
+    };
+    // What a read records: the owning task (read off the blob's partition),
+    // the address, and the human's device as the destination. The ledger
+    // commits to the payload's hash, so the expected payload is spelt out in
+    // the record's own field order.
+    let released = vk_contracts::hash_bytes(
+        format!(r#"{{"task_id":"{id}","hashes":["{hash}"],"destination":"terminal:laptop"}}"#)
+            .as_bytes(),
+    );
+
     // `task.show` names it, by hash and kind.
     let shown = c
         .call("task.show", json!({"task_id": id}), None)
@@ -1201,7 +1220,8 @@ async fn artefact_read_is_a_human_act_held_to_the_label() {
         "{shown}"
     );
 
-    // A machine principal is refused, with the remedy.
+    // A machine principal is refused, with the remedy, and nothing is recorded.
+    let before = events(&k).len();
     let err = c
         .call("artefact.read", json!({"hash": hash}), None)
         .await
@@ -1213,8 +1233,10 @@ async fn artefact_read_is_a_human_act_held_to_the_label() {
         ),
         "{err}"
     );
+    assert_eq!(events(&k).len(), before, "a refused read records nothing");
 
-    // A human reads it, with or without the `sha256:` prefix.
+    // A human reads it, with or without the `sha256:` prefix — each read a
+    // release on the ledger.
     for given in [hash.clone(), hash.trim_start_matches("sha256:").to_string()] {
         let proof = prove(&c, &device).await;
         let read = c
@@ -1227,7 +1249,15 @@ async fn artefact_read_is_a_human_act_held_to_the_label() {
             .decode(read["bytes_base64"].as_str().unwrap())
             .unwrap();
         assert_eq!(bytes, text.as_bytes());
+        let after = events(&k);
+        let last = after.last().unwrap();
+        assert_eq!(last.kind, "artefact.released");
+        assert_eq!(
+            last.payload_hash, released,
+            "task, hash and terminal:laptop"
+        );
     }
+    let before = events(&k).len();
 
     // Above the human's clearance: I2, and no bytes.
     let proof = prove(&c, &device).await;
@@ -1258,6 +1288,11 @@ async fn artefact_read_is_a_human_act_held_to_the_label() {
         .await
         .unwrap_err();
     assert_eq!(code_of(&err), vk_ipc::E_NOT_FOUND, "{err}");
+    assert_eq!(
+        events(&k).len(),
+        before,
+        "refused reads (I2, malformed, unknown) record nothing"
+    );
 
     drop(c);
     shutdown(server, k, d).await;

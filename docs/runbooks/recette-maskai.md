@@ -24,7 +24,7 @@ Le pilote se lit comme un système embarqué.
 | `max_actions`, `timeout_s` d'un pas | Le budget d'appels de la tâche, et son chien de garde. |
 | `vkd --harness-timeout-secs` | Le chien de garde global. Le plus court des deux chiens de garde gagne. |
 | `vk approve` | Le point de validation, signé par la clé de l'appareil : la preuve de présence humaine. |
-| `vk artefact cat` | La lecture de ce qu'on va signer, par un humain, signée elle aussi : on lit la mémoire avant de valider. |
+| `vk artefact cat` | La lecture de ce qu'on va signer, par un humain, signée elle aussi : on lit la mémoire avant de valider. La lecture est inscrite à la boîte noire comme une publication (`artefact.released`, destination `terminal:<appareil>`). |
 | `vk stop` | L'arrêt d'urgence. Il tue l'arbre du harnais et l'action en vol. |
 | `driver_id`, `files_sha256` | L'empreinte du firmware du pilote. Un octet changé dans `drivers/maskai-recette/` donne un autre pilote. |
 | `inputs_sha256` | L'empreinte des tables de calibration du verdict (§13). |
@@ -305,7 +305,7 @@ vk artefact cat $a[-1].hash
 ```
 Attendu : le texte du verdict, qui commence par `judge:`.
 
-`vk artefact cat` est un acte humain, signé par la clé de l'appareil comme `vk approve`. Pour un artefact qui n'est pas du texte, ajoutez `--out fichier`. La page `vk task show $t` le dit aussi, sur la ligne `artefacts` : `N, latest verdict.md sha256:…`.
+`vk artefact cat` est un acte humain, signé par la clé de l'appareil comme `vk approve`. C'est aussi une sortie de texte en clair hors du noyau. Le ledger l'inscrit donc avant de rendre les octets (Ruling R24) : un `artefact.released` qui nomme la tâche, l'adresse et la destination `terminal:<appareil>`. Une lecture refusée n'inscrit rien. Pour un artefact qui n'est pas du texte, ajoutez `--out fichier`. La page `vk task show $t` le dit aussi, sur la ligne `artefacts` : `N, latest verdict.md sha256:…`.
 
 ```powershell
 vk approve $t                   # 13 : verdict et KO sécurité
@@ -351,7 +351,7 @@ Attendu :
 - au moins 1 `driver.mounted` ;
 - environ 160 `driver.acted` pour une passe sans reprise ;
 - 2 `approval.recorded` de plus qu'avant la séance ;
-- 1 `artefact.released` de plus.
+- au moins 3 `artefact.released` de plus : la publication du pas 16, et une par lecture `vk artefact cat`. Il y a au moins les deux lectures avant signature, et `--out` compte comme une lecture.
 
 **10.2 Le dossier publié**
 ```powershell
@@ -460,7 +460,11 @@ Deux exécutions dont les lignes portent la même `inputs_sha256` ont été jug�
 
 ## 14. Répétition à blanc (facultative, environ 3 min)
 
-C'est la même chaîne que la séance réelle, sur le banc d'essai local et avec une arch simulée. Elle tourne dans un dossier d'état à part, pour ne pas mêler un faux run au ledger du nœud. Elle a été faite le 2026-10-15 sur ce nœud : les 8 pas sont passés à `done`, avec 17 `driver.acted`, 2 `approval.recorded` et 1 `artefact.released`.
+C'est la même chaîne que la séance réelle, sur le banc d'essai local et avec une arch simulée. Elle tourne dans un dossier d'état à part, pour ne pas mêler un faux run au ledger du nœud. Elle a été refaite le 2026-10-15 sur ce nœud, avec les lectures avant signature :
+- les 8 pas sont passés à `done` ;
+- 17 `driver.acted` ;
+- 2 `approval.recorded` ;
+- 3 `artefact.released` : les deux lectures `vk artefact cat` et la publication.
 
 ```powershell
 $D = "$env:USERPROFILE\.cargo-target\vk-repetition"     # à effacer ensuite
@@ -474,8 +478,13 @@ vk mount mock mock
 vk mount driver --manifest drivers\maskai-recette\manifest-fixture.json
 $t = (vk task submit --steps recipes\recette-fixture.json --json | ConvertFrom-Json).id
 vk task step $t ; vk harness run $t ; vk harness run $t
-vk task step $t ; vk approve $t ; vk task step $t --all ; vk approve $t ; vk task step $t --all
+vk task step $t
+$a = (vk task show $t --json | ConvertFrom-Json).artefacts ; $a[-1].kind ; vk artefact cat $a[-1].hash
+vk approve $t ; vk task step $t --all
+$a = (vk task show $t --json | ConvertFrom-Json).artefacts ; $a[-1].kind ; vk artefact cat $a[-1].hash
+vk approve $t ; vk task step $t --all
 ```
+`$a[-1].kind` vaut `verdict.md`, puis `report.md`. Avec l'arch simulée, chaque texte commence par `judge: JUDGE: ROLE: judge`, puis par `draft: DRAFT: ROLE: draft`.
 Attendu : `status    done`. Le dossier publié est sous `$D\state\exports\recettage-chat-ia\runs\fixture`.
 
 Pour finir : Ctrl+C sur ce `vkd`, et fermez la fenêtre de `serve.py`. Puis `Remove-Item Env:VK_ENDPOINT, Env:VK_NODE_KEY_FILE` avant de revenir au vrai nœud.
@@ -490,7 +499,7 @@ Pour finir : Ctrl+C sur ce `vkd`, et fermez la fenêtre de `serve.py`. Puis `Rem
   - au moins 1 `driver.mounted`. Un montage n'appartient à aucune tâche : c'est le pilote mis sous tension, et chaque remontage en ajoute un ;
   - les lignes `driver.acted` des dix niveaux ;
   - 2 `approval.recorded` pour la tâche qui publie : 1 de plus pour chaque verdict signé dans une tâche abandonnée ensuite ;
-  - 1 `artefact.released` pour la tâche qui publie.
+  - 1 `artefact.released` pour la publication de la tâche, plus 1 par lecture `vk artefact cat` (destination `terminal:…`), soit au moins 3.
 - [ ] Les 34 cas de N0 à N9 (`cases.json`, hors banc d'essai) ont chacun une ligne au journal, ou bien sont nommés NON TESTÉ dans le rapport avec la raison.
 - [ ] Le rapport, le journal et les preuves expurgés sont sous `docs/use-cases/recettage-chat-ia/runs/<date>/`. S'il reste un KO sécurité non corrigé, ils sont gardés privés et la raison est notée.
 - [ ] Le delta avec `2026-10-13-maskai-benchmark.md` est écrit (notes par ENF, cinq défauts majeurs).

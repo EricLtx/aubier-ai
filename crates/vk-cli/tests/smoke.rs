@@ -2241,6 +2241,18 @@ fn vk_artefact_cat_prints_what_the_approval_signs() {
     let printed = sh.ok(&["artefact", "cat", &hash]);
     assert!(printed.starts_with("draft: DRAFT:"), "{printed}");
     assert!(printed.contains("Rédiger le verdict"), "{printed}");
+    // Ruling R24: the read is a release, on the ledger before the bytes left:
+    // `artefact.released` whose payload names this task, this hash and the
+    // terminal of the node's device (the ledger keeps the payload's hash).
+    let last = sh.json(&["dmesg", "-n", "1", "--json"]);
+    assert_eq!(dmesg_kinds(&last), ["artefact.released"], "{last}");
+    let expected = vk_contracts::hash_bytes(
+        format!(
+            r#"{{"task_id":"{task}","hashes":["{hash}"],"destination":"terminal:node:node-1"}}"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(last[0]["payload_hash"], expected.as_str(), "{last}");
     let bare = hash.trim_start_matches("sha256:");
     assert_eq!(sh.ok(&["artefact", "cat", bare]), printed);
     let saved = dir.path().join("verdict.md");
@@ -2254,7 +2266,9 @@ fn vk_artefact_cat_prints_what_the_approval_signs() {
     let approved = sh.json(&["approve", &task, "--json"]);
     assert_eq!(approved["subject_hash"], hash.as_str(), "{approved}");
 
-    // Not an address: refused, nothing printed.
+    // Not an address: refused, nothing printed, nothing recorded.
+    let ledger_len = |sh: &Shell| sh.json(&["status", "--json"])["ledger_len"].as_u64();
+    let before = ledger_len(&sh);
     let o = sh.run(&["artefact", "cat", "not-a-hash"]);
     assert!(!o.status.success(), "a malformed hash is refused");
     assert!(o.stdout.is_empty());
@@ -2277,6 +2291,99 @@ fn vk_artefact_cat_prints_what_the_approval_signs() {
         .map(|e| e.code);
     assert_eq!(code, Some(vk_ipc::E_INVARIANT), "{err}");
     assert!(err.to_string().contains("human act"), "{err}");
+    assert_eq!(ledger_len(&sh), before, "refused reads record nothing");
+}
+
+/// `vk artefact cat` on bytes that are not text (a screenshot, say) prints
+/// nothing to the terminal and names the remedy; `--out FILE` saves them
+/// exactly. The binary artefact is attached the only way a smoke test can
+/// without a browser: with the daemon stopped, through the kernel opened on
+/// the same state directory and key, as a driver's evidence is attached.
+#[test]
+fn vk_artefact_cat_refuses_binary_on_the_terminal_and_saves_it_with_out() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let spawn = || {
+        Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        )
+    };
+    let daemon = spawn();
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key,
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+    let task = str_of(
+        &sh.json(&[
+            "task", "submit", "--goal", "g", "--plan", &arch, "--draft", &arch, "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    drop(daemon);
+    wait_until(&sh, false, "vkd did not stop");
+
+    // A PNG-like blob: the signature's first bytes, a NUL, and a byte that is
+    // not UTF-8.
+    let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\x00";
+    let hash = {
+        let mut k = vk_kernel::RealKernel::open(
+            dir.path(),
+            vk_store::keys::KeySource::File(dir.path().join("master.key")),
+            "node-1",
+        )
+        .expect("open the stopped node's kernel");
+        let ctx = vk_contracts::syscalls::Ctx {
+            principal: vk_contracts::principal::Principal::Machine {
+                node_id: "node-1".into(),
+                lease_id: "test".into(),
+            },
+            clearance: vk_contracts::labels::Clearance {
+                max_scope: vk_contracts::labels::Scope::Personal,
+                third_party_allowed: true,
+            },
+            partition: "local".into(),
+            now_ms: vk_kernel::now_ms(),
+        };
+        let register = k.task(&ctx, &task).unwrap().unwrap().register;
+        k.attach_artefact(&ctx, &register, "screen.png", png)
+            .unwrap()
+            .hash
+    };
+
+    let _daemon = spawn();
+    wait_until(&sh, true, "vkd did not answer again").expect("status");
+    let shown = sh.json(&["task", "show", &task, "--json"]);
+    assert_eq!(
+        shown["artefacts"].as_array().and_then(|a| a.last()),
+        Some(&serde_json::json!({"hash": hash, "kind": "screen.png"})),
+        "{shown}"
+    );
+
+    let o = sh.run(&["artefact", "cat", &hash]);
+    assert!(!o.status.success(), "binary on the terminal is refused");
+    assert!(o.stdout.is_empty(), "no byte reaches the terminal");
+    let why = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        why.contains(&format!("{} bytes, not text; use --out FILE", png.len())),
+        "{why}"
+    );
+
+    let saved = dir.path().join("screen.png");
+    let wrote = sh.ok(&["artefact", "cat", &hash, "--out", &path_of(&saved)]);
+    assert!(
+        wrote.starts_with(&format!("wrote {} bytes to", png.len())),
+        "{wrote}"
+    );
+    assert_eq!(std::fs::read(&saved).unwrap(), png, "the exact bytes");
 }
 
 /// The scripted driver of Task 1's brief, verbatim (`crates/vk-driver/tests/

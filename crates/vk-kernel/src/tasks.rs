@@ -584,6 +584,59 @@ impl RealKernel {
         self.store.state_dir.join("exports")
     }
 
+    /// One artefact's bytes, to a human at a terminal (`vk artefact cat`,
+    /// Rulings R22 and R24). Plaintext leaving the kernel is a release,
+    /// whether it lands in the export root or on a screen, so it is recorded
+    /// exactly as a `Release` step records one: an `artefact.released` event
+    /// in the same `ReleaseRecord` shape, **before** the bytes are read, with
+    /// `destination` = `terminal:<device id of the human>`.
+    ///
+    /// The owning task is read off the blob's own partition: every artefact
+    /// is stored under the key id `task:<task_id>` (`attach_artefact_labelled`),
+    /// which the envelope carries, so no register has to be searched. A blob
+    /// stored under any other key id — none is today — is recorded with
+    /// `task_id: "unknown"` rather than not at all.
+    ///
+    /// Refusals record nothing, and are checked before the event: a principal
+    /// that is not human (I1), an address nothing holds (NotFound), and a
+    /// label that does not flow to the caller's clearance (I2). A blob that
+    /// fails its integrity check after the event leaves an over-broad record,
+    /// which an auditor can reconcile — the order `Release` keeps, for the
+    /// same reason.
+    pub fn read_artefact_for_human(
+        &mut self,
+        ctx: &Ctx,
+        hash: &str,
+    ) -> Result<Vec<u8>, KernelError> {
+        let Principal::Human { device_id } = &ctx.principal else {
+            return Err(KernelError::I1(
+                "reading an artefact's bytes is a human act; re-run it with a presence proof"
+                    .into(),
+            ));
+        };
+        let env = self
+            .store
+            .blobs
+            .envelope(hash)
+            .map_err(crate::blob_failed)?;
+        if !env.label.flows_to(&ctx.clearance) {
+            return Err(KernelError::I2(format!(
+                "artefact {hash} exceeds caller clearance"
+            )));
+        }
+        let task_id = env.key_id.strip_prefix("task:").unwrap_or("unknown");
+        self.log(
+            "artefact.released",
+            ctx.now_ms,
+            &ReleaseRecord {
+                task_id,
+                hashes: vec![env.hash.clone()],
+                destination: format!("terminal:{device_id}"),
+            },
+        )?;
+        self.read_artefact(ctx, hash)
+    }
+
     /// Resolve a caller-supplied release destination under the export root.
     ///
     /// A machine principal chooses `to_dir`, so it is confined rather than
