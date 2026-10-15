@@ -294,8 +294,8 @@ Mounting is a human act, signed with this node's device key like the cloud
 arches' mounts, because it puts a browser — with whatever session its profile
 holds — under this node's control. Unmounting is one too, for the same reason
 the other way round: it ends that session, and kills an action in flight
-(pilot ruling R25). The kernel refuses either to a machine principal. The manifest (`driver_manifest`) names the
-driver, its program, the hosts it may navigate to, and every action with its
+(pilot ruling R25). The kernel refuses either to a machine principal. The
+manifest (`driver_manifest`) names the driver, its program, the hosts it may navigate to, and every action with its
 argument schema, its evidence file names, whether it is reversible and
 whether its result goes to the register.
 
@@ -334,7 +334,7 @@ Three ledger kinds record a driver, each with its own schema:
 | kind | what it carries |
 |---|---|
 | `driver.mounted` | `driver_id`, `name`, `manifest_hash`, `profile_dir_hash`, `governed`, and `by`, the device key that signed the mount |
-| `driver.acted` | `task_id`, `step_index`, `driver_id`, `action`, `args_hash`, `result_hash`, `ok`, `reason` when it failed — a word of a closed vocabulary (`timeout`, `dead`, `protocol: malformed response`, `would not start`, …) — `duration_ms`, `evidence` (the blob hashes), `evidence_bytes`, `hosts_seen` |
+| `driver.acted` | `task_id`, `step_index`, `driver_id`, `action`, `args_hash`, `result_hash`, `ok`, `reason` when it failed — a host or daemon failure's word from a closed vocabulary (`timeout`, `dead`, `protocol: malformed response`, `would not start`, …), a driver refusal's word from the protocol's five (`dialog`, `timeout`, `host`, `precondition`, `internal`; anything else is pinned to `internal`), or a kernel refusal composed of plain tokens and byte counts — `duration_ms`, `evidence` (the blob hashes), `evidence_bytes`, `hosts_seen` |
 | `driver.unmounted` | `driver_id` and the reason: the operator, what degraded it (a word of the same vocabulary), or `row unreadable at boot` |
 
 `driver.acted` carries hashes and sizes, never text (Ruling 28): what the

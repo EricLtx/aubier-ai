@@ -123,14 +123,22 @@ pub struct DriverActPlan {
     pub act_id: u64,
 }
 
-/// Every `reason` a failed act can leave on `driver.acted` and
+/// Every `reason` a host or daemon failure can leave on `driver.acted` and
 /// `driver.unmounted`, and on a degraded row: a closed vocabulary (Ruling 28,
 /// final review I1). `evidence too large` is followed by `: <name>` when the
-/// file's name is a plain token, as every name the host reads back is.
-/// Nothing else a host or the daemon says about a failure — a path, a hash,
-/// an exit code, an excerpt of the driver's output and the site's words in
-/// it — reaches the record: that is [`DriverFailure::detail`], for the
-/// daemon's log and the driver's `driver.log`.
+/// file's name is a plain token, as every name the host reads back is; a
+/// settle after an unmount prefixes the word with `stale act: `. Nothing else
+/// a host or the daemon says about a failure — a path, a hash, an exit code,
+/// an excerpt of the driver's output and the site's words in it — reaches
+/// the record: that is [`DriverFailure::detail`], for the daemon's log and
+/// the driver's `driver.log`.
+///
+/// The two other producers of `reason` are closed too, by other rules: the
+/// driver's own `ok: false` gives one of the protocol's five words
+/// (`vk_driver::RESPONSE_REASONS`; the host pins anything else to
+/// `internal`), and the kernel's own refusals at the settle door are
+/// kernel-composed, with plain-token names and byte counts and no third
+/// party's text.
 pub const DRIVER_FAILURE_REASONS: &[&str] = &[
     "timeout",
     "stopped",

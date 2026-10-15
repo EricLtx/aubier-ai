@@ -121,6 +121,18 @@ for line in sys.stdin:
         say({"id": r["id"], "ok": True, "result": {"pid": child.pid}})
 "#;
 
+/// A driver that refuses every action, `wordy` with the site's words as its
+/// `reason` and `terse` with a word of the protocol's set — the two ways an
+/// `ok: false` can arrive at the host.
+const WORDY_DRIVER: &str = r#"import json, sys
+def say(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+say({"hello": {"protocol": 1, "driver": "wordy", "version": "0", "actions": ["wordy", "terse"]}})
+for line in sys.stdin:
+    r = json.loads(line)
+    if r["action"] == "wordy": say({"id": r["id"], "ok": False, "reason": "the site said: " + r["args"]["marker"], "detail": "page text"})
+    else: say({"id": r["id"], "ok": False, "reason": "precondition", "detail": "no session"})
+"#;
+
 /// A driver whose first line is JSON but not a hello, and which then waits.
 const NO_HELLO_DRIVER: &str = r#"import sys, time
 sys.stdout.write('{"greeting": "hi"}\n'); sys.stdout.flush()
@@ -800,6 +812,53 @@ fn the_environment_names_the_dirs_the_mode_and_the_hosts() {
     assert_eq!(out.result["VK_DRIVER_HEADLESS"], "1");
     assert_eq!(out.result["VK_DRIVER_CHANNEL"], "");
     assert_eq!(out.result["VK_DRIVER_HOSTS"], "example.invalid");
+}
+
+/// Re-review of the final fix wave: the driver's own `ok: false` reason is
+/// pinned to the protocol's five words before the kernel sees it. A reason
+/// carrying the site's words becomes `internal`, with the driver's word moved
+/// into the detail for the log; a word of the set passes as given.
+#[test]
+fn a_drivers_reason_outside_the_protocols_set_becomes_internal() {
+    if !python_available() {
+        return;
+    }
+    let rig = Rig::new(WORDY_DRIVER);
+    let actions = json!([
+        {"name": "wordy", "reversible": true, "args": {"type": "object"}, "evidence": []},
+        {"name": "terse", "reversible": true, "args": {"type": "object"}, "evidence": []},
+    ]);
+    let m = rig.manifest(rig.command(), actions);
+    let marker = "words-from-the-site ".repeat(15);
+    let mut host = rig.spawn(&m);
+
+    let out = host
+        .act(
+            action(&m, "wordy"),
+            &json!({"marker": marker}),
+            Duration::from_secs(10),
+            WIDE,
+            &never,
+        )
+        .expect("a refusal is an outcome, not a host error");
+    assert!(!out.ok);
+    assert_eq!(out.reason.as_deref(), Some("internal"));
+    let detail = out.detail.expect("the driver's word is kept, for the log");
+    assert!(detail.contains("words-from-the-site"), "{detail}");
+    assert!(detail.contains("page text"), "{detail}");
+    assert!(vk_driver::RESPONSE_REASONS.contains(&"internal"));
+
+    let out = host
+        .act(
+            action(&m, "terse"),
+            &json!({}),
+            Duration::from_secs(10),
+            WIDE,
+            &never,
+        )
+        .expect("a refusal is an outcome, not a host error");
+    assert_eq!(out.reason.as_deref(), Some("precondition"));
+    assert_eq!(out.detail.as_deref(), Some("no session"));
 }
 
 /// Final review I1: every protocol failure says which kind it is, so the

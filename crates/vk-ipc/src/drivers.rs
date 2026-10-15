@@ -9,8 +9,7 @@
 //! spawned by [`DriverPool::ensure`] under this platform's governor — a Job
 //! Object on Windows, capped at the manifest's `program.max_memory_bytes`
 //! (6 GiB for a browser that names none), no CPU cap, failing closed as a
-//! harness does —
-//! and driven by [`DriverPool::act`] with neither the kernel lock nor the
+//! harness does — and driven by [`DriverPool::act`] with neither the kernel lock nor the
 //! pool's map held across the action: an act takes its host out of the map,
 //! acts on the owned value and puts it back. That is the shape of
 //! `harness.run`, for the same reason: an action lasts seconds to minutes, and

@@ -53,7 +53,7 @@ use vk_harness::netwatch;
 pub mod protocol;
 
 use protocol::HelloLine;
-pub use protocol::{EvidenceRef, Hello, Request, Response};
+pub use protocol::{EvidenceRef, Hello, Request, Response, RESPONSE_REASONS};
 
 /// How long a freshly spawned driver has to print its hello.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -517,10 +517,11 @@ impl DriverHost {
                     duration_ms,
                     hosts_seen,
                 } = exchange;
+                let (reason, detail) = Response::closed_reason(response.reason, response.detail);
                 Ok(ActOutcome {
                     ok: response.ok,
-                    reason: response.reason,
-                    detail: response.detail,
+                    reason,
+                    detail,
                     result: response.result,
                     evidence,
                     duration_ms,

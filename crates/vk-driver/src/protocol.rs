@@ -50,6 +50,13 @@ pub struct EvidenceRef {
     pub path: String,
 }
 
+/// The five words a driver's `ok: false` may give as its `reason` (pilot spec
+/// §4.2). The host pins every response to this set before the kernel sees it
+/// ([`Response::closed_reason`]), so the driver's own `reason` on the ledger
+/// is one of these words and never the driver's, or the site's, text
+/// (Ruling 28).
+pub const RESPONSE_REASONS: &[&str] = &["dialog", "timeout", "host", "precondition", "internal"];
+
 /// The driver's answer to the request with the same `id`. `ok: false` carries
 /// a `reason` (`dialog|timeout|host|precondition|internal`) and a `detail`;
 /// either way `result` and `evidence` may be present.
@@ -65,6 +72,30 @@ pub struct Response {
     pub result: Value,
     #[serde(default)]
     pub evidence: Vec<EvidenceRef>,
+}
+
+impl Response {
+    /// The response's `reason` and `detail` with the reason pinned to
+    /// [`RESPONSE_REASONS`]: a word outside the set becomes `internal`, and
+    /// the word the driver gave moves into the detail, for the log. A
+    /// missing reason stays missing.
+    pub fn closed_reason(
+        reason: Option<String>,
+        detail: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        match reason {
+            Some(word) if RESPONSE_REASONS.contains(&word.as_str()) => (Some(word), detail),
+            Some(word) => {
+                let note = format!("reason outside the protocol's set: {word:?}");
+                let detail = match detail {
+                    Some(d) if !d.is_empty() => format!("{note}; {d}"),
+                    _ => note,
+                };
+                (Some("internal".into()), Some(detail))
+            }
+            None => (None, detail),
+        }
+    }
 }
 
 #[cfg(test)]

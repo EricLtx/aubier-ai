@@ -2411,8 +2411,8 @@ for line in sys.stdin:
 /// `vk mount driver --manifest FILE`, then `vk driver ls | show | umount` and
 /// `vk ls /drivers[/<name>]`, as a person would type them. The mount and the
 /// unmount are signed with the node's key (I1, Ruling R25), the manifest's
-/// relative command resolves
-/// against the manifest file's own directory — sent canonical, as the root
+/// relative command resolves against the manifest file's own directory —
+/// sent canonical, as the root
 /// the row keeps — and the driver is up and listed until it is unmounted.
 #[test]
 fn vk_mount_driver_lists_shows_and_unmounts_it() {
