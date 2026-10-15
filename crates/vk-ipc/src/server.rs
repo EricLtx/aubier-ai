@@ -1137,11 +1137,16 @@ fn dispatch(
                 .find(|(a, _, _)| a == id)
                 .ok_or_else(|| not_found(id))?;
             let spec = k.mount_spec(&arch_id).map_err(kerr)?;
+            // What the provider last said about its plan (2026-10-15): kernel
+            // memory, not the manifest, and printed beside the quota the
+            // manifest claims — the claim and the observation side by side.
+            let health = k.arch_health(&arch_id);
             Ok(json!({
                 "arch_id": arch_id,
                 "manifest": manifest,
                 "state": state.name(),
                 "reason": state.reason(),
+                "health": health,
                 "governed": manifest.governed,
                 "kind": spec.as_ref().map(|s| s.kind.clone()),
                 "config": spec.map(|s| s.config),

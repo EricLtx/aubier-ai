@@ -236,6 +236,13 @@ async fn a_claude_code_mount_runs_the_daemons_binary() {
         shown["config"].get("binary").is_none(),
         "the spec records no binary: {shown}"
     );
+    // The provider's health beside the manifest (2026-10-15), healthy from
+    // the mount on; and no quota claim, which this adapter does not make.
+    assert_eq!(shown["health"]["state"], "healthy", "{shown}");
+    assert!(shown["manifest"].get("quota").is_none(), "{shown}");
+    let top = n.c.call("top", json!({}), None).await.unwrap();
+    let id = mounted["arch_id"].as_str().unwrap();
+    assert_eq!(top["health"][id]["state"], "healthy", "{top}");
     n.stop().await;
 }
 

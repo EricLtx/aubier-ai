@@ -39,6 +39,52 @@ fn zeroless(v: &Value, render: impl Fn(f64) -> String) -> String {
     }
 }
 
+/// A manifest's quota claim on one line: the plan and the limits it states,
+/// and only those — a limit the plan does not state is not printed as zero
+/// or as unlimited, it is not printed (2026-10-15).
+fn quota(q: &Value) -> String {
+    let Some(plan) = q["plan"].as_str() else {
+        // Not "unlimited" and not "0": a manifest that makes no claim about
+        // the provider's plan, which is every arch mounted before the field.
+        return "none declared".into();
+    };
+    let limits: Vec<String> = [
+        ("requests_per_minute", "requests/min"),
+        ("tokens_per_minute", "tokens/min"),
+        ("tokens_per_day", "tokens/day"),
+    ]
+    .iter()
+    .filter_map(|(field, unit)| q[*field].as_u64().map(|n| format!("{n} {unit}")))
+    .collect();
+    if limits.is_empty() {
+        format!("{plan} (no limit stated)")
+    } else {
+        format!("{plan} ({})", limits.join(", "))
+    }
+}
+
+/// What the kernel last saw of an arch's provider, on one line: the state,
+/// until when for a rate limit (and whose figure that is), since when, and
+/// the provider's own words (2026-10-15). A dash for no entry — an arch that
+/// is no longer mounted.
+fn health(h: &Value) -> String {
+    let Some(state) = h["state"].as_str() else {
+        return "-".into();
+    };
+    let mut line = state.to_string();
+    if state == "rate_limited" {
+        line.push_str(&match h["until_ms"].as_u64() {
+            Some(until) => format!(" until {until} ms (the provider's figure)"),
+            None => " (no figure from the provider; held 60 s by the kernel)".into(),
+        });
+    }
+    line.push_str(&format!(" since {} ms", text(&h["since_ms"])));
+    if let Some(said) = h["last_error"].as_str() {
+        line.push_str(&format!(": {said}"));
+    }
+    line
+}
+
 /// `label  value` lines, labels padded to the widest.
 fn fields(rows: &[(&str, String)]) -> String {
     let w = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -449,6 +495,12 @@ pub fn top(v: &Value) -> String {
                             Some(false) => "no".into(),
                             None => "-".to_string(),
                         },
+                        // Would the provider answer it? The state says the
+                        // adapter is there; this says the far end has not
+                        // rate-limited it, run out of plan or withdrawn the
+                        // model (2026-10-15). A dash for an arch no longer
+                        // mounted, like the state two columns back.
+                        v["health"][id]["state"].as_str().unwrap_or("-").to_string(),
                         text(&s["calls"]),
                         text(&s["tokens_in"]),
                         // How much of TOKENS the arch itself counted. A dash
@@ -479,6 +531,7 @@ pub fn top(v: &Value) -> String {
                 "JURISDICTION",
                 "STATE",
                 "GOVERNED",
+                "HEALTH",
                 "CALLS",
                 "TOKENS",
                 "MEASURED",
@@ -520,6 +573,13 @@ pub fn top(v: &Value) -> String {
     if let Some(down) = v["unavailable"].as_object().filter(|m| !m.is_empty()) {
         for (id, why) in down {
             out.push(format!("{id} is unavailable: {}", text(why)));
+        }
+    }
+    // And why an arch the provider will not answer is in that state, for the
+    // same reason: the provider's words are a sentence.
+    if let Some(all) = v["health"].as_object() {
+        for (id, h) in all.iter().filter(|(_, h)| h["state"] != "healthy") {
+            out.push(format!("{id} is {}", health(h)));
         }
     }
     // `--calls`: the rows the totals above are the sum of. Under them, not
@@ -611,6 +671,9 @@ pub fn arch_show(v: &Value) -> String {
                 None => text(&v["state"]),
             },
         ),
+        // What the provider last said, beside whether the adapter is there:
+        // an arch can be `ready` and `exhausted` at once (2026-10-15).
+        ("health", health(&v["health"])),
         ("locality", text(&m["locality"])),
         ("jurisdiction", text(&m["jurisdiction"])),
         (
@@ -642,6 +705,9 @@ pub fn arch_show(v: &Value) -> String {
             },
         ),
         ("price (EUR/1k in)", price(&m["cost_per_1k_tokens_eur"])),
+        // The plan the manifest claims — a claim, like the price above it,
+        // and part of the arch id when present.
+        ("quota", quota(&m["quota"])),
         (
             "clearance",
             format!(
@@ -705,7 +771,7 @@ pub fn arch_show(v: &Value) -> String {
         ("seed", text(&id["seed"])),
     ]);
     format!(
-        "{}\n\nidentity (this is what the arch id hashes):\n{}",
+        "{}\n\nidentity (this, and the quota when one is declared, is what the arch id hashes):\n{}",
         fields(&head),
         identity
             .lines()
@@ -1514,6 +1580,98 @@ mod tests {
         }));
         assert!(bare.contains("no mount spec was recorded"), "{bare}");
         assert!(bare.contains('?'), "an unknown price is `?`: {bare}");
+    }
+
+    /// `vk top` (2026-10-15): a HEALTH column beside STATE, and the
+    /// provider's words under the table for every arch that is not healthy.
+    #[test]
+    fn top_shows_each_arch_s_health_and_says_why_under_the_table() {
+        let stats = json!({"calls": 1, "tokens_in": 10, "tokens_in_measured": 10,
+                           "cost_list_usd": 0.0, "projected": 0});
+        let screen = top(&json!({
+            "arches": {"sha256:ok": stats, "sha256:spent": stats, "sha256:slow": stats},
+            "states": {"sha256:ok": "ready", "sha256:spent": "ready", "sha256:slow": "ready"},
+            "health": {
+                "sha256:ok": {"state": "healthy", "since_ms": 1},
+                "sha256:spent": {"state": "exhausted", "since_ms": 5,
+                                 "last_error": "credit balance is too low"},
+                "sha256:slow": {"state": "rate_limited", "since_ms": 7},
+            },
+            "governed": {}, "locality": {}, "jurisdiction": {}, "price_eur_per_1k": {},
+            "tasks": {}, "stopped_scopes": [], "liveness": {},
+        }));
+        let row = |id: &str| {
+            screen
+                .lines()
+                .find(|l| l.starts_with(id))
+                .unwrap_or_else(|| panic!("a row for {id}:\n{screen}"))
+                .to_string()
+        };
+        assert!(row("sha256:ok").contains(" healthy "), "{screen}");
+        assert!(row("sha256:spent").contains(" exhausted "), "{screen}");
+        assert!(
+            screen.contains("sha256:spent is exhausted since 5 ms: credit balance is too low"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("sha256:slow is rate_limited (no figure from the provider"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("sha256:ok is"),
+            "a healthy arch has nothing to explain"
+        );
+    }
+
+    /// `vk arch show` (2026-10-15): the quota the manifest claims, limit by
+    /// limit and only those stated, and the health the kernel observed.
+    #[test]
+    fn arch_show_prints_the_quota_claim_and_the_observed_health() {
+        let page = |quota: Value, health: Value| {
+            arch_show(&json!({
+                "arch_id": "sha256:q", "state": "ready", "reason": null,
+                "governed": false, "kind": "anthropic", "config": {},
+                "health": health,
+                "manifest": {
+                    "name": "anthropic/claude-opus-5", "capabilities": ["generate"],
+                    "locality": "cloud", "jurisdiction": "US", "retention_days": 30,
+                    "cost_per_1k_tokens_eur": 0.0046, "latency_ms_p50": 9000,
+                    "context_ceiling": 200000, "determinism": "non_deterministic",
+                    "identity": {"weights_sha256": "model:claude-opus-5", "engine": "anthropic-api",
+                                 "engine_version": "2023-06-01", "backend": "anthropic-first-party",
+                                 "quant": "-", "kv_cache": "-", "threads": 0, "batch": 0,
+                                 "sampling": {}, "seed": null},
+                    "clearance": {"max_scope": "business", "third_party_allowed": false},
+                    "governed": false,
+                    "quota": quota,
+                },
+            }))
+        };
+        let metered = page(
+            json!({"plan": "pay-as-you-go", "requests_per_minute": 50, "tokens_per_minute": 30000}),
+            json!({"state": "rate_limited", "until_ms": 31000, "since_ms": 1000,
+                   "last_error": "the provider is rate-limiting this arch; it asked for 30 s"}),
+        );
+        assert!(
+            metered.contains("pay-as-you-go (50 requests/min, 30000 tokens/min)"),
+            "{metered}"
+        );
+        assert!(
+            !metered.contains("tokens/day"),
+            "an unstated limit is not printed: {metered}"
+        );
+        assert!(
+            metered.contains("rate_limited until 31000 ms (the provider's figure) since 1000 ms"),
+            "{metered}"
+        );
+        let plain = page(
+            json!({"plan": "subscription"}),
+            json!({"state": "healthy", "since_ms": 3}),
+        );
+        assert!(plain.contains("subscription (no limit stated)"), "{plain}");
+        assert!(plain.contains("healthy since 3 ms"), "{plain}");
+        let none = page(Value::Null, Value::Null);
+        assert!(none.contains("none declared"), "{none}");
     }
 
     /// `vk fsck`: one line per tier, the verdict first, and the reasons under
