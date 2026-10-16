@@ -251,10 +251,60 @@ impl SecretString {
         SecretString(key.as_bytes().to_vec())
     }
 
-    /// The key itself. Private on purpose: the only caller is the header this
-    /// crate sets.
+    /// The key itself. Private on purpose: the only callers are the header
+    /// this crate sets and [`SecretString::authorize`].
     fn expose(&self) -> &str {
         std::str::from_utf8(&self.0).unwrap_or_default()
+    }
+
+    /// `request`, built, with the key on header `name` after `prefix` —
+    /// `"Bearer "` for an `Authorization` header, `""` for a bare one like
+    /// `x-goog-api-key` — marked sensitive, so reqwest's own `Debug` output
+    /// does not print it either. **Only** if the request goes under
+    /// `base_url`, and only if `base_url` itself passes [`check_base_url`]:
+    /// the same scheme, host and port, a path at or below the base's, and no
+    /// credentials in the URL. Anything else is refused and the key never
+    /// touches the request (review M-4).
+    ///
+    /// The one way another crate puts the key on a wire. The other API arches
+    /// (`vk-arch-openai-compat`, `vk-arch-mistral`, `vk-arch-gemini`) share
+    /// this type rather than copy it, so the scrub, the redacted `Debug`, the
+    /// zeroing on drop and now the origin check cannot drift apart between
+    /// them — and none of them can read the key back out as a string, or put
+    /// it on a request bound anywhere but the origin it was configured with.
+    /// The built request goes out with `Client::execute`.
+    pub fn authorize(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+        base_url: &str,
+        name: &str,
+        prefix: &str,
+    ) -> Result<reqwest::blocking::Request> {
+        check_base_url(base_url)?;
+        let base =
+            reqwest::Url::parse(base_url).map_err(|e| anyhow!("{base_url} is not a URL: {e}"))?;
+        // Built before the key is on it, so a builder error cannot carry it.
+        let mut request = request
+            .build()
+            .map_err(|e| anyhow!("cannot build the request: {e}"))?;
+        anyhow::ensure!(
+            is_under(request.url(), &base),
+            "refusing to put the key on a request to {}: it is not under {base_url}",
+            request.url().origin().ascii_serialization()
+        );
+        let value = zeroize::Zeroizing::new(format!("{prefix}{}", self.expose()));
+        // A byte no header may carry is a refusal naming no value, rather than
+        // a request sent keyless that comes back a 401 blaming the key's owner.
+        let mut header = reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
+            anyhow!(
+                "the key holds a byte no HTTP header may carry; set it again with vk secret set"
+            )
+        })?;
+        header.set_sensitive(true);
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| anyhow!("{name} is not a header name: {e}"))?;
+        request.headers_mut().insert(name, header);
+        Ok(request)
     }
 
     /// `text` with every occurrence of the key replaced. Applied to every
@@ -687,6 +737,20 @@ pub fn check_base_url(raw: &str) -> Result<()> {
     }
 }
 
+/// Is `url` at or below `base`? The same scheme, host and port, no
+/// credentials, and a path that is the base's or continues it past a `/` —
+/// so `…/api` covers `…/api/v1/x` and not `…/apix` or `…/other`.
+fn is_under(url: &reqwest::Url, base: &reqwest::Url) -> bool {
+    let prefix = base.path().trim_end_matches('/');
+    let path = url.path();
+    url.scheme() == base.scheme()
+        && url.host() == base.host()
+        && url.port_or_known_default() == base.port_or_known_default()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && (path == prefix || path.starts_with(&format!("{prefix}/")))
+}
+
 /// The blocking client every call goes through.
 ///
 /// **`no_proxy()` is deliberately absent**, which is the opposite of the
@@ -877,6 +941,74 @@ impl ArchAdapter for AnthropicAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_KEY: &str = "sk-test-AUTHORIZEAUTHORIZEAUTHORIZE";
+
+    /// Review M-4: the primitive that puts the key on a request checks where
+    /// the request goes, so no caller can hand it one bound elsewhere — a
+    /// URL built from the wrong field, a path that climbs out of the base,
+    /// another port on the same host.
+    #[test]
+    fn the_key_goes_only_on_a_request_under_the_checked_origin() {
+        let client = Client::new();
+        let key = SecretString::new(TEST_KEY);
+        let ok = key
+            .authorize(
+                client.post("http://127.0.0.1:8080/v1/chat/completions"),
+                "http://127.0.0.1:8080",
+                "authorization",
+                "Bearer ",
+            )
+            .expect("under the origin");
+        let header = ok.headers().get("authorization").expect("the header");
+        assert!(header.is_sensitive(), "reqwest's Debug would print it");
+        assert_eq!(header.to_str().unwrap(), format!("Bearer {TEST_KEY}"));
+        // Under a path prefix too.
+        assert!(key
+            .authorize(
+                client.post("https://openrouter.ai/api/v1/chat/completions"),
+                "https://openrouter.ai/api/",
+                "authorization",
+                "Bearer ",
+            )
+            .is_ok());
+
+        for (url, base) in [
+            ("http://127.0.0.2:8080/v1/x", "http://127.0.0.1:8080"),
+            ("http://127.0.0.1:8081/v1/x", "http://127.0.0.1:8080"),
+            ("https://127.0.0.1:8080/v1/x", "http://127.0.0.1:8080"),
+            ("https://collector.example/v1/x", "https://api.mistral.ai"),
+            (
+                "https://openrouter.ai/other/v1/x",
+                "https://openrouter.ai/api",
+            ),
+            (
+                "https://openrouter.ai/apix/v1/x",
+                "https://openrouter.ai/api",
+            ),
+            // (Credentials in the URL are not a case here: reqwest lifts them
+            // into a Basic header before the request is built, and `is_under`
+            // refuses them anyway should that ever change.)
+        ] {
+            let err = key
+                .authorize(client.post(url), base, "authorization", "Bearer ")
+                .expect_err(url);
+            let text = format!("{err:#}");
+            assert!(text.contains("not under"), "{url}: {text}");
+            assert!(!text.contains(TEST_KEY), "{url}: {text}");
+        }
+        // And a base the origin rule refuses is refused even when the request
+        // is under it: plaintext off this machine.
+        let err = key
+            .authorize(
+                client.post("http://collector.example/v1/x"),
+                "http://collector.example",
+                "authorization",
+                "Bearer ",
+            )
+            .expect_err("plaintext");
+        assert!(format!("{err:#}").contains("in the clear"), "{err:#}");
+    }
 
     #[test]
     fn the_price_tag_is_the_input_rate_per_thousand_tokens_in_euros() {

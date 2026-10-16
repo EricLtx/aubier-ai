@@ -3715,6 +3715,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "vk-arch-gemini"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "vk-arch-openai-compat",
+ "vk-contracts",
+ "vk-kernel",
+]
+
+[[package]]
+name = "vk-arch-mistral"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tempfile",
+ "vk-arch-openai-compat",
+ "vk-contracts",
+ "vk-kernel",
+]
+
+[[package]]
 name = "vk-arch-ollama"
 version = "0.1.0"
 dependencies = [
@@ -3727,6 +3753,23 @@ dependencies = [
  "vk-contracts",
  "vk-kernel",
  "vk-store",
+]
+
+[[package]]
+name = "vk-arch-openai-compat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "keyring",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "vk-arch-anthropic",
+ "vk-contracts",
+ "vk-kernel",
+ "zeroize",
 ]
 
 [[package]]
@@ -3815,7 +3858,10 @@ dependencies = [
  "uuid",
  "vk-arch-anthropic",
  "vk-arch-claude-code",
+ "vk-arch-gemini",
+ "vk-arch-mistral",
  "vk-arch-ollama",
+ "vk-arch-openai-compat",
  "vk-contracts",
  "vk-driver",
  "vk-harness",
@@ -3960,6 +4006,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vk-arch-anthropic",
+ "vk-arch-gemini",
+ "vk-arch-mistral",
+ "vk-arch-openai-compat",
  "vk-ipc",
  "vk-kernel",
  "vk-store",

@@ -129,6 +129,45 @@ Bedrock in particular the request shape, the `eu.` cross-region
 inference-profile prefix and the credential-resolution path are pinned by unit
 tests and by AWS's documentation, and by nothing that has run.
 
+### Mistral, Gemini and OpenAI-compatible adapters
+
+The same discipline as the Anthropic arch, shared rather than copied: the key
+type, the scrub and the keyring loader are `vk-arch-anthropic`'s — and the key
+reaches a request only through `SecretString::authorize`, which refuses one
+that is not under the checked origin (same scheme, host and port, a path at or
+below the base's), so no caller can put it on a request bound elsewhere — the client
+(no redirects followed, rustls, connect timeout) and the `http status <code>:`
+classification are `vk-arch-openai-compat`'s, every origin is daemon
+configuration bounded by the same `check_base_url`, every mount config is a
+closed shape, and every mount is a human act (I1) — `openai-compat` too, even
+on loopback, since the kernel did not start that server. A response body is
+read to 4 MiB (`MAX_BODY_BYTES`) and no further, declared length or not. What each one
+**trusts** is the provider's own word, carried in the manifest where I2 reads
+it:
+
+- **`mistral`** trusts Mistral that `api.eu.mistral.ai` runs only in "EU and
+  EFTA" data centres (`jurisdiction: EU`, a rounding that does not name
+  Switzerland, Norway, Iceland or Liechtenstein) and that API inputs and
+  outputs are kept "thirty (30) rolling days to monitor abuse"
+  (`retention_days: 30`) — and the account owner to have turned off
+  "Anonymous improvement data", which no manifest field can express.
+- **`gemini`** trusts Google's paid-tier terms: prompts and outputs kept 55
+  days for abuse detection and not used to improve Google's products
+  (`retention_days: 55`, `jurisdiction: US`). The unpaid tier trains on them;
+  in the EEA the paid-tier data terms apply to unpaid quota too, and a node
+  serving customers must use a billing-enabled key, which this arch cannot
+  verify.
+- **`openai-compat`** trusts **the operator** — the jurisdiction, the
+  retention window and the context window are the mount's stated claims
+  (`--jurisdiction`, `--retention-days`, `--ctx`, all required and all in the
+  arch identity), and the operator in turn trusts whoever runs the server.
+  On a loopback address it is `locality: local` but never governed, and still
+  capped at Business: the arch cannot see behind the socket.
+
+None of the three has made a call to its provider from this repository: every
+test is against a loopback stand-in, and the model tables (read 2026-10-16)
+are the providers' published figures.
+
 ### Ollama adapter
 
 The first **governed** arch, and the only one so far: the kernel starts the container itself (`docker run -d --name vk-ollama -p 127.0.0.1:11434:11434 -v vk-ollama:/root/.ollama --memory 12g --cpus 6 ollama/ollama:0.33.3`), so the inference is a process this node launched, capped at 12 GiB of memory and 6 CPUs, published on loopback only, with the weights in a volume it owns. `governed: true` is claimed only after the caps have been read *back* off the running container (`HostConfig.Memory`, `HostConfig.NanoCpus`): a container running without them is not a governor, whatever it was meant to be started with, and an existing `vk-ollama` whose image or caps are not the ones this mount asks for is refused rather than adopted — the remedy, `vk mount ollama --recreate`, replaces it and keeps the volume. A mount is also refused when a foreign process already answers on the published port while that container is stopped, because the identity would otherwise be read off somebody else's server.

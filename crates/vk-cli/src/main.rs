@@ -238,19 +238,22 @@ struct BootArgs {
 enum SecretCmd {
     /// Put a secret in this account's keyring, under service `vk`.
     ///
-    /// `vk secret set anthropic` is the one an API arch needs: the daemon
-    /// reads it at `vk mount anthropic` and again whenever it re-creates that
-    /// arch at boot. The value is prompted for without echo and is never
-    /// printed, never logged and never written to a file — it does not go
-    /// into the mount spec either, which is stored in the clear and refuses
-    /// anything credential-shaped.
+    /// `vk secret set anthropic` is the one an API arch needs — and
+    /// `mistral`, `gemini` and `openai-compat` for theirs: the daemon reads
+    /// it at `vk mount <kind>` and again whenever it re-creates that arch at
+    /// boot. The value is prompted for without echo and is never printed,
+    /// never logged and never written to a file — it does not go into the
+    /// mount spec either, which is stored in the clear and refuses anything
+    /// credential-shaped.
     ///
     /// The keyring is **this account's**. A daemon running under the Windows
     /// service account (`vkd --as-service`) reads that account's keyring, not
-    /// this one, and is given its key with `vkd --anthropic-key-file` or by
-    /// running this verb as that account.
+    /// this one, and is given its key with `vkd --anthropic-key-file` (and
+    /// `--mistral-key-file`, `--gemini-key-file`, `--openai-compat-key-file`)
+    /// or by running this verb as that account.
     Set {
-        /// What it is called: `anthropic` for the first-party API arch.
+        /// What it is called: `anthropic`, `mistral`, `gemini` or
+        /// `openai-compat` — the API arch that reads it.
         name: String,
         /// Read the value as one line on stdin instead of prompting, for
         /// scripts. Still never echoed and never printed back.
@@ -355,6 +358,85 @@ enum MountCmd {
         /// The longest answer one call may produce. Capped at 4096.
         #[arg(long, default_value_t = 4096)]
         max_tokens: u32,
+    },
+    /// Mistral's **native API on its EU endpoint** (`api.eu.mistral.ai`), on a
+    /// key in this account's keyring (`vk secret set mistral`).
+    ///
+    /// `jurisdiction: EU` — Mistral's EU and EFTA data centres — 30-day
+    /// retention for abuse monitoring, clearance capped at Business with
+    /// third-party data refused, metered at the EU endpoint's price (the
+    /// standard list plus 10%).
+    Mistral {
+        /// A pinned model id (`mistral-large-2512`, `mistral-medium-3-5`,
+        /// `mistral-small-2603`). An alias mounts, unpriced.
+        #[arg(long, default_value = "mistral-large-2512")]
+        model: String,
+        /// Context ceiling in tokens. `0` is the model's documented window.
+        #[arg(long, default_value_t = 0)]
+        ctx: u32,
+        /// The longest answer one call may produce. Capped at 4096.
+        #[arg(long, default_value_t = 4096)]
+        max_tokens: u32,
+        /// How long one call may take, in seconds.
+        #[arg(long, default_value_t = 600)]
+        timeout: u32,
+    },
+    /// Google's **native Gemini API**, on a key in this account's keyring
+    /// (`vk secret set gemini`) — a billing-enabled one for anything a
+    /// customer uses.
+    ///
+    /// `jurisdiction: US`, 55-day retention for abuse monitoring (the paid
+    /// tier's), clearance capped at Business with third-party data refused,
+    /// metered. The answer bound counts the model's thinking too.
+    Gemini {
+        /// The model id (`gemini-3.8-flash`, `gemini-4-argon`,
+        /// `gemini-3.5-flash-lite`).
+        #[arg(long, default_value = "gemini-3.8-flash")]
+        model: String,
+        /// Context ceiling in tokens. `0` is the model's documented window.
+        #[arg(long, default_value_t = 0)]
+        ctx: u32,
+        /// The longest answer one call may produce, thinking included.
+        /// Capped at 4096.
+        #[arg(long, default_value_t = 4096)]
+        max_tokens: u32,
+        /// How long one call may take, in seconds.
+        #[arg(long, default_value_t = 600)]
+        timeout: u32,
+    },
+    /// Any **OpenAI-compatible** chat-completions server — Mammouth,
+    /// llama-server, vLLM — at the one origin the daemon was started with
+    /// (`vkd --openai-compat-base-url`), on a key in this account's keyring
+    /// (`vk secret set openai-compat`; a server on a loopback address may do
+    /// without one).
+    ///
+    /// No table can know a server it has never seen, so this mount **states
+    /// the claims** a manifest carries: the model, its window, where the
+    /// server is and how long it keeps what it is sent. All four are
+    /// required, and part of the arch id. Never governed; `locality: cloud`
+    /// unless the server is on a loopback address; clearance capped at
+    /// Business with third-party data refused; no price claimed.
+    OpenaiCompat {
+        /// The model id, exactly as the server names it.
+        #[arg(long)]
+        model: String,
+        /// The context window the server was started with, in tokens.
+        #[arg(long)]
+        ctx: u32,
+        /// Where the server is: an ISO 3166-1 alpha-2 code (FR, DE, US), EU,
+        /// or local for a server on this machine's loopback.
+        #[arg(long)]
+        jurisdiction: String,
+        /// How many days the far end keeps what it is sent, as its operator
+        /// publishes it; 0 if it keeps nothing.
+        #[arg(long)]
+        retention_days: u32,
+        /// The longest answer one call may produce. Capped at 4096.
+        #[arg(long, default_value_t = 4096)]
+        max_tokens: u32,
+        /// How long one call may take, in seconds.
+        #[arg(long, default_value_t = 600)]
+        timeout: u32,
     },
     /// A Gemma-class model on this machine, served by Ollama in a container
     /// this kernel starts, caps and can stop.
@@ -631,8 +713,8 @@ fn secret(cli: &Cli, what: &SecretCmd) -> Result<()> {
     let name = name.trim();
     if name.is_empty() || name.split_whitespace().count() != 1 {
         return Err(anyhow!(
-            "a secret's name is one word with no spaces in it; `anthropic` is the one an \
-             API arch reads"
+            "a secret's name is one word with no spaces in it; `anthropic`, `mistral`, \
+             `gemini` and `openai-compat` are the ones the API arches read"
         ));
     }
     // Wrapped the moment it exists and never copied out of the wrapper: this
@@ -841,6 +923,84 @@ async fn call(cli: &Cli) -> Result<()> {
                             "model": model,
                             "context_ceiling": ctx,
                             "max_tokens": max_tokens,
+                        },
+                    }),
+                    Some(proof),
+                )
+                .await?,
+                render::mounted_arch,
+            )
+        }
+        // The two newer API arches with a model table: the model and the
+        // numbers travel, the key and the origin stay the daemon's, and the
+        // mount is a human act like `vk mount anthropic`.
+        Cmd::Mount {
+            what:
+                what @ (MountCmd::Mistral {
+                    model,
+                    ctx,
+                    max_tokens,
+                    timeout,
+                }
+                | MountCmd::Gemini {
+                    model,
+                    ctx,
+                    max_tokens,
+                    timeout,
+                }),
+        } => {
+            let kind = if matches!(what, MountCmd::Mistral { .. }) {
+                "mistral"
+            } else {
+                "gemini"
+            };
+            let proof = presence(&c).await?;
+            show(
+                cli,
+                c.call(
+                    "arch.mount",
+                    json!({
+                        "kind": kind,
+                        "config": {
+                            "model": model,
+                            "context_ceiling": ctx,
+                            "max_tokens": max_tokens,
+                            "timeout_secs": timeout,
+                        },
+                    }),
+                    Some(proof),
+                )
+                .await?,
+                render::mounted_arch,
+            )
+        }
+        // The claims travel, the key and the origin do not: both are the
+        // daemon's. A human act like every other API mount.
+        Cmd::Mount {
+            what:
+                MountCmd::OpenaiCompat {
+                    model,
+                    ctx,
+                    jurisdiction,
+                    retention_days,
+                    max_tokens,
+                    timeout,
+                },
+        } => {
+            let proof = presence(&c).await?;
+            show(
+                cli,
+                c.call(
+                    "arch.mount",
+                    json!({
+                        "kind": "openai-compat",
+                        "config": {
+                            "model": model,
+                            "context_ceiling": ctx,
+                            "jurisdiction": jurisdiction,
+                            "retention_days": retention_days,
+                            "max_tokens": max_tokens,
+                            "timeout_secs": timeout,
                         },
                     }),
                     Some(proof),

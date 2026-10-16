@@ -3591,6 +3591,23 @@ fn vk_secret_set_refuses_a_bad_name_and_an_empty_value_without_touching_a_keyrin
     assert!(err.contains("the keyring was not touched"), "{err}");
 }
 
+/// `vk mount openai-compat` cannot be run without the claims its manifest
+/// carries: the shell refuses it, naming what is missing, before a daemon is
+/// even dialled — no default can stand in for where a server is or how long
+/// it keeps what it is sent.
+#[test]
+fn vk_mount_openai_compat_will_not_run_without_its_claims() {
+    let refused = Command::new(vk_exe())
+        .args(["mount", "openai-compat", "--model", "m"])
+        .output()
+        .expect("run vk");
+    assert!(!refused.status.success(), "the claims are required");
+    let err = String::from_utf8_lossy(&refused.stderr);
+    for flag in ["--ctx", "--jurisdiction", "--retention-days"] {
+        assert!(err.contains(flag), "{flag} is not named: {err}");
+    }
+}
+
 /// `vk mount bedrock` takes an EU region and no other: the manifest's
 /// `jurisdiction: EU` *is* the region, so naming somewhere else is refused by
 /// the shell before a daemon is even dialled.

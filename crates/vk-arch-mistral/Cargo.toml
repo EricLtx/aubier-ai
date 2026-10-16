@@ -1,0 +1,19 @@
+[package]
+name = "vk-arch-mistral"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VerticalAI arch adapter: Mistral's native API, hosted in the EU"
+
+[dependencies]
+vk-contracts = { path = "../vk-contracts" }
+vk-kernel = { path = "../vk-kernel" }
+# The chat-completions wire Mistral's native API is, the HTTP plumbing every
+# API arch shares, and — through it — the Anthropic arch's key handling.
+vk-arch-openai-compat = { path = "../vk-arch-openai-compat" }
+anyhow.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"

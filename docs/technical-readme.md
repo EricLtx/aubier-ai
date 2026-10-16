@@ -234,6 +234,93 @@ model, a subscription); a **`?`** means this node has no price list for that
 arch, which is the Bedrock case — AWS prices it and nobody here has read that
 table. `?` is never rendered as `0`, because `0` would read as free.
 
+### Arches: Mistral (EU), Gemini (US) and any OpenAI-compatible server
+
+Three more API arches, built the Anthropic way: the key in this account's
+keyring and nowhere else, the origin fixed in the daemon, a closed mount
+config, a presence proof to mount, every error scrubbed of the key, no
+redirect followed, one answer bounded at 4096 tokens, I4′ before and after
+the call. A response is read to 4 MiB and no further: a far end that declares
+more, or sends more, fails the call with `answer larger than 4194304 bytes`.
+
+```
+vk secret set mistral                                   # prompts, no echo, keyring only
+vk mount mistral                                        # mistral-large-2512, EU endpoint
+vk mount mistral --model mistral-medium-3-5 --ctx 128000
+
+vk secret set gemini                                    # a billing-enabled key
+vk mount gemini                                         # gemini-3.8-flash, US
+vk mount gemini --model gemini-4-argon --max-tokens 2048
+
+vkd --openai-compat-base-url https://api.mammouth.ai    # the daemon names the one server
+vk secret set openai-compat                             # optional for a loopback server
+vk mount openai-compat --model mistral-medium-3 --ctx 131072 --jurisdiction FR --retention-days 30
+```
+
+| | `mistral` | `gemini` | `openai-compat` |
+|---|---|---|---|
+| origin | `https://api.eu.mistral.ai` (fixed) | `https://generativelanguage.googleapis.com` (fixed) | `vkd --openai-compat-base-url` |
+| wire | `POST /v1/chat/completions`, `Authorization: Bearer` | `v1beta/models/{m}:generateContent` and `:countTokens`, `x-goog-api-key` | `POST /v1/chat/completions`, `Authorization: Bearer` |
+| `jurisdiction` | `EU` | `US` | stated: `--jurisdiction` |
+| `retention_days` | 30 (abuse monitoring) | 55 (paid tier, abuse detection) | stated: `--retention-days` |
+| `locality` | cloud | cloud | cloud; local on a loopback address |
+| context ceiling | the table's documented window | the table's documented window | stated: `--ctx` |
+| I4′ pre-check count | `bytes/3 + 64` (no count endpoint) | `countTokens`, the estimate if it fails | `bytes/3 + 64` |
+| price | the table's, ×1.1 for the EU endpoint | the table's, long-prompt tier included | none claimed (`?`) |
+
+**Mistral** answers on its EU regional endpoint, `api.eu.mistral.ai` — "EU and
+EFTA" data centres; the global `api.mistral.ai` makes no location promise and
+is not used. Mistral bills the regional endpoints at 1.1× the standard list, so
+that is the price claimed. Its model table carries pinned ids only (an alias
+such as `mistral-large-latest` mounts but is unpriced: Mistral warns that
+aliases change behaviour and price silently, and the model id is the arch's
+identity). No `reasoning_effort` is sent; a reasoning answer's `thinking`
+chunks are left out of the register. Turn off "Anonymous improvement data" in
+the Mistral console (Admin → Privacy): training is a setting no manifest
+field can say.
+
+**Gemini** speaks Google's native `generateContent`, which Google has called
+"legacy" since its Interactions API became generally available in June 2026
+while keeping it "fully supported"; the API version is in the arch identity.
+The key goes on the `x-goog-api-key` header, never in a `?key=` query string,
+which every error and proxy log would repeat. Nearly every current Gemini
+model thinks, and the answer bound — at most 1 024 tokens on every call the
+kernel makes — counts the thinking. So the thinking budget is derived from
+each call's bound: a `thinkingBudget` of a quarter of it (256 at the kernel's
+1 024), never more than 1 024, never less than the model's floor (128 for a
+model that cannot stop thinking, 0 for 2.5 Flash). It is sent to every
+listed model that thinks by default, Gemini 3 and later included — a
+`thinkingLevel` bounds nothing in tokens — and to none other: 2.5 Flash-Lite
+does not think unless asked, and an unlisted model is sent nothing. A bound
+the floor would take entirely is refused before anything is sent, and an
+answer whose bound still went on thinking is refused with a message that says
+so. The rule is in the arch identity; the budget each call was sent is in its
+record. The retention figure is the
+**paid** tier's: the unpaid tier lets Google use prompts to improve its
+products, so a customer node mounts it on a billing-enabled key (in the EEA,
+Google applies the paid-tier data terms to unpaid quota too).
+
+**OpenAI-compatible** servers — Mammouth, llama-server, vLLM — have no table:
+the mount states the model, the window, the jurisdiction (an ISO 3166 code,
+`EU`, or `local` for a loopback server; `unknown` and the user-assigned codes
+such as `ZZ` are refused) and the retention window (`0` if nothing is kept).
+All four are required and all four are in the arch id, so a corrected claim is
+a new arch. The base URL is the daemon's, without the trailing `/v1` an
+OpenAI SDK example carries — the adapter appends `/v1/chat/completions` and a
+`…/v1` base is refused at start with the fix in the message. A key is optional
+on a loopback **address** and required anywhere else — and on loopback only a
+keyring with **no entry** counts as no key: a keyring that cannot be read, or
+an empty entry, refuses the mount with the remedy rather than calling the
+server keyless (a node with no keyring names `vkd --openai-compat-key-file`).
+Every mount is checked for what it says — origin, model id, claims, an answer
+bound of at least 1 — before any keyring is read. The window is only as
+good as `--ctx`: a server that silently truncates at a smaller window than the
+one stated cannot be caught by the post-check.
+
+A failed call says `http status <code>:` first, then `rate limited` (429),
+`credit or quota exhausted` (402, or OpenAI's `insufficient_quota`) or
+`model not served` (404), then the provider's own words with the key removed.
+
 ### Arches: a model this kernel governs
 
 `vk mount ollama` is the other kind. It runs a Gemma-class model in an Ollama

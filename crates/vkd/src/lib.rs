@@ -49,6 +49,36 @@ pub struct Args {
     /// what the tests use.
     #[arg(long)]
     pub anthropic_base_url: Option<String>,
+    /// Mistral API key file — the `--anthropic-key-file` seam for the
+    /// `mistral` arch; without it, `vk`/`mistral` in this account's keyring.
+    #[arg(long)]
+    pub mistral_key_file: Option<PathBuf>,
+    /// Where a `mistral` arch's calls go: Mistral's EU origin unless this
+    /// says otherwise, for tests, under the same rule as
+    /// `--anthropic-base-url`.
+    #[arg(long)]
+    pub mistral_base_url: Option<String>,
+    /// Gemini API key file; without it, `vk`/`gemini` in this account's
+    /// keyring.
+    #[arg(long)]
+    pub gemini_key_file: Option<PathBuf>,
+    /// Where a `gemini` arch's calls go: Google's origin unless this says
+    /// otherwise, for tests, under the same rule as `--anthropic-base-url`.
+    #[arg(long)]
+    pub gemini_base_url: Option<String>,
+    /// Key file for the OpenAI-compatible server; without it,
+    /// `vk`/`openai-compat` in this account's keyring — which a server on a
+    /// loopback address may do without.
+    #[arg(long)]
+    pub openai_compat_key_file: Option<PathBuf>,
+    /// The one OpenAI-compatible server this daemon's `openai-compat` arches
+    /// call (Mammouth, llama-server, vLLM…): the origin, and any path prefix
+    /// in front of `/v1/chat/completions`, without the `/v1`. Daemon
+    /// configuration only — no pipe client can name it — and `https://`, or
+    /// `http://` to a loopback address. Without it, every `openai-compat`
+    /// mount is refused.
+    #[arg(long)]
+    pub openai_compat_base_url: Option<String>,
     /// SP1a convenience: enroll this node's own device key at first start, so
     /// the interactive machine can be the human this node knows. SP1b replaces
     /// it with the passkey enrolment ceremony.
@@ -354,10 +384,10 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     // after the endpoint is answering, so the order is: lock → bind → boot →
     // serve, with re-creation alongside the serving (Task 1b review,
     // Important 1).
-    // Where an `anthropic` arch's key comes from, at mount and again every
-    // time a persisted one is re-created (SP1b Task 2b). The keyring unless
-    // the operator named a file.
-    let anthropic_keys = match &a.anthropic_key_file {
+    // Where an API arch's key comes from, at mount and again every time a
+    // persisted one is re-created (SP1b Task 2b). The keyring unless the
+    // operator named a file.
+    let key_source_of = |file: &Option<PathBuf>, flag: &str| match file {
         Some(p) => {
             // A key in a file is a key anyone who can read the file has. The
             // store's master key file is held to the same rule, and for the
@@ -372,11 +402,12 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
             let owner_refs: Vec<&str> = owners.iter().map(String::as_str).collect();
             #[cfg(not(windows))]
             let owner_refs: Vec<&str> = Vec::new();
-            vk_store::keys::check_private_file(p, &owner_refs).context("--anthropic-key-file")?;
-            vk_arch_anthropic::KeySource::File(p.clone())
+            vk_store::keys::check_private_file(p, &owner_refs).context(flag.to_string())?;
+            anyhow::Ok(vk_arch_anthropic::KeySource::File(p.clone()))
         }
-        None => vk_arch_anthropic::KeySource::Keyring,
+        None => Ok(vk_arch_anthropic::KeySource::Keyring),
     };
+    let anthropic_keys = key_source_of(&a.anthropic_key_file, "--anthropic-key-file")?;
     // Bounded here, once, rather than trusted: everything downstream of this
     // point puts an API key on whatever it names.
     let anthropic_base_url = a
@@ -384,14 +415,37 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| vk_arch_anthropic::DEFAULT_BASE_URL.to_string());
     vk_arch_anthropic::check_base_url(&anthropic_base_url).context("--anthropic-base-url")?;
+    // The same for the three newer API arches: every origin bounded here, by
+    // the rule its adapter will apply again.
+    let api_arches = vk_ipc::server::ApiArches {
+        mistral_keys: key_source_of(&a.mistral_key_file, "--mistral-key-file")?,
+        mistral_base_url: a
+            .mistral_base_url
+            .clone()
+            .unwrap_or_else(|| vk_arch_mistral::DEFAULT_BASE_URL.to_string()),
+        gemini_keys: key_source_of(&a.gemini_key_file, "--gemini-key-file")?,
+        gemini_base_url: a
+            .gemini_base_url
+            .clone()
+            .unwrap_or_else(|| vk_arch_gemini::DEFAULT_BASE_URL.to_string()),
+        openai_compat_keys: key_source_of(&a.openai_compat_key_file, "--openai-compat-key-file")?,
+        openai_compat_base_url: a.openai_compat_base_url.clone(),
+    };
+    vk_arch_anthropic::check_base_url(&api_arches.mistral_base_url)
+        .context("--mistral-base-url")?;
+    vk_arch_anthropic::check_base_url(&api_arches.gemini_base_url).context("--gemini-base-url")?;
+    if let Some(url) = &api_arches.openai_compat_base_url {
+        vk_arch_openai_compat::check_compat_base_url(url).context("--openai-compat-base-url")?;
+    }
     let mut kernel = vk_kernel::RealKernel::open_with_factory(
         &state_dir,
         key_source,
         &a.node_id,
-        vk_ipc::server::adapter_factory(
+        vk_ipc::server::adapter_factory_with(
             state_dir.clone(),
             anthropic_keys.clone(),
             anthropic_base_url.clone(),
+            api_arches.clone(),
             claude_bin.clone(),
         ),
     )?;
@@ -561,6 +615,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         web: Some(Arc::new(LinkMinter(web.links))),
         anthropic_keys,
         anthropic_base_url,
+        api_arches,
         claude_bin,
         // Empty at start: a mounted driver's process is spawned again by the
         // first `driver.act` that needs it, from the row the kernel kept.

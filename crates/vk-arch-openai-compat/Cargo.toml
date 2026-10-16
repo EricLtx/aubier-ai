@@ -1,0 +1,31 @@
+[package]
+name = "vk-arch-openai-compat"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VerticalAI arch adapter: any OpenAI-compatible chat-completions server (Mammouth, llama-server, vLLM), and the HTTP base the Mistral and Gemini arches share"
+
+[dependencies]
+vk-contracts = { path = "../vk-contracts" }
+vk-kernel = { path = "../vk-kernel" }
+# The key plumbing — `SecretString`, `KeySource`, `load_key` — and the origin
+# rule, `check_base_url`, shared with the Anthropic arch rather than copied, so
+# the scrub, the redacted `Debug`, the zeroing on drop and the loopback verdict
+# cannot drift apart between the API arches. Without its `bedrock` feature:
+# nothing of the AWS SDK comes along.
+vk-arch-anthropic = { path = "../vk-arch-anthropic", default-features = false }
+reqwest.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# Only to tell "no entry" from every other answer, for a loopback server that
+# needs no key (`load_key_for`). The key itself is still read by `load_key`.
+keyring.workspace = true
+# The probe copy of a loopback key is wiped as soon as it has been looked at.
+zeroize = "1"
+
+[dev-dependencies]
+# The one test that reads back the warning a skipped I4′ post-check logs.
+tracing-subscriber.workspace = true
+tempfile = "3"

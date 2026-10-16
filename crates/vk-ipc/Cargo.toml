@@ -24,6 +24,10 @@ vk-driver = { path = "../vk-driver" }
 vk-arch-claude-code = { path = "../vk-arch-claude-code" }
 vk-arch-ollama = { path = "../vk-arch-ollama" }
 vk-arch-anthropic = { path = "../vk-arch-anthropic", default-features = false }
+# The three newer API arches (`vk mount mistral|gemini|openai-compat`).
+vk-arch-openai-compat = { path = "../vk-arch-openai-compat" }
+vk-arch-mistral = { path = "../vk-arch-mistral" }
+vk-arch-gemini = { path = "../vk-arch-gemini" }
 vk-store = { path = "../vk-store" }
 tokio.workspace = true
 serde.workspace = true
