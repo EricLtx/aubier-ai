@@ -151,6 +151,25 @@ fn an_answer_reports_google_s_counts_with_thinking_billed_as_output() {
     assert_eq!(details["prompt_counted_by_api"], true);
 }
 
+/// Review M-3: a count that is not an integer is not a count. It is recorded
+/// as unmeasured, and nothing is priced from a zero it never was.
+#[test]
+fn a_count_that_is_not_an_integer_is_unmeasured_not_zero() {
+    let mut body = ok_answer();
+    body["usageMetadata"]["promptTokenCount"] = json!("12");
+    let fake = server(Some(1_200), Reply::json(200, &body));
+    let done = adapter(&fake).complete("hello", 0).expect("answered");
+    assert_eq!(done.tokens_in_measured, None);
+    assert_eq!(done.cost_list_usd, None);
+
+    let mut body = ok_answer();
+    body["usageMetadata"]["candidatesTokenCount"] = json!(40.5);
+    let fake = server(Some(1_200), Reply::json(200, &body));
+    let done = adapter(&fake).complete("hello", 0).expect("answered");
+    assert_eq!(done.tokens_out, None);
+    assert_eq!(done.cost_list_usd, None);
+}
+
 #[test]
 fn a_long_prompt_on_a_tiered_model_is_priced_at_the_long_rate() {
     let model = "gemini-2.5-pro";

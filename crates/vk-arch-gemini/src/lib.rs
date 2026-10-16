@@ -635,12 +635,21 @@ impl ArchAdapter for GeminiAdapter {
 
         let usage = &answer["usageMetadata"];
         let measured = usage.is_object();
-        let prompt_tokens = usage.get("promptTokenCount").map(http::count);
-        let candidates_tokens = http::count(&usage["candidatesTokenCount"]);
-        let thoughts_tokens = http::count(&usage["thoughtsTokenCount"]);
+        // A count is an integer or it is not a count: a string or a float is
+        // unmeasured, never a zero that would price the call at nothing
+        // (review M-3). A count Google leaves out is a zero it means.
+        let integer = |key: &str| usage.get(key).filter(|v| v.is_u64()).map(http::count);
+        let left_out = |key: &str| usage.get(key).is_none_or(Value::is_null);
+        let part = |key: &str| integer(key).or_else(|| left_out(key).then_some(0));
+        let prompt_tokens = integer("promptTokenCount");
+        let candidates_tokens = part("candidatesTokenCount");
+        let thoughts_tokens = part("thoughtsTokenCount");
         // Thinking is billed at the output rate and bounded by the same
         // `maxOutputTokens`: it is output, as far as cost and the bound go.
-        let tokens_out = measured.then(|| candidates_tokens.saturating_add(thoughts_tokens));
+        let tokens_out = match (measured, candidates_tokens, thoughts_tokens) {
+            (true, Some(c), Some(t)) => Some(c.saturating_add(t)),
+            _ => None,
+        };
 
         // I4′ again, from Google's own count of what it read, against the
         // whole window — the number the refusal names.
@@ -662,6 +671,7 @@ impl ArchAdapter for GeminiAdapter {
         }
         let text = text_of(candidate);
         if text.trim().is_empty() {
+            let thoughts_tokens = thoughts_tokens.unwrap_or(0);
             return Err(AdapterError::Other(if finish == "MAX_TOKENS" {
                 anyhow!(
                     "{PROVIDER} spent the whole answer bound before writing any text \
@@ -688,7 +698,7 @@ impl ArchAdapter for GeminiAdapter {
                 "prompt_tokens": prompt_tokens,
                 "candidates_tokens": candidates_tokens,
                 "thoughts_tokens": thoughts_tokens,
-                "cached_tokens": http::count(&usage["cachedContentTokenCount"]),
+                "cached_tokens": part("cachedContentTokenCount"),
                 "finish_reason": finish,
                 // Strings off the far end, scrubbed like every other one
                 // (review M-5).
