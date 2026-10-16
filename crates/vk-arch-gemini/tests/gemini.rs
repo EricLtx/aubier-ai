@@ -11,6 +11,7 @@ use vk_arch_gemini::{
     GeminiAdapter, GeminiConfig, SecretString, Thinking, API_VERSION, DEFAULT_BASE_URL,
     DEFAULT_MODEL, KEY_HEADER, MODELS,
 };
+use vk_arch_openai_compat::http::MAX_BODY_BYTES;
 use vk_arch_openai_compat::MAX_OUTPUT_TOKENS;
 use vk_contracts::arch::{Determinism, Locality};
 use vk_contracts::labels::Scope;
@@ -336,6 +337,23 @@ fn a_key_echoed_back_by_the_far_end_never_reaches_an_error() {
     let text = other(adapter(&fake).complete("hi", 0).expect_err("400"));
     assert!(!text.contains(KEY), "{text}");
     assert!(text.contains("API key [redacted] not valid"), "{text}");
+}
+
+/// Review I-1: a response is read to a cap, not to its end.
+#[test]
+fn an_answer_past_the_body_cap_is_refused_and_not_repeated() {
+    let huge = Reply {
+        status: 200,
+        body: "SECRET-BODY".repeat(MAX_BODY_BYTES as usize / 11 + 1),
+        headers: vec![("content-type".into(), "application/json".into())],
+    };
+    let fake = server(Some(9), huge);
+    let text = other(adapter(&fake).complete("hi", 0).expect_err("too large"));
+    assert!(
+        text.contains(&format!("answer larger than {MAX_BODY_BYTES} bytes")),
+        "{text}"
+    );
+    assert!(!text.contains("SECRET-BODY"), "the body was repeated");
 }
 
 #[test]

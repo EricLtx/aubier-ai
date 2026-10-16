@@ -6,6 +6,7 @@ mod fake;
 
 use fake::{Fake, Reply};
 use serde_json::{json, Value};
+use vk_arch_openai_compat::http::MAX_BODY_BYTES;
 use vk_arch_openai_compat::{
     KeySource, OpenAiCompatAdapter, OpenAiCompatConfig, SecretString, CHAT_PATH, MAX_OUTPUT_TOKENS,
 };
@@ -511,6 +512,24 @@ fn a_far_end_message_is_cut_before_it_is_repeated() {
         "{} characters reached the client",
         text.chars().count()
     );
+}
+
+/// Review I-1: a response is read to a cap, not to its end. A far end that
+/// declares a body past it is refused, and none of that body is repeated.
+#[test]
+fn an_answer_past_the_body_cap_is_refused_and_not_repeated() {
+    let huge = Reply {
+        status: 200,
+        body: "SECRET-BODY".repeat(MAX_BODY_BYTES as usize / 11 + 1),
+        headers: vec![("content-type".into(), "application/json".into())],
+    };
+    let fake = Fake::start(&[(CHAT_PATH, huge)]);
+    let text = other(adapter(&fake).complete("hi", 0).expect_err("too large"));
+    assert!(
+        text.contains(&format!("answer larger than {MAX_BODY_BYTES} bytes")),
+        "{text}"
+    );
+    assert!(!text.contains("SECRET-BODY"), "the body was repeated");
 }
 
 /// Review M-5: the provider's own ids are strings off the far end like any

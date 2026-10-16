@@ -11,6 +11,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::{Client, Request, Response};
 use serde_json::Value;
+use std::io::Read;
 use std::time::Duration;
 use vk_arch_anthropic::SecretString;
 
@@ -23,6 +24,11 @@ pub const MAX_OUTPUT_TOKENS: u32 = 4096;
 /// How much of the ceiling a prompt may take before the call is refused (I4′).
 /// The tenth left over is the margin the count is allowed to be wrong by.
 pub const CONTEXT_HEADROOM: f64 = 0.9;
+
+/// The most one response may weigh, on every arch in this family. A real
+/// answer is a few kilobytes of JSON; a far end that sends more is broken or
+/// hostile, and the kernel does not buffer it to find out which.
+pub const MAX_BODY_BYTES: u64 = 4 * 1024 * 1024;
 
 /// How long a call that is only metadata — a token count — may take.
 pub const COUNT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -171,7 +177,12 @@ pub fn read_json(
     r: Response,
 ) -> Result<Value> {
     let status = r.status();
-    let text = r.text().unwrap_or_default();
+    // A far end that declares more than the cap is refused before a byte of
+    // it is read; one that does not declare, or lies, is cut at the cap.
+    if r.content_length().is_some_and(|n| n > MAX_BODY_BYTES) {
+        bail!("{what}: answer larger than {MAX_BODY_BYTES} bytes");
+    }
+    let text = read_bounded(r)?;
     let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     if !status.is_success() {
         let body = ErrorBody::of(&parsed);
@@ -196,6 +207,19 @@ pub fn read_json(
         );
     }
     Ok(parsed)
+}
+
+/// `r` read to its end, but never past [`MAX_BODY_BYTES`]: one byte more than
+/// the cap is asked for, so that "exactly the cap" passes and "past it" is
+/// told apart. The refusal repeats none of the body.
+fn read_bounded<R: Read>(r: R) -> Result<String> {
+    let mut bytes = Vec::new();
+    // A read that fails midway leaves what was read, as `Response::text` did.
+    let _ = r.take(MAX_BODY_BYTES + 1).read_to_end(&mut bytes);
+    if bytes.len() as u64 > MAX_BODY_BYTES {
+        bail!("answer larger than {MAX_BODY_BYTES} bytes");
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// The first `n` characters of `s`, marked when something was cut — a far end
@@ -248,6 +272,18 @@ pub fn count(v: &Value) -> u32 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_body_is_read_up_to_the_cap_and_refused_one_byte_past_it() {
+        let at_cap = vec![b'a'; MAX_BODY_BYTES as usize];
+        assert_eq!(
+            read_bounded(&at_cap[..]).expect("at the cap").len() as u64,
+            MAX_BODY_BYTES
+        );
+        let past = vec![b'a'; MAX_BODY_BYTES as usize + 1];
+        let err = format!("{:#}", read_bounded(&past[..]).expect_err("past the cap"));
+        assert_eq!(err, format!("answer larger than {MAX_BODY_BYTES} bytes"));
+    }
 
     #[test]
     fn a_429_is_a_rate_limit_unless_its_code_says_the_account_is_out() {

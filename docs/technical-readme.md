@@ -240,7 +240,8 @@ Three more API arches, built the Anthropic way: the key in this account's
 keyring and nowhere else, the origin fixed in the daemon, a closed mount
 config, a presence proof to mount, every error scrubbed of the key, no
 redirect followed, one answer bounded at 4096 tokens, I4′ before and after
-the call.
+the call. A response is read to 4 MiB and no further: a far end that declares
+more, or sends more, fails the call with `answer larger than 4194304 bytes`.
 
 ```
 vk secret set mistral                                   # prompts, no echo, keyring only

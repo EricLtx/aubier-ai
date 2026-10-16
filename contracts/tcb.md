@@ -140,7 +140,8 @@ below the base's), so no caller can put it on a request bound elsewhere — the 
 classification are `vk-arch-openai-compat`'s, every origin is daemon
 configuration bounded by the same `check_base_url`, every mount config is a
 closed shape, and every mount is a human act (I1) — `openai-compat` too, even
-on loopback, since the kernel did not start that server. What each one
+on loopback, since the kernel did not start that server. A response body is
+read to 4 MiB (`MAX_BODY_BYTES`) and no further, declared length or not. What each one
 **trusts** is the provider's own word, carried in the manifest where I2 reads
 it:
 
