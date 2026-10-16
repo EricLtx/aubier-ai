@@ -226,7 +226,8 @@ impl ArchAdapter for ChatArch {
                 {
                     tracing::warn!(
                         arch = %self.manifest.name,
-                        "{} reports no usage: the I4' post-check on the prompt it read is                          skipped for this arch, and only the estimate before the call stands",
+                        "{} reports no usage: the I4' post-check on the prompt it read is \
+                         skipped for this arch, and only the estimate before the call stands",
                         self.settings.provider
                     );
                 }

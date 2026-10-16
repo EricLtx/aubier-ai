@@ -68,5 +68,8 @@ fn a_skipped_post_check_is_said_once_and_recorded() {
         "once per arch, not per call: {log}"
     );
     assert!(log.contains("WARN"), "{log}");
+    // One clean sentence, not a run of padding where a line was joined
+    // (review M-1).
+    assert!(log.contains("it read is skipped for this arch"), "{log}");
     assert_eq!(details["usage_reported"], false);
 }
