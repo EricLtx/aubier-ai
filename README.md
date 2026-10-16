@@ -44,7 +44,7 @@ Early-stage, under active development.
 | SP1a | Single-node kernel: tasks, scheduler, leases and approvals, STOP, encrypted storage, hash-chained ledger, local IPC, the `vk` shell | Done (`sp1a`) |
 | SP1b | Real model adapters (local and cloud), confined agent harness, passkey approvals, Windows service, signed builds | Done (`sp1b`) |
 | Pilot | First application driver under the driver contract (a browser behind typed business actions), task recipes, and a complete governed process run through the kernel: plan, confined execution, judgement, two signed approvals, release | Done (`pilot-driver`) |
-| Next | Driver packaging and deployment, more model adapters with quota and health tracking, the execution context for drivers on a desktop, then evidence-gated promotion, AI capital packaging and re-qualification, peer-to-peer nodes | Being specified |
+| Next | Driver packaging and deployment, quota and health tracking for the model adapters, the execution context for drivers on a desktop, then evidence-gated promotion, AI capital packaging and re-qualification, peer-to-peer nodes | Being specified |
 
 Feasibility of the next stages has been checked with throwaway prototypes before any product code is written.
 
@@ -54,6 +54,7 @@ Feasibility of the next stages has been checked with throwaway prototypes before
 - `crates/` — the kernel, written in Rust. Internal codename: `vk` (`vkd` is the daemon, `vk` the shell).
   - `vk-contracts` contract types · `vk-kernel` syscalls, locks, labels, ledger · `vk-store` storage tiering · `vk-ipc` local transport · `vk-cli` the shell · `vkd` the daemon · `vk-service` the Windows service · `vk-web` the local web surface · `vk-stub` / `vk-props` invariant testing.
   - `vk-arch-ollama` · `vk-arch-claude-code` · `vk-arch-anthropic` — model adapters (local engine, the founder's coding-agent subscription, the API in US and EU hosting).
+  - `vk-arch-mistral` · `vk-arch-gemini` · `vk-arch-openai-compat` — model adapters for the API providers (Mistral on its EU endpoint, Google's Gemini, any OpenAI-compatible server).
   - `vk-harness` the confined agent harness · `vk-mcp` the tools it may call · `vk-driver` the application-driver host.
 - `drivers/` — application drivers (Python), each with its manifest; `recipes/` — task recipes the kernel runs end to end.
 - `docs/` — technical README, runbooks and use cases; `scripts/` — recette tooling.
