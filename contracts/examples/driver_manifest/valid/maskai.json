@@ -134,6 +134,79 @@
       "to_register": false
     },
     {
+      "name": "choisir_modele",
+      "reversible": false,
+      "args": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "additionalProperties": false
+      },
+      "evidence": [
+        "model.json"
+      ],
+      "to_register": false
+    },
+    {
+      "name": "recherche_web",
+      "reversible": false,
+      "args": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "off",
+              "auto",
+              "on"
+            ]
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "additionalProperties": false
+      },
+      "evidence": [
+        "web.json"
+      ],
+      "to_register": false
+    },
+    {
+      "name": "conversation_longue",
+      "reversible": false,
+      "args": {
+        "type": "object",
+        "properties": {
+          "case": {
+            "type": "string"
+          },
+          "turns": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 20
+          }
+        },
+        "required": [
+          "case",
+          "turns"
+        ],
+        "additionalProperties": false
+      },
+      "evidence": [
+        "turns.json",
+        "answer.png"
+      ],
+      "to_register": false
+    },
+    {
       "name": "verdict_oracle",
       "reversible": true,
       "args": {

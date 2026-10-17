@@ -1,9 +1,9 @@
 {
-  "version": 1,
-  "date": "2026-10-15",
+  "version": 2,
+  "date": "2026-10-17",
   "procedure": "docs/functional/use-cases/recettage-chat-ia/PROCEDURE.md",
   "notes": [
-    "Un cas par test de la grille N0–N9 (PROCEDURE.md §3). kind : load (mesurer_chargement), message (poser_question), attach_question (joindre_document puis poser_question), list (lister_conversations), concurrent (charge_concurrente).",
+    "Un cas par test de la grille N0–N9 (PROCEDURE.md §3). kind : load (mesurer_chargement), message (poser_question), attach_question (joindre_document puis poser_question), list (lister_conversations), concurrent (charge_concurrente) ; depuis la v2 du driver : model (choisir_modele avec model, puis poser_question ; la bannière de la réponse doit nommer ce modèle), web (recherche_web avec web, puis poser_question ; le POST et les étapes serveur doivent suivre ce mode), long (conversation_longue avec turns : first, filler pour chaque tour du milieu, {i} étant le rang du tour, puis last ; l'oracle juge le dernier tour).",
     "file est relatif au dossier du driver (fixture/…) ou à docs/functional/use-cases/recettage-chat-ia/ (corpus/, corpus-v2/).",
     "Un cas qui porte oracle prend question, must, must_not et pii dans corpus-v2/oracles-v2.json ; les autres portent les leurs. Les motifs sont des expressions régulières insensibles à la casse et aux accents (scripts/recette/evaluer.py) : pas d'échappement en majuscule (\\S, \\D, \\W), evaluer.py met le motif en minuscules.",
     "same_conversation_as : le cas se pose dans la conversation du cas nommé, sans nouvelle_conversation entre les deux.",
@@ -16,11 +16,13 @@
     {"id": "N1-1", "level": "N1", "kind": "message", "title": "Message court sans donnée personnelle", "nfr": ["disponibilite", "performance"], "budget_s": 10, "question": "Quelle est la capitale du Portugal ? Réponds en une phrase.", "must": ["lisbonne"], "must_not": []},
     {"id": "N1-2", "level": "N1", "kind": "message", "title": "Envoi vide : rien ne part, aucune erreur", "nfr": ["disponibilite"], "budget_s": 10, "question": "", "must": ["aucun envoi"], "must_not": []},
     {"id": "N1-3", "level": "N1", "kind": "message", "title": "Rendu d'une réponse structurée", "nfr": ["disponibilite"], "budget_s": 10, "question": "Donne trois conseils pour relancer un locataire en retard de loyer, sous forme de liste.", "must": ["relance|rappel|courrier|appel"], "must_not": []},
+    {"id": "N1-4", "level": "N1", "kind": "web", "web": "off", "title": "Message court, recherche web coupée (la base du 13/10) : même question que N1-1", "nfr": ["performance", "conformite"], "budget_s": 10, "question": "Quelle est la capitale du Portugal ? Réponds en une phrase.", "must": ["lisbonne"], "must_not": []},
 
     {"id": "N2-1a", "level": "N2", "kind": "message", "title": "Multi-tours : poser un fait", "nfr": ["veracite"], "budget_s": 10, "question": "Retiens ce numéro de dossier : AX-4471. Réponds seulement « noté ».", "must": ["note"], "must_not": []},
     {"id": "N2-1b", "level": "N2", "kind": "message", "title": "Multi-tours : le fait est retrouvé au tour suivant", "nfr": ["veracite"], "budget_s": 10, "same_conversation_as": "N2-1a", "question": "Quel numéro de dossier t'ai-je donné ?", "must": ["ax-?4471"], "must_not": []},
     {"id": "N2-2a", "level": "N2", "kind": "message", "title": "Multi-tours : poser une donnée chiffrée", "nfr": ["veracite"], "budget_s": 10, "question": "Le loyer de Mme Martin est de 835 € par mois. Réponds seulement « noté ».", "must": ["note"], "must_not": []},
     {"id": "N2-2b", "level": "N2", "kind": "message", "title": "Multi-tours : calcul sur la donnée du tour précédent", "nfr": ["veracite"], "budget_s": 10, "same_conversation_as": "N2-2a", "question": "Combien paie-t-elle sur un an ?", "must": ["10[ .]?020"], "must_not": []},
+    {"id": "N2-3", "level": "N2", "kind": "long", "title": "Conversation longue : le fait du premier tour est retrouvé au dernier, latence tour par tour", "nfr": ["veracite", "performance"], "budget_s": 10, "turns": 6, "first": "Retiens ce code de dossier : QT-2093. Réponds seulement « noté ».", "filler": "Tour {i} : donne un synonyme du mot « rapide », en un seul mot.", "last": "Quel code de dossier t'ai-je donné au premier tour ?", "must": ["qt-?2093"], "must_not": []},
 
     {"id": "N3-1", "level": "N3", "kind": "message", "title": "Factuel", "nfr": ["veracite"], "budget_s": 10, "question": "Quelle est la capitale de l'Australie, et depuis quelle année ?", "must": ["canberra", "1913|1908|1927"], "must_not": []},
     {"id": "N3-2", "level": "N3", "kind": "message", "title": "Calcul", "nfr": ["veracite"], "budget_s": 10, "question": "Un locataire paie 835 € par mois. Combien paie-t-il pour un trimestre ?", "must": ["2[ .]?505"], "must_not": []},
@@ -35,6 +37,7 @@
 
     {"id": "N5-1", "level": "N5", "kind": "message", "title": "Le modèle en service se nomme", "nfr": ["conformite"], "budget_s": 10, "question": "Quel modèle de langage produit cette réponse, et quel est son éditeur ?", "must": ["claude|gemini|gpt|mistral|llama"], "must_not": []},
     {"id": "N5-2", "level": "N5", "kind": "message", "title": "Même prompt que N3-2 : même résultat", "nfr": ["performance", "veracite"], "budget_s": 10, "question": "Un locataire paie 835 € par mois. Combien paie-t-il pour un trimestre ?", "must": ["2[ .]?505"], "must_not": []},
+    {"id": "N5-3", "level": "N5", "kind": "model", "model": "gemini", "title": "Un autre modèle choisi : même prompt que N3-2, la réponse est signée par le modèle choisi", "nfr": ["conformite", "veracite"], "budget_s": 10, "question": "Un locataire paie 835 € par mois. Combien paie-t-il pour un trimestre ?", "must": ["2[ .]?505"], "must_not": []},
 
     {"id": "V2-L1", "level": "N6", "kind": "attach_question", "oracle": "V2-L1", "title": "Fil d'e-mails : réponse sans données médicales ni fiscales", "file": "corpus-v2/L1_fil_emails_dupont.txt", "nfr": ["securite", "conformite", "veracite"], "budget_s": 20},
     {"id": "V2-L2", "level": "N6", "kind": "attach_question", "oracle": "V2-L2", "title": "Export JSON : extraction structurée", "file": "corpus-v2/L2_fiche_client_C001.json", "nfr": ["securite", "veracite"], "budget_s": 20},

@@ -66,10 +66,17 @@ class CasesTest(unittest.TestCase):
             levels.setdefault(c["level"], []).append(c)
             for key in ("id", "level", "kind", "nfr", "budget_s"):
                 self.assertIn(key, c, c["id"])
-            self.assertIn(c["kind"], ("load", "message", "attach_question", "list", "concurrent"), c["id"])
+            self.assertIn(c["kind"], ("load", "message", "attach_question", "list", "concurrent",
+                                      "model", "web", "long"), c["id"])
             self.assertLessEqual(set(c["nfr"]), set(drv.journal.NFR), c["id"])
-            if c["kind"] in ("message", "attach_question"):
+            if c["kind"] in ("message", "attach_question", "model", "web"):
                 self.assertIn("question", c, c["id"])
+            if c["kind"] == "model":
+                self.assertTrue(c["model"], c["id"])
+            if c["kind"] == "web":
+                self.assertIn(c["web"], drv.WEB_MODES, c["id"])
+            if c["kind"] == "long":
+                self.assertGreaterEqual(len(drv.long_questions(c, c["turns"])), 2, c["id"])
             if c["kind"] == "attach_question":
                 drv.Recette._resolve(c["file"])
             if c.get("same_conversation_as"):
@@ -84,6 +91,9 @@ class CasesTest(unittest.TestCase):
         self.assertGreaterEqual(len([c for c in levels["N8"] if c["kind"] == "message"]), 3)
         for fid in ("fixture-case-1", "fixture-case-2"):
             self.assertTrue(cases[fid]["file"].startswith("fixture/corpus/"))
+        # v2: one case of each new kind, at the level whose question it asks
+        self.assertEqual({c["kind"]: c["level"] for c in cases.values() if c["kind"] in ("model", "web", "long")},
+                         {"model": "N5", "web": "N1", "long": "N2"})
 
     def test_an_unknown_nfr_is_refused_at_start(self):
         drv = load_driver()
@@ -215,6 +225,44 @@ class GuardParseTest(unittest.TestCase):
         g = drv.parse_guard("PASS", "PASS", True)  # a body that also reads like a header word
         self.assertIsNone(g["model"])
         self.assertEqual(g["header"], "")
+
+
+class KindChecksTest(unittest.TestCase):
+    """What the cases model, web and long check beyond their oracle (no browser needed)."""
+
+    def check(self, case, obs):
+        drv = load_driver()
+        r = {"verdict": "OK", "notes": []}
+        nfr = drv.Recette._kind_checks(case, obs, r, [])
+        return r, nfr
+
+    def test_a_model_case_wants_the_banner_to_name_the_chosen_model(self):
+        case = {"kind": "model", "model": "gemini"}
+        r, nfr = self.check(case, {"guard": {"model": "google/eu.claude-haiku-5-5"},
+                                   "composer": {"model": "google/eu.gemini-3-flash"}})
+        self.assertEqual((r["verdict"], nfr), ("KO", ["conformite"]))
+        self.assertIn("réponse signée « google/eu.claude-haiku-5-5 », modèle choisi « google/eu.gemini-3-flash »",
+                      r["notes"][0])
+        r, _ = self.check(case, {"guard": {"model": "google/eu.gemini-3-flash"}})
+        self.assertEqual(r["verdict"], "OK")
+
+    def test_a_web_case_wants_the_post_and_the_steps_to_follow_the_mode(self):
+        case = {"kind": "web", "web": "off"}
+        r, nfr = self.check(case, {"sent": json.dumps({"message": "x", "web_search": "auto"}), "pipeline_ms": {}})
+        self.assertEqual((r["verdict"], nfr), ("KO", ["conformite"]))
+        self.assertIn("le POST porte web_search=auto, recherche web choisie off", r["notes"][0])
+        r, _ = self.check(case, {"sent": json.dumps({"web_search": "off"}), "pipeline_ms": {"web_search": 3665}})
+        self.assertEqual(r["verdict"], "KO")
+        self.assertIn("étape web_search de 3665 ms", r["notes"][0])
+        r, _ = self.check(case, {"sent": json.dumps({"web_search": "off"}), "pipeline_ms": {"web_search": 3}})
+        self.assertEqual(r["verdict"], "OK")
+
+    def test_a_long_case_wants_every_turn_answered(self):
+        turns = [{"turn": 1, "answer": "noté", "total_s": 4.1}, {"turn": 2, "answer": "", "total_s": 9.0},
+                 {"turn": 3, "answer": "QT-2093", "total_s": 12.5}]
+        r, nfr = self.check({"kind": "long"}, {"turns": turns})
+        self.assertEqual((r["verdict"], nfr), ("KO", ["disponibilite"]))
+        self.assertEqual(r["notes"], ["tours sans réponse : 2", "3 tours ; tour 1 en 4.1 s, tour 3 en 12.5 s"])
 
 
 class FixtureBench(unittest.TestCase):
@@ -727,6 +775,13 @@ class DriverOnFixture(FixtureBench):
         res = run("charge_concurrente", {"cases": ["fixture-case-1", "fixture-case-2"]})
         self.assertEqual(res["verdict"], "OK", res)
         self.assertTrue(res["a"]["answer"] and res["b"]["answer"])
+        self.assertEqual(run("choisir_modele", {"model": "mistral"})["model"], "mistral/mistral-large-3")
+        self.assertEqual(run("recherche_web", {"mode": "off"})["mode"], "off")
+        run("nouvelle_conversation")
+        recette.cases["every-long"] = {"id": "every-long", "level": "N2", "kind": "long", "budget_s": 5,
+                                       "nfr": ["veracite"], "first": "Bonjour", "last": "Au revoir",
+                                       "must": ["revoir"], "must_not": [], "pii": []}
+        self.assertEqual(run("conversation_longue", {"case": "every-long", "turns": 2})["turns"], 2)
         n = len(journal_lines(recette.work))
         self.assertEqual(run("exporter_journal")["lines"], n)
         self.assertEqual(run("exporter_journal")["lines"], 0)
@@ -923,6 +978,117 @@ class DriverV2OnFixture(FixtureBench):
         self.act(A, "capture_ecran")  # the guard closes the known modal by its cross
         self.assertEqual(recette.browser.call(
             "() => [window.__survey_answered, document.getElementById('avis').hidden]"), [False, True])
+
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class NewActionsOnFixture(FixtureBench):
+    """choisir_modele, recherche_web, conversation_longue (v2, design point 4)."""
+
+    def test_choisir_modele_picks_the_option_and_reads_it_back(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "choisir_modele", {"model": "gemini"})
+        self.assertEqual((res["model"], res["previous"], res["changed"]),
+                         ("google/eu.gemini-3-flash", "google/eu.claude-haiku-5-5", True))
+        rec = self.evidence_json(ev, "model.json")
+        self.assertEqual(rec["picked"], {"text": "Gemini 3 Flash", "value": "google/eu.gemini-3-flash"})
+        self.assertEqual(rec["options"], ["Claude Haiku 5.5", "Gemini 3 Flash", "Mistral Large 3"])
+        self.assertTrue(rec["list_closed"])
+        recette.cases["v2-model"] = {"id": "v2-model", "level": "N5", "kind": "model", "model": "gemini",
+                                     "question": "Bonjour", "budget_s": 5, "nfr": ["conformite"],
+                                     "must": ["bonjour"], "must_not": [], "pii": []}
+        res, _ = self.act(A, "poser_question", {"case": "v2-model"})
+        self.assertEqual(res["model"], "google/eu.gemini-3-flash", "the banner names the chosen model")
+        res, _ = self.act(A, "verdict_oracle", {"case": "v2-model"})
+        self.assertEqual(res["verdict"], "OK")
+        self.assertIn("modèle choisi « google/eu.gemini-3-flash », réponse signée « google/eu.gemini-3-flash »",
+                      journal_lines(recette.work)[-1]["evidence"])
+        res, _ = self.act(A, "choisir_modele", {"model": "google/eu.claude-haiku-5-5"})  # back, by its value
+        self.assertEqual((res["model"], res["changed"]), ("google/eu.claude-haiku-5-5", True))
+        res, _ = self.act(A, "choisir_modele", {"model": "claude haiku"})  # already shown: no click
+        self.assertFalse(res["changed"])
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "choisir_modele", {"model": "gpt-9"})
+        self.assertEqual(refused.exception.reason, "precondition")
+        self.assertIn("aucun modèle « gpt-9 » dans la liste", refused.exception.detail)
+        self.assertTrue(recette.browser.page().evaluate("() => document.getElementById('model-list').hidden"),
+                        "the list is closed again")
+        recette.cases["v2-model-2"] = {**recette.cases["v2-model"], "id": "v2-model-2"}
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "poser_question", {"case": "v2-model-2"})
+        self.assertIn("choisir_modele gemini d'abord", refused.exception.detail)
+
+    def test_recherche_web_cycles_to_the_mode_and_the_web_case_checks_it(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "recherche_web", {"mode": "off"})
+        self.assertEqual((res["mode"], res["previous"], res["clicks"]), ("off", "auto", 2))
+        self.assertEqual(self.evidence_json(ev, "web.json")["seen"], ["auto", "on", "off"])
+        recette.cases["v2-web"] = {"id": "v2-web", "level": "N1", "kind": "web", "web": "off", "question": "Bonjour",
+                                   "budget_s": 5, "nfr": ["performance"], "must": ["bonjour"], "must_not": [], "pii": []}
+        res, _ = self.act(A, "poser_question", {"case": "v2-web"})
+        self.assertEqual([s["node"] for s in res["server_steps"]], ["retrieve", "generate"])
+        res, _ = self.act(A, "verdict_oracle", {"case": "v2-web"})
+        self.assertEqual(res["verdict"], "OK")
+        self.assertIn("recherche web off ; POST web_search=off ; étape web_search absente",
+                      journal_lines(recette.work)[-1]["evidence"])
+        self.assertEqual(self.act(A, "recherche_web", {"mode": "on"})[0]["mode"], "on")
+        recette.cases["v2-web-on"] = {**recette.cases["v2-web"], "id": "v2-web-on", "web": "on"}
+        self.act(A, "nouvelle_conversation")
+        res, _ = self.act(A, "poser_question", {"case": "v2-web-on"})
+        self.assertIn("web_search", [s["node"] for s in res["server_steps"]])
+        recette.cases["v2-web-2"] = {**recette.cases["v2-web"], "id": "v2-web-2"}
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "poser_question", {"case": "v2-web-2"})
+        self.assertIn("recherche_web off d'abord (recherche web : on)", refused.exception.detail)
+
+    def long_case(self, recette, cid, **over):
+        recette.cases[cid] = {"id": cid, "level": "N2", "kind": "long", "budget_s": 5, "nfr": ["veracite"],
+                              "first": "Retiens le code QT-2093", "filler": "Tour {i} : un synonyme de rapide",
+                              "last": "Quel code au premier tour ?", "must": ["quel code au premier tour"],
+                              "must_not": [], "pii": [], **over}
+
+    def test_conversation_longue_asks_n_turns_in_one_conversation(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.long_case(recette, "v2-long")
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "conversation_longue", {"case": "v2-long", "turns": 4})
+        self.assertEqual(res["turns"], 4)
+        self.assertEqual({e["name"] for e in ev}, {"turns.json", "answer.png"})
+        turns = self.evidence_json(ev, "turns.json")["turns"]
+        self.assertEqual([t["question"] for t in turns],
+                         ["Retiens le code QT-2093", "Tour 2 : un synonyme de rapide",
+                          "Tour 3 : un synonyme de rapide", "Quel code au premier tour ?"])
+        self.assertEqual(turns[2]["answer"], "TOUR 3 : UN SYNONYME DE RAPIDE — pièces jointes : aucune")
+        self.assertTrue(all(t["display_stable"] and t["sent_source"] == "popover" for t in turns), turns)
+        self.assertEqual(recette.browser.call("() => document.querySelectorAll('article').length"), 4,
+                         "one conversation")
+        res, _ = self.act(A, "verdict_oracle", {"case": "v2-long"})
+        self.assertEqual(res["verdict"], "OK")
+        self.assertIn("4 tours ; tour 1 en", journal_lines(recette.work)[-1]["evidence"])
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "conversation_longue", {"case": "fixture-case-1", "turns": 3})
+        self.assertEqual(refused.exception.reason, "precondition")
+
+    def test_an_abandoned_turn_is_journaled_with_the_turns_done(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.long_case(recette, "v2-long-slow", budget_s=1, filler="SLOW tour {i}")
+        self.act(A, "nouvelle_conversation")
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "conversation_longue", {"case": "v2-long-slow", "turns": 3})
+        self.assertEqual(refused.exception.reason, "timeout")
+        self.assertIn("au tour 2/3", refused.exception.detail)
+        self.assertEqual([e["name"] for e in refused.exception.evidence], ["turns.json"])
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual((line["case"], line["verdict"]), ("v2-long-slow", "KO"))
+        self.assertIn("disponibilite", line["nfr"])
+        self.assertIn("arrêt cliqué", line["evidence"])
+        res, _ = self.act(A, "verdict_oracle", {"case": "v2-long-slow"})
+        self.assertEqual((res["verdict"], res["replayed"]), ("KO", True))
 
 
 if __name__ == "__main__":

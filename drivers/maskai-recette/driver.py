@@ -39,7 +39,10 @@ Ce que la v2 ajoute (debrief du 2026-10-17, docs/technical/debriefs/) :
   driver ouvre et referme lui-même dans la même action (`sent.json`, D4) ;
 - au délai d'abandon, le driver clique sur le bouton d'arrêt avant de rendre la
   main : aucune génération laissée en vol (D2), et la ligne dit ce qui était
-  parti (D8).
+  parti (D8) ;
+- trois actions de plus : choisir_modele et recherche_web règlent le compositeur
+  et relisent ce qu'il affiche ; conversation_longue pose n questions dans la
+  même conversation. Les cas `model`, `web` et `long` les utilisent.
 
 Environnement (posé par l'hôte) : VK_DRIVER_PROFILE_DIR, VK_DRIVER_WORK_DIR,
 VK_DRIVER_HEADLESS, VK_DRIVER_CHANNEL, VK_DRIVER_HOSTS ; MASKAI_ENTRY_URL
@@ -158,6 +161,17 @@ SELECTORS = {
     # Libellé du panneau « texte envoyé au modèle » : « SENT TO THE LLM » vu le 13/10, disparu le
     # 17/10 ; le secours du popover.
     "sent_label": r"sent to the llm|envoy[ée] au mod[èe]le|texte envoy[ée]",
+    # Compositeur (v2) : le bouton « Model: <modèle> » qui ouvre une liste d'options, le bouton
+    # « Web search: <mode> » et son data-mode (relevés le 17/10 par le fondateur). À confirmer : le
+    # rôle de la liste (listbox ou menu), le mode web en cycle ou en menu, les mots des modes.
+    "model_button": ['button[aria-label^="Model:"]', 'button[aria-label^="Modèle"]'],
+    "model_prefix": r"^\s*(?:model|modèle)\s*:\s*",
+    "listbox": '[role="listbox"]',
+    "option": '[role="option"]',
+    "web_button": ['button[aria-label^="Web search:"]', 'button[aria-label^="Recherche web"]'],
+    "web_menu": '[role="menu"], [role="listbox"]',
+    "web_menu_item": '[role="menuitemradio"], [role="menuitem"], [role="option"]',
+    "web_words": {"off": r"\boff\b|désactiv|jamais|never", "auto": r"\bauto", "on": r"\bon\b|activ|toujours|always"},
     # Fenêtres modales (CSS).
     "modal": '[role="dialog"], [role="alertdialog"], [aria-modal="true"], .modal',
 }
@@ -204,6 +218,9 @@ ATTACH_QUIET_S = 2.0
 # plus SENT_SETTLE_S.
 SENT_STABLE_S = 0.5
 SENT_SETTLE_S = 3.0
+# Recherche web coupée : une étape web_search plus longue que cela est une recherche faite.
+WEB_OFF_MAX_MS = 1000
+WEB_MODES = ("off", "auto", "on")
 MARGIN_S = 8                      # laissé sous l'échéance de l'hôte pour écrire les preuves
 NFR_ORDER = ["performance", "veracite", "disponibilite", "securite", "conformite", "scalabilite"]
 
@@ -412,6 +429,33 @@ CHIP_JS = """(a) => {
            attr: el.getAttribute('data-state') || el.getAttribute('data-status') || '' };
 }"""
 
+# Le premier élément visible d'une liste de sélecteurs : le sélecteur, son rang parmi ses
+# correspondances, son aria-label, son texte, son data-mode.
+CONTROL_JS = "(a) => {" + _VISIBLE + """
+  for (const s of a.sels) {
+    const els = [...document.querySelectorAll(s)];
+    const i = els.findIndex(visible);
+    if (i < 0) continue;
+    const el = els[i];
+    return { sel: s, index: i, label: (el.getAttribute('aria-label') || '').trim(),
+             text: (el.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 200),
+             mode: el.getAttribute('data-mode') || '', expanded: el.getAttribute('aria-expanded') === 'true' };
+  }
+  return null;
+}"""
+
+# Les options de la dernière liste ouverte (a.list) : rang, texte, valeur, visibilité.
+OPTIONS_JS = "(a) => {" + _VISIBLE + """
+  const lists = [...document.querySelectorAll(a.list)].filter(visible);
+  if (!lists.length) return null;
+  const list = lists[lists.length - 1];
+  return [...list.querySelectorAll(a.option)].map((o, i) => ({ index: i, visible: visible(o),
+    text: (o.innerText || o.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 200),
+    value: o.getAttribute('data-value') || o.getAttribute('value') || o.getAttribute('data-mode') || '' }));
+}"""
+
+LIST_OPEN_JS = "(a) => {" + _VISIBLE + " return [...document.querySelectorAll(a.list)].some(visible); }"
+
 TITLES_JS = "(a) => {" + _PICK + """
   return pick(a.items).map((el) => (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 120)).filter(Boolean).slice(0, 200);
 }"""
@@ -547,6 +591,88 @@ class ChipWatch:
         return state
 
 
+def norm_label(s: str) -> str:
+    """Un libellé pour comparer : minuscules, `-`, `_`, `.` et blancs réduits à une espace."""
+    return re.sub(r"[\s._-]+", " ", (s or "").casefold()).strip()
+
+
+def model_matches(want: str, seen: str | None) -> bool:
+    """Le modèle `seen` (relu sur le bouton ou sur la bannière) est-il `want` ? L'un contient
+    l'autre, à la casse et aux séparateurs près (« gemini » et « google/eu.gemini-3-flash »)."""
+    w, v = norm_label(want), norm_label(seen or "")
+    return bool(w and v) and (w in v or (len(v) >= 4 and v in w))
+
+
+def choose_option(want: str, options: list) -> tuple[dict | None, list]:
+    """L'option à choisir pour `want`, et toutes celles qui convenaient : égalité du texte ou de
+    la valeur, sinon `want` contenu dans le texte ou la valeur, sinon un texte d'au moins quatre
+    caractères contenu dans `want` ; la première dans l'ordre de la liste."""
+    w = norm_label(want)
+    shown = [o for o in options if o.get("visible", True)] or options
+    for test in (lambda o: w in (norm_label(o["text"]), norm_label(o["value"])),
+                 lambda o: w in norm_label(o["text"]) or (o["value"] and w in norm_label(o["value"])),
+                 lambda o: (len(norm_label(o["text"])) >= 4 and norm_label(o["text"]) in w)
+                 or (len(norm_label(o["value"])) >= 4 and norm_label(o["value"]) in w)):
+        found = [o for o in shown if w and test(o)]
+        if found:
+            return found[0], found
+    return None, []
+
+
+def model_of(control: dict | None) -> str | None:
+    """Le modèle affiché par le bouton du compositeur : son aria-label sans « Model: »."""
+    if not control:
+        return None
+    return re.sub(SELECTORS["model_prefix"], "", control["label"], flags=re.I).strip() or control["text"] or None
+
+
+def web_mode_of(control: dict | None) -> str | None:
+    """Le mode de recherche web affiché : data-mode s'il dit off/auto/on, sinon le mot du
+    libellé après « : » (« Web search: Auto »)."""
+    if not control:
+        return None
+    if control.get("mode", "").lower() in WEB_MODES:
+        return control["mode"].lower()
+    return web_word(re.sub(r"^[^:]*:\s*", "", control["label"] or control["text"]))
+
+
+def web_word(text: str) -> str | None:
+    for mode in ("off", "auto", "on"):  # off first: « désactivée » contains « activ »
+        if re.search(SELECTORS["web_words"][mode], text or "", re.I):
+            return mode
+    return None
+
+
+def web_field(post_body: str | None) -> str | None:
+    """Le champ web_search du POST envoyé au flux, s'il en porte un."""
+    if not post_body:
+        return None
+    try:
+        value = json.loads(post_body).get("web_search")
+        return str(value).lower() if value is not None else None
+    except (ValueError, AttributeError):
+        m = re.search(r'"web_search"\s*:\s*"(\w+)"', post_body)
+        return m.group(1).lower() if m else None
+
+
+def long_questions(case: dict, turns: int) -> list:
+    """Les questions d'un cas `long` : `first`, puis `filler` pour chaque tour du milieu ({i} est
+    le rang du tour), puis `last`."""
+    first, filler, last = case.get("first"), case.get("filler"), case.get("last")
+    if turns < 2 or not first or not last or (turns > 2 and not filler):
+        raise ValueError(f"case {case['id']}: a long case needs first, last, filler and turns >= 2")
+    return [first] + [filler.format(i=i) for i in range(2, turns)] + [last]
+
+
+def turn_summary(i: int, question: str, obs: dict) -> dict:
+    guard = obs.get("guard") or {}
+    return {"turn": i, "question": question, "answer": (obs.get("answer") or "")[:4000],
+            "ttft_s": obs.get("ttft_s"), "total_s": obs.get("total_s"), "display_s": obs.get("display_s"),
+            "display_stable": obs.get("display_stable"), "end": obs.get("end"), "model": guard.get("model"),
+            "pii_detected": guard.get("pii_detected"), "sent_source": (obs.get("sent_info") or {}).get("source"),
+            "sent_to_model": (obs.get("sent_to_model") or "")[:4000] or None, "pipeline_ms": obs.get("pipeline_ms")}
+
+
 def chip_label(reading: dict | None) -> str:
     if not reading:
         return ""
@@ -593,6 +719,8 @@ def load_cases(path: Path = DRIVER_DIR / "cases.json") -> dict:
                 c.setdefault(key, o.get(key, []))
         for key in ("must", "must_not", "pii", "nfr"):
             c.setdefault(key, [])
+        if c.get("kind") == "long":
+            long_questions(c, c.get("turns") or 2)  # refused at start, not at the first turn
         unknown = [n for n in c["nfr"] if n not in journal.NFR]
         if unknown:
             raise ValueError(f"case {c['id']}: unknown NFR {unknown}; the journal knows {journal.NFR}")
@@ -1034,7 +1162,8 @@ class Recette:
     def actions(self) -> dict:
         browser = ["mesurer_chargement", "nouvelle_conversation", "joindre_document", "poser_question",
                    "envoyer_message", "lire_reponse", "capturer_flux", "lister_conversations",
-                   "charge_concurrente", "capture_ecran"]
+                   "charge_concurrente", "capture_ecran", "choisir_modele", "recherche_web",
+                   "conversation_longue"]
         local = ["verdict_oracle", "exporter_journal"]
         return {**{n: self._wrap(getattr(self, n), browser=True) for n in browser},
                 **{n: self._wrap(getattr(self, n), browser=False) for n in local}}
@@ -1731,8 +1860,18 @@ class Recette:
         armé ; abandon à 3 × le budget du cas, journalisé KO disponibilité."""
         cid = args["case"]
         case = self._case(cid)
-        if case["kind"] not in ("message", "attach_question") or "question" not in case:
-            raise DriverRefusal("precondition", f"le cas {cid} ({case['kind']}) n'a pas de question")
+        if case["kind"] not in ("message", "attach_question", "model", "web") or "question" not in case:
+            hint = " : conversation_longue" if case["kind"] == "long" else ""
+            raise DriverRefusal("precondition", f"le cas {cid} ({case['kind']}) n'a pas de question{hint}")
+        composer = None
+        if case["kind"] in ("model", "web"):  # the composer as it is now, read on screen
+            composer = self._composer_now(self.browser.page())
+            if case["kind"] == "model" and not model_matches(case["model"], composer["model"]):
+                raise DriverRefusal("precondition", f"choisir_modele {case['model']} d'abord "
+                                                    f"(modèle du compositeur : {composer['model']})")
+            if case["kind"] == "web" and composer["web"] != case["web"]:
+                raise DriverRefusal("precondition", f"recherche_web {case['web']} d'abord "
+                                                    f"(recherche web : {composer['web']})")
         if case["kind"] == "attach_question":
             if cid not in self.conv["attached"]:
                 raise DriverRefusal("precondition", f"joindre_document {cid} d'abord (pièce jointe : aucune)")
@@ -1761,7 +1900,8 @@ class Recette:
                                                                 **t.profile}
             raise DriverRefusal("timeout", t.why, extra={"journal": line, "abort": t.profile}) from None
         self.conv["asked"].append(cid)
-        self.observations[cid] = {**obs, "html": None, **({"attach": attach} if attach else {})}
+        self.observations[cid] = {**obs, "html": None, **({"attach": attach} if attach else {}),
+                                  **({"composer": composer} if composer else {})}
         self._answer_evidence(ev, obs, mark)
         return self._answer_result(obs, cid)
 
@@ -1879,7 +2019,7 @@ class Recette:
             nfr = nfr_union(nfr, ["disponibilite"])
         elif not asked and not dialog and not offlist:
             hint = {"load": "mesurer_chargement", "list": "lister_conversations",
-                    "concurrent": "charge_concurrente"}.get(case["kind"], "poser_question")
+                    "concurrent": "charge_concurrente", "long": "conversation_longue"}.get(case["kind"], "poser_question")
             raise DriverRefusal("precondition", f"aucune observation pour {cid} : {hint} d'abord")
         elif asked:
             oracle = {"id": cid, "must": case["must"], "must_not": case["must_not"], "pii": case["pii"]}
@@ -1896,6 +2036,7 @@ class Recette:
                 r["notes"].append("corps de réponse introuvable : texte de la carte entière, en-tête compris")
             if obs.get("display_stable") is False:
                 r["notes"].append("affichage encore en mouvement à la capture")
+            nfr = self._kind_checks(case, obs, r, nfr)
         else:
             r = {"verdict": "KO", "notes": []}
         for key_ in ("missing", "forbidden", "leaks", "span_issues", "notes"):
@@ -1921,6 +2062,43 @@ class Recette:
         ev.add("journal.jsonl", (line + "\n").encode("utf-8", "replace"))
         return {"case": cid, "verdict": r["verdict"], "missing": r["missing"], "forbidden": r["forbidden"],
                 "leaks": r["leaks"], "span_issues": r["span_issues"], "replayed": False, "text": line}
+
+    @staticmethod
+    def _kind_checks(case: dict, obs: dict, r: dict, nfr: list) -> list:
+        """Ce que les cas model, web et long vérifient en plus de l'oracle (v2) ; rend les ENF."""
+        kind = case["kind"]
+        if kind == "model":
+            seen = (obs.get("guard") or {}).get("model")
+            chosen = (obs.get("composer") or {}).get("model") or case["model"]
+            if not model_matches(case["model"], seen):
+                r["verdict"] = "KO"
+                r["notes"].insert(0, f"réponse signée « {seen or 'sans bannière'} », modèle choisi « {chosen} »")
+                nfr = nfr_union(nfr, ["conformite"])
+            else:
+                r["notes"].append(f"modèle choisi « {chosen} », réponse signée « {seen} »")
+        elif kind == "web":
+            posted = web_field(obs.get("sent"))
+            web_ms = (obs.get("pipeline_ms") or {}).get("web_search")
+            if posted is not None and posted != case["web"]:
+                r["verdict"] = "KO"
+                r["notes"].insert(0, f"le POST porte web_search={posted}, recherche web choisie {case['web']}")
+                nfr = nfr_union(nfr, ["conformite"])
+            elif case["web"] == "off" and web_ms is not None and web_ms >= WEB_OFF_MAX_MS:
+                r["verdict"] = "KO"
+                r["notes"].insert(0, f"étape web_search de {web_ms} ms, recherche web coupée")
+                nfr = nfr_union(nfr, ["conformite"])
+            r["notes"].append(f"recherche web {case['web']} ; POST web_search={posted or 'absent'} ; étape web_search "
+                              + (f"{web_ms} ms" if web_ms is not None else "absente"))
+        elif kind == "long" and obs.get("turns"):
+            turns = obs["turns"]
+            empty = [str(t["turn"]) for t in turns if not t.get("answer")]
+            if empty:
+                r["verdict"] = "KO"
+                r["notes"].insert(0, f"tours sans réponse : {', '.join(empty)}")
+                nfr = nfr_union(nfr, ["disponibilite"])
+            r["notes"].append(f"{len(turns)} tours ; tour 1 en {turns[0]['total_s']} s, tour {len(turns)} en "
+                              f"{turns[-1]['total_s']} s")
+        return nfr
 
     @staticmethod
     def _summary(r: dict, obs: dict) -> str:
@@ -2046,6 +2224,156 @@ class Recette:
             # recorded with the second tab open, and may name another tab now.
             raise self._host_refusal(navs[-1], ev, page=b.page())
         return {"case": cid, "a": out[a], "b": out[bb], "verdict": verdict, "replayed": False, "text": line}
+
+    # -- le compositeur (v2) -----------------------------------------------------------------
+    def _control(self, page, sels: list) -> dict | None:
+        return self.browser.call(CONTROL_JS, {"sels": sels}, page=page)
+
+    def _composer_now(self, page) -> dict:
+        return {"model": model_of(self._control(page, SELECTORS["model_button"])),
+                "web": web_mode_of(self._control(page, SELECTORS["web_button"]))}
+
+    def _close_list(self, page, sel: str) -> bool:
+        """Une liste encore ouverte est refermée par Échap ; rend True si elle est fermée."""
+        b = self.browser
+        for attempt in range(2):
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                if not b.call(LIST_OPEN_JS, {"list": sel}, page=page, timeout_ms=2000):
+                    return True
+                page.wait_for_timeout(100)
+            if attempt == 0:
+                page.keyboard.press("Escape")
+        return False
+
+    def choisir_modele(self, args: dict, ev: Evidence) -> dict:
+        """Choisir le modèle du compositeur : le bouton « Model: … » ouvre une liste ; l'option qui
+        correspond à `model` (choose_option) est cliquée, puis le modèle est relu sur le bouton
+        (model.json). Le changement reste : l'action ne restaure rien (reversible: false)."""
+        want = args["model"]
+        b = self.browser
+        page = b.page()
+        self._ensure_on_app(page)
+        button = self._control(page, SELECTORS["model_button"])
+        if button is None:
+            raise DriverRefusal("precondition", "pas de bouton de modèle (« Model: … ») dans le compositeur")
+        previous = model_of(button)
+        record = {"asked": want, "previous": previous, "options": [], "picked": None, "candidates": [],
+                  "read_back": previous, "changed": False, "list_closed": None}
+        if not model_matches(want, previous):
+            page.locator(button["sel"]).nth(button["index"]).click(timeout=5000)
+            arg = {"list": SELECTORS["listbox"], "option": SELECTORS["option"]}
+            options, deadline = None, time.monotonic() + 5
+            while not options and time.monotonic() < deadline:
+                page.wait_for_timeout(150)
+                options = b.call(OPTIONS_JS, arg, page=page)
+            record["options"] = [o["text"] or o["value"] for o in options or []][:50]
+            pick, candidates = choose_option(want, options or [])
+            record["candidates"] = [o["text"] for o in candidates][:10]
+            if pick is None:
+                record["list_closed"] = self._close_list(page, SELECTORS["listbox"])
+                ev.json("model.json", record)
+                why = ("la liste des modèles ne s'ouvre pas" if not options
+                       else f"aucun modèle « {want} » dans la liste : {', '.join(record['options'][:10])}")
+                raise DriverRefusal("precondition", why, extra={"options": record["options"]})
+            record["picked"] = {"text": pick["text"], "value": pick["value"]}
+            page.locator(f'{SELECTORS["listbox"]} >> visible=true').last.locator(
+                SELECTORS["option"]).nth(pick["index"]).click(timeout=5000)
+            record["list_closed"] = self._close_list(page, SELECTORS["listbox"])
+            deadline = time.monotonic() + 3
+            while True:  # read back on the button, once it shows the change
+                record["read_back"] = model_of(self._control(page, SELECTORS["model_button"]))
+                if model_matches(want, record["read_back"]) or time.monotonic() >= deadline:
+                    break
+                page.wait_for_timeout(150)
+            record["changed"] = record["read_back"] != previous
+        ev.json("model.json", record)
+        if not model_matches(want, record["read_back"]):
+            raise DriverRefusal("precondition", f"modèle relu « {record['read_back']} » au lieu de « {want} »",
+                                extra={"read_back": record["read_back"]})
+        return {"model": record["read_back"], "previous": previous, "changed": record["changed"],
+                "text": f"modèle du compositeur : {record['read_back']} (avant : {previous})"}
+
+    def recherche_web(self, args: dict, ev: Evidence) -> dict:
+        """Régler la recherche web du compositeur : le bouton « Web search: … » (data-mode) est
+        cliqué jusqu'à afficher `mode` (un cycle, quatre clics au plus) ; s'il ouvre un menu, l'entrée
+        du mode est choisie. Le mode est relu sur le bouton (web.json). Le réglage reste : l'action
+        ne restaure rien (reversible: false)."""
+        want = args["mode"]
+        b = self.browser
+        page = b.page()
+        self._ensure_on_app(page)
+        control = self._control(page, SELECTORS["web_button"])
+        if control is None:
+            raise DriverRefusal("precondition", "pas de bouton de recherche web (« Web search: … ») dans le compositeur")
+        previous = web_mode_of(control)
+        seen, clicks, menu = [previous], 0, False
+        while control is not None and web_mode_of(control) != want and clicks < 4:
+            page.locator(control["sel"]).nth(control["index"]).click(timeout=5000)
+            clicks += 1
+            page.wait_for_timeout(300)
+            items = b.call(OPTIONS_JS, {"list": SELECTORS["web_menu"], "option": SELECTORS["web_menu_item"]}, page=page)
+            if items:  # a menu rather than a cycle: pick the mode's entry
+                menu = True
+                pick = next((o for o in items if web_word(o["value"]) == want or web_word(o["text"]) == want), None)
+                if pick is None:
+                    self._close_list(page, SELECTORS["web_menu"])
+                    break
+                page.locator(f'{SELECTORS["web_menu"]} >> visible=true').last.locator(
+                    SELECTORS["web_menu_item"]).nth(pick["index"]).click(timeout=5000)
+                self._close_list(page, SELECTORS["web_menu"])
+            control = self._control(page, SELECTORS["web_button"])
+            seen.append(web_mode_of(control))
+        read_back = web_mode_of(control)
+        record = {"asked": want, "previous": previous, "read_back": read_back, "clicks": clicks, "menu": menu,
+                  "seen": seen, "label": control["label"] if control else None}
+        ev.json("web.json", record)
+        if read_back != want:
+            raise DriverRefusal("precondition", f"recherche web relue « {read_back} » au lieu de « {want} »",
+                                extra={"read_back": read_back})
+        return {"mode": read_back, "previous": previous, "changed": read_back != previous, "clicks": clicks,
+                "text": f"recherche web : {read_back} (avant : {previous}, {clicks} clic{'s' if clicks > 1 else ''})"}
+
+    def conversation_longue(self, args: dict, ev: Evidence) -> dict:
+        """Un cas `long` : `turns` questions dans la conversation en cours (first, filler, last),
+        chacune lue comme poser_question (fin de réponse, en-tête, texte envoyé) ; turns.json
+        garde chaque tour, verdict_oracle juge le dernier. L'abandon d'un tour est journalisé KO
+        disponibilité, arrêt cliqué, comme poser_question."""
+        cid, n = args["case"], int(args["turns"])
+        case = self._case(cid)
+        if case["kind"] != "long":
+            raise DriverRefusal("precondition", f"le cas {cid} ({case['kind']}) n'est pas une conversation longue")
+        try:
+            questions = long_questions(case, n)
+        except ValueError as e:
+            raise DriverRefusal("precondition", str(e)) from None
+        self._case_in_hand = cid
+        self.observations[cid] = {}
+        mark = self.browser.mark()
+        self._last_asked = {"case": cid, "mark": mark}
+        budget = case.get("budget_s") or DEFAULT_BUDGET_S
+        turns, obs = [], {}
+        for i, q in enumerate(questions, 1):
+            try:
+                obs = self._ask(q, budget)
+            except AskTimeout as t:
+                why = f"{t.why} au tour {i}/{n}"
+                line = self._journal_add(cid, "KO", t.seconds, f"{why} : pas de fin de réponse ; {abort_text(t.profile)}",
+                                         nfr_union(case["nfr"], ["disponibilite"]))
+                timeout = {"seconds": round(t.seconds, 1), "turn": i, "t": now_iso(), **t.profile}
+                self.observations[cid] = {"turns": turns, "timeout": timeout}
+                ev.json("turns.json", {"case": cid, "asked_turns": n, "turns": turns, "timeout": timeout})
+                raise DriverRefusal("timeout", why, extra={"journal": line, "abort": t.profile, "turns": len(turns)},
+                                    evidence=ev.items) from None
+            turns.append(turn_summary(i, q, obs))
+        self.conv["asked"].append(cid)
+        self.observations[cid] = {**obs, "html": None, "turns": turns}
+        ev.json("turns.json", {"case": cid, "asked_turns": n, "turns": turns})
+        ev.screenshot(self.browser.page(), "answer.png")
+        return {"case": cid, "turns": len(turns), "answer": obs.get("answer"),
+                "total_s": [t["total_s"] for t in turns],
+                "text": f"{cid} : {len(turns)} tours, le dernier en {obs.get('total_s')} s — "
+                        f"{one_line(obs.get('answer') or '', 140)}"}
 
     def capture_ecran(self, args: dict, ev: Evidence) -> dict:
         """Une capture de la partie visible de la page."""
