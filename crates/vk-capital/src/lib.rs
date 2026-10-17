@@ -8,5 +8,6 @@
 pub mod error;
 pub mod fingerprint;
 pub mod layout;
+pub mod signature;
 
 pub use error::CapitalError;
