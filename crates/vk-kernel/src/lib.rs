@@ -529,11 +529,26 @@ pub struct RealKernel {
 /// else `%ProgramFiles%\Aubier\drivers` — `/opt/aubier/drivers` off Windows,
 /// so the kernel and its tests build everywhere.
 fn default_install_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("VK_DRIVER_INSTALL_ROOT").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
+    install_root_from(
+        std::env::var_os("VK_DRIVER_INSTALL_ROOT"),
+        std::env::var_os("ProgramFiles"),
+    )
+}
+
+/// [`default_install_root`] from the two variables' values. A relative
+/// override is made absolute here, once, against the current directory: the
+/// context rules compare every root with it, and a relative one would move
+/// with the process's directory.
+fn install_root_from(
+    override_dir: Option<std::ffi::OsString>,
+    program_files: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(dir) = override_dir.filter(|d| !d.is_empty()) {
+        let dir = PathBuf::from(dir);
+        return std::path::absolute(&dir).unwrap_or(dir);
     }
     if cfg!(windows) {
-        std::env::var_os("ProgramFiles")
+        program_files
             .filter(|d| !d.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
@@ -3126,6 +3141,34 @@ mod tests {
     fn open(dir: &std::path::Path) -> RealKernel {
         vk_contracts::testing::guard_state_dir(dir);
         RealKernel::open(dir, KeySource::File(dir.join("master.key")), "n1").unwrap()
+    }
+
+    /// `VK_DRIVER_INSTALL_ROOT` is made absolute once, against the directory
+    /// the daemon starts in: a relative root would otherwise move with every
+    /// later change of directory, and the context rules compare against it.
+    #[test]
+    fn a_relative_install_root_is_made_absolute_once() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            install_root_from(Some("rel/drivers".into()), None),
+            cwd.join("rel").join("drivers")
+        );
+        let absolute = cwd.join("abs");
+        assert_eq!(
+            install_root_from(Some(absolute.clone().into_os_string()), None),
+            absolute
+        );
+        let pf = cwd.join("pf");
+        let expected = if cfg!(windows) {
+            pf.join("Aubier").join("drivers")
+        } else {
+            PathBuf::from("/opt/aubier/drivers")
+        };
+        assert_eq!(
+            install_root_from(Some("".into()), Some(pf.into_os_string())),
+            expected,
+            "an empty variable is no override"
+        );
     }
 
     /// The arch id hashes `ArchIdentity` alone, so two fixtures that differ only

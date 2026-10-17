@@ -189,8 +189,9 @@ fn sync_marker_in(dir: &Path) -> Option<&'static str> {
 /// ancestor canonicalised, and the components below it — the ones that do
 /// not exist yet — joined back on. `None` when nothing of it exists, or when
 /// a component is not a plain name (`..`), in which case the raw check above
-/// is all there is.
-fn canonical_form(dir: &Path) -> Option<PathBuf> {
+/// is all there is. Public for the kernel, which compares a driver's root
+/// with the install root the same way (packaging Task 8).
+pub fn canonical_form(dir: &Path) -> Option<PathBuf> {
     let mut existing = dir;
     let mut rest: Vec<&OsStr> = Vec::new();
     while !existing.exists() {

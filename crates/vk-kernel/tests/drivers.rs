@@ -328,7 +328,9 @@ fn mount_is_a_human_act_and_is_idempotent() {
     let row = mount(&mut k);
     assert_eq!(row.driver_id, maskai_like().driver_id());
     assert_eq!(row.state, DriverState::Ready);
-    assert_eq!(row.root, root());
+    // Stored resolved (Task 8): absolute, the relative root kept as its tail.
+    assert!(row.root.is_absolute(), "{}", row.root.display());
+    assert!(row.root.ends_with(root()), "{}", row.root.display());
     assert_eq!(row.mounted_ms, 1);
     assert_eq!(row.last_act_ms, 0);
     assert!(

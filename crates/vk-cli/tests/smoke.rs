@@ -2504,6 +2504,406 @@ fn vk_mount_driver_lists_shows_and_unmounts_it() {
     assert_eq!(sh.ok(&["driver", "ls"]).trim_end().lines().count(), 1);
 }
 
+/// The manifest of the smoke [`FAKE_DRIVER`] with its `echo` action, as
+/// `name`, run as `python -I fake_driver.py`.
+fn fake_manifest(name: &str, files_sha256: &str, source: &str) -> Value {
+    serde_json::json!({
+        "name": name,
+        "kind": "browser",
+        "program": {
+            "runtime": "python",
+            "command": ["python", "-I", "fake_driver.py"],
+            "files_sha256": files_sha256,
+            "browser_channel": null,
+            "headless": true
+        },
+        "hosts": ["example.invalid"],
+        "actions": [{
+            "name": "echo",
+            "reversible": true,
+            "args": {"type": "object"},
+            "evidence": ["note.txt"],
+            "to_register": false
+        }],
+        "min_interval_ms": 0,
+        "max_action_ms": 60_000,
+        "clearance": {"max_scope": "business", "third_party_allowed": true},
+        "source": source,
+        "governed": false
+    })
+}
+
+/// An installed tree laid out by hand, as `vk driver install` lays one out
+/// (the same as `vk-ipc/tests/capital.rs`'s, copied): the driver's script,
+/// `manifest.json` — `source: installed`, its `files_sha256` the tree's
+/// fingerprint — and `.package/` holding the image manifest whose manifest
+/// layer is that very file, and `key`'s signature over its digest.
+fn install_by_hand(
+    install_root: &std::path::Path,
+    name: &str,
+    version: &str,
+    key: &vk_capital::signature::PublisherKey,
+) -> PathBuf {
+    use vk_capital::layout::{self, Annotations, Layers};
+    let root = install_root.join(name).join(version);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("fake_driver.py"), FAKE_DRIVER).unwrap();
+    let fingerprint = vk_capital::fingerprint::hash_tree(&root).unwrap();
+    let m: vk_contracts::driver::DriverManifest =
+        serde_json::from_value(fake_manifest(name, &fingerprint, "installed")).unwrap();
+    let manifest_bytes = serde_json::to_vec(&m).unwrap();
+    std::fs::write(root.join("manifest.json"), &manifest_bytes).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let out = scratch.path().join("pkg");
+    let (_, digest) = layout::write(
+        &out,
+        &Layers {
+            manifest: manifest_bytes,
+            files: b"FILES".to_vec(),
+            lock: b"[]".to_vec(),
+            wheels: b"WHEELS".to_vec(),
+            python: b"PY".to_vec(),
+        },
+        &Annotations {
+            name: name.into(),
+            version: version.into(),
+            driver_id: m.driver_id(),
+            created: "2026-10-17T00:00:00Z".into(),
+            publisher_key_id: key.key_id(),
+            python_release: "test".into(),
+            python_upstream_sha256: "0".repeat(64),
+        },
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(".package")).unwrap();
+    std::fs::copy(
+        layout::blob_path(&out, &digest),
+        root.join(".package").join("manifest.json"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".package").join("signature.json"),
+        serde_json::to_vec_pretty(&key.sign(&digest)).unwrap(),
+    )
+    .unwrap();
+    root
+}
+
+/// Is a `python` on PATH? When not, the test says so and returns.
+fn python_on_path() -> bool {
+    let python = Command::new("python")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let found = python.as_ref().is_ok_and(|s| s.success());
+    if !found {
+        eprintln!("no python on PATH; skipping ({python:?})");
+    }
+    found
+}
+
+/// A `vkd` over `dir` with its install root at `<dir>/installed` and its
+/// publisher key in `<dir>/publisher.key` — the two packaging seams, set on
+/// the daemon, never on this test process — and the shell that drives it.
+fn packaging_node(dir: &std::path::Path, extra_env: &[(&str, &str)]) -> (Daemon, Shell) {
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let mut cmd = vkd_cmd(dir, &endpoint, &[]);
+    cmd.env("VK_DRIVER_INSTALL_ROOT", dir.join("installed"))
+        .env("VK_PUBLISHER_KEY_FILE", dir.join("publisher.key"))
+        .env_remove("VK_TEST_PYTHON_RELEASE");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let daemon = Daemon(
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell {
+        endpoint,
+        node_key: dir.join("node.key"),
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    (daemon, sh)
+}
+
+/// `vk capital key show` on an account with no publisher key says how to
+/// make one and makes none; `vk capital key init` makes it, pinned here, and
+/// prints its id and public half; a second init shows the same key.
+#[test]
+fn vk_capital_key_init_and_show_print_the_key_id() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let (_daemon, sh) = packaging_node(dir.path(), &[]);
+
+    let none = sh.run(&["capital", "key", "show"]);
+    assert!(!none.status.success());
+    let why = String::from_utf8_lossy(&none.stderr);
+    assert!(
+        why.contains("no publisher key; remedy: vk capital key init"),
+        "{why}"
+    );
+    assert!(
+        !dir.path().join("publisher.key").exists(),
+        "show made no key"
+    );
+
+    let made = sh.ok(&["capital", "key", "init"]);
+    let shown = sh.json(&["capital", "key", "show", "--json"]);
+    let key_id = str_of(&shown, "key_id");
+    assert!(key_id.starts_with("sha256:"), "{shown}");
+    assert_eq!(shown["pinned"], true, "{shown}");
+    assert!(made.starts_with("publisher key"), "{made}");
+    assert!(made.contains(key_id), "{made}");
+    assert!(made.contains("pinned here    yes"), "{made}");
+    assert!(
+        made.contains("-----BEGIN AUBIER PUBLISHER KEY-----"),
+        "{made}"
+    );
+    assert_eq!(sh.ok(&["capital", "key", "show"]), made);
+    assert_eq!(
+        sh.ok(&["capital", "key", "init"]),
+        made,
+        "a second init shows the key it made"
+    );
+}
+
+/// `vk driver ls` lists what is installed before anything is mounted: one
+/// row per name, state and source `installed`, every version of it; and
+/// `vk status` says where the install root is.
+#[test]
+fn vk_driver_ls_lists_installed_versions_before_any_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let version = dir.path().join("installed/maskai-fixture/0.1.0");
+    std::fs::create_dir_all(&version).unwrap();
+    std::fs::write(version.join("manifest.json"), b"{}").unwrap();
+    let (_daemon, sh) = packaging_node(dir.path(), &[]);
+
+    let listed = sh.ok(&["driver", "ls"]);
+    let lines: Vec<Vec<&str>> = listed
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            vec!["NAME", "STATE", "GOVERNED", "SOURCE", "VERSION", "ACTIONS", "WHY"],
+            vec![
+                "maskai-fixture",
+                "installed",
+                "-",
+                "installed",
+                "0.1.0",
+                "-",
+                "-"
+            ],
+        ],
+        "{listed}"
+    );
+    let status = sh.ok(&["status"]);
+    let root = path_of(&dir.path().join("installed"));
+    assert!(
+        status
+            .lines()
+            .any(|l| l.starts_with("install root") && l.ends_with(&root)),
+        "{status}"
+    );
+}
+
+/// `vk mount driver NAME@VERSION` mounts the installed tree — signed by a
+/// publisher this node pinned (`vk capital key init` pins this account's
+/// own) — and says where it came from; `vk driver ls` lists it as running
+/// that version; a version that is not installed is refused with the
+/// remedy, and the name and `--manifest` together are a usage error.
+#[test]
+fn vk_mount_driver_by_name_prints_the_source_and_version() {
+    if !python_on_path() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let (_daemon, sh) = packaging_node(dir.path(), &[]);
+    sh.ok(&["capital", "key", "init"]);
+    let key = vk_capital::signature::PublisherKey::load(&vk_capital::signature::KeySource::File(
+        dir.path().join("publisher.key"),
+    ))
+    .unwrap()
+    .expect("init made the key");
+    install_by_hand(&dir.path().join("installed"), "fake", "1.0.0", &key);
+
+    let mounted = sh.ok(&["mount", "driver", "fake@1.0.0"]);
+    let lines: Vec<Vec<&str>> = mounted
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        lines[0],
+        ["DRIVER", "ID", "GOVERNED", "SOURCE", "VERSION"],
+        "{mounted}"
+    );
+    assert_eq!(lines[1][0], "fake", "{mounted}");
+    assert!(lines[1][1].starts_with("sha256:"), "{mounted}");
+    assert_eq!(lines[1][3..], ["installed", "1.0.0"], "{mounted}");
+
+    let listed = sh.ok(&["driver", "ls"]);
+    let row: Vec<&str> = listed
+        .lines()
+        .nth(1)
+        .expect("a row")
+        .split_whitespace()
+        .collect();
+    assert_eq!(row[..2], ["fake", "ready"], "{listed}");
+    assert_eq!(row[3..], ["installed", "1.0.0", "echo", "-"], "{listed}");
+    let page = sh.ok(&["driver", "show", "fake"]);
+    assert!(
+        page.lines()
+            .any(|l| l.starts_with("source") && l.ends_with("installed")),
+        "{page}"
+    );
+    assert!(
+        page.lines()
+            .any(|l| l.starts_with("package") && l.contains("sha256:")),
+        "{page}"
+    );
+
+    let absent = sh.run(&["mount", "driver", "fake@9.9.9"]);
+    assert!(!absent.status.success());
+    let why = String::from_utf8_lossy(&absent.stderr);
+    assert!(
+        why.contains("fake@9.9.9 is not installed; remedy: vk driver install"),
+        "{why}"
+    );
+    let both = sh.run(&["mount", "driver", "fake@1.0.0", "--manifest", "x.json"]);
+    assert_eq!(both.status.code(), Some(2), "a usage error");
+
+    assert_eq!(
+        sh.ok(&["driver", "umount", "fake"]).trim_end(),
+        "unmounted driver fake"
+    );
+    let listed = sh.ok(&["driver", "ls"]);
+    let row: Vec<&str> = listed
+        .lines()
+        .nth(1)
+        .expect("a row")
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        row,
+        ["fake", "installed", "-", "installed", "1.0.0", "-", "-"],
+        "{listed}"
+    );
+}
+
+/// `vk driver pack` sends absolute paths and a presence proof; what the
+/// daemon refuses before it writes anything comes back as one line with its
+/// remedy: a version that is not MAJOR.MINOR.PATCH, an `--out` that holds
+/// something. Neither needs the CPython release.
+#[test]
+fn vk_driver_pack_refuses_before_it_writes_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let (_daemon, sh) = packaging_node(dir.path(), &[]);
+    sh.ok(&["capital", "key", "init"]);
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("fake_driver.py"), FAKE_DRIVER).unwrap();
+    let hash = vk_contracts::driver::hash_dir(&src).unwrap();
+    let manifest = src.join("manifest.json");
+    std::fs::write(
+        &manifest,
+        fake_manifest("fake", &hash, "development").to_string(),
+    )
+    .unwrap();
+    let out = dir.path().join("dist");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("stray"), b"x").unwrap();
+    let pack = |version: &str| {
+        sh.run(&[
+            "driver",
+            "pack",
+            "--manifest",
+            &path_of(&manifest),
+            "--version",
+            version,
+            "--out",
+            &path_of(&out),
+        ])
+    };
+    let bad_version = pack("1.0");
+    assert!(!bad_version.status.success());
+    let why = String::from_utf8_lossy(&bad_version.stderr);
+    assert!(
+        why.contains("remedy: pass a version such as 1.0.0"),
+        "{why}"
+    );
+    let full_out = pack("1.0.0");
+    assert!(!full_out.status.success());
+    let why = String::from_utf8_lossy(&full_out.stderr);
+    assert!(
+        why.contains("exists and is not an empty directory; remedy: choose an empty --out"),
+        "{why}"
+    );
+    assert_eq!(why.trim_end().lines().count(), 1, "one line: {why}");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1, "untouched");
+}
+
+/// With the pinned CPython release (`VK_TEST_PYTHON_RELEASE`, handed to the
+/// daemon, whose `driver.pack` uses it instead of downloading): `vk driver
+/// pack` writes the package and prints what it packed, its digests, and
+/// `driver.packed` is on the record.
+#[test]
+fn vk_driver_pack_prints_what_it_packed() {
+    let Some(archive) = std::env::var_os("VK_TEST_PYTHON_RELEASE") else {
+        eprintln!("VK_TEST_PYTHON_RELEASE is not set; skipping the pack with the real release");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let archive = archive.to_str().expect("a utf-8 path").to_string();
+    let (_daemon, sh) = packaging_node(dir.path(), &[("VK_TEST_PYTHON_RELEASE", &archive)]);
+    sh.ok(&["capital", "key", "init"]);
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("fake_driver.py"), FAKE_DRIVER).unwrap();
+    let hash = vk_contracts::driver::hash_dir(&src).unwrap();
+    let manifest = src.join("manifest.json");
+    std::fs::write(
+        &manifest,
+        fake_manifest("fake", &hash, "development").to_string(),
+    )
+    .unwrap();
+    let out = dir.path().join("dist");
+    let printed = sh.ok(&[
+        "driver",
+        "pack",
+        "--manifest",
+        &path_of(&manifest),
+        "--version",
+        "1.0.0",
+        "--out",
+        &path_of(&out),
+    ]);
+    let opened = vk_capital::layout::open(&out).unwrap();
+    let field = |label: &str| {
+        printed
+            .lines()
+            .find(|l| l.starts_with(label))
+            .and_then(|l| l.split_whitespace().last())
+            .unwrap_or_else(|| panic!("no {label} line in {printed}"))
+            .to_string()
+    };
+    assert_eq!(field("packed"), "fake@1.0.0", "{printed}");
+    assert_eq!(field("into"), path_of(&out), "{printed}");
+    assert_eq!(field("package"), opened.package_digest, "{printed}");
+    assert!(field("files").starts_with("sha256:"), "{printed}");
+    let tail = sh.json(&["dmesg", "-n", "1", "--json"]);
+    assert_eq!(dmesg_kinds(&tail), ["driver.packed"], "{tail}");
+}
+
 fn path_of(p: &std::path::Path) -> String {
     p.to_str().expect("utf-8 path").to_string()
 }

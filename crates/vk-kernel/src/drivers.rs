@@ -69,8 +69,8 @@ pub struct DriverRow {
     pub driver_id: String,
     /// The directory the manifest's relative `program.command` resolves
     /// against (Ruling R6). Per machine, so no part of the identity; kept here
-    /// for the daemon, which is the only thing that spawns. The kernel neither
-    /// resolves nor checks it.
+    /// for the daemon, which is the only thing that spawns. Kept [`resolved`]:
+    /// the path the context rules were checked on (packaging spec §4.2).
     pub root: PathBuf,
     pub mounted_ms: u64,
     pub state: DriverState,
@@ -206,16 +206,63 @@ fn plain_name(name: &str) -> Option<&str> {
     crate::validate_artefact_kind(name).ok().map(|()| name)
 }
 
-/// `root` relative to `base` when `root` is `base` or below it. Both are
-/// resolved on disk when both exist, so a link, a junction, a `..`, a case or
-/// a short-name difference cannot carry a tree in or out; otherwise both are
-/// compared after the same lexical clean-up ([`lexical`]).
+/// `root` relative to `base` when `root` is `base` or below it, both
+/// [`resolved`] first, so a link, a junction, a `..`, a case or a short-name
+/// difference in the part of either that exists cannot carry a tree in or out.
 fn within(root: &Path, base: &Path) -> Option<PathBuf> {
-    let (root, base) = match (std::fs::canonicalize(root), std::fs::canonicalize(base)) {
-        (Ok(root), Ok(base)) => (root, base),
-        _ => (lexical(root), lexical(base)),
-    };
-    root.strip_prefix(&base).ok().map(Path::to_path_buf)
+    resolved(root)
+        .strip_prefix(resolved(base))
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+/// `path` as the context rules compare it and a driver row keeps it: made
+/// absolute with `.` dropped and `..` folded ([`lexical`], as Windows folds
+/// them before it resolves anything), then every link in its existing part
+/// followed — the deepest existing ancestor canonicalised and the rest joined
+/// back (`vk_store::paths::canonical_form`) — and spelled without Windows'
+/// verbatim prefix, so it reads as a person would type it and a relative
+/// command with `/` still joins onto it. Nothing of it existing, the lexical
+/// form is all there is.
+pub fn resolved(path: &Path) -> PathBuf {
+    let clean = lexical(path);
+    match vk_store::paths::canonical_form(&clean) {
+        Some(real) => without_verbatim(real),
+        None => clean,
+    }
+}
+
+/// `\\?\C:\…` as `C:\…` and `\\?\UNC\host\share\…` as `\\host\share\…`;
+/// any other path as it is.
+fn without_verbatim(path: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        if let Some(s) = path.to_str() {
+            if let Some(share) = s.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{share}"));
+            }
+            if let Some(local) = s.strip_prefix(r"\\?\") {
+                if local.as_bytes().get(1) == Some(&b':') {
+                    return PathBuf::from(local);
+                }
+            }
+        }
+    }
+    path
+}
+
+/// Whether `rel`, a path under the install root, is exactly
+/// `<name>/<version>` with the version `MAJOR.MINOR.PATCH`.
+fn installed_at(rel: &Path, name: &str) -> bool {
+    let steps: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect::<Option<_>>()
+        .unwrap_or_default();
+    matches!(steps.as_slice(), [n, v]
+        if *n == name && v.to_str().is_some_and(crate::capital::is_version))
 }
 
 /// `path` made absolute, with `.` dropped and `..` folded into its parent,
@@ -294,6 +341,17 @@ impl DriverFailure {
 }
 
 impl RealKernel {
+    /// `<state_dir>/drivers/<name>/fingerprint.json`: where the daemon keeps
+    /// an installed driver's fingerprint cache (packaging spec §4.3), beside
+    /// its three directories.
+    pub fn driver_fingerprint_cache(&self, name: &str) -> PathBuf {
+        self.store
+            .state_dir
+            .join("drivers")
+            .join(name)
+            .join("fingerprint.json")
+    }
+
     /// `<state_dir>/drivers/<name>/{profile,work,evidence}`. A path, not a
     /// promise: the directories exist once the driver has been mounted.
     pub fn driver_dirs(&self, name: &str) -> DriverDirs {
@@ -327,7 +385,8 @@ impl RealKernel {
     /// - `execution_context: service` is refused: that mode ships with
     ///   `vk-agent`, and this daemon is interactive only;
     /// - `source: installed` is verified by path, never trusted as declared:
-    ///   `root` must be under [`RealKernel::install_root`];
+    ///   `root` must be `<install_root>/<name>/<version>` exactly, the name
+    ///   the manifest's and the version `MAJOR.MINOR.PATCH`;
     /// - a `development` root must not be: an installed tree mounts by
     ///   `name@version`, so it is fingerprinted whole and never hashed as a
     ///   development directory.
@@ -342,11 +401,18 @@ impl RealKernel {
             ));
         }
         match (manifest.source, within(root, &self.install_root)) {
-            (DriverSource::Installed, None) => Err(KernelError::I1(format!(
-                "a manifest that says installed must live under {}; remedy: install the package \
-                 with vk driver install",
-                self.install_root.display()
-            ))),
+            (DriverSource::Installed, rel)
+                if !rel
+                    .as_deref()
+                    .is_some_and(|rel| installed_at(rel, &manifest.name)) =>
+            {
+                Err(KernelError::I1(format!(
+                    "a manifest that says installed must live under {}, at {}/<MAJOR.MINOR.PATCH>; \
+                     remedy: install the package with vk driver install",
+                    self.install_root.display(),
+                    manifest.name
+                )))
+            }
             (DriverSource::Development, Some(rel)) => {
                 // `<root>/<name>/<version>`: the version is the second step
                 // below the root, when the tree is that deep.
@@ -410,6 +476,9 @@ impl RealKernel {
         manifest
             .validate()
             .map_err(|e| KernelError::Gate(e.to_string()))?;
+        // The root the rules are checked on is the root the row keeps: a
+        // link retargeted after this call cannot move the tree it names.
+        let root = resolved(&root);
         self.check_context(&manifest, &root)?;
         let source = manifest.source;
         if (source == DriverSource::Installed) != package_digest.is_some() {
@@ -434,7 +503,7 @@ impl RealKernel {
                 if row.package_digest != package_digest {
                     return Err(KernelError::Gate(format!(
                         "driver {name} is already mounted from another package; \
-                         run `vk driver umount {name}` first"
+                         remedy: vk driver umount {name}, then mount it again"
                     )));
                 }
                 return Ok(row.clone());
@@ -445,13 +514,8 @@ impl RealKernel {
             vk_store::paths::private_dir(dir).map_err(store_failed)?;
         }
         let profile_dir_hash = hash_bytes(dirs.profile.to_string_lossy().as_bytes());
-        let fingerprint_cache = (source == DriverSource::Installed).then(|| {
-            self.store
-                .state_dir
-                .join("drivers")
-                .join(&name)
-                .join("fingerprint.json")
-        });
+        let fingerprint_cache =
+            (source == DriverSource::Installed).then(|| self.driver_fingerprint_cache(&name));
         let row = DriverRow {
             manifest,
             driver_id: driver_id.clone(),

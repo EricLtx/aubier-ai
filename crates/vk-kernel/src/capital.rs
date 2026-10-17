@@ -78,8 +78,10 @@ impl RealKernel {
     }
 
     /// The file a test named ([`RealKernel::with_publisher_key_file`]), else
-    /// `VK_PUBLISHER_KEY_FILE`, read at each call, else the keyring.
-    fn publisher_key_source(&self) -> KeySource {
+    /// `VK_PUBLISHER_KEY_FILE`, read at each call, else the keyring. Public
+    /// for the daemon's `driver.pack`, which loads the key and signs with the
+    /// kernel lock released (a keyring read can block).
+    pub fn publisher_key_source(&self) -> KeySource {
         let file = self.publisher_key_file.clone().or_else(|| {
             std::env::var_os("VK_PUBLISHER_KEY_FILE")
                 .filter(|f| !f.is_empty())
@@ -148,8 +150,9 @@ impl RealKernel {
 }
 
 /// `MAJOR.MINOR.PATCH`, each a run of ASCII digits: the version rule of
-/// `vk mount driver <name>@<version>`.
-fn is_version(v: &str) -> bool {
+/// `vk mount driver <name>@<version>`, of `vk driver pack --version` and of
+/// a version directory under the install root.
+pub fn is_version(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
     parts.len() == 3
         && parts

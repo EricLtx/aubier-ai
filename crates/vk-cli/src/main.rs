@@ -10,6 +10,7 @@
 //! key over a nonce the daemon just issued (spec §3.6, invariant I1). In SP1a
 //! the interactive machine *is* the enrolled device; SP1b replaces the key
 //! file with a passkey.
+mod capital;
 mod man;
 mod render;
 mod until;
@@ -105,6 +106,12 @@ enum Cmd {
     Driver {
         #[command(subcommand)]
         what: DriverCmd,
+    },
+    /// Capital packages: the publisher key that signs this account's driver
+    /// packages (`vk driver pack` makes one).
+    Capital {
+        #[command(subcommand)]
+        what: capital::CapitalCmd,
     },
     /// The artefacts a task attached: read one before you sign it.
     Artefact {
@@ -495,20 +502,31 @@ enum MountCmd {
     /// manifest, caps, and lets a harness step act through.
     ///
     /// A human act: signed with this node's device key, because it puts a
-    /// browser under this node's control. The manifest's command is resolved
-    /// against the manifest file's own directory, whose files must hash to the
-    /// manifest's `files_sha256`. The process is started now; `vk driver ls`
-    /// says whether the kernel governs it.
+    /// browser under this node's control. Either an installed driver by
+    /// NAME@VERSION — the tree `vk driver install` laid out, checked against
+    /// its package's signature and fingerprint — or a development one by
+    /// `--manifest`, whose command is resolved against the manifest file's
+    /// own directory and whose files must hash to its `files_sha256`. The
+    /// process is started now; `vk driver ls` says whether the kernel
+    /// governs it.
     Driver {
-        /// The driver manifest (JSON), next to the driver's files.
+        /// An installed driver, as `vk driver ls` lists it: `maskai-1@1.0.0`.
+        #[arg(
+            value_name = "NAME@VERSION",
+            conflicts_with = "manifest",
+            required_unless_present = "manifest"
+        )]
+        installed: Option<String>,
+        /// A development driver's manifest (JSON), next to its files.
         #[arg(long, value_name = "FILE")]
-        manifest: PathBuf,
+        manifest: Option<PathBuf>,
     },
 }
 
 #[derive(Subcommand)]
 enum DriverCmd {
-    /// The mounted drivers: state, governance and actions.
+    /// The mounted drivers and the installed ones: state, governance,
+    /// source, version and actions.
     Ls,
     /// One driver in full: its identity, state, hosts and actions.
     Show { name: String },
@@ -517,6 +535,15 @@ enum DriverCmd {
     /// A human act, as the mount is: signed with this node's device key,
     /// because it ends the browser session the driver holds.
     Umount { name: String },
+    /// Pack a development driver into a signed package (an OCI image
+    /// layout) that `vk driver install` installs on any node: its files,
+    /// the pinned CPython, the wheels of its `requirements.txt`, locked.
+    ///
+    /// A human act: signed with this node's device key, and the package with
+    /// this account's publisher key (`vk capital key init`). The daemon
+    /// does the work — a download on first use, pip, a whole tree hashed —
+    /// and records `driver.packed`.
+    Pack(capital::PackArgs),
 }
 
 #[derive(Subcommand)]
@@ -1081,18 +1108,24 @@ async fn call(cli: &Cli) -> Result<()> {
         // manifest is read first, so a file that is not there spends no
         // nonce, then the request carries a presence proof.
         Cmd::Mount {
-            what: MountCmd::Driver { manifest },
+            what:
+                MountCmd::Driver {
+                    installed,
+                    manifest,
+                },
         } => {
-            let (manifest, root) = driver_manifest(manifest)?;
+            let params = match (installed, manifest) {
+                (Some(installed), _) => json!({ "installed": installed }),
+                (None, Some(manifest)) => {
+                    let (manifest, root) = driver_manifest(manifest)?;
+                    json!({ "manifest": manifest, "root": root })
+                }
+                (None, None) => unreachable!("clap requires one of the two"),
+            };
             let proof = presence(&c).await?;
             show(
                 cli,
-                c.call(
-                    "driver.mount",
-                    json!({ "manifest": manifest, "root": root }),
-                    Some(proof),
-                )
-                .await?,
+                c.call("driver.mount", params, Some(proof)).await?,
                 render::mounted_driver,
             )
         }
@@ -1115,6 +1148,10 @@ async fn call(cli: &Cli) -> Result<()> {
         ),
         // Ending the browser session a driver holds is a human act too
         // (Ruling R25), signed with this node's device key like the mount.
+        Cmd::Driver {
+            what: DriverCmd::Pack(args),
+        } => capital::pack(cli, &c, args).await,
+        Cmd::Capital { what } => capital::capital(cli, &c, what).await,
         Cmd::Driver {
             what: DriverCmd::Umount { name },
         } => {
@@ -1565,16 +1602,21 @@ fn driver_manifest(file: &Path) -> Result<(Value, String)> {
         std::fs::canonicalize(file).with_context(|| format!("resolve {}", file.display()))?;
     let dir = canonical
         .parent()
-        .ok_or_else(|| anyhow!("{} has no directory", canonical.display()))?
-        .display()
-        .to_string();
+        .ok_or_else(|| anyhow!("{} has no directory", canonical.display()))?;
+    Ok((manifest, plain_path(dir)))
+}
+
+/// A path as a person would type it: Windows' verbatim `\\?\` prefix, which
+/// `canonicalize` puts there, taken off.
+fn plain_path(path: &Path) -> String {
+    let path = path.display().to_string();
     #[cfg(windows)]
-    let dir = match (dir.strip_prefix(r"\\?\UNC\"), dir.strip_prefix(r"\\?\")) {
+    let path = match (path.strip_prefix(r"\\?\UNC\"), path.strip_prefix(r"\\?\")) {
         (Some(share), _) => format!(r"\\{share}"),
         (None, Some(local)) => local.to_string(),
-        (None, None) => dir,
+        (None, None) => path,
     };
-    Ok((manifest, dir))
+    path
 }
 
 /// A task that will not move again without something else happening: a human,

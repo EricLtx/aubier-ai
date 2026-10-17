@@ -140,6 +140,7 @@ pub fn status(v: &Value) -> String {
         ("node", text(&v["node_id"])),
         ("state dir", text(&v["state_dir"])),
         ("export root", text(&v["export_root"])),
+        ("install root", text(&v["install_root"])),
         ("arches", arch_count(v)),
         ("devices", text(&v["devices"])),
         // Where the passkey pages are, or that there are none: the person
@@ -324,25 +325,41 @@ fn action_names(row: &Value) -> String {
 }
 
 /// `vk driver ls`: what this node has mounted, whether each would act now,
-/// and whether the kernel contains the process behind it. A degraded driver
-/// is on the screen with its reason, because it is the one an operator has to
-/// remount. No driver is the header alone.
+/// whether the kernel contains the process behind it, and where it came
+/// from — a development directory, or an installed package and its version.
+/// A driver installed and not mounted is listed too, in state `installed`,
+/// with the versions there are of it. A degraded driver is on the screen
+/// with its reason, because it is the one an operator has to remount. No
+/// driver is the header alone.
 pub fn drivers(v: &Value) -> String {
     let rows: Vec<Vec<String>> = v
         .as_array()
         .map_or(&[][..], |a| a.as_slice())
         .iter()
         .map(|d| {
+            let installed: Vec<String> = array(d, "installed_versions").iter().map(text).collect();
+            let version = match d["version"].as_str() {
+                Some(version) => version.to_string(),
+                None if !installed.is_empty() => installed.join(","),
+                None => "-".into(),
+            };
             vec![
-                text(&d["manifest"]["name"]),
+                text(&d["name"]),
                 text(&d["state"]["state"]),
                 yes_no(&d["manifest"]["governed"]),
+                text(&d["source"]),
+                version,
                 action_names(d),
                 d["state"]["reason"].as_str().unwrap_or("-").to_string(),
             ]
         })
         .collect();
-    table(&["NAME", "STATE", "GOVERNED", "ACTIONS", "WHY"], &rows)
+    table(
+        &[
+            "NAME", "STATE", "GOVERNED", "SOURCE", "VERSION", "ACTIONS", "WHY",
+        ],
+        &rows,
+    )
 }
 
 /// One driver, as `vk driver show` and `vk ls /drivers/<name>` print it:
@@ -363,8 +380,16 @@ pub fn driver(v: &Value) -> String {
         ("hosts", hosts.join(",")),
         ("actions", action_names(v)),
         ("governed", yes_no(&m["governed"])),
+        // A manifest leaves `source` out when it is the default.
+        (
+            "source",
+            m["source"].as_str().unwrap_or("development").to_string(),
+        ),
         ("root", text(&v["root"])),
     ]);
+    if let Some(package) = v["package_digest"].as_str() {
+        rows.push(("package", package.to_string()));
+    }
     fields(&rows)
 }
 
@@ -1133,16 +1158,19 @@ pub fn unmounted(v: &Value) -> String {
     format!("unmounted {}", text(&v["arch_id"]))
 }
 
-/// `vk mount driver`: what was mounted, the id that names it, and whether the
+/// `vk mount driver`: what was mounted, the id that names it, whether the
 /// kernel governs the process behind it — the first thing the person who just
-/// put a browser under this node's control should see.
+/// put a browser under this node's control should see — and where it came
+/// from: a development directory, or an installed package's version.
 pub fn mounted_driver(v: &Value) -> String {
     let mut out = table(
-        &["DRIVER", "ID", "GOVERNED"],
+        &["DRIVER", "ID", "GOVERNED", "SOURCE", "VERSION"],
         &[vec![
             text(&v["name"]),
             text(&v["driver_id"]),
             yes_no(&v["governed"]),
+            text(&v["source"]),
+            text(&v["version"]),
         ]],
     );
     // As for an arch (Ruling 13): a repeat mount is a success, said so.
@@ -1155,6 +1183,34 @@ pub fn mounted_driver(v: &Value) -> String {
 /// `vk driver umount`: what was taken away, named back.
 pub fn unmounted_driver(v: &Value) -> String {
     format!("unmounted driver {}", text(&v["name"]))
+}
+
+/// `vk capital key init|show`: the key's id, whether this node pins it, and
+/// the public half, whole, as it is handed to the nodes that will install
+/// this account's packages.
+pub fn publisher_key(v: &Value) -> String {
+    let head = fields(&[
+        ("publisher key", text(&v["key_id"])),
+        ("pinned here", yes_no(&v["pinned"])),
+    ]);
+    let pem = v["public_pem"].as_str().unwrap_or_default().trim_end();
+    format!("{head}\n{pem}")
+}
+
+/// `vk driver pack`: what was packed, where, and the three digests that
+/// name it — the package (what the signature signs and `driver.packed`
+/// records), the installed tree's fingerprint, the driver's identity.
+pub fn packed(v: &Value) -> String {
+    fields(&[
+        (
+            "packed",
+            format!("{}@{}", text(&v["name"]), text(&v["version"])),
+        ),
+        ("into", text(&v["out"])),
+        ("package", text(&v["package_digest"])),
+        ("files", text(&v["files_sha256"])),
+        ("driver_id", text(&v["driver_id"])),
+    ])
 }
 
 /// A `--dry-run` of `vk harness run`: the launch line and the `.mcp.json` it
@@ -2038,6 +2094,64 @@ mod tests {
         assert_eq!(
             value(&super::status(&one_down), "arches").as_deref(),
             Some("2 (1 unavailable)")
+        );
+    }
+
+    /// `vk driver ls` (packaging Task 8): a mounted development driver, a
+    /// mounted installed one with the version it runs, and one installed and
+    /// not mounted, with every version there is of it.
+    #[test]
+    fn vk_driver_ls_says_where_each_driver_came_from() {
+        let listed = json!([
+            {"name": "dev", "state": {"state": "ready"}, "source": "development",
+             "version": null, "installed_versions": [],
+             "manifest": {"name": "dev", "governed": true, "actions": [{"name": "echo"}]}},
+            {"name": "maskai-1", "state": {"state": "degraded", "reason": "tampered"},
+             "source": "installed", "version": "1.0.0", "installed_versions": ["0.9.0", "1.0.0"],
+             "manifest": {"name": "maskai-1", "governed": false, "actions": [{"name": "look"}]}},
+            {"name": "maskai-fixture", "state": {"state": "installed"}, "source": "installed",
+             "version": null, "installed_versions": ["0.1.0", "0.2.0"]},
+        ]);
+        let screen = drivers(&listed);
+        let cells = |n: usize| -> Vec<&str> {
+            screen
+                .lines()
+                .nth(n)
+                .expect("that many lines")
+                .split_whitespace()
+                .collect()
+        };
+        assert_eq!(
+            cells(0),
+            ["NAME", "STATE", "GOVERNED", "SOURCE", "VERSION", "ACTIONS", "WHY"]
+        );
+        assert_eq!(
+            cells(1),
+            ["dev", "ready", "yes", "development", "-", "echo", "-"]
+        );
+        assert_eq!(
+            cells(2),
+            [
+                "maskai-1",
+                "degraded",
+                "no",
+                "installed",
+                "1.0.0",
+                "look",
+                "tampered"
+            ]
+        );
+        assert_eq!(
+            cells(3),
+            [
+                "maskai-fixture",
+                "installed",
+                "-",
+                "installed",
+                "0.1.0,0.2.0",
+                "-",
+                "-"
+            ]
         );
     }
 }

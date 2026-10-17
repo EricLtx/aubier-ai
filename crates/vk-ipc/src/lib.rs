@@ -17,6 +17,7 @@
 //! `resume`, `approve`) take a proof; every other method refuses a request
 //! carrying one with `-32602` (`"this method does not take a presence
 //! proof"`) — the nonce spent all the same.
+mod capital;
 pub mod client;
 pub mod drivers;
 pub mod server;

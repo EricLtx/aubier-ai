@@ -343,7 +343,11 @@ fn an_installed_mount_records_the_package_digest_and_source() {
         )
         .unwrap_err();
     assert!(matches!(e, KernelError::Gate(_)), "{e}");
-    assert!(e.to_string().contains("umount"), "{e}");
+    assert!(
+        e.to_string()
+            .contains("from another package; remedy: vk driver umount maskai-1"),
+        "{e}"
+    );
     // An installed mount names its package, and only an installed one does.
     let e = k
         .mount_driver(&common::human(4), m, installed, true, None)
@@ -443,6 +447,134 @@ fn tampered_degrades_the_driver_and_is_a_closed_word() {
     assert!(matches!(row.state, DriverState::Degraded { ref reason } if reason == "tampered"));
     let last = k.ledger().events().last().unwrap().clone();
     assert_eq!(last.kind, "driver.unmounted");
+}
+
+/// An installed tree is `<install_root>/<name>/<version>` and nothing else:
+/// the root itself, the name's directory, another driver's name, a deeper
+/// directory and a version that is not `MAJOR.MINOR.PATCH` are each refused,
+/// so the version a mount reports is the directory it ran from.
+#[test]
+fn an_installed_tree_lives_exactly_at_name_and_version() {
+    let t = tempfile::tempdir().unwrap();
+    let install_root = t.path().join("installed");
+    std::fs::create_dir_all(&install_root).unwrap();
+    let mut k = open_installed(t.path(), &install_root);
+    let mut m = common::maskai_like();
+    m.source = DriverSource::Installed;
+    for rel in [
+        "",
+        "maskai-1",
+        "other/1.0.0",
+        "maskai-1/1.0.0/sub",
+        "maskai-1/v1",
+        "maskai-1/1.0",
+    ] {
+        let root = install_root.join(rel);
+        std::fs::create_dir_all(&root).unwrap();
+        let e = k
+            .mount_driver(
+                &common::human(1),
+                m.clone(),
+                root,
+                true,
+                Some("sha256:dd".into()),
+            )
+            .unwrap_err();
+        assert!(matches!(e, KernelError::I1(_)), "{rel}: {e}");
+        assert!(
+            e.to_string().contains("must live under")
+                && e.to_string().contains("at maskai-1/<MAJOR.MINOR.PATCH>")
+                && e.to_string()
+                    .contains("remedy: install the package with vk driver install"),
+            "{rel}: {e}"
+        );
+    }
+    assert!(k.drivers().unwrap().is_empty());
+}
+
+/// The row keeps the root the context rules were checked on: resolved, with
+/// `..` folded and every link in its existing part followed, spelled without
+/// Windows' verbatim prefix.
+#[test]
+fn the_stored_root_is_the_resolved_path() {
+    let t = tempfile::tempdir().unwrap();
+    let mut k = common::open(t.path());
+    let dev = t.path().join("dev");
+    std::fs::create_dir_all(&dev).unwrap();
+    let row = k
+        .mount_driver(
+            &common::human(1),
+            common::maskai_like(),
+            t.path().join("other").join("..").join("dev"),
+            true,
+            None,
+        )
+        .unwrap();
+    assert_eq!(row.root, plain(std::fs::canonicalize(&dev).unwrap()));
+    assert!(
+        !row.root.to_string_lossy().starts_with(r"\\?\"),
+        "{}",
+        row.root.display()
+    );
+    assert_eq!(k.driver("maskai-1").unwrap().unwrap().root, row.root);
+}
+
+/// A link on the way cannot carry a development tree into the install root:
+/// the deepest existing part of each path is resolved before they are
+/// compared, so a root whose last step does not exist yet is still seen
+/// under the install root through a junction (a symlink off Windows).
+#[test]
+fn a_link_cannot_carry_a_development_tree_into_the_install_root() {
+    let t = tempfile::tempdir().unwrap();
+    let real = t.path().join("pf");
+    let install_root = real.join("drivers");
+    std::fs::create_dir_all(install_root.join("maskai-1")).unwrap();
+    let link = t.path().join("j");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    #[cfg(windows)]
+    {
+        // A junction needs no privilege; a symlink would.
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "mklink /J: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+    }
+    let mut k = open_installed(t.path(), &install_root);
+    let through_the_link = link.join("drivers").join("maskai-1").join("9.9.9");
+    let e = k
+        .mount_driver(
+            &common::human(1),
+            common::maskai_like(),
+            through_the_link,
+            true,
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(e, KernelError::I1(_)), "{e}");
+    assert!(
+        e.to_string()
+            .contains("remedy: vk mount driver maskai-1@9.9.9"),
+        "{e}"
+    );
+    assert!(k.drivers().unwrap().is_empty());
+}
+
+/// `path` as the kernel stores a resolved root: Windows' verbatim prefix off.
+fn plain(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy().into_owned();
+    match (s.strip_prefix(r"\\?\UNC\"), s.strip_prefix(r"\\?\")) {
+        (Some(share), _) => PathBuf::from(format!(r"\\{share}")),
+        (None, Some(local)) => PathBuf::from(local),
+        (None, None) => path,
+    }
 }
 
 /// The default install root, when nothing overrides it: under Program Files

@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use vk_contracts::driver::{hash_dir, DriverAction, DriverKind, DriverManifest};
+use vk_contracts::driver::{hash_dir, DriverAction, DriverKind, DriverManifest, DriverSource};
 use vk_contracts::syscalls::Ctx;
 use vk_driver::{ActOutcome, DriverHost, EvidenceCaps, HostError};
 use vk_kernel::drivers::{DriverActPlan, DriverDirs, DriverFailure, DriverRow, DriverState};
@@ -228,7 +228,9 @@ impl DriverPool {
     /// already killed and the host is dropped, so the next `ensure` spawns a
     /// fresh one. The `Err` is the host's own error, typed
     /// ([`DriverFailure::Host`]), or the pool's account of why the act had
-    /// no process ([`DriverFailure::WouldNotStart`]); the kernel words the
+    /// no process ([`DriverFailure::WouldNotStart`]), or
+    /// [`DriverFailure::Tampered`] when the installed tree it would have
+    /// started no longer hashes to its fingerprint; the kernel words the
     /// ledger from the variant alone.
     #[allow(clippy::too_many_arguments)]
     pub fn act(
@@ -244,8 +246,15 @@ impl DriverPool {
         let name = row.manifest.name.as_str();
         let mut taken = None;
         for _ in 0..2 {
-            self.ensure(row, dirs)
-                .map_err(|e| DriverFailure::WouldNotStart(format!("{e:#}")))?;
+            self.ensure(row, dirs).map_err(|e| {
+                // The installed tree changed since its install: the one
+                // spawn refusal the kernel degrades by its own word.
+                if e.is::<Tampered>() {
+                    DriverFailure::Tampered
+                } else {
+                    DriverFailure::WouldNotStart(format!("{e:#}"))
+                }
+            })?;
             let mut map = self.map();
             match map.remove(name) {
                 Some(Slot::Idle {
@@ -414,13 +423,14 @@ impl Drop for Claim<'_> {
 
 /// Start the driver `row` describes: its files held to `files_sha256` again
 /// ([`files_hold`]: a file changed since the mount is a new driver, never the
-/// old one re-spawned after a restart), the three directories made private
+/// old one re-spawned after a restart, and an installed tree changed since
+/// its install is [`Tampered`]), the three directories made private
 /// before the process exists, the command resolved against `row.root`
 /// (Ruling R6, [`spawnable`]) and the platform governor made first, capped at
 /// [`memory_cap_of`] the manifest — a governor the OS refuses is no spawn.
 /// The host comes back with the cap its governor was made with.
 fn spawn_host(row: &DriverRow, dirs: &DriverDirs) -> anyhow::Result<(Box<DriverHost>, u64)> {
-    files_hold(&row.manifest, &row.root)?;
+    files_hold(row)?;
     for dir in [&dirs.profile, &dirs.work, &dirs.evidence] {
         vk_store::paths::private_dir(dir).with_context(|| format!("create {}", dir.display()))?;
     }
@@ -465,20 +475,29 @@ fn spawnable(manifest: &DriverManifest, root: &Path) -> DriverManifest {
     m
 }
 
-/// What `driver.mount` takes, and nothing else: an unknown key is a bad
+/// What `driver.mount` takes, and nothing else: either a development driver
+/// — its `manifest` and the `root` its command resolves against — or an
+/// installed one by `installed: "name@version"`. An unknown key is a bad
 /// request, not a silently ignored one.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MountParams {
-    manifest: DriverManifest,
+    #[serde(default)]
+    manifest: Option<DriverManifest>,
     /// The absolute directory the manifest's relative command resolves
-    /// against: `vk mount driver` sends the manifest file's own directory.
-    root: PathBuf,
+    /// against: `vk mount driver --manifest` sends the manifest file's own
+    /// directory.
+    #[serde(default)]
+    root: Option<PathBuf>,
+    /// `name@version`: the tree `<install_root>/<name>/<version>`, mounted
+    /// as its package signed it (`vk mount driver NAME@VERSION`).
+    #[serde(default)]
+    installed: Option<String>,
 }
 
-/// Everything `driver.mount` checks before anything runs: the manifest
-/// validates; `root` is an absolute directory (Ruling R6); and the driver's
-/// files hold to `files_sha256` ([`files_hold`]).
+/// What `driver.mount` checks of a `{manifest, root}` request before
+/// anything else: the manifest validates and `root` is an absolute directory
+/// (Ruling R6).
 fn checked_mount(manifest: &DriverManifest, root: &Path) -> anyhow::Result<()> {
     manifest.validate()?;
     anyhow::ensure!(
@@ -488,7 +507,46 @@ fn checked_mount(manifest: &DriverManifest, root: &Path) -> anyhow::Result<()> {
         root.display()
     );
     anyhow::ensure!(root.is_dir(), "root {} is not a directory", root.display());
-    files_hold(manifest, root)
+    Ok(())
+}
+
+/// The installed tree a driver runs from no longer hashes to its manifest's
+/// `files_sha256`: something rewrote it after the install. Found before a
+/// spawn ([`files_hold`]); the act that needed the process is refused and the
+/// kernel degrades the driver with `tampered` (packaging spec §4.3).
+#[derive(Debug)]
+pub(crate) struct Tampered;
+
+impl std::fmt::Display for Tampered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the installed tree no longer hashes to its manifest's files_sha256; reinstall the \
+             package, then remount",
+        )
+    }
+}
+
+impl std::error::Error for Tampered {}
+
+/// The code that runs is the code the manifest names, checked before every
+/// spawn: for a development row, its script's directory hashes to
+/// `files_sha256` ([`development_hold`]); for an installed row, the whole
+/// tree does, through the row's fingerprint cache
+/// ([`crate::capital::tree_holds`]), and a tree that does not is
+/// [`Tampered`].
+fn files_hold(row: &DriverRow) -> anyhow::Result<()> {
+    match row.manifest.source {
+        DriverSource::Development => development_hold(&row.manifest, &row.root).map(|_| ()),
+        DriverSource::Installed => {
+            let holds = crate::capital::tree_holds(
+                &row.root,
+                &row.manifest.program.files_sha256,
+                row.fingerprint_cache.as_deref(),
+            )
+            .with_context(|| format!("hash the installed tree {}", row.root.display()))?;
+            holds.map_err(|_| anyhow::Error::new(Tampered))
+        }
+    }
 }
 
 /// The directory of the command's script — its first element ending in
@@ -499,7 +557,9 @@ fn checked_mount(manifest: &DriverManifest, root: &Path) -> anyhow::Result<()> {
 /// the root and bind the manifest to one machine (review round 1, Important
 /// 1). Checked at mount and again before every spawn: a file changed since
 /// the mount is a new driver, never the old one re-spawned after a restart.
-fn files_hold(manifest: &DriverManifest, root: &Path) -> anyhow::Result<()> {
+/// Also what `driver.pack` holds a development driver to before packing it.
+/// Returns the script, as the command names it.
+pub(crate) fn development_hold(manifest: &DriverManifest, root: &Path) -> anyhow::Result<String> {
     let script = manifest
         .program
         .command
@@ -516,6 +576,7 @@ fn files_hold(manifest: &DriverManifest, root: &Path) -> anyhow::Result<()> {
         "program.command paths must be relative to the manifest's directory, without `..`: \
          `{script}` is not"
     );
+    let named = script.clone();
     let script = root.join(script);
     anyhow::ensure!(
         script.is_file(),
@@ -533,40 +594,93 @@ fn files_hold(manifest: &DriverManifest, root: &Path) -> anyhow::Result<()> {
         dir.display(),
         manifest.program.files_sha256
     );
-    Ok(())
+    Ok(named)
 }
 
-/// `driver.mount {manifest, root}`, for a principal `dispatch` has already
-/// proved human (I1). Checked before anything runs; then the process is
-/// started with the kernel lock released and the row written under it with
-/// what the host observed (`governed`). A different manifest under a mounted
-/// name is the kernel's refusal, given under the lock that read the row and
-/// before anything is spawned; a repeat mount keeps the row and the process
-/// it has (Ruling 13), re-spawning only one a restart took away.
+/// `driver.mount`, for a principal `dispatch` has already proved human (I1),
+/// in either of its two forms:
+///
+/// - `{manifest, root}`, a development driver: the manifest validates, the
+///   root is an absolute directory, the kernel's context rules hold on it
+///   (no `service`, not under the install root — and a manifest that says
+///   installed mounts by name), and the script's directory hashes to
+///   `files_sha256`;
+/// - `{installed: "name@version"}`, an installed one: the tree is what its
+///   publisher signed and hashes to its fingerprint
+///   ([`crate::capital::installed`]), and the context rules hold on it too.
+///
+/// All of that before anything runs — the context rules included, so no
+/// process is started for a driver the kernel would refuse. Then the process
+/// is started with the kernel lock released and the row written under it
+/// with what the host observed (`governed`) and, for an installed tree, the
+/// package digest. A different manifest under a mounted name, or another
+/// package of a ready one, is the kernel's refusal, given under the lock that
+/// read the row and before anything is spawned; a repeat mount keeps the row
+/// and the process it has (Ruling 13), re-spawning only one a restart took
+/// away. The root is the one the kernel keeps: resolved.
 pub(crate) fn mount(
     kernel: &Shared,
     pool: &DriverPool,
     ctx: Ctx,
     p: Value,
 ) -> Result<Value, RpcError> {
-    let MountParams { manifest, root } = serde_json::from_value(p).map_err(|e| {
-        bad(&format!(
-            "driver.mount takes manifest and root, nothing else: {e}"
-        ))
-    })?;
-    checked_mount(&manifest, &root).map_err(|e| bad(&format!("{e:#}")))?;
+    const FORMS: &str =
+        "driver.mount takes {manifest, root} or {installed: \"name@version\"}, nothing else";
+    let params: MountParams =
+        serde_json::from_value(p).map_err(|e| bad(&format!("{FORMS}: {e}")))?;
+    let (manifest, root, package_digest, version) =
+        match (params.manifest, params.root, params.installed) {
+            (Some(manifest), Some(root), None) => {
+                checked_mount(&manifest, &root).map_err(|e| bad(&format!("{e:#}")))?;
+                let root = vk_kernel::drivers::resolved(&root);
+                lock(kernel)?
+                    .check_context(&manifest, &root)
+                    .map_err(kerr)?;
+                if manifest.source == DriverSource::Installed {
+                    return Err(bad(&format!(
+                        "a manifest that says installed mounts by name@version; remedy: vk mount \
+                         driver {}@<version>",
+                        manifest.name
+                    )));
+                }
+                development_hold(&manifest, &root).map_err(|e| bad(&format!("{e:#}")))?;
+                (manifest, root, None, None)
+            }
+            (None, None, Some(spec)) => {
+                let tree = crate::capital::installed(kernel, &spec)?;
+                lock(kernel)?
+                    .check_context(&tree.manifest, &tree.root)
+                    .map_err(kerr)?;
+                (
+                    tree.manifest,
+                    tree.root,
+                    Some(tree.package_digest),
+                    Some(tree.version),
+                )
+            }
+            _ => return Err(bad(FORMS)),
+        };
     let name = manifest.name.clone();
     let driver_id = manifest.driver_id();
-    let (existing, dirs) = {
+    let (existing, dirs, fingerprint_cache) = {
         let mut k = lock(kernel)?;
         let existing = k.driver(&name).map_err(kerr)?;
-        if existing.as_ref().is_some_and(|r| r.driver_id != driver_id) {
-            return Err(match k.mount_driver(&ctx, manifest, root, false, None) {
-                Err(e) => kerr(e),
-                Ok(_) => internal("a different manifest was mounted without its process"),
-            });
+        let refused = existing.as_ref().is_some_and(|r| {
+            r.driver_id != driver_id
+                || (r.state == DriverState::Ready && r.package_digest != package_digest)
+        });
+        if refused {
+            return Err(
+                match k.mount_driver(&ctx, manifest, root, false, package_digest) {
+                    Err(e) => kerr(e),
+                    Ok(_) => internal("a different driver was mounted without its process"),
+                },
+            );
         }
-        (existing, k.driver_dirs(&name))
+        let cache = package_digest
+            .is_some()
+            .then(|| k.driver_fingerprint_cache(&name));
+        (existing, k.driver_dirs(&name), cache)
     };
     let ready = existing.filter(|r| r.state == DriverState::Ready);
     // The row as stored for a repeat mount, root included; otherwise the row
@@ -578,14 +692,14 @@ pub(crate) fn mount(
         mounted_ms: ctx.now_ms,
         state: DriverState::Ready,
         last_act_ms: 0,
-        package_digest: None,
-        fingerprint_cache: None,
+        package_digest: package_digest.clone(),
+        fingerprint_cache,
     });
     let had_host = pool.has_host(&name);
     let governed = pool
         .ensure(&row, &dirs)
         .map_err(|e| bad(&format!("driver {name} would not start: {e:#}")))?;
-    let mounted = lock(kernel)?.mount_driver(&ctx, manifest, root, governed, None);
+    let mounted = lock(kernel)?.mount_driver(&ctx, manifest, root, governed, package_digest);
     let row = match mounted {
         Ok(row) => row,
         Err(e) => {
@@ -603,6 +717,8 @@ pub(crate) fn mount(
         "name": row.manifest.name,
         "governed": row.manifest.governed,
         "already_mounted": already_mounted,
+        "source": row.manifest.source,
+        "version": version,
     }))
 }
 

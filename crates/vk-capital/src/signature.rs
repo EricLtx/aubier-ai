@@ -386,7 +386,7 @@ fn decode(text: &str) -> Result<Seed> {
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ`, by civil-from-days (Howard Hinnant's algorithm).
-fn rfc3339_utc(t: std::time::SystemTime) -> String {
+pub fn rfc3339_utc(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs()) as i64;

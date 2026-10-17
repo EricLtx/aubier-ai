@@ -29,6 +29,9 @@ vk-arch-openai-compat = { path = "../vk-arch-openai-compat" }
 vk-arch-mistral = { path = "../vk-arch-mistral" }
 vk-arch-gemini = { path = "../vk-arch-gemini" }
 vk-store = { path = "../vk-store" }
+# `driver.pack` builds, signs and lays out a driver package; `driver.mount`
+# by name@version verifies an installed tree against it (packaging Task 8).
+vk-capital = { path = "../vk-capital" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

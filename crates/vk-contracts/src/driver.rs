@@ -154,6 +154,16 @@ pub(crate) fn plain_token(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// The driver name rule: 1 to 32 characters of `a-z`, `0-9` and `-`. A name
+/// is a path component (`<state_dir>/drivers/<name>`, the install root's
+/// `<name>/<version>`), so it is checked wherever one is read.
+pub fn is_driver_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 32
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// Does `s` read like a hash: `sha256:` and 64 lower-case hex digits?
 fn is_sha256(s: &str) -> bool {
     s.strip_prefix("sha256:").is_some_and(|h| {
@@ -215,13 +225,7 @@ impl DriverManifest {
     /// requirement, hosts, actions (count, duplicates, names, `args`,
     /// evidence), the interval ceiling, and last the credential-shaped keys.
     pub fn validate(&self) -> Result<(), DriverError> {
-        let name_ok = !self.name.is_empty()
-            && self.name.len() <= 32
-            && self
-                .name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-        if !name_ok {
+        if !is_driver_name(&self.name) {
             return invalid(format!(
                 "name `{}` must be 1 to 32 characters of a-z, 0-9 and `-`",
                 self.name
