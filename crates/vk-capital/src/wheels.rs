@@ -38,7 +38,9 @@ const ALTERED: &str = "the archive was altered; fetch it again from its source";
 /// computed). `wheels_dir` should be new: every wheel in it enters the lock.
 /// Refuses if pip fails or leaves anything that is not a wheel (an sdist means
 /// a wheel was missing). A `requirements` with no requirement line resolves to
-/// an empty lock without running pip.
+/// an empty lock without running pip. pip runs from `wheels_dir`, never the
+/// daemon's working directory (final review, minor 6), every path it is
+/// handed made absolute first.
 pub fn resolve(python_exe: &Path, requirements: &Path, wheels_dir: &Path) -> Result<Vec<Locked>> {
     fs::create_dir_all(wheels_dir)?;
     let text = fs::read(requirements)?;
@@ -47,7 +49,9 @@ pub fn resolve(python_exe: &Path, requirements: &Path, wheels_dir: &Path) -> Res
         !l.is_empty() && !l.starts_with('#')
     });
     if has_requirement {
-        let out = Command::new(python_exe)
+        let dest = std::path::absolute(wheels_dir)?;
+        let out = Command::new(std::path::absolute(python_exe)?)
+            .current_dir(&dest)
             .args(["-I", "-m", "pip", "download"])
             .args([
                 "--disable-pip-version-check",
@@ -55,9 +59,9 @@ pub fn resolve(python_exe: &Path, requirements: &Path, wheels_dir: &Path) -> Res
                 "--only-binary=:all:",
             ])
             .arg("--dest")
-            .arg(wheels_dir)
+            .arg(&dest)
             .arg("-r")
-            .arg(requirements)
+            .arg(std::path::absolute(requirements)?)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

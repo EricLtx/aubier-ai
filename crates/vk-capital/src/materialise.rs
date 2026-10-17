@@ -143,7 +143,9 @@ fn on_interpreter(path: &Path) -> bool {
 
 /// Unpacks `wheels_tar` into a scratch directory beside `root` (same parent,
 /// outside the tree), checks it against `lock`, and installs the lock with
-/// pip, offline and isolated.
+/// pip, offline and isolated — from the interpreter's own directory, never
+/// the daemon's or the shell's working directory (final review, minor 6),
+/// every path it is handed made absolute first.
 fn install_wheels(root: &Path, python: &Path, wheels_tar: &[u8], lock: &[Locked]) -> Result<()> {
     let scratch = Scratch::beside(root)?;
     wheels::untar_into(wheels_tar, &scratch.0)?;
@@ -151,8 +153,11 @@ fn install_wheels(root: &Path, python: &Path, wheels_tar: &[u8], lock: &[Locked]
     if lock.is_empty() {
         return Ok(());
     }
+    let python = std::path::absolute(python)?;
+    let find_links = std::path::absolute(&scratch.0)?;
     let null_device = if cfg!(windows) { "nul" } else { "/dev/null" };
     let out = Command::new(python.join("python.exe"))
+        .current_dir(&python)
         .args([
             "-I",
             "-m",
@@ -168,7 +173,7 @@ fn install_wheels(root: &Path, python: &Path, wheels_tar: &[u8], lock: &[Locked]
             "--no-cache-dir",
         ])
         .args(["--no-warn-script-location", "--find-links"])
-        .arg(&scratch.0)
+        .arg(&find_links)
         .args(lock.iter().map(|l| format!("{}=={}", l.name, l.version)))
         .env("PIP_CONFIG_FILE", null_device)
         .stdin(Stdio::null())
