@@ -35,3 +35,10 @@ rand = "0.8"
 # parses with, so the check and the client cannot disagree about the host
 # (`vk_kernel::arch::origin_loopback`, final review I-4).
 url = "2"
+# The capital package (vk-capital): a driver leaves the tree as a signed OCI
+# image layout. `ed25519-dalek` and `tempfile` were per-crate pins until then.
+ed25519-dalek = "2"
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
+walkdir = "2"
