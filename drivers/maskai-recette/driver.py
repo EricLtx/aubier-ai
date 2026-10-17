@@ -156,7 +156,8 @@ SELECTORS = {
     # PASS·Le Chirurgien : 2 PII détectées Détails maskai google/eu.claude-haiku-5-5 » ; le balisage
     # de ces blocs n'a pas été relevé, d'où des motifs sur le texte. « · en direct » suivait la
     # bannière d'une réponse coupée (N1-3) : marque de génération en cours, hypothèse.
-    "model_banner": r"\b[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9._:-]*",
+    "model_banner": r"\b[a-z][a-z0-9_-]*/[a-z0-9][a-z0-9._:-]*",
+    "brand_model": r"\bmaskai\s+([a-z][a-z0-9_-]*/[a-z0-9][a-z0-9._:-]*)",
     "brand": r"\bmaskai\s*$",
     "live_marker": r"en direct|\blive\b",
     "guard_pii": r"anonymis|<[A-Z][A-Z_]*_\d+>|\b[1-9]\d*\s*PII\b",
@@ -237,9 +238,10 @@ DOM_CAP = 1024 * 1024
 NETWORK_CAP = 1024 * 1024
 DEFAULT_BUDGET_S = 60
 # Budget de latence par classe de cas, pour un cas sans `budget_s` (cases.json garde les siens) :
-# les classes du debrief du 17/10 (§3) ; une pièce jointe sans budget prend celui des lourdes.
-CLASS_BUDGET_S = {"load": 3, "message": 10, "model": 10, "web": 10, "long": 10, "list": 10,
-                  "attach_question": 60, "concurrent": 60}
+# les classes de PROCEDURE-2 §5 (pièce jointe 20 s, recherche web 15 s, charge concurrente 15 s) ;
+# les cas lourds portent leur propre budget_s (60 s).
+CLASS_BUDGET_S = {"load": 3, "message": 10, "model": 10, "web": 15, "long": 10, "list": 10,
+                  "attach_question": 20, "concurrent": 15}
 PASTED_PII_BUDGET_S = 20
 # La couleur des zones masquées sur les captures.
 MASK_COLOR = "#FF00FF"
@@ -576,12 +578,19 @@ def parse_guard(card: str, body: str, body_found: bool) -> dict:
     head, sep, tail = card_l.rpartition(body_l) if body_found and body_l else ("", "", card_l)
     header = f"{head} {tail}" if sep else card_l  # the body is the card's last block
     header = one_line(header, 100_000)
-    m = re.search(SELECTORS["model_banner"], header)
-    model, guard_text, after = None, header, ""
-    if m:
-        model = m.group(0)
-        guard_text = re.sub(SELECTORS["brand"], "", header[:m.start()], flags=re.I).strip()
-        after = header[m.end():]
+    # The model is the token after « maskai » (17/10), else the first « provider/model » whose
+    # provider starts with a letter: a date in the header (« le 17/10 ») is never a model.
+    m = re.search(SELECTORS["brand_model"], header, re.I)
+    start, end = (m.start(), m.end()) if m else (None, None)
+    model = m.group(1) if m else None
+    if m is None:
+        m = re.search(SELECTORS["model_banner"], header)
+        if m:
+            start, end, model = m.start(), m.end(), m.group(0)
+    guard_text, after = header, ""
+    if model:
+        guard_text = re.sub(SELECTORS["brand"], "", header[:start], flags=re.I).strip()
+        after = header[end:]
     if re.search(SELECTORS["guard_pii"], guard_text, re.I):
         pii = True
     elif re.search(SELECTORS["guard_clean"], guard_text, re.I):
@@ -669,18 +678,24 @@ def model_matches(want: str, seen: str | None) -> bool:
 
 
 def choose_option(want: str, options: list) -> tuple[dict | None, list]:
-    """L'option à choisir pour `want`, et toutes celles qui convenaient : égalité du texte ou de
-    la valeur, sinon `want` contenu dans le texte ou la valeur, sinon un texte d'au moins quatre
-    caractères contenu dans `want` ; la première dans l'ordre de la liste."""
+    """L'option à choisir pour `want`, et celles qui convenaient : égalité du texte ou de la valeur
+    (la première en cas d'égalités), sinon `want` contenu dans le texte ou la valeur, sinon un texte
+    d'au moins quatre caractères contenu dans `want`. Hors égalité, une seule option doit convenir :
+    plusieurs, c'est ambigu (« gemini » devant Gemini 3 Flash et Gemini 3 Pro) et rien n'est choisi
+    — rend (None, les candidates) ; aucune : (None, [])."""
     w = norm_label(want)
     shown = [o for o in options if o.get("visible", True)] or options
-    for test in (lambda o: w in (norm_label(o["text"]), norm_label(o["value"])),
-                 lambda o: w in norm_label(o["text"]) or (o["value"] and w in norm_label(o["value"])),
+    exact = [o for o in shown if w and w in (norm_label(o["text"]), norm_label(o["value"]))]
+    if exact:
+        return exact[0], exact
+    for test in (lambda o: w in norm_label(o["text"]) or (o["value"] and w in norm_label(o["value"])),
                  lambda o: (len(norm_label(o["text"])) >= 4 and norm_label(o["text"]) in w)
                  or (len(norm_label(o["value"])) >= 4 and norm_label(o["value"]) in w)):
         found = [o for o in shown if w and test(o)]
-        if found:
+        if len(found) == 1:
             return found[0], found
+        if found:
+            return None, found
     return None, []
 
 
@@ -773,13 +788,18 @@ def turn_summary(i: int, question: str, obs: dict) -> dict:
             "sent_to_model": (obs.get("sent_to_model") or "")[:4000] or None, "pipeline_ms": obs.get("pipeline_ms")}
 
 
-def looks_like_sent(shown: str | None, question: str) -> bool:
+def looks_like_sent(shown: str | None, question: str, pii=()) -> bool:
     """Le texte du popover est-il le message envoyé (masqué ou non), et pas un simple statut
     (« Encrypted — no PII detected ») ? Au moins la moitié des mots de quatre lettres ou plus de la
-    question doivent s'y retrouver (un mot masqué est remplacé par un jeton, les autres restent).
-    Sinon la fuite de PII n'est pas vérifiable, et le verdict le dit, plutôt que de juger un
-    statut comme si c'était le texte envoyé."""
-    words = set(re.findall(r"\w{4,}", evaluer.fold(question or "")))
+    question doivent s'y retrouver. Les valeurs de l'inventaire `pii` sont retirées de la question
+    d'abord : masquées, elles deviennent des jetons et ne peuvent pas compter contre le texte (N9-1
+    tenait sinon à 8 mots sur 16). Sinon la fuite de PII n'est pas vérifiable, et le verdict le
+    dit, plutôt que de juger un statut comme si c'était le texte envoyé."""
+    q = evaluer.fold(question or "")
+    for value in pii or ():
+        if not str(value).startswith("("):  # « (inventaire descriptif) » is no value
+            q = q.replace(evaluer.fold(str(value)), " ")
+    words = set(re.findall(r"\w{4,}", q))
     if not shown or not words:
         return False
     seen = evaluer.fold(shown)
@@ -1259,6 +1279,7 @@ class AskTimeout(Exception):
         super().__init__(why)
         self.seconds, self.why = seconds, why
         self.profile = {}  # ce qui était parti, et le clic d'arrêt (Recette._abort)
+        self.capped = False  # l'échéance de l'action a coupé l'attente avant 3 × le budget
 
 
 class Recette:
@@ -1527,7 +1548,7 @@ class Recette:
         return json.dumps(event, ensure_ascii=False)
 
     # -- envoyer un message et attendre la réponse -------------------------------------------
-    def _send(self, page, text: str, read_sent: bool = True) -> dict:
+    def _send(self, page, text: str, read_sent: bool = True, pii=()) -> dict:
         """Annexe B : setter natif, événement input, un espace tapé ; puis (read_sent) le popover
         « Chiffré » lu et refermé, le focus rendu à la zone de saisie ; puis Entrée (ou le bouton
         d'envoi si Entrée n'a rien envoyé). Rend le tour à surveiller."""
@@ -1536,7 +1557,7 @@ class Recette:
         # stop_before: the stop selectors already match something before anything is sent; that is
         # no generation indicator (a guessed selector on a permanent button): ignored, never clicked.
         turn = {"page": page, "n0": st["n"], "count0": st["count"], "posts0": len(b.posts),
-                "page_no": b.context.pages.index(page), "stop_before": st["stop"], "text": text}
+                "page_no": b.context.pages.index(page), "stop_before": st["stop"], "text": text, "pii": list(pii or [])}
         if not b.call(FILL_JS, {"sel": SELECTORS["textarea"], "text": text}, page=page):
             raise DriverRefusal("precondition", "pas de zone de saisie dans la page")
         page.bring_to_front()
@@ -1610,13 +1631,21 @@ class Recette:
                 info["missing"] = "popover"
         except PWTimeout:
             if b.pending():
+                b.own_modal = None  # a frozen page: the dialog refusal follows, the popover is not ours to keep
                 raise
             info["error"] = "timeout"
         except PWError as e:
             info["error"] = one_line(str(e), 200)
         finally:
             if b.own_modal == "envoi" and not b.pending():
-                info["closed"] = self._close_sent_popover(page, trig["index"] if trig else None)
+                try:
+                    info["closed"] = self._close_sent_popover(page, trig["index"] if trig else None)
+                except PWError as e:
+                    info["closed"], info["close_error"] = False, one_line(str(e), 200)
+            if info.get("error") or info.get("close_error"):
+                # After an error the popover's state is unknown: the driver no longer claims it, so a
+                # popover still open is an unknown dialog for the next guard, never closed as ours.
+                b.own_modal = None
             info["seconds"] = round(time.monotonic() - t0, 2)
         if info["closed"] is False:
             raise DriverRefusal("dialog", "le popover du texte envoyé reste ouvert (Échap, croix et "
@@ -1764,7 +1793,8 @@ class Recette:
         posts = [p for p in b.posts[turn["posts0"]:] if p["page"] in (turn["page_no"], -1)]
         panel = b.call(SENT_JS, {"label": SELECTORS["sent_label"]}, page=page)
         sent_info = dict(turn.get("sent_popover") or {"source": None})
-        if sent_info.get("source") == "popover" and not looks_like_sent(sent_info.get("text"), turn.get("text", "")):
+        if sent_info.get("source") == "popover" and not looks_like_sent(sent_info.get("text"), turn.get("text", ""),
+                                                                         turn.get("pii")):
             sent_info.update(source=None, rejected="le popover ne montre pas le texte de la question")
         if sent_info.get("source") == "popover":
             sent_to_model = sent_info["text"]
@@ -1833,7 +1863,7 @@ class Recette:
             self._in_flight = not profile.get("stop_gone")
         return profile
 
-    def _ask(self, text: str, budget_s: float) -> dict:
+    def _ask(self, text: str, budget_s: float, pii=()) -> dict:
         b = self.browser
         page = b.page()
         self._ensure_on_app(page)
@@ -1847,17 +1877,28 @@ class Recette:
                     "sent": "" if sent else None, "sent_to_model": None, "ttft_s": None, "total_s": 0.0,
                     "timing_s": 0.0, "server_steps": [], "pipeline_ms": {}, "t": now_iso()}
         wait_s, capped = self._deadline(3 * budget_s)
-        turn = self._send(page, text)
+        turn = self._send(page, text, pii=pii)
         try:
             self._wait([turn], wait_s)
         except AskTimeout as t:
             t.why = (f"abandon à {t.seconds:.0f} s ("
                      + ("échéance de l'action" if capped else f"3 × budget {budget_s:g} s") + ")")
+            t.capped = capped  # cut by the action's deadline before 3 × budget: no verdict on the product
             t.profile = self._abort(turn)
             raise
         obs = self._collect(turn)
         self._check_host()  # a page that left after <END> is not the answer
         return obs
+
+    def _timeout_line(self, cid: str, nfr: list, t: AskTimeout, why: str) -> str:
+        """La ligne d'un abandon. À 3 × le budget : KO disponibilité. Coupé avant par l'échéance de
+        l'action (le produit n'a pas eu son temps) : NON TESTÉ, sans ENF, « échéance de l'action »."""
+        if getattr(t, "capped", False):
+            return self._journal_add(cid, "NON TESTÉ", t.seconds,
+                                     f"{why} : échéance de l'action avant 3 × le budget, pas de verdict sur le "
+                                     f"produit ; {abort_text(t.profile)}", [])
+        return self._journal_add(cid, "KO", t.seconds, f"{why} : pas de fin de réponse ; {abort_text(t.profile)}",
+                                 nfr_union(nfr, ["disponibilite"]))
 
     def _answer_evidence(self, ev: Evidence, obs: dict, mark: int) -> None:
         page = self.browser.page()
@@ -1906,7 +1947,7 @@ class Recette:
                           f"DOMContentLoaded {result['dom_content_loaded_ms']} ms, load {result['load_ms']} ms, "
                           f"FCP {result['fcp_ms']} ms, {result['transfer_bytes']} octets transférés "
                           f"({t['resources']} ressources)")
-        ev.json("timing.json", t)
+        ev.json("timing.json", {**t, "url": short_url(t["url"])})
         ev.screenshot(page, "screen.png")
         self.observations["@load"] = {"answer": result["text"], "timing_s": result["load_ms"] / 1000,
                                       "t": now_iso()}
@@ -2075,10 +2116,9 @@ class Recette:
         self._last_asked = {"case": cid, "mark": mark}  # what happens from here on is this case's
         budget = budget_of(case)
         try:
-            obs = self._ask(case["question"], budget)
+            obs = self._ask(case["question"], budget, pii=case.get("pii"))
         except AskTimeout as t:
-            line = self._journal_add(cid, "KO", t.seconds, f"{t.why} : pas de fin de réponse ; {abort_text(t.profile)}",
-                                     nfr_union(case["nfr"], ["disponibilite"]))
+            line = self._timeout_line(cid, case["nfr"], t, t.why)
             self.observations.setdefault(cid, {})["timeout"] = {"seconds": round(t.seconds, 1), "t": now_iso(),
                                                                 **t.profile}
             raise DriverRefusal("timeout", t.why, extra={"journal": line, "abort": t.profile}) from None
@@ -2101,8 +2141,7 @@ class Recette:
         try:
             obs = self._ask(text, DEFAULT_BUDGET_S)
         except AskTimeout as t:
-            line = self._journal_add(f"message : {one_line(text, 60)}", "KO", t.seconds,
-                                     f"{t.why} : pas de fin de réponse ; {abort_text(t.profile)}", ["disponibilite"])
+            line = self._timeout_line(f"message : {one_line(text, 60)}", [], t, t.why)
             raise DriverRefusal("timeout", t.why, extra={"journal": line, "abort": t.profile}) from None
         self.observations["@message"] = {**obs, "html": None, "text": text}
         self._answer_evidence(ev, obs, mark)
@@ -2517,9 +2556,16 @@ class Recette:
             if not options and model_matches(want, previous):  # no list to read, but already shown
                 record["seconds"] = round(time.monotonic() - t0, 1)
                 return record
-            why = ("la liste des modèles ne s'ouvre pas" if not options
-                   else f"aucun modèle « {want} » dans la liste : {', '.join(record['options'][:10])}")
-            raise DriverRefusal("precondition", why, extra={"options": record["options"], "record": record})
+            if candidates:
+                why = (f"« {want} » désigne plusieurs modèles de la liste : {', '.join(record['candidates'])} ; "
+                       f"donne le libellé exact")
+                record["ambiguous"] = True
+            else:
+                why = ("la liste des modèles ne s'ouvre pas" if not options
+                       else f"aucun modèle « {want} » dans la liste : {', '.join(record['options'][:10])}")
+            record["refused"] = why
+            raise DriverRefusal("precondition", why, extra={"options": record["options"],
+                                                            "candidates": record["candidates"], "record": record})
         record["picked"] = {"text": pick["text"], "value": pick["value"]}
         page.locator(f'{SELECTORS["listbox"]} >> visible=true').last.locator(
             SELECTORS["option"]).nth(pick["index"]).click(timeout=5000)
@@ -2543,9 +2589,13 @@ class Recette:
     def model_text(record: dict) -> str:
         """Le texte d'un choix de modèle, celui que juge un cas de configuration `model`
         (PROCEDURE-2 §4) : « options : A | B | C ; choisi : X ; relu : Y »."""
+        options = ' | '.join(record.get('options') or []) or 'non relevées'
+        if record.get("refused"):  # the judge sees why nothing was chosen, candidates included
+            why = (f"ambigu entre : {' | '.join(record['candidates'])}" if record.get("ambiguous")
+                   else f"refusé : {record['refused']}")
+            return f"options : {options} ; choisi : aucun ; {why} ; relu : {record.get('read_back')}"
         chosen = (record.get("picked") or {}).get("text") or record.get("read_back")
-        return (f"options : {' | '.join(record.get('options') or []) or 'non relevées'} ; choisi : {chosen} ; "
-                f"relu : {record.get('read_back')}")
+        return f"options : {options} ; choisi : {chosen} ; relu : {record.get('read_back')}"
 
     def choisir_modele(self, args: dict, ev: Evidence) -> dict:
         """Choisir le modèle du compositeur (_set_model) ; model.json, et l'observation `@model` qui
@@ -2559,6 +2609,12 @@ class Recette:
         except DriverRefusal as r:
             if r.extra.get("record"):
                 ev.json("model.json", r.extra["record"])
+                # A refused choice is observed too: a configuration case judged on @model then sees
+                # it (an ambiguous label lists its candidates), never an older success.
+                rec = r.extra["record"]
+                self.observations["@model"] = {"answer": self.model_text(rec), "timing_s": None,
+                                               "model": rec.get("read_back"), "options": rec.get("options"),
+                                               "t": now_iso()}
             raise
         ev.json("model.json", record)
         text = self.model_text(record)
@@ -2648,11 +2704,10 @@ class Recette:
         turns, obs = [], {}
         for i, q in enumerate(questions, 1):
             try:
-                obs = self._ask(q, budget)
+                obs = self._ask(q, budget, pii=case.get("pii"))
             except AskTimeout as t:
                 why = f"{t.why} au tour {i}/{n}"
-                line = self._journal_add(cid, "KO", t.seconds, f"{why} : pas de fin de réponse ; {abort_text(t.profile)}",
-                                         nfr_union(case["nfr"], ["disponibilite"]))
+                line = self._timeout_line(cid, case["nfr"], t, why)
                 timeout = {"seconds": round(t.seconds, 1), "turn": i, "t": now_iso(), **t.profile}
                 self.observations[cid] = {"turns": turns, "timeout": timeout}
                 ev.json("turns.json", {"case": cid, "asked_turns": n, "turns": turns, "timeout": timeout})

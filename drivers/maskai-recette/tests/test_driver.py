@@ -107,8 +107,10 @@ class CasesTest(unittest.TestCase):
             self.assertTrue(cases[fid]["file"].startswith("fixture/corpus/"))
         # v2: one case of each new kind, at the level whose question it asks
         self.assertEqual({c["kind"]: c["level"] for c in cases.values()
-                          if c["kind"] in ("model", "web", "long") and c["level"].startswith("N")},
+                          if c["kind"] in ("model", "web", "long") and c["level"].startswith("N")
+                          and not c["id"].startswith("fixture-")},
                          {"model": "N5", "web": "N1", "long": "N2"})
+        self.assertEqual(cases["fixture-case-3"]["turns"], 20, "the dry run's 20-turn conversation")
 
     def test_an_unknown_nfr_is_refused_at_start(self):
         drv = load_driver()
@@ -237,6 +239,10 @@ class GuardParseTest(unittest.TestCase):
         g = drv.parse_guard("Aucune donnée personnelle détectée L'Aiguilleur : PASS maskai google/eu.claude-haiku-5-5 "
                             "· en direct Voici trois conseils", "Voici trois conseils", True)
         self.assertTrue(g["live"], "« · en direct » after the banner: the answer was still being drawn")
+        g = drv.parse_guard("Mis à jour le 17/10 L'Aiguilleur : PASS maskai google/eu.claude-haiku-5-5 OK", "OK", True)
+        self.assertEqual(g["model"], "google/eu.claude-haiku-5-5", "a date is never the model")
+        g = drv.parse_guard("Mis à jour le 17/10 L'Aiguilleur : PASS OK", "OK", True)
+        self.assertIsNone(g["model"])
         g = drv.parse_guard("PASS", "PASS", True)  # a body that also reads like a header word
         self.assertIsNone(g["model"])
         self.assertEqual(g["header"], "")
@@ -253,10 +259,38 @@ class SentTextTest(unittest.TestCase):
         self.assertFalse(drv.looks_like_sent("Encrypted — no PII detected", q))
         self.assertFalse(drv.looks_like_sent("", q))
         self.assertFalse(drv.looks_like_sent(None, q))
+        # N9-1, fully masked: its inventory's own words are not counted against the masked text
+        n91 = drv.load_cases()["N9-1"]
+        masked = ("Rédige une relance courtoise pour <PERSON_1> (<IBAN_1>) au sujet d'un loyer impayé de 940 €.")
+        self.assertFalse(drv.looks_like_sent(masked.replace("courtoise", "aimable").replace("sujet", "propos"),
+                                             n91["question"]), "without the inventory taken out: rejected")
+        self.assertTrue(drv.looks_like_sent(masked.replace("courtoise", "aimable").replace("sujet", "propos"),
+                                            n91["question"], n91["pii"]))
+        self.assertTrue(drv.looks_like_sent(masked, n91["question"], n91["pii"]))
 
 
 class KindChecksTest(unittest.TestCase):
     """What the cases model, web and long check beyond their oracle (no browser needed)."""
+
+    def test_a_label_matching_several_options_is_ambiguous_never_a_silent_pick(self):
+        drv = load_driver()
+        options = [{"index": i, "text": t, "value": "", "visible": True}
+                   for i, t in enumerate(["Gemini 3 Flash", "Gemini 3 Pro", "Claude Haiku 5.5", "Claude Sonnet 5"])]
+        texts = lambda found: [o["text"] for o in found]  # noqa: E731
+        pick, found = drv.choose_option("gemini", options)
+        self.assertEqual((pick, texts(found)), (None, ["Gemini 3 Flash", "Gemini 3 Pro"]))
+        pick, found = drv.choose_option("claude", options)
+        self.assertEqual((pick, texts(found)), (None, ["Claude Haiku 5.5", "Claude Sonnet 5"]))
+        self.assertEqual(drv.choose_option("Gemini 3 Pro", options)[0]["text"], "Gemini 3 Pro")
+        self.assertEqual(drv.choose_option("claude haiku 5-5", options)[0]["text"], "Claude Haiku 5.5")
+        self.assertEqual(drv.choose_option("sonnet", options)[0]["text"], "Claude Sonnet 5")
+        self.assertEqual(drv.choose_option("google/eu.claude-haiku-5-5", options)[0]["text"], "Claude Haiku 5.5")
+        self.assertEqual(drv.choose_option("gpt", options), (None, []))
+        record = {"options": texts(options), "candidates": ["Gemini 3 Flash", "Gemini 3 Pro"], "ambiguous": True,
+                  "refused": "…", "read_back": "google/eu.claude-haiku-5-5"}
+        self.assertEqual(drv.Recette.model_text(record),
+                         "options : Gemini 3 Flash | Gemini 3 Pro | Claude Haiku 5.5 | Claude Sonnet 5 ; choisi : aucun ; "
+                         "ambigu entre : Gemini 3 Flash | Gemini 3 Pro ; relu : google/eu.claude-haiku-5-5")
 
     def check(self, case, obs):
         drv = load_driver()
@@ -345,8 +379,11 @@ class ProfileAndBudgetTest(unittest.TestCase):
         self.assertEqual(drv.budget_of({"kind": "message", "budget_s": 20}), 20)
         self.assertEqual(drv.budget_of({"kind": "message"}), 10)
         self.assertEqual(drv.budget_of({"kind": "load"}), 3)
-        self.assertEqual(drv.budget_of({"kind": "attach_question"}), 60)
-        self.assertEqual(drv.budget_of({"kind": "concurrent"}), 60)
+        # PROCEDURE-2 §5: attachment 20 s, web search 15 s, concurrent 15 s
+        self.assertEqual(drv.budget_of({"kind": "attach_question"}), 20)
+        self.assertEqual(drv.budget_of({"kind": "web"}), 15)
+        self.assertEqual(drv.budget_of({"kind": "concurrent"}), 15)
+        self.assertEqual(drv.budget_of({"kind": "message", "pii": ["x"]}), 20)
         self.assertEqual(drv.budget_of({"kind": "other"}), drv.DEFAULT_BUDGET_S)
         self.assertEqual(set(drv.CLASS_BUDGET_S), {"load", "message", "model", "web", "long", "list",
                                                    "attach_question", "concurrent"})
@@ -1155,6 +1192,34 @@ class DriverV2OnFixture(FixtureBench):
         self.act(A, "capture_ecran")
         self.assertEqual(recette.browser.call("() => window.__survey_shown"), 0)
 
+    def test_timing_json_carries_the_short_url(self):
+        drv, recette, A = self.make()
+        recette.entry += "?jeton=secret"  # a query (a token, say) never reaches the evidence
+        _, ev = self.act(A, "mesurer_chargement")
+        timing = self.evidence_json(ev, "timing.json")
+        self.assertEqual(timing["url"], drv.short_url(recette.entry))
+        self.assertNotIn("secret", timing["url"])
+
+    def test_a_wait_cut_by_the_action_deadline_is_non_teste_not_ko(self):
+        """The action's deadline came before 3 × budget: the product did not have its time, so the
+        line is NON TESTÉ without NFR, never KO disponibilité."""
+        drv, recette, A = self.make()
+        recette.open()
+        self.slow_case(recette)
+        recette.cases["v2-slow"]["budget_s"] = 5  # 15 s wanted; the host gives the action 12 s
+        self.act(A, "nouvelle_conversation")
+        protocol = sys.modules["vkdriver.protocol"]
+        self.addCleanup(setattr, protocol, "_deadline_at", None)
+        protocol._deadline_at = time.monotonic() + 12
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "poser_question", {"case": "v2-slow"})
+        protocol._deadline_at = None
+        self.assertEqual(refused.exception.reason, "timeout")
+        self.assertIn("échéance de l'action", refused.exception.detail)
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual((line["case"], line["verdict"], line.get("nfr")), ("v2-slow", "NON TESTÉ", None))
+        self.assertIn("échéance de l'action avant 3 × le budget, pas de verdict sur le produit", line["evidence"])
+
     def test_a_stop_lookalike_visible_before_sending_is_neither_waited_for_nor_clicked(self):
         """The stop selectors are a guess: one that matches a permanent button (« Stop sharing »)
         must not hold every answer 30 s, nor be clicked at an abandon."""
@@ -1225,6 +1290,14 @@ class NewActionsOnFixture(FixtureBench):
         res, _ = self.act(A, "choisir_modele", {"model": "claude haiku"})  # already shown: options read all the same
         self.assertFalse(res["changed"])
         self.assertEqual(res["options"], ["Claude Haiku 5.5", "Gemini 3 Flash", "Mistral Large 3"])
+        with self.assertRaises(drv.DriverRefusal) as refused:  # « 3 »: Gemini 3 Flash and Mistral Large 3
+            self.act(A, "choisir_modele", {"model": "3"})
+        self.assertEqual(refused.exception.reason, "precondition")
+        self.assertIn("désigne plusieurs modèles de la liste : Gemini 3 Flash, Mistral Large 3", refused.exception.detail)
+        self.assertIn("choisi : aucun ; ambigu entre : Gemini 3 Flash | Mistral Large 3",
+                      recette.observations["@model"]["answer"])
+        self.assertEqual(recette._composer_now(recette.browser.page())["model"], "google/eu.claude-haiku-5-5",
+                         "nothing was chosen")
         with self.assertRaises(drv.DriverRefusal) as refused:
             self.act(A, "choisir_modele", {"model": "gpt-9"})
         self.assertEqual(refused.exception.reason, "precondition")

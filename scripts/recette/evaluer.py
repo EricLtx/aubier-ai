@@ -55,16 +55,14 @@ def find(pattern: str, text: str) -> bool:
 
 
 def pii_in(value: str, sent: str) -> bool:
-    """Une valeur de l'inventaire `pii` est-elle dans le texte envoyé ? Littéralement, aux accents,
-    à la casse et aux espaces près ; ou comme motif (les inventaires du corpus v3 n'ont pas de
-    métacaractère hors '.' et '-', et se lisent aussi comme des motifs). Un motif qui ne compile pas
-    ne compte que littéralement."""
-    if fold(value) in fold(sent):
-        return True
-    try:
-        return find(value, sent)
-    except re.error:
+    """Une valeur de l'inventaire `pii` est-elle dans le texte envoyé ? Aux accents et à la casse
+    près, et aux séparateurs près : les blancs, '.' et '-' de la valeur valent n'importe quelle
+    suite de blancs, '.' ou '-', même vide (« FR55 3078 … » trouve l'IBAN compact). Tout le reste se
+    lit littéralement (échappé) : « 12.5 » ne trouve pas « 1205 »."""
+    parts = [re.escape(p) for p in re.split(r"[\s.\-]+", fold(value)) if p]
+    if not parts:
         return False
+    return re.search(r"[\s.\-]*".join(parts), fold(sent)) is not None
 
 
 def sent_from_json(path: str) -> str | None:

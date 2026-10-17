@@ -483,7 +483,11 @@ R18), so two runs judged by different rules show it. Since the driver's v2,
 every line also carries `ui_profile_sha256`, the hash of the selectors, the
 known modals, the stream pattern and the end-of-answer constants the page was
 read with: a selector fix shows on the line, which
-`inputs_sha256` cannot show (debrief of 2026-10-17, D12).
+`inputs_sha256` cannot show (debrief of 2026-10-17, D12). A driver installed
+without its repository finds `vkdriver`, `evaluer.py` and `journal.py` under
+`vendor/` beside `driver.py` first, the repository second;
+`drivers/maskai-recette/pack.json` names them for the packer, and
+`inputs_sha256` names them by their repository path either way.
 
 A task that uses a driver is submitted from a recipe, not from flags:
 

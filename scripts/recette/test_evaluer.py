@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from evaluer import BROKEN_TOKEN, SPAN_LEAK, evaluate, evaluate_case  # noqa: E402
+from evaluer import BROKEN_TOKEN, SPAN_LEAK, evaluate, evaluate_case, pii_in  # noqa: E402
 
 CASE = {
     "id": "T1", "size": "léger",
@@ -105,11 +105,17 @@ class EvaluerTests(unittest.TestCase):
         r = evaluate_case(CASE, {"answer": "2 820 € sous 15 jours", "sent_json": "absent/sent.json"})
         self.assertTrue(any("non observé" in n for n in r["notes"]))
 
-    def test_an_inventory_value_also_reads_as_a_pattern(self):
+    def test_an_inventory_value_is_matched_up_to_its_separators_only(self):
         case = dict(CASE, pii=["FR55 3078 8009 0002 8479 1365 147", "M. Malzac"])
         r = evaluate_case(case, {"answer": "2 820 € sous 15 jours",
-                                 "sent": "compte fr55  3078 8009 0002 8479 1365 147 de Mr Malzac"})
+                                 "sent": "compte FR5530788009000284791365147 de M Malzac"})
         self.assertEqual(r["leaks"], ["FR55 3078 8009 0002 8479 1365 147", "M. Malzac"])
+        # everything but blanks, '.' and '-' reads literally: no wildcard, no regex syntax
+        self.assertFalse(pii_in("12.5", "le code 1205"))
+        self.assertTrue(pii_in("12.5", "le code 12-5"))
+        self.assertFalse(pii_in("M. Malzac", "Mr Malzac"))
+        self.assertTrue(pii_in("+33 6 12 (34)", "appelez le +336-12 (34)"))
+        self.assertFalse(pii_in("a+b", "aab"))
 
 
 if __name__ == "__main__":

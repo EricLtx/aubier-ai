@@ -88,7 +88,7 @@ N7 (historique) n'est pas repris : il attend un compte de test dédié, qui est 
 
 **M0 — socle.** Les chargements sont ceux de N0. M0-3 et M0-4 sont des cas de configuration,
 sans question. M0-3 est jugé sur le résultat de `choisir_modele`, texte
-« options : A | B | C ; choisi : X ». M0-4 est jugé sur celui de `recherche_web`, texte
+« options : A | B | C ; choisi : X ; relu : Y ». M0-4 est jugé sur celui de `recherche_web`, texte
 « mode : X (trouvé : Y) ». La ligne de M0-3 donne au juge les options du sélecteur, celle de
 M0-4 l'état à remettre en fin de recette.
 
@@ -248,7 +248,9 @@ motif de M0-3 lit toujours `choisi : …`) ; `poser_question` sur un cas de conf
 renvoie que l'observation `@model` ou `@web`, sans rien envoyer ; en pièce jointe, `sent.json` porte
 `document_in_sent` (vrai, faux, ou inconnu pour un format que le driver ne lit pas en texte), et
 la fuite n'est vérifiée que s'il est vrai. Chaque ligne porte `config` (modèle et mode web lus sur
-le compositeur, bannière lue avec la réponse) et `sent_sha256` (point 9).
+le compositeur, bannière lue avec la réponse) et `sent_sha256` (point 9). Un libellé de modèle qui
+désigne plusieurs options sans égalité exacte (« gemini » devant deux Gemini) est refusé, et
+l'observation `@model` liste les candidats ; `max_action_ms` vaut 360 s (point 7).
 
 1. `corpus-v3/oracles-v3.json` dans les fichiers d'oracles du driver et dans `inputs_sha256`.
 2. Les sorts `model`, `web` et `long`, décrits dans les notes de `cases-2.json`.
@@ -266,9 +268,12 @@ le compositeur, bannière lue avec la réponse) et `sent_sha256` (point 9).
 6. Persistance des réglages. Si le modèle ou le mode web reviennent à leur défaut à chaque
    `nouvelle_conversation`, celle-ci réapplique la configuration épinglée. Sinon, il faut un
    épinglage par cas et des `max_actions` plus hauts.
-7. Durée de `conversation_longue` : huit tours à 30 s d'abandon font 240 s, soit déjà le
-   `max_action_ms` du manifeste (`drivers/maskai-recette/manifest.json`). Il faut au moins
-   300 s pour cette action.
+7. Durée de `conversation_longue` : huit tours à 30 s d'abandon font 240 s, auxquels chaque tour
+   ajoute ≈ 5 s (lecture du popover « Chiffré », affichage immobile 2 s), soit ≈ 280 s, plus la
+   marge de 8 s que le driver garde pour écrire ses preuves. Le `max_action_ms` du manifeste
+   (`drivers/maskai-recette/manifest.json`) vaut donc 360 s, et le délai d'outil MCP du harnais
+   au moins 390 s (runbook §7.0). Un tour coupé par l'échéance de l'action, avant 3 × le budget,
+   est journalisé NON TESTÉ, jamais KO disponibilité.
 8. `sent.json` en pièce jointe : dire si le document y figure. Sinon, la fuite se déclare non
    vérifiable sur M1-J et M2.
 9. `replay_of` : le pilote compare les textes envoyés de a et b, ou la ligne en porte assez pour

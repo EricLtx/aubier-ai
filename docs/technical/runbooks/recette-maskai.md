@@ -55,10 +55,12 @@ powershell -ExecutionPolicy Bypass -File drivers\maskai-recette\setup.ps1
 ```
 Attendu, en première ligne, `python de base : ` suivi du chemin du 1.1, puis en dernières lignes :
 ```
-files_sha256 : sha256:5b6f2210db62c8975bdd34569597bf068ad26768d0a6909f75e0c296ee628480
+files_sha256 : sha256:12a16356bdd00ac34a23a5fa577b0605e9f8e0b5b4a828bd965c39f58cb9c435
 manifest.json : à jour
 manifest-fixture.json : à jour
 ```
+Installé par le chantier de paquetage, le driver vit sans dépôt autour de lui : `drivers/maskai-recette/pack.json` nomme ce que le paquet emporte sous `vendor/` (vkdriver, `evaluer.py`, `journal.py`), et le driver cherche là d'abord, dans le dépôt ensuite. Ici, en développement, `vendor/` n'existe pas et rien ne change ; `inputs_sha256` nomme ces fichiers par leur chemin dans le dépôt dans les deux cas.
+
 Pourquoi un virtualenv à part ? Les chemins internes de Playwright dépassent la limite MAX_PATH de 260 caractères sous OneDrive. Le virtualenv vit donc sous `%LOCALAPPDATA%\vk\venvs\maskai-recette`, et `drivers\maskai-recette\.venv` est une jonction vers lui. `.venv` est exclu de l'empreinte.
 
 **Le Python de base compte (ruling R27).** Le virtualenv est construit sur le Python de base, et c'est lui que le démon lancera. Le Python du Microsoft Store est une application empaquetée : Windows démarre ses enfants non empaquetés, donc le nœud Playwright et Chrome, **hors du Job Object**. Chrome n'a alors ni le plafond mémoire, ni l'arrêt avec le démon, et `hosts_seen` ne voit pas ses connexions. L'arrêt par l'arbre des processus (échéance, STOP, démontage) l'atteint toujours. `setup.ps1` refuse donc une base sous `WindowsApps`, et refuse aussi un virtualenv déjà construit dessus : dans ce cas, renommez `%LOCALAPPDATA%\vk\venvs\maskai-recette`, supprimez la jonction `drivers\maskai-recette\.venv` si elle existe, puis relancez le 1.2. Sans `-Python`, le script prend le CPython de `uv` ; à défaut, `python` du PATH.
@@ -118,6 +120,7 @@ Stop-ScheduledTask -TaskName "Aubier vkd"
 
 **3.2 Démarrage**, dans un terminal dédié qu'on laisse ouvert toute la séance :
 ```powershell
+$env:MCP_TOOL_TIMEOUT = "390000"   # le délai d'outil MCP du harnais, voir §7.0
 vkd --auto-enroll-node --harness-timeout-secs 2700
 ```
 Attendu, dans les traces :
@@ -235,7 +238,7 @@ Le profil Chrome est conservé au démontage, et la session MaskAI avec lui.
 |---|---|---|
 | `choisir_modele {model}` | Ouvre la liste du bouton « Model: … » du compositeur, clique l'option qui correspond (texte ou valeur, sans tenir compte de la casse ni des séparateurs), puis relit le modèle sur le bouton. Refus `precondition` si aucune option ne correspond ou si la relecture diffère. | `model.json` |
 | `recherche_web {mode}` | Clique le bouton « Web search: … » jusqu'à ce que son `data-mode` vaille `off`, `auto` ou `on` (quatre clics au plus ; si un menu s'ouvre, son entrée est choisie), puis relit le mode. | `web.json` |
-| `conversation_longue {case, turns}` | Pose `turns` questions (2 à 20) dans la conversation en cours : les `messages` du cas, ou `first`, `filler` pour chaque tour du milieu, puis `last`. Chaque tour est lu comme `poser_question` ; la ligne garde le tour le plus lent. L'abandon d'un tour est journalisé KO disponibilité. Cette action peut durer : `max_action_ms` vaut 300 s. | `turns.json`, `answer.png` |
+| `conversation_longue {case, turns}` | Pose `turns` questions (2 à 20) dans la conversation en cours : les `messages` du cas, ou `first`, `filler` pour chaque tour du milieu, puis `last`. Chaque tour est lu comme `poser_question` ; la ligne garde le tour le plus lent. L'abandon d'un tour est journalisé KO disponibilité ; un tour coupé par l'échéance de l'action, avant 3 × le budget, est journalisé NON TESTÉ. Cette action peut durer : `max_action_ms` vaut 360 s (huit tours de 30 s d'abandon, plus ≈ 5 s de lecture par tour), d'où le §7.0. | `turns.json`, `answer.png` |
 
 Les deux premières changent le compositeur et ne restaurent rien (`reversible: false`) : la recette lui rend son réglage d'origine avec le champ `previous` du premier appel. Elles servent trois cas nouveaux : N1-4 (recherche web coupée, même question que N1-1, pour une latence comparable au 13/10), N2-3 (six tours, le fait du premier retrouvé au dernier) et N5-3 (`gemini` choisi, la réponse doit être signée par ce modèle).
 
@@ -249,6 +252,12 @@ Ce qui change dans les actions existantes :
 ---
 
 ## 7. Soumettre la recette
+
+**7.0 Pré-vol : le délai d'outil MCP du harnais.** Une action du driver peut durer jusqu'à `max_action_ms`, 360 s (`conversation_longue`, §6.4). Le harnais est Claude Code : il abandonne un appel d'outil MCP au bout de `MCP_TOOL_TIMEOUT` millisecondes, et l'action serait alors perdue côté harnais alors que le driver travaille encore. Il faut `MCP_TOOL_TIMEOUT` d'au moins **390000** (360 s plus une marge) dans l'environnement du **démon**, que le harnais hérite. C'est la première ligne du §3.2. Pour la tâche planifiée du §3.3, posez-la une fois pour votre compte, puis relancez la tâche :
+```powershell
+[Environment]::SetEnvironmentVariable("MCP_TOOL_TIMEOUT", "390000", "User")
+```
+Vérification, dans le terminal du démon avant de lancer `vkd` : `$env:MCP_TOOL_TIMEOUT` affiche `390000`. La répétition à blanc (§14) l'éprouve par la chaîne réelle : son niveau N4 joue une conversation de vingt tours en une seule action.
 
 ```powershell
 $t = (vk task submit --steps recipes\recette-maskai.json --json | ConvertFrom-Json).id
@@ -534,7 +543,9 @@ Depuis la v2, chaque ligne porte aussi `ui_profile_sha256` : l'empreinte de `SEL
 
 ---
 
-## 14. Répétition à blanc (facultative, environ 3 min)
+## 14. Répétition à blanc (facultative, environ 5 min)
+
+Avec le driver v2, son niveau N4 joue aussi `fixture-case-3`, une conversation de vingt tours en une seule action (≈ 2 min) : c'est le contrôle de `max_action_ms` et de `MCP_TOOL_TIMEOUT` (§7.0) par la chaîne réelle, à faire avant la séance. Les chiffres ci-dessous sont ceux du 2026-10-15, avant la v2 : quatre `driver.acted` de plus sont attendus.
 
 C'est la même chaîne que la séance réelle, sur le banc d'essai local et avec une arch simulée. Elle tourne dans un dossier d'état à part, pour ne pas mêler un faux run au ledger du nœud. Elle a été refaite le 2026-10-15 sur ce nœud, avec les lectures avant signature :
 - les 8 pas sont passés à `done` ;
@@ -548,6 +559,7 @@ $env:VK_ENDPOINT = '\\.\pipe\vk-repetition'
 $env:VK_NODE_KEY_FILE = "$D\node.key"
 Start-Process python -ArgumentList '-I','drivers\maskai-recette\fixture\serve.py','8765'
 # dans un autre terminal (même $D, mêmes variables) :
+$env:MCP_TOOL_TIMEOUT = "390000"
 vkd --state-dir "$D\state" --endpoint '\\.\pipe\vk-repetition' --master-key-file "$D\master.key" --node-key-file "$D\node.key" --auto-enroll-node --web-port 0 --harness-timeout-secs 2700
 # puis :
 vk mount mock mock
