@@ -122,6 +122,12 @@ SELECTORS = {
 # À confirmer pour MaskAI (aucune bannière relevée les 12 et 13 octobre).
 KNOWN_MODALS = [
     {"name": "cookies", "selector": "#cookies", "dismiss": "#cookies button#accept"},
+    # « Votre avis » (vu le 17 octobre) : enquête de satisfaction Radix, un formulaire avec le
+    # groupe radio suggestion/problème et une croix de fermeture. Reconnue par sa structure
+    # (pas par son texte, localisé) et fermée par la croix, jamais par « Envoyer ».
+    {"name": "avis",
+     "selector": '[role="dialog"][data-slot="dialog-content"]:has([data-slot="radio-group-item"][value="probleme"])',
+     "dismiss": '[role="dialog"][data-slot="dialog-content"]:has([data-slot="radio-group-item"][value="probleme"]) button[data-slot="dialog-close"]'},
 ]
 # Motif de l'URL du flux de réponse (annexe A) : /api/chat/stream chez MaskAI.
 STREAM_PATTERN = r"chat/stream"
