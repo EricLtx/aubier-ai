@@ -228,7 +228,8 @@ jobs:
     # tree and see `tampered`.
     #
     # GitHub's Windows runner is an elevated administrator, so this is the
-    # first place the elevated half of `vk driver install` runs: the
+    # first place `vk driver install` runs end to end elevated (the `test` job
+    # already runs its refusal paths there): the
     # read-only tree (administrators and SYSTEM full, users read and
     # execute), the root check, the interpreter spawned from that tree. A
     # failure here is a finding about that path; do not loosen the test.
