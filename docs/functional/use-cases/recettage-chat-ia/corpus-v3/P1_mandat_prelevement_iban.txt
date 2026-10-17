@@ -1,0 +1,10 @@
+AGENCE RHÔNE GESTION — MANDAT DE PRÉLÈVEMENT SEPA (document fictif de recette)
+
+Débiteur : Théodore Malzac, locataire du lot 7
+Référence unique du mandat : RG-MDT-2026-0412
+Compte à débiter : IBAN FR55 3078 8009 0002 8479 1365 147
+Montant : 865 € prélevés le 5 de chaque mois, à partir du 5 décembre 2026.
+
+Ancien compte, clôturé le 30 novembre 2026, à ne plus utiliser : FR1513335000400800451763212
+
+Fait à Lyon, le 12 octobre 2026.
