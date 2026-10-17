@@ -48,6 +48,6 @@
     "org.aubier.driver.version": "0.1.0",
     "org.aubier.driver.id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "org.aubier.package.created": "2026-10-17T00:00:00Z",
-    "org.aubier.publisher.key_id": "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    "org.aubier.publisher.key_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   }
 }

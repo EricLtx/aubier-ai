@@ -543,7 +543,11 @@ manifest — carrying `{key_id, algorithm: ed25519, signed, signature}` and, as
 the annotation `org.aubier.publisher.public_key`, the publisher's public key,
 so that an installer that has never met the publisher can show it. That key is
 untrusted text until its id is pinned (below). The package digest is the
-SHA-256 of the image manifest.
+SHA-256 of the image manifest. A packed driver has its own `driver_id` (its
+`command` and `files_sha256` differ from the development manifest's); only
+`source` is excluded from the id (with `governed`, what the host observed),
+so the id does not depend on where the same packed manifest is mounted —
+which bytes ran is the package digest's to say.
 
 **`vk driver pack`** is a human act (signed with the node's device key; the
 daemon records `driver.packed` with the package digest). It is the only step
