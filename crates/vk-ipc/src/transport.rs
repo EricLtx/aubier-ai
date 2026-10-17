@@ -653,8 +653,18 @@ pub mod os {
     /// somebody else cannot be staged from a single logon, so the decision is
     /// checked here and the live cross-account case belongs to
     /// `scripts/spike-6a.ps1`.
-    fn owner_is_expected(owner: &str, mine: &str) -> bool {
-        owner.eq_ignore_ascii_case(mine) || owner.eq_ignore_ascii_case(VKD_SERVICE_SID)
+    ///
+    /// "Its own account" is [`vk_store::win_acl::owned_by_this_account`]:
+    /// its user SID, or the local administrators group when this client is
+    /// an elevated administrator (`elevated_admin`) — Windows gives what an
+    /// elevated administrator creates the token's default owner, which
+    /// policy may make the group (CI-4: GitHub's Windows runner, any
+    /// Windows Server), so a daemon started elevated serves a pipe the group
+    /// owns. A client that is not elevated does not hold the group, and
+    /// such a pipe is refused.
+    fn owner_is_expected(owner: &str, mine: &str, elevated_admin: bool) -> bool {
+        vk_store::win_acl::owned_by_this_account(owner, mine, elevated_admin)
+            || owner.eq_ignore_ascii_case(VKD_SERVICE_SID)
     }
 
     /// Who is on the other end. A DACL decides who may *open* the pipe; it
@@ -693,15 +703,27 @@ pub mod os {
             }
         };
         let mine = current_process_sid()?;
+        // Asked only when it can change the answer; a probe that fails
+        // counts as "not elevated", which refuses.
+        let administrators = owner.eq_ignore_ascii_case(vk_store::win_acl::ADMINISTRATORS_SID);
+        let elevated_admin =
+            administrators && vk_store::win_acl::process_is_elevated_admin().unwrap_or(false);
         anyhow::ensure!(
-            owner_is_expected(&owner, &mine),
+            owner_is_expected(&owner, &mine, elevated_admin),
             "{name} is served by a pipe owned by {owner} — not this account ({mine}) and not the \
              vkd service account ({VKD_SERVICE_SID}){}. Refusing to speak to it: a process that \
              claimed this name before the node did would receive every syscall and could answer \
-             anything it liked.",
+             anything it liked.{}",
             server_pid(pipe)
                 .map(|pid| format!(", process {pid}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if administrators {
+                " The administrators own what an elevated administrator creates, and this shell \
+                 is not elevated; remedy: start vkd from a shell that is not elevated, or run vk \
+                 from an elevated one."
+            } else {
+                ""
+            }
         );
         Ok(())
     }
@@ -874,34 +896,57 @@ pub mod os {
 
         /// The decision the client makes about a server, without a second
         /// account to stage one with: its own and the service's pass, anything
-        /// else — including SYSTEM, the administrators, and another user —
-        /// does not. A pipe owned by a stranger cannot be created from one
-        /// logon, so this is where the rule is checked and
-        /// `scripts/spike-6a.ps1` is where it is seen.
+        /// else — SYSTEM, another user, another service — does not. A pipe
+        /// owned by a stranger cannot be created from one logon, so this is
+        /// where the rule is checked and `scripts/spike-6a.ps1` is where it
+        /// is seen.
+        ///
+        /// The administrators group is the one owner whose answer depends on
+        /// the client (CI-4): an elevated administrator's objects are owned
+        /// by `BUILTIN\Administrators` where the policy says so (Windows
+        /// Server, GitHub's runner), so a daemon started elevated serves a
+        /// pipe the group owns. A client that is itself an elevated
+        /// administrator holds that group and accepts it; one that is not
+        /// refuses it, as it refuses any other account.
         #[test]
         fn a_client_speaks_only_to_its_own_daemon_or_the_service() {
             let mine = "S-1-5-21-1111111111-2222222222-3333333333-1001";
-            assert!(owner_is_expected(mine, mine));
-            assert!(owner_is_expected(VKD_SERVICE_SID, mine));
-            // SDDL and Win32 both fold SID case; the comparison must too.
-            assert!(owner_is_expected(&VKD_SERVICE_SID.to_lowercase(), mine));
-            for stranger in [
-                "S-1-5-21-1111111111-2222222222-3333333333-1002", // the second logon
-                "S-1-5-18",                                       // SYSTEM
-                "S-1-5-32-544",                                   // the administrators
-                "S-1-5-80-0-0-0-0-0",                             // another service account
-                "",
-            ] {
-                assert!(
-                    !owner_is_expected(stranger, mine),
-                    "{stranger} must not pass for {mine}"
-                );
+            for elevated_admin in [false, true] {
+                // Owner == me.
+                assert!(owner_is_expected(mine, mine, elevated_admin));
+                assert!(owner_is_expected(VKD_SERVICE_SID, mine, elevated_admin));
+                // SDDL and Win32 both fold SID case; the comparison must too.
+                assert!(owner_is_expected(
+                    &VKD_SERVICE_SID.to_lowercase(),
+                    mine,
+                    elevated_admin
+                ));
+                for stranger in [
+                    "S-1-5-21-1111111111-2222222222-3333333333-1002", // the second logon
+                    "S-1-5-18",                                       // SYSTEM
+                    "S-1-5-80-0-0-0-0-0",                             // another service account
+                    "",
+                ] {
+                    assert!(
+                        !owner_is_expected(stranger, mine, elevated_admin),
+                        "{stranger} must not pass for {mine} (elevated: {elevated_admin})"
+                    );
+                }
             }
+            // Owner == the administrators, and this client is an elevated
+            // administrator: a daemon of its own, started elevated.
+            assert!(owner_is_expected("S-1-5-32-544", mine, true));
+            // Owner == the administrators, and this client is not elevated:
+            // refused.
+            assert!(!owner_is_expected("S-1-5-32-544", mine, false));
         }
 
         /// And the measurement the rule rests on: the owner of a pipe **is**
         /// readable off the client's own handle, which is the whole reason
-        /// this check reads the object rather than the server's process.
+        /// this check reads the object rather than the server's process. It
+        /// is this account's by the client's own rule: its user SID, or the
+        /// administrators when this process is an elevated administrator and
+        /// the policy makes the group its objects' owner.
         #[tokio::test]
         async fn the_owner_of_a_pipe_is_readable_from_the_client_handle() {
             let ep = test_endpoint();
@@ -912,7 +957,13 @@ pub mod os {
                 pipe_owner(&client)
             });
             let _server = listener.accept().await.unwrap();
-            assert_eq!(read.await.unwrap().unwrap(), current_process_sid().unwrap());
+            let owner = read.await.unwrap().unwrap();
+            let me = current_process_sid().unwrap();
+            let elevated_admin = vk_store::win_acl::process_is_elevated_admin().unwrap();
+            assert!(
+                vk_store::win_acl::owned_by_this_account(&owner, &me, elevated_admin),
+                "owner {owner}, this account {me}, elevated administrator: {elevated_admin}"
+            );
         }
 
         /// …and the other half: a client that connects to a server of its own
@@ -946,9 +997,12 @@ pub mod os {
             let _server = listener.accept().await.unwrap();
             let (pid, account) = holder.await.unwrap().expect("our own pipe has a server");
             assert_eq!(pid, std::process::id());
-            assert_eq!(
-                account.as_deref(),
-                Some(current_process_sid().unwrap().as_str())
+            let account = account.expect("the owner of our own pipe is readable");
+            let me = current_process_sid().unwrap();
+            let elevated_admin = vk_store::win_acl::process_is_elevated_admin().unwrap();
+            assert!(
+                vk_store::win_acl::owned_by_this_account(&account, &me, elevated_admin),
+                "account {account}, this account {me}, elevated administrator: {elevated_admin}"
             );
         }
 

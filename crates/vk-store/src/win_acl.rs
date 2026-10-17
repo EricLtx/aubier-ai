@@ -365,6 +365,53 @@ pub fn process_is_elevated() -> Result<bool> {
     }
 }
 
+/// Whether this process is an **elevated administrator**: its token is
+/// elevated ([`process_is_elevated`]) *and* holds the local administrators
+/// group enabled (`CheckTokenMembership`), which an administrator's filtered
+/// UAC token does not — there the group is deny-only.
+///
+/// Why it matters (CI-4): Windows gives an object the creating token's
+/// *default owner*, and for an elevated administrator that is, by policy,
+/// the `BUILTIN\Administrators` group rather than the user ("System objects:
+/// Default owner for objects created by members of the Administrators
+/// group" — the group on Windows Server, the creator on client editions).
+/// So a pipe or a directory such a process makes may be owned by
+/// `S-1-5-32-544`, and [`owned_by_this_account`] needs to know whether that
+/// group is this process's own.
+pub fn process_is_elevated_admin() -> Result<bool> {
+    use windows::Win32::Security::CheckTokenMembership;
+    if !process_is_elevated()? {
+        return Ok(false);
+    }
+    let wide_sid = wide(ADMINISTRATORS_SID);
+    // SAFETY: the SID string is NUL-terminated and outlives the call; the SID
+    // the conversion allocates is freed once, after the membership check that
+    // reads it.
+    unsafe {
+        let mut sid = PSID::default();
+        ConvertStringSidToSidW(PCWSTR(wide_sid.as_ptr()), &mut sid)
+            .context("make the administrators' SID")?;
+        let mut member = windows::core::BOOL::default();
+        let checked = CheckTokenMembership(None, sid, &mut member);
+        LocalFree(Some(HLOCAL(sid.0)));
+        checked.context("check this process's token for the administrators group")?;
+        Ok(member.as_bool())
+    }
+}
+
+/// Whether an object owned by `owner` was made under this account (`me`, its
+/// user SID): `owner` is `me`, or it is the local administrators group and
+/// this process is an elevated administrator (`elevated_admin`, from
+/// [`process_is_elevated_admin`]) — the default owner Windows gives what
+/// such a process creates. SIDs compare case-insensitively, as Windows
+/// compares their string forms. A process that is not elevated does not
+/// hold the group, so an object it is shown as owned by the administrators
+/// is somebody else's.
+pub fn owned_by_this_account(owner: &str, me: &str, elevated_admin: bool) -> bool {
+    owner.eq_ignore_ascii_case(me)
+        || (elevated_admin && owner.eq_ignore_ascii_case(ADMINISTRATORS_SID))
+}
+
 /// `D:P(A;OICI;FA;;;<sid>)…` — protected, so nothing is inherited from the
 /// parent, and inheritable, so nothing created underneath is reachable by
 /// anybody else either. This is a string this crate *writes*; it is never
@@ -988,6 +1035,46 @@ mod tests {
     #[test]
     fn whether_this_process_is_elevated_can_be_read() {
         process_is_elevated().unwrap();
+    }
+
+    /// An elevated administrator is an elevated process first: the probe
+    /// answers, and never says yes for a process that is not elevated.
+    #[test]
+    fn whether_this_process_is_an_elevated_administrator_can_be_read() {
+        let admin = process_is_elevated_admin().unwrap();
+        assert!(
+            !admin || process_is_elevated().unwrap(),
+            "an elevated administrator's token is elevated"
+        );
+    }
+
+    /// The owner rule (CI-4): an object of this account's is owned by its
+    /// user SID, or — when this process is an elevated administrator, whose
+    /// token's default owner Windows may set to the group — by the local
+    /// administrators. Anything else is somebody else's, and the group is
+    /// not this account's when this process is not elevated.
+    #[test]
+    fn an_object_is_this_accounts_when_its_owner_is_this_user_or_its_elevated_group() {
+        let me = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        // Owner == this user: always.
+        assert!(owned_by_this_account(me, me, false));
+        assert!(owned_by_this_account(me, me, true));
+        assert!(owned_by_this_account(&me.to_lowercase(), me, false));
+        // Owner == the administrators, and this process is an elevated
+        // administrator: the token's default owner.
+        assert!(owned_by_this_account(ADMINISTRATORS_SID, me, true));
+        // Owner == the administrators, and this process is not elevated:
+        // not this account's object.
+        assert!(!owned_by_this_account(ADMINISTRATORS_SID, me, false));
+        for stranger in [
+            "S-1-5-21-1111111111-2222222222-3333333333-1002",
+            LOCAL_SYSTEM_SID,
+            USERS_SID,
+            "",
+        ] {
+            assert!(!owned_by_this_account(stranger, me, true), "{stranger}");
+            assert!(!owned_by_this_account(stranger, me, false), "{stranger}");
+        }
     }
 
     fn set_of_entries<'a>(it: impl IntoIterator<Item = (&'a str, u32)>) -> BTreeSet<(String, u32)> {
