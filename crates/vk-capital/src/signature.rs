@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use vk_contracts::package::Signature;
+use zeroize::Zeroizing;
 
 pub const KEYRING_SERVICE: &str = "vk";
 pub const KEYRING_USER: &str = "publisher";
@@ -54,7 +55,7 @@ impl PublisherKey {
         Ok(seed.map(|s| PublisherKey::from_seed(&s)))
     }
 
-    fn from_seed(seed: &[u8; 32]) -> PublisherKey {
+    fn from_seed(seed: &Seed) -> PublisherKey {
         PublisherKey {
             signing: SigningKey::from_bytes(seed),
         }
@@ -132,6 +133,11 @@ pub fn parse_public_pem(text: &str) -> Result<PinnedKey> {
 
 /// Verifies `sig` over `package_digest` with `pinned`; refuses on a key id
 /// mismatch and on a bad signature, with distinct messages.
+///
+/// `sig.signed` is ignored on purpose: `package_digest` is the digest the
+/// caller computed itself from the bytes in hand, and that is what the
+/// signature must cover (Tasks 8 and 9 rely on this). A claimed digest inside
+/// the signature file proves nothing.
 pub fn verify(pinned: &PinnedKey, package_digest: &str, sig: &Signature) -> Result<()> {
     const ALTERED: &str = "the package was altered or re-signed; refuse it";
     if sig.key_id != pinned.key_id {
@@ -202,14 +208,20 @@ impl Pins {
         }
         let hex = hex_of(&key.key_id)?;
         std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(self.dir.join(format!("{hex}.pub")), pem_of(&key.verifying))?;
         let sidecar = serde_json::json!({
             "pinned_at": rfc3339_utc(std::time::SystemTime::now()),
             "pinned_by": pinned_by,
         });
-        std::fs::write(
-            self.dir.join(format!("{hex}.json")),
-            serde_json::to_vec_pretty(&sidecar)?,
+        // The sidecar first, the `.pub` last: the `.pub` is the commit point
+        // (`get` and `list` look at nothing else), so a crash in between leaves
+        // no pin, and the next `pin` completes it.
+        write_atomic(
+            &self.dir.join(format!("{hex}.json")),
+            &serde_json::to_vec_pretty(&sidecar)?,
+        )?;
+        write_atomic(
+            &self.dir.join(format!("{hex}.pub")),
+            pem_of(&key.verifying).as_bytes(),
         )?;
         Ok(())
     }
@@ -233,6 +245,19 @@ impl Pins {
         ids.sort();
         Ok(ids)
     }
+}
+
+/// Write-to-temp, sync, rename: the file is whole or absent, never torn.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn b64() -> base64::engine::GeneralPurpose {
@@ -259,9 +284,14 @@ fn hex_of(key_id: &str) -> Result<&str> {
     }
 }
 
+/// The seed on its way from the keyring or the file into the signing key:
+/// wiped when dropped, as is every text it travels as (as the node device
+/// key's, `vk-kernel/src/presence.rs`).
+type Seed = Zeroizing<[u8; 32]>;
+
 /// The keyring's seed; when there is none, a fresh one stored there if
 /// `create`, else `None`. Keyring errors are not echoed: they come from the OS.
-fn keyring_seed(create: bool) -> Result<Option<[u8; 32]>> {
+fn keyring_seed(create: bool) -> Result<Option<Seed>> {
     const REMEDY: &str = "check the OS credential store, or use a key file";
     let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) else {
         return refuse(
@@ -270,7 +300,7 @@ fn keyring_seed(create: bool) -> Result<Option<[u8; 32]>> {
         );
     };
     match entry.get_password() {
-        Ok(text) => decode(&text).map(Some),
+        Ok(text) => decode(&Zeroizing::new(text)).map(Some),
         Err(keyring::Error::NoEntry) if !create => Ok(None),
         Err(keyring::Error::NoEntry) => {
             let seed = fresh();
@@ -286,19 +316,26 @@ fn keyring_seed(create: bool) -> Result<Option<[u8; 32]>> {
     }
 }
 
-/// An atomic `create_new`, so there is no exists-then-write window; born
-/// `0o600` on Unix. On Windows the file inherits the directory's ACL.
-fn file_seed(path: &Path, create: bool) -> Result<Option<[u8; 32]>> {
+/// A new key file appears whole or not at all: the seed is written to a
+/// private temp file beside it, synced, then hard-linked onto the final name
+/// (which fails if the name exists, so there is no exists-then-write window and
+/// a crash leaves no empty key file). Born `0o600` on Unix; on Windows the file
+/// inherits the directory's ACL.
+fn file_seed(path: &Path, create: bool) -> Result<Option<Seed>> {
     if !create {
         return match std::fs::read_to_string(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
-            Ok(text) => decode(text.trim()).map(Some),
+            Ok(text) => decode(Zeroizing::new(text).trim()).map(Some),
         };
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let _ = std::fs::remove_file(&tmp);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -306,38 +343,42 @@ fn file_seed(path: &Path, create: bool) -> Result<Option<[u8; 32]>> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    match opts.open(path) {
-        Ok(mut file) => {
-            let seed = fresh();
-            file.write_all(encode(&seed).as_bytes())?;
-            Ok(Some(seed))
-        }
+    let seed = fresh();
+    let written = opts.open(&tmp).and_then(|mut file| {
+        file.write_all(encode(&seed).as_bytes())?;
+        file.sync_all()
+    });
+    let linked = written.and_then(|()| std::fs::hard_link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(Some(seed)),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let text = std::fs::read_to_string(path)?;
+            let text = Zeroizing::new(std::fs::read_to_string(path)?);
             decode(text.trim()).map(Some)
         }
         Err(e) => Err(e.into()),
     }
 }
 
-fn fresh() -> [u8; 32] {
-    let mut seed = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut seed);
+fn fresh() -> Seed {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(&mut *seed);
     seed
 }
 
-fn encode(seed: &[u8; 32]) -> String {
-    b64().encode(seed)
+fn encode(seed: &[u8; 32]) -> Zeroizing<String> {
+    Zeroizing::new(b64().encode(seed))
 }
 
-fn decode(text: &str) -> Result<[u8; 32]> {
-    let seed = b64()
-        .decode(text)
-        .ok()
-        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
-    match seed {
-        Some(seed) => Ok(seed),
-        None => refuse(
+fn decode(text: &str) -> Result<Seed> {
+    let bytes = b64().decode(text).ok().map(Zeroizing::new);
+    match bytes {
+        Some(v) if v.len() == 32 => {
+            let mut seed = Zeroizing::new([0u8; 32]);
+            seed.copy_from_slice(&v);
+            Ok(seed)
+        }
+        _ => refuse(
             "the publisher key is not a base64 32-byte seed",
             "restore the key from a backup, or create a new publisher key",
         ),
@@ -484,6 +525,90 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("another key"));
+    }
+    #[test]
+    fn a_sidecar_without_its_pub_is_not_a_pin_and_pin_completes_it() {
+        let t = tempfile::tempdir().unwrap();
+        let k = PublisherKey::load_or_create(&KeySource::File(t.path().join("k"))).unwrap();
+        let pinned = parse_public_pem(&k.public_pem()).unwrap();
+        let pins = Pins::at(t.path());
+        pins.pin(&pinned, "S-1").unwrap();
+        let dir = t.path().join("capital/publishers");
+        let hex = k.key_id().trim_start_matches("sha256:").to_string();
+        std::fs::remove_file(dir.join(format!("{hex}.pub"))).unwrap(); // a crash before the commit point
+        assert!(pins.get(&k.key_id()).unwrap().is_none());
+        assert!(pins.list().unwrap().is_empty());
+        pins.pin(&pinned, "S-2").unwrap();
+        assert_eq!(pins.get(&k.key_id()).unwrap().unwrap().key_id, k.key_id());
+        assert_eq!(pins.list().unwrap(), vec![k.key_id()]);
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![format!("{hex}.json"), format!("{hex}.pub")]);
+    }
+    #[test]
+    fn creating_a_key_file_leaves_one_file_and_never_replaces_an_existing_key() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("publisher.key");
+        let k1 = PublisherKey::load_or_create(&KeySource::File(path.clone())).unwrap();
+        assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 1);
+        let k2 = PublisherKey::load_or_create(&KeySource::File(path)).unwrap();
+        assert_eq!(k1.key_id(), k2.key_id());
+        assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn verify_refuses_hostile_signatures_without_panicking() {
+        let t = tempfile::tempdir().unwrap();
+        let k = PublisherKey::load_or_create(&KeySource::File(t.path().join("k"))).unwrap();
+        let pinned = parse_public_pem(&k.public_pem()).unwrap();
+        let digest = "sha256:".to_string() + &"a".repeat(64);
+        let good = k.sign(&digest);
+        verify(&pinned, &digest, &good).unwrap();
+
+        let mut other_algorithm = good.clone();
+        other_algorithm.algorithm = "rsa".into();
+        assert!(verify(&pinned, &digest, &other_algorithm)
+            .unwrap_err()
+            .to_string()
+            .contains("algorithm"));
+
+        for bad in [
+            "",
+            "!!! not base64 !!!",
+            "AAAA",                   // valid base64, 3 bytes
+            &b64().encode([7u8; 63]), // one byte short
+            &b64().encode([7u8; 65]), // one byte long
+            &b64().encode([0u8; 64]), // right length, wrong bytes
+        ] {
+            let mut sig = good.clone();
+            sig.signature = bad.to_string();
+            assert!(
+                verify(&pinned, &digest, &sig)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not verify"),
+                "accepted {bad:?}"
+            );
+        }
+
+        // Valid over another digest, even when `signed` claims this one.
+        let other = "sha256:".to_string() + &"b".repeat(64);
+        let mut sig = k.sign(&other);
+        sig.signed = digest.clone();
+        assert!(verify(&pinned, &digest, &sig)
+            .unwrap_err()
+            .to_string()
+            .contains("does not verify"));
+    }
+    #[test]
+    fn the_seed_and_its_texts_are_wiped_on_drop() {
+        fn wiped<T: zeroize::ZeroizeOnDrop>() {}
+        wiped::<Seed>();
+        wiped::<Zeroizing<String>>();
+        let seed = fresh();
+        assert_eq!(*decode(&encode(&seed)).unwrap(), *seed);
     }
     #[test]
     fn the_timestamp_is_rfc3339_utc() {
