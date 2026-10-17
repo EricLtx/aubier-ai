@@ -5,6 +5,7 @@ The fixture server (fixture/serve.py) runs on a free port; each test builds a
 calls the actions directly (the protocol loop itself is tested in
 drivers/vkdriver/test_protocol.py).
 """
+import base64
 import importlib.util
 import json
 import os
@@ -263,6 +264,51 @@ class KindChecksTest(unittest.TestCase):
         r, nfr = self.check({"kind": "long"}, {"turns": turns})
         self.assertEqual((r["verdict"], nfr), ("KO", ["disponibilite"]))
         self.assertEqual(r["notes"], ["tours sans réponse : 2", "3 tours ; tour 1 en 4.1 s, tour 3 en 12.5 s"])
+
+
+class ProfileAndBudgetTest(unittest.TestCase):
+    """ui_profile_sha256 (D12) and the class budgets (no browser needed)."""
+
+    def recette(self, drv):
+        work, profile = tempfile.mkdtemp(prefix="maskai-recette-"), tempfile.mkdtemp(prefix="maskai-recette-")
+        self.addCleanup(shutil.rmtree, work, True)
+        self.addCleanup(shutil.rmtree, profile, True)
+        return drv.Recette(env={"VK_DRIVER_WORK_DIR": work, "VK_DRIVER_PROFILE_DIR": profile,
+                                "VK_DRIVER_HOSTS": "127.0.0.1"})
+
+    def test_every_journal_line_carries_the_ui_profile_and_a_selector_change_shows(self):
+        drv = load_driver()
+        recette = self.recette(drv)
+        self.assertRegex(recette.ui_profile_sha256, r"^sha256:[0-9a-f]{64}$")
+        recette.observations["@load"] = {"answer": "chargement : ttfb 50 ms", "timing_s": 0.1}
+        evidence_dir = tempfile.mkdtemp(prefix="maskai-recette-")
+        self.addCleanup(shutil.rmtree, evidence_dir, True)
+        recette.actions()["verdict_oracle"]({"case": "N0-1"}, evidence_dir)
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual((line["ui_profile_sha256"], line["inputs_sha256"]),
+                         (recette.ui_profile_sha256, recette.inputs_sha256))
+        # One selector changed: another ui profile, the same verdict inputs (inputs_sha256 never saw it).
+        drv2 = load_driver()
+        drv2.SELECTORS["answer_body"] = ".prose"
+        other = self.recette(drv2)
+        self.assertNotEqual(other.ui_profile_sha256, recette.ui_profile_sha256)
+        self.assertEqual(other.inputs_sha256, recette.inputs_sha256)
+        # One known modal more: another ui profile too.
+        drv3 = load_driver()
+        drv3.KNOWN_MODALS.append({"name": "x", "selector": "#x", "dismiss": "#x button"})
+        self.assertNotEqual(self.recette(drv3).ui_profile_sha256, recette.ui_profile_sha256)
+        self.assertEqual(self.recette(load_driver()).ui_profile_sha256, recette.ui_profile_sha256, "deterministic")
+
+    def test_a_case_without_a_budget_takes_its_class_budget(self):
+        drv = load_driver()
+        self.assertEqual(drv.budget_of({"kind": "message", "budget_s": 20}), 20)
+        self.assertEqual(drv.budget_of({"kind": "message"}), 10)
+        self.assertEqual(drv.budget_of({"kind": "load"}), 3)
+        self.assertEqual(drv.budget_of({"kind": "attach_question"}), 60)
+        self.assertEqual(drv.budget_of({"kind": "concurrent"}), 60)
+        self.assertEqual(drv.budget_of({"kind": "other"}), drv.DEFAULT_BUDGET_S)
+        self.assertEqual(set(drv.CLASS_BUDGET_S), {"load", "message", "model", "web", "long", "list",
+                                                   "attach_question", "concurrent"})
 
 
 class FixtureBench(unittest.TestCase):
@@ -938,6 +984,43 @@ class DriverV2OnFixture(FixtureBench):
         self.assertIn("modale inconnue : Une fenêtre que personne", refused.exception.detail)
         self.assertFalse(recette.browser.page().evaluate("() => document.getElementById('mystery').hidden"))
 
+    @staticmethod
+    def pixel(recette, png_path, x, y) -> list:
+        """The RGB of one pixel of a PNG, read by the browser itself (no imaging library)."""
+        with open(png_path, "rb") as f:
+            src = "data:image/png;base64," + base64.b64encode(f.read()).decode()
+        page = recette.browser.context.new_page()
+        try:
+            return page.evaluate("""async ([src, x, y]) => {
+                const img = new Image(); img.src = src; await img.decode();
+                const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+                const g = c.getContext('2d'); g.drawImage(img, 0, 0);
+                return [...g.getImageData(x, y, 1, 1).data].slice(0, 3); }""", [src, x, y])
+        finally:
+            page.close()
+
+    def test_screenshots_mask_the_sidebar_and_the_account(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "nouvelle_conversation")
+        magenta = [255, 0, 255]
+        _, ev = self.act(A, "capture_ecran")
+        shot = next(e["path"] for e in ev if e["name"] == "screen.png")
+        self.assertEqual(self.pixel(recette, shot, 100, 300), magenta, "the sidebar (history) is masked")
+        box = recette.browser.page().locator('[data-slot="sidebar-footer"]').bounding_box()
+        self.assertEqual(self.pixel(recette, shot, int(box["x"] + 5), int(box["y"] + box["height"] / 2)), magenta,
+                         "the account block is masked")
+        self.assertNotEqual(self.pixel(recette, shot, 700, 300), magenta, "the conversation is not")
+        _, ev = self.act(A, "joindre_document", {"case": "fixture-case-1"})
+        attach = next(e["path"] for e in ev if e["name"] == "attach.png")
+        self.assertEqual(self.pixel(recette, attach, 100, 300), magenta)
+        _, ev = self.act(A, "poser_question", {"case": "fixture-case-1"})
+        answer = next(e["path"] for e in ev if e["name"] == "answer.png")
+        self.assertEqual(self.pixel(recette, answer, 100, 300), magenta)
+        drv.SELECTORS["mask"] = []  # the same capture unmasked: the test does see a difference
+        _, ev = self.act(A, "capture_ecran")
+        self.assertNotEqual(self.pixel(recette, ev[0]["path"], 100, 300), magenta)
+
     def slow_case(self, recette) -> None:
         recette.cases["v2-slow"] = {"id": "v2-slow", "level": "N8", "kind": "message", "question": "SLOW",
                                     "budget_s": 1, "nfr": ["securite"], "must": [], "must_not": [], "pii": []}
@@ -956,6 +1039,7 @@ class DriverV2OnFixture(FixtureBench):
         line = journal_lines(recette.work)[-1]
         self.assertEqual((line["case"], line["verdict"]), ("v2-slow", "KO"))
         self.assertIn("question partie (POST vu), flux ouvert, arrêt cliqué", line["evidence"])
+        self.assertEqual(line["ui_profile_sha256"], recette.ui_profile_sha256)
         res, _ = self.act(A, "nouvelle_conversation")
         self.assertIsNone(res["stopped_first"], "nothing was left in flight")
         time.sleep(1.5)  # the bench shows its survey 0.4 s after an abandoned generation

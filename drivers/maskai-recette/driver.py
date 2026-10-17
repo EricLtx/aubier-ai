@@ -42,7 +42,12 @@ Ce que la v2 ajoute (debrief du 2026-10-17, docs/technical/debriefs/) :
   parti (D8) ;
 - trois actions de plus : choisir_modele et recherche_web règlent le compositeur
   et relisent ce qu'il affiche ; conversation_longue pose n questions dans la
-  même conversation. Les cas `model`, `web` et `long` les utilisent.
+  même conversation. Les cas `model`, `web` et `long` les utilisent ;
+- `ui_profile_sha256`, l'empreinte de `SELECTORS` et `KNOWN_MODALS`, est sur
+  chaque ligne de journal : un changement de sélecteur s'y voit, ce que
+  `inputs_sha256` ne montre pas (D12) ;
+- les captures masquent la barre latérale (l'historique) et le bloc du compte ;
+- un cas sans `budget_s` prend le budget de sa classe (`CLASS_BUDGET_S`).
 
 Environnement (posé par l'hôte) : VK_DRIVER_PROFILE_DIR, VK_DRIVER_WORK_DIR,
 VK_DRIVER_HEADLESS, VK_DRIVER_CHANNEL, VK_DRIVER_HOSTS ; MASKAI_ENTRY_URL
@@ -51,6 +56,7 @@ remplace `ENTRY_URL` (le banc d'essai sur un autre port).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import logging
@@ -172,6 +178,12 @@ SELECTORS = {
     "web_menu": '[role="menu"], [role="listbox"]',
     "web_menu_item": '[role="menuitemradio"], [role="menuitem"], [role="option"]',
     "web_words": {"off": r"\boff\b|désactiv|jamais|never", "auto": r"\bauto", "on": r"\bon\b|activ|toujours|always"},
+    # Zones masquées sur toute capture (Playwright `mask`) : la barre latérale, qui montre l'historique
+    # des conversations, et le bloc du compte en bas. Vu le 17/10 : nav[aria-label="Main navigation"]
+    # dans un aside, le compte en bas de la barre (les captures publiées du 17/10 le montraient, D10) ;
+    # les data-slot sont à confirmer.
+    "mask": ['nav[aria-label="Main navigation"]', 'aside', '[data-slot="sidebar"]',
+             '[data-slot="sidebar-footer"]', '[data-slot="avatar"]'],
     # Fenêtres modales (CSS).
     "modal": '[role="dialog"], [role="alertdialog"], [aria-modal="true"], .modal',
 }
@@ -202,6 +214,12 @@ PER_ACTION = 4 * 1024 * 1024      # HARNESS_MAX_RUN_BYTES / 4
 DOM_CAP = 1024 * 1024
 NETWORK_CAP = 1024 * 1024
 DEFAULT_BUDGET_S = 60
+# Budget de latence par classe de cas, pour un cas sans `budget_s` (cases.json garde les siens) :
+# les classes du debrief du 17/10 (§3) ; une pièce jointe sans budget prend celui des lourdes.
+CLASS_BUDGET_S = {"load": 3, "message": 10, "model": 10, "web": 10, "long": 10, "list": 10,
+                  "attach_question": 60, "concurrent": 60}
+# La couleur des zones masquées sur les captures.
+MASK_COLOR = "#FF00FF"
 # Fin de réponse (D6) : après la fin du flux, le corps de la nouvelle réponse immobile
 # DISPLAY_STABLE_S et le bouton d'arrêt disparu ; au plus DISPLAY_CAP_S après la fin du flux
 # (au-delà : capturée « encore en mouvement », notée, sans abandon) ; NO_ANSWER_WAIT_S pour qu'une
@@ -500,6 +518,20 @@ def clean(value):
     if isinstance(value, dict):
         return {k: clean(v) for k, v in value.items()}
     return value
+
+
+def ui_profile_sha256() -> str:
+    """L'empreinte du profil d'interface du driver : SELECTORS et KNOWN_MODALS en JSON canonique
+    (clés triées, sans espaces, UTF-8). Sur chaque ligne de journal : deux lignes qui la portent
+    ont été lues avec les mêmes adresses de page et les mêmes modales connues (D12)."""
+    profile = {"known_modals": KNOWN_MODALS, "selectors": SELECTORS}
+    data = json.dumps(profile, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def budget_of(case: dict) -> float:
+    """Le budget de latence d'un cas : le sien, sinon celui de sa classe, sinon DEFAULT_BUDGET_S."""
+    return case.get("budget_s") or CLASS_BUDGET_S.get(case.get("kind"), DEFAULT_BUDGET_S)
 
 
 def parse_guard(card: str, body: str, body_found: bool) -> dict:
@@ -824,7 +856,10 @@ class Evidence:
         self.add(name, data)
 
     def screenshot(self, page, name: str) -> None:
-        self.add(name, page.screenshot(full_page=False, type="png", timeout=10_000))
+        """La partie visible de la page, barre latérale et bloc du compte masqués (SELECTORS["mask"])."""
+        masks = [page.locator(sel) for sel in SELECTORS["mask"]]
+        self.add(name, page.screenshot(full_page=False, type="png", timeout=10_000, mask=masks,
+                                       mask_color=MASK_COLOR))
 
 
 class Browser:
@@ -1148,6 +1183,8 @@ class Recette:
         # Ruling R18: what the verdict depends on outside the hashed driver directory.
         self.inputs_sha256 = hash_files(verdict_inputs(self.cases, self.cases_path))
         self.version = f"{VERSION}+{self.inputs_sha256.removeprefix('sha256:')[:12]}"
+        # What the page was read with (SELECTORS, KNOWN_MODALS): on every journal line (D12).
+        self.ui_profile_sha256 = ui_profile_sha256()
         self.journal_path = self.work / "journal.jsonl"
         self.cursor_path = self.work / "journal.cursor"
         self.obs_path = self.work / "observations.json"
@@ -1381,7 +1418,8 @@ class Recette:
             evidence=clean(evidence)[:600],
             pipeline=[f"{k}={int(v)}" for k, v in (pipeline_ms or {}).items()] or None,
             nfr=",".join(nfr) or None, supersedes=None),
-            extra={"inputs_sha256": self.inputs_sha256, **(extra or {})})
+            extra={"inputs_sha256": self.inputs_sha256, "ui_profile_sha256": self.ui_profile_sha256,
+                   **(extra or {})})
         return json.dumps(event, ensure_ascii=False)
 
     # -- envoyer un message et attendre la réponse -------------------------------------------
@@ -1806,7 +1844,7 @@ class Recette:
         page = b.page()
         self._ensure_on_app(page)
         mark = b.mark()
-        att = self._attach(page, path, case.get("budget_s") or DEFAULT_BUDGET_S)
+        att = self._attach(page, path, budget_of(case))
         self.conv["attached"][cid] = {k: att[k] for k in ("state", "ready_by", "pending_seen")} | {"file": path.name}
         self.observations[cid] = {"attach": {k: att[k] for k in ("state", "ready_by", "seconds", "label", "trace")}
                                   | {"t": now_iso()}}
@@ -1890,7 +1928,7 @@ class Recette:
         self.observations[cid] = {"attach": attach} if attach else {}
         mark = self.browser.mark()
         self._last_asked = {"case": cid, "mark": mark}  # what happens from here on is this case's
-        budget = case.get("budget_s") or DEFAULT_BUDGET_S
+        budget = budget_of(case)
         try:
             obs = self._ask(case["question"], budget)
         except AskTimeout as t:
@@ -2026,7 +2064,7 @@ class Recette:
             seen = {"answer": obs.get("answer"), "timing_s": obs.get("timing_s")}
             if obs.get("sent_to_model") is not None:
                 seen["sent"] = obs["sent_to_model"]
-            r = evaluer.evaluate_case(oracle, seen, case.get("budget_s"))
+            r = evaluer.evaluate_case(oracle, seen, budget_of(case))
             if r["verdict"] == "NON TESTÉ" and not dialog and not offlist:  # échec silencieux
                 r["verdict"] = "KO"
                 r["notes"].append("réponse vide : échec silencieux"
@@ -2153,14 +2191,14 @@ class Recette:
             for page, case in ((first, cases[0]), (second, cases[1])):
                 out[case["id"]] = {}
                 if case.get("file"):
-                    att = self._attach(page, self._resolve(case["file"]), case.get("budget_s") or DEFAULT_BUDGET_S)
+                    att = self._attach(page, self._resolve(case["file"]), budget_of(case))
                     out[case["id"]]["attach"] = {k: att[k] for k in ("state", "label", "seconds", "ready_by")}
             if all(o.get("attach", {"state": "ready"})["state"] == "ready" for o in out.values()):
                 for page, case in ((first, cases[0]), (second, cases[1])):
                     # no popover read here: the two sends must leave within 2 s of each other
                     turns.append({**self._send(page, case["question"], read_sent=False), "case": case["id"]})
                 gap = round(abs(turns[1]["t_send"] - turns[0]["t_send"]), 2)
-                budget = max(c.get("budget_s") or DEFAULT_BUDGET_S for c in cases)
+                budget = max(budget_of(c) for c in cases)
                 wait_s, capped = self._deadline(3 * budget)
                 try:
                     self._wait(turns, wait_s, check_host=False)
@@ -2351,7 +2389,7 @@ class Recette:
         self.observations[cid] = {}
         mark = self.browser.mark()
         self._last_asked = {"case": cid, "mark": mark}
-        budget = case.get("budget_s") or DEFAULT_BUDGET_S
+        budget = budget_of(case)
         turns, obs = [], {}
         for i, q in enumerate(questions, 1):
             try:
