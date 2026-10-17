@@ -8,6 +8,9 @@
 pub mod error;
 pub mod fingerprint;
 pub mod layout;
+pub mod materialise;
+pub mod python;
 pub mod signature;
+pub mod wheels;
 
 pub use error::CapitalError;
