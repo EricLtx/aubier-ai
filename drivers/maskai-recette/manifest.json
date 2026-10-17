@@ -78,6 +78,8 @@
       },
       "evidence": [
         "dom.html",
+        "guard.json",
+        "sent.json",
         "network.json",
         "answer.png"
       ],
@@ -100,6 +102,8 @@
       },
       "evidence": [
         "dom.html",
+        "guard.json",
+        "sent.json",
         "network.json",
         "answer.png"
       ],

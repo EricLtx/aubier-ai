@@ -378,6 +378,7 @@ async function send() {
     typer.push(gen.stopped ? " [génération arrêtée]" : " Erreur : " + e.message);
   }
   if (state.generating === gen) state.generating = null;
+  if (!state.generating) $("stop").hidden = true;  // the stop goes with the stream; the drawing goes on
   // The unexpected dialog: true only if someone accepts it.
   if (/TRIGGER_DIALOG/.test(text)) window.__dialog_answered = confirm("unexpected");
   // The page leaves for another host (the driver's list holds 127.0.0.1 only).
@@ -387,7 +388,6 @@ async function send() {
   await typer.end();
   const live = art.querySelector(".live");
   if (live) live.remove();
-  if (!state.generating) $("stop").hidden = true;
   // A dialog well after the answer, once the action that asked is over.
   if (/LATE_DIALOG/.test(text)) setTimeout(() => { window.__dialog_answered = confirm("late"); }, 3500);
 }

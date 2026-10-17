@@ -153,8 +153,73 @@ class EvidenceJsonTest(unittest.TestCase):
             self.assertEqual(ev.dropped, [])
 
 
-@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
-class DriverOnFixture(unittest.TestCase):
+class ChipStateTest(unittest.TestCase):
+    """The attachment chip's state machine (D7), over plain readings (no browser needed)."""
+
+    def test_readings_to_raw_states(self):
+        drv = load_driver()
+        name = "upload_errors.csv"  # a name full of state words: they say nothing of the state
+
+        def raw(text, labels=(), busy=False, attr=""):
+            return drv.chip_state({"text": text, "labels": list(labels), "busy": busy, "attr": attr}, name)
+
+        self.assertEqual(drv.chip_state(None, name), "absent")
+        self.assertEqual(raw(f"{name} Uploading…"), "uploading")
+        self.assertEqual(raw(f"{name} Indexing in progress"), "indexing")
+        self.assertEqual(raw(name, busy=True), "indexing")
+        self.assertEqual(raw(f"{name} Failed", labels=["Failed"]), "failed")
+        self.assertEqual(raw(name, attr="error"), "failed")
+        self.assertEqual(raw(f"{name} Ready"), "ready")
+        self.assertEqual(raw(name, labels=[f"Retirer {name}"]), "unmarked",
+                         "the « Retirer <file> » button is no state (D7 read it as attached)")
+
+    def test_the_state_machine(self):
+        drv = load_driver()
+        w = drv.ChipWatch(quiet_s=2.0)
+        for t, raw in ((0.0, "absent"), (0.1, "uploading"), (0.4, "indexing"), (0.9, "indexing")):
+            w.feed(raw, t)
+        self.assertEqual(w.state, "indexing")
+        self.assertEqual((w.feed("unmarked", 1.2), w.ready_by), ("ready", "after_pending"))
+        self.assertEqual([x["state"] for x in w.trace], ["uploading", "indexing", "ready"])
+        q = drv.ChipWatch(quiet_s=2.0)
+        self.assertEqual(q.feed("unmarked", 0.1), "present", "never ready at once (D7)")
+        self.assertEqual(q.feed("unmarked", 1.0), "present")
+        self.assertEqual((q.feed("unmarked", 2.2), q.ready_by), ("ready", "quiet"))
+        f = drv.ChipWatch()
+        f.feed("failed", 0.3)
+        self.assertEqual(f.feed("unmarked", 5.0), "failed", "failed is final")
+        m = drv.ChipWatch()
+        self.assertEqual((m.feed("ready", 0.2), m.ready_by), ("ready", "marker"))
+
+
+class GuardParseTest(unittest.TestCase):
+    """The answer card's header as the 17/10 UI showed it (D5), from the published journal."""
+
+    def test_headers_seen_on_2026_10_17(self):
+        drv = load_driver()
+        body = "La capitale du Portugal est Lisbonne."
+        g = drv.parse_guard("Aucune donnée personnelle détectée\nL'Aiguilleur : PASS\nmaskai "
+                            "google/eu.claude-haiku-5-5\n" + body, body, True)
+        self.assertEqual(g["model"], "google/eu.claude-haiku-5-5")
+        self.assertEqual(g["guard_text"], "Aucune donnée personnelle détectée L'Aiguilleur : PASS")
+        self.assertIs(g["pii_detected"], False)
+        self.assertFalse(g["live"])
+        g = drv.parse_guard("Anonymisé → <PERSON_1> <CREDIT_CARD_1> L'Aiguilleur : PASS·Le Chirurgien : 2 PII "
+                            "détectées Détails maskai google/eu.claude-haiku-5-5 noté", "noté", True)
+        self.assertIs(g["pii_detected"], True)
+        self.assertEqual(g["tokens"], ["<PERSON_1>", "<CREDIT_CARD_1>"])
+        self.assertTrue(g["guard_text"].endswith("2 PII détectées Détails"), g)
+        g = drv.parse_guard("Aucune donnée personnelle détectée L'Aiguilleur : PASS maskai google/eu.claude-haiku-5-5 "
+                            "· en direct Voici trois conseils", "Voici trois conseils", True)
+        self.assertTrue(g["live"], "« · en direct » after the banner: the answer was still being drawn")
+        g = drv.parse_guard("PASS", "PASS", True)  # a body that also reads like a header word
+        self.assertIsNone(g["model"])
+        self.assertEqual(g["header"], "")
+
+
+class FixtureBench(unittest.TestCase):
+    """The fixture server and the helpers of the browser tests (no test of its own)."""
+
     @classmethod
     def setUpClass(cls):
         cls.server = subprocess.Popen(
@@ -202,6 +267,15 @@ class DriverOnFixture(unittest.TestCase):
             self.assertTrue(os.path.isfile(e["path"]), e)
         return result, evidence
 
+    @staticmethod
+    def evidence_json(evidence, name):
+        with open(next(e["path"] for e in evidence if e["name"] == name), encoding="utf-8") as f:
+            return json.load(f)
+
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class DriverOnFixture(FixtureBench):
+
     def test_replay_ten_of_ten(self):
         drv, recette, A = self.make()
         recette.open()
@@ -212,17 +286,22 @@ class DriverOnFixture(unittest.TestCase):
             t0 = time.monotonic()
             self.act(A, "nouvelle_conversation")
             res, ev = self.act(A, "joindre_document", {"case": cid})
-            self.assertEqual(res["state"], "attached")
+            # v2 (D7): « ready » once the chip left its pending states, not « attached » at once
+            self.assertEqual((res["state"], res["ready_by"]), ("ready", "after_pending"))
             self.assertEqual({e["name"] for e in ev}, {"attach.png", "network.json"})
             res, ev = self.act(A, "poser_question", {"case": cid})
             self.assertIn("QUEL EST LE MONTANT DU LOYER", res["answer"])
             self.assertIn("Quel est le montant du loyer", res["sent"])
             self.assertEqual([s["node"] for s in res["server_steps"]], ["retrieve", "generate"])
-            self.assertEqual({e["name"] for e in ev}, {"dom.html", "network.json", "answer.png"})
+            # v2 (D4, D5): the card header and the sent text are evidence of their own
+            self.assertEqual({e["name"] for e in ev},
+                             {"dom.html", "guard.json", "sent.json", "network.json", "answer.png"})
             res, ev = self.act(A, "verdict_oracle", {"case": cid})
             self.assertEqual((res["verdict"], res["replayed"]), ("OK", False), res)
             self.assertEqual([e["name"] for e in ev], ["journal.jsonl"])
-            self.assertLess(time.monotonic() - t0, 5, f"run {i + 1}")
+            # v2 (D6): 2 s of stillness after the stream's end, and the « Chiffré » popover read
+            # before sending, cost about 3 s a case by design (v1: 5 s a run)
+            self.assertLess(time.monotonic() - t0, 9, f"run {i + 1}")
         lines = journal_lines(recette.work)
         self.assertEqual(len({line["case"] for line in lines}), 10)
         self.assertTrue(all(line["verdict"] == "OK" and line["timing_s"] < 5 for line in lines), lines)
@@ -542,7 +621,7 @@ class DriverOnFixture(unittest.TestCase):
 
     def test_inputs_sha256_in_hello_and_journal(self):
         drv, recette, A = self.make()
-        self.assertRegex(recette.version, r"^0\.1\.0\+[0-9a-f]{12}$")
+        self.assertRegex(recette.version, r"^0\.2\.0\+[0-9a-f]{12}$")  # v2 of the driver
         self.assertTrue(recette.inputs_sha256.startswith("sha256:" + recette.version[6:]))
         # The hello of the driver process carries it.
         env = dict(os.environ, VK_DRIVER_WORK_DIR=self.tmp(), VK_DRIVER_PROFILE_DIR=self.tmp(),
@@ -652,6 +731,198 @@ class DriverOnFixture(unittest.TestCase):
         self.assertEqual(run("exporter_journal")["lines"], n)
         self.assertEqual(run("exporter_journal")["lines"], 0)
         self.assertEqual(set(seen), set(declared))
+
+
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class DriverV2OnFixture(FixtureBench):
+    """What the 2026-10-17 debrief asked of v2, on the bench in the 17/10 shapes."""
+
+    def test_the_answer_is_the_body_and_the_header_goes_to_guard_json(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.message_case(recette, "v2-body", "Bonjour, quelle heure est-il ?")
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "poser_question", {"case": "v2-body"})
+        self.assertEqual(res["answer"], "BONJOUR, QUELLE HEURE EST-IL ? — pièces jointes : aucune")
+        for word in ("maskai", "Aiguilleur", "claude-haiku", "en direct"):
+            self.assertNotIn(word, res["answer"], "D5: the header is not the answer")
+        guard = self.evidence_json(ev, "guard.json")
+        self.assertEqual(guard["model"], "google/eu.claude-haiku-5-5")
+        self.assertEqual(guard["guard_text"], "Aucune donnée personnelle détectée L'Aiguilleur : PASS")
+        self.assertIs(guard["pii_detected"], False)
+        self.assertTrue(guard["body_found"])
+        self.assertEqual(res["model"], "google/eu.claude-haiku-5-5")
+        res, ev = self.act(A, "lire_reponse")
+        self.assertEqual(res["answer"], "BONJOUR, QUELLE HEURE EST-IL ? — pièces jointes : aucune")
+
+    def test_the_answer_is_read_once_the_screen_stops_moving(self):
+        """D6: the bench draws the answer about a second after the server's end, with a 700 ms
+        pause and the stop button already gone. v2 waits for 2 s of stillness: the answer is
+        whole. The same bench read after 0.3 s of stillness (the old reader's) is cut: the
+        bench does discriminate."""
+        drv, recette, A = self.make()
+        recette.open()
+        q = "Voici une phrase assez longue pour que son affichage prenne du temps sur le banc"
+        full = q.upper() + " — pièces jointes : aucune"
+        self.message_case(recette, "v2-display", q)
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "poser_question", {"case": "v2-display"})
+        self.assertEqual(res["answer"], full)
+        self.assertGreater(res["display_s"], res["total_s"], "the screen still moved after the stream's end")
+        self.assertTrue(self.evidence_json(ev, "guard.json")["display_stable"])
+        res, _ = self.act(A, "verdict_oracle", {"case": "v2-display"})
+        self.assertIsInstance(journal_lines(recette.work)[-1]["display_s"], float)
+        drv.DISPLAY_STABLE_S = 0.3
+        self.message_case(recette, "v2-cut", q)
+        self.act(A, "nouvelle_conversation")
+        res, _ = self.act(A, "poser_question", {"case": "v2-cut"})
+        self.assertLess(len(res["answer"]), len(full), res["answer"])
+
+    def test_the_chip_is_followed_until_ready(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "nouvelle_conversation")
+        res, _ = self.act(A, "joindre_document", {"case": "fixture-case-1"})
+        self.assertEqual((res["state"], res["ready_by"]), ("ready", "after_pending"))
+        states = [x["state"] for x in res["trace"]]
+        self.assertEqual(states[-1], "ready")
+        self.assertIn("indexing", states)
+        self.assertGreaterEqual(res["seconds"], 0.5, "the bench indexes for 0.65 s: never ready at once (D7)")
+        res, _ = self.act(A, "poser_question", {"case": "fixture-case-1"})
+        self.assertIn("pièces jointes : case1.txt", res["answer"])
+
+    def test_a_chip_without_any_state_word_is_ready_only_after_a_quiet_spell(self):
+        drv, recette, A = self.make()
+        recette.cases["v2-instant"] = {**recette.cases["fixture-case-1"], "id": "v2-instant",
+                                       "file": "fixture/corpus/instant.txt"}
+        self.act(A, "nouvelle_conversation")
+        res, _ = self.act(A, "joindre_document", {"case": "v2-instant"})
+        self.assertEqual((res["state"], res["ready_by"]), ("ready", "quiet"))
+        self.assertGreaterEqual(res["seconds"], drv.ATTACH_QUIET_S)
+        self.assertEqual([x["state"] for x in res["trace"]], ["present", "ready"])
+
+    def test_a_question_on_a_chip_not_ready_is_a_precondition_refusal_journaled_as_such(self):
+        drv, recette, A = self.make()
+        recette.cases["v2-slowidx"] = {**recette.cases["fixture-case-1"], "id": "v2-slowidx",
+                                       "file": "fixture/corpus/slowidx.txt", "budget_s": 1}
+        self.act(A, "nouvelle_conversation")
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "joindre_document", {"case": "v2-slowidx"})
+        self.assertEqual((refused.exception.reason, refused.exception.extra["state"]), ("precondition", "indexing"))
+        with self.assertRaises(drv.DriverRefusal) as not_sent:
+            self.act(A, "poser_question", {"case": "v2-slowidx"})
+        self.assertEqual(not_sent.exception.reason, "precondition")
+        self.assertIn("pas prête (indexing)", not_sent.exception.detail)
+        self.assertEqual(recette.browser.posts, [], "the question never left")
+        res, _ = self.act(A, "verdict_oracle", {"case": "v2-slowidx"})
+        self.assertEqual(res["verdict"], "KO")
+        line = journal_lines(recette.work)[-1]
+        self.assertIn("question non envoyée (précondition) : pièce jointe indexing", line["evidence"])
+        self.assertIn("disponibilite", line["nfr"])
+
+    def test_the_sent_text_is_read_in_the_popover_which_is_closed_again(self):
+        drv, recette, A = self.make()
+        recette.open()
+        recette.cases["v2-pii"] = {"id": "v2-pii", "level": "N9", "kind": "message",
+                                   "question": "Rédige une relance courtoise pour M. Hugo Bernard au sujet du loyer.",
+                                   "budget_s": 5, "nfr": ["conformite"], "must": ["relance"], "must_not": [],
+                                   "pii": ["Hugo Bernard"]}
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "poser_question", {"case": "v2-pii"})
+        sent = self.evidence_json(ev, "sent.json")
+        self.assertEqual((sent["source"], sent["closed"], sent["block_found"]), ("popover", "escape", True))
+        self.assertEqual(sent["text"], "Rédige une relance courtoise pour <PERSON_1> au sujet du loyer.")
+        self.assertIn("1 PII", sent["trigger_label"])
+        self.assertIn("Hugo Bernard", sent["post_body"], "the POST is the raw text, masked by the server")
+        self.assertEqual(res["sent_source"], "popover")
+        page = recette.browser.page()
+        self.assertTrue(page.evaluate("() => document.getElementById('enc-pop').hidden"), "closed again")
+        self.assertIsNone(recette.browser.own_modal)
+        guard = self.evidence_json(ev, "guard.json")
+        self.assertEqual((guard["pii_detected"], guard["tokens"]), (True, ["<PERSON_1>"]))
+        res, _ = self.act(A, "verdict_oracle", {"case": "v2-pii"})
+        self.assertEqual((res["verdict"], res["leaks"]), ("OK", []))
+        self.assertNotIn("texte envoyé non observé", journal_lines(recette.work)[-1]["evidence"])
+        # The same question with LEAK: the popover shows the name in clear: a leak, KO.
+        recette.cases["v2-leak"] = {**recette.cases["v2-pii"], "id": "v2-leak",
+                                    "question": recette.cases["v2-pii"]["question"] + " LEAK"}
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "poser_question", {"case": "v2-leak"})
+        res, _ = self.act(A, "verdict_oracle", {"case": "v2-leak"})
+        self.assertEqual((res["verdict"], res["leaks"]), ("KO", ["Hugo Bernard"]))
+
+    def test_the_popover_is_known_only_when_the_driver_opened_it(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "nouvelle_conversation")
+        page = recette.browser.page()
+        hidden = "() => document.getElementById('enc-pop').hidden"
+        page.click("#enc")  # opened by hand: an unknown dialog for the driver
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "capture_ecran")
+        self.assertEqual(refused.exception.reason, "dialog")
+        self.assertIn("modale inconnue : Ce qui part au modèle", refused.exception.detail)
+        self.assertFalse(page.evaluate(hidden), "the driver never closes what it did not open")
+        page.keyboard.press("Escape")  # the founder closes it
+        self.act(A, "capture_ecran")
+        recette.browser.own_modal = "envoi"  # opened by the driver, left open by an action cut short
+        page.click("#enc")
+        self.act(A, "capture_ecran")
+        self.assertTrue(page.evaluate(hidden), "the next guard closes it")
+        self.assertIsNone(recette.browser.own_modal)
+
+    def test_an_unknown_dialog_is_still_refused_and_never_answered(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "envoyer_message", {"text": "Bonjour UNKNOWN_MODAL"})
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "nouvelle_conversation")
+        self.assertEqual(refused.exception.reason, "dialog")
+        self.assertIn("modale inconnue : Une fenêtre que personne", refused.exception.detail)
+        self.assertFalse(recette.browser.page().evaluate("() => document.getElementById('mystery').hidden"))
+
+    def slow_case(self, recette) -> None:
+        recette.cases["v2-slow"] = {"id": "v2-slow", "level": "N8", "kind": "message", "question": "SLOW",
+                                    "budget_s": 1, "nfr": ["securite"], "must": [], "must_not": [], "pii": []}
+
+    def test_a_clean_abort_stops_the_generation_and_no_survey_follows(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.slow_case(recette)
+        self.act(A, "nouvelle_conversation")
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "poser_question", {"case": "v2-slow"})
+        self.assertEqual(refused.exception.reason, "timeout")
+        abort = refused.exception.extra["abort"]
+        self.assertEqual((abort["posted"], abort["stream_started"], abort["stop_clicked"], abort["stop_gone"]),
+                         (True, True, True, True))
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual((line["case"], line["verdict"]), ("v2-slow", "KO"))
+        self.assertIn("question partie (POST vu), flux ouvert, arrêt cliqué", line["evidence"])
+        res, _ = self.act(A, "nouvelle_conversation")
+        self.assertIsNone(res["stopped_first"], "nothing was left in flight")
+        time.sleep(1.5)  # the bench shows its survey 0.4 s after an abandoned generation
+        self.act(A, "capture_ecran")
+        self.assertEqual(recette.browser.call("() => window.__survey_shown"), 0)
+
+    def test_without_the_stop_the_survey_follows_and_is_closed_never_answered(self):
+        """The counter-proof, v1's behaviour: no stop click, the generation is left in flight, the
+        « Votre avis » survey follows (5/5 on 17/10, D2); the guard closes it by its cross."""
+        drv, recette, A = self.make()
+        recette.open()
+        self.slow_case(recette)
+        recette._stop_generation = lambda page: {"stop_clicked": False}
+        self.act(A, "nouvelle_conversation")
+        with self.assertRaises(drv.DriverRefusal):
+            self.act(A, "poser_question", {"case": "v2-slow"})
+        self.act(A, "nouvelle_conversation")
+        time.sleep(1.5)
+        self.assertEqual(recette.browser.call("() => window.__survey_shown"), 1)
+        self.act(A, "capture_ecran")  # the guard closes the known modal by its cross
+        self.assertEqual(recette.browser.call(
+            "() => [window.__survey_answered, document.getElementById('avis').hidden]"), [False, True])
 
 
 if __name__ == "__main__":
