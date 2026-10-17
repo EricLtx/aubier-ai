@@ -47,28 +47,29 @@ pub struct UninstallArgs {
 /// `vk driver install PKG`: refused unless this shell may write under the
 /// install root; otherwise the package is verified, materialised, checked
 /// against its fingerprint and renamed into place by
-/// [`vk_capital::install::install`], the publisher pinned in the daemon's
-/// state directory when the administrator confirms it, and the tree made
-/// read-only to everyone but the administrators and SYSTEM — when this
-/// shell is elevated. A non-elevated install (a root this account may
-/// write, through `VK_DRIVER_INSTALL_ROOT`: the test seam) leaves the tree
-/// the root's own ACL: a tree its owner may rewrite is not protected by
-/// any DACL it sets.
+/// [`vk_capital::install::install`], and the publisher pinned in the
+/// daemon's state directory when the administrator confirms it.
+///
+/// Elevated, the root must be the administrators' alone
+/// ([`administrators_only`]), and the tree is read-only to everyone but the
+/// administrators and SYSTEM from its first byte: `<name>` and `.part` are
+/// created with that DACL ([`make_tree_dir`]) before the interpreter is
+/// extracted and run in them. A non-elevated install (a root this account
+/// may write, through `VK_DRIVER_INSTALL_ROOT`: the test seam) makes plain
+/// directories under the root's own ACL: a tree its owner may rewrite is
+/// not protected by any DACL it sets, and nothing in it runs elevated.
 pub fn install(cli: &Cli, args: &InstallArgs) -> Result<()> {
     let root = vk_kernel::default_install_root();
     writable(&root, "install")?;
+    let elevated = elevated()?;
+    if elevated {
+        administrators_only(&root)?;
+    }
     let state_dir = args.state_dir.as_deref().map(absolute).transpose()?;
     let state_dir = vk_store::paths::resolve_state_dir(state_dir)?;
     let pins = Pins::at(&state_dir);
     let package = absolute(&args.package)?;
-    let elevated = elevated()?;
-    let acl = |dir: &Path| -> vk_capital::error::Result<()> {
-        if elevated {
-            read_only(dir)
-        } else {
-            Ok(())
-        }
-    };
+    let make_dir = |dir: &Path| make_tree_dir(dir, elevated);
     let yes = args.yes;
     let mut confirm = |key: &PinnedKey| ask(key, yes);
     let report = vk_capital::install::install(
@@ -77,7 +78,7 @@ pub fn install(cli: &Cli, args: &InstallArgs) -> Result<()> {
         &pins,
         Tofu::Confirm(&mut confirm),
         &pinned_by()?,
-        &acl,
+        &make_dir,
     )
     .map_err(refusal)?;
     let publishers = state_dir.join("capital").join("publishers");
@@ -128,11 +129,18 @@ pub async fn uninstall(cli: &Cli, args: &UninstallArgs) -> Result<()> {
 
 /// Whether the daemon answering on this shell's endpoint reports
 /// `name@version` mounted: one of its `driver.ls` rows names it, in any
-/// state but `installed`. No daemon answering: nothing is mounted.
+/// state but `installed`. No daemon there — the endpoint does not exist —
+/// means nothing is mounted; a daemon this shell cannot ask is a refusal.
 async fn mounted(cli: &Cli, name: &str, version: &str) -> Result<bool> {
     let ep = endpoint(cli);
-    let Ok(c) = Client::connect(&ep).await else {
-        return Ok(false);
+    let c = match Client::connect(&ep).await {
+        Ok(c) => c,
+        Err(e) if no_daemon(&e) => return Ok(false),
+        Err(e) => bail!(
+            "the daemon on {} cannot be asked what is mounted ({e:#}); remedy: start or stop the \
+             daemon, then retry",
+            ep.0
+        ),
     };
     let rows = c
         .call("driver.ls", json!({}), None)
@@ -143,6 +151,63 @@ async fn mounted(cli: &Cli, name: &str, version: &str) -> Result<bool> {
             r["name"] == name && r["version"] == version && r["state"]["state"] != "installed"
         })
     }))
+}
+
+/// Whether a failed connect means there is no daemon on the endpoint: the
+/// pipe (or the socket) is not there. Anything else — a busy pipe, a
+/// refused connection, a pipe served by another account — is a daemon this
+/// shell cannot ask, and an uninstall is not decided without it.
+fn no_daemon(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Refused when non-administrators may write the install root: an elevated
+/// install extracts the interpreter there and runs it as an administrator,
+/// so whoever can write the root could put their code between the two
+/// (review fix 1). Windows: no allow entry may give Everyone,
+/// Authenticated Users, the built-in Users or INTERACTIVE a write right.
+fn administrators_only(root: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if let Some((sid, group)) = vk_store::win_acl::non_admin_writer(root)? {
+        bail!(
+            "the install root {} can be written by {group} ({sid}), not only by administrators: \
+             an elevated install would run what they put there; remedy: install under the \
+             default root, %ProgramFiles%\\Aubier\\drivers (VK_DRIVER_INSTALL_ROOT unset), or \
+             give this root the administrators-only ACL of %ProgramFiles%",
+            plain_path(root)
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = root;
+    Ok(())
+}
+
+/// The directory maker of an install: `<name>` (when it is new) and
+/// `.part`, each of which must not exist yet. Elevated, on Windows, the
+/// read-only tree DACL from creation on (`create_readonly_tree_dir`, which
+/// never adopts an existing directory), so that the interpreter and pip run
+/// as an administrator never sit in a directory another account can write;
+/// otherwise a plain directory.
+fn make_tree_dir(dir: &Path, elevated: bool) -> vk_capital::error::Result<()> {
+    #[cfg(windows)]
+    if elevated {
+        return vk_store::win_acl::create_readonly_tree_dir(dir).map_err(|e| {
+            match e.downcast_ref::<std::io::Error>().map(std::io::Error::kind) {
+                Some(std::io::ErrorKind::AlreadyExists) => {
+                    CapitalError::Io(std::io::ErrorKind::AlreadyExists.into())
+                }
+                _ => CapitalError::Refused(format!(
+                    "{} could not be created read-only ({e:#}); remedy: run vk driver install \
+                     from an elevated shell",
+                    plain_path(dir)
+                )),
+            }
+        });
+    }
+    let _ = elevated;
+    std::fs::create_dir(dir)?;
+    Ok(())
 }
 
 /// Refused, with nothing written, unless this shell may create `dir` and
@@ -186,27 +251,9 @@ fn ask(key: &PinnedKey, yes: bool) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-/// The read-only tree DACL, on Windows; nothing elsewhere.
-fn read_only(dir: &Path) -> vk_capital::error::Result<()> {
-    #[cfg(windows)]
-    {
-        vk_store::win_acl::create_readonly_tree_dir(dir).map_err(|e| {
-            CapitalError::Refused(format!(
-                "the read-only ACL could not be set on {} ({e:#}); remedy: run vk driver install \
-                 from an elevated shell",
-                plain_path(dir)
-            ))
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = dir;
-        Ok(())
-    }
-}
-
-/// Whether this shell runs elevated (Windows); off Windows the ACL is not
-/// set, so the question does not arise.
+/// Whether this shell runs elevated (Windows). Off Windows a package cannot
+/// run (its interpreter is a Windows build), and the question does not
+/// arise.
 fn elevated() -> Result<bool> {
     #[cfg(windows)]
     return vk_store::win_acl::process_is_elevated();
@@ -238,5 +285,52 @@ fn refusal(e: CapitalError) -> anyhow::Error {
             anyhow!(e).context("the install root or the package could not be written or read")
         }
         CapitalError::Json(e) => anyhow!(e).context("a package component did not encode"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only an endpoint that is not there means no daemon: a refused or
+    /// busy connection, or a pipe this shell may not open, is a daemon it
+    /// cannot ask (review fix 4).
+    #[test]
+    fn only_a_missing_endpoint_means_no_daemon() {
+        let io = |kind: std::io::ErrorKind| anyhow::Error::new(std::io::Error::from(kind));
+        assert!(no_daemon(&io(std::io::ErrorKind::NotFound)));
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert!(!no_daemon(&io(kind)), "{kind:?}");
+        }
+        assert!(!no_daemon(&anyhow!("pipe busy")));
+    }
+
+    /// An elevated install refuses a root a broad group may write, and
+    /// takes one that only this account, SYSTEM and the administrators may
+    /// (review fix 1).
+    #[cfg(windows)]
+    #[test]
+    fn an_elevated_install_refuses_a_root_a_broad_group_may_write() {
+        let t = tempfile::tempdir().unwrap();
+        administrators_only(t.path()).unwrap();
+        let open = t.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        let granted = std::process::Command::new("icacls")
+            .arg(&open)
+            .args(["/grant", "*S-1-5-11:(OI)(CI)M"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(granted, "icacls");
+        let e = administrators_only(&open).unwrap_err().to_string();
+        assert!(e.contains("Authenticated Users (S-1-5-11)"), "{e}");
+        assert!(e.contains("; remedy: "), "{e}");
+        assert!(e.contains(r"%ProgramFiles%\Aubier\drivers"), "{e}");
+        assert_eq!(e.lines().count(), 1, "{e}");
     }
 }

@@ -23,3 +23,8 @@ keyring = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# The install tests read back the DACL an elevated install's tree is born
+# with, through the function `vk driver install` makes it with.
+[target.'cfg(windows)'.dev-dependencies]
+vk-store = { path = "../vk-store" }

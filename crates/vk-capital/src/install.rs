@@ -41,6 +41,10 @@ const MAX_INSTALLED_PATH: usize = 240;
 /// than [`MAX_INSTALLED_PATH`] minus this cannot hold the interpreter.
 const PYTHON_DEEPEST: usize = 105;
 const ALTERED: &str = "do not install this copy; fetch the package again from its publisher";
+/// What a path-length refusal recommends: never a root of the
+/// administrator's own choosing, which may be one other accounts can write.
+const SHORTER: &str = "give the driver a shorter name or version, or install under the default \
+                       root, %ProgramFiles%\\Aubier\\drivers";
 
 /// What an install did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +74,8 @@ pub enum Tofu<'a> {
 
 /// The tree builder [`install_with`] calls: [`materialise::materialise`]'s
 /// signature, so that tests can stand in for the interpreter and pip.
-pub type Materialiser = dyn Fn(&Path, &[u8], &Path, &str, &[u8], &[Locked]) -> Result<Materialised>;
+pub type Materialiser<'a> =
+    dyn Fn(&Path, &[u8], &Path, &str, &[u8], &[Locked]) -> Result<Materialised> + 'a;
 
 /// Opens the layout, resolves the signature's key against `pins`; unknown key →
 /// TOFU callback (pin on true, refuse on false); known key → verify, no prompt.
@@ -78,17 +83,22 @@ pub type Materialiser = dyn Fn(&Path, &[u8], &Path, &str, &[u8], &[Locked]) -> R
 /// Refuses if `root/name/version` exists. Materialises into `root/name/version.part`,
 /// compares the fingerprint with the manifest's `files_sha256` (mismatch → remove,
 /// refuse "repack on a node with the same CPython release"), writes `.package/`
-/// (image manifest + signature), applies the ACL, renames `.part` → `version`.
+/// (image manifest + signature), renames `.part` → `version`, then pins.
 ///
-/// `pinned_by` goes into the pin's sidecar (the administrator's SID). `acl`
-/// is applied to the `.part` directory, whole, before it is renamed.
+/// `pinned_by` goes into the pin's sidecar (the administrator's SID).
+/// `make_dir` creates `<root>/<name>` (when it is new) and `.part`, each of
+/// which must not exist yet (`AlreadyExists` otherwise), with the
+/// protection the tree is to have from its first byte: an elevated install
+/// passes the read-only tree DACL's maker, so that nothing it materialises
+/// — the interpreter and pip it runs as an administrator included — sits
+/// for one moment in a directory another account can write.
 pub fn install(
     layout: &Path,
     root: &Path,
     pins: &Pins,
     tofu: Tofu,
     pinned_by: &str,
-    acl: &dyn Fn(&Path) -> Result<()>,
+    make_dir: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<InstallReport> {
     install_with(
         layout,
@@ -96,7 +106,7 @@ pub fn install(
         pins,
         tofu,
         pinned_by,
-        acl,
+        make_dir,
         &materialise::materialise,
     )
 }
@@ -113,19 +123,22 @@ pub fn install(
 /// the deepest path the interpreter would reach; then the signature — under
 /// the pinned key with no prompt, or under the key the package carries
 /// (its id the signature's) before the administrator is asked to pin it.
-/// Then the tree is built in `<version>.part` beside the target, its paths
-/// and its fingerprint checked, `manifest.json` and `.package/` written,
-/// `acl` applied, the publisher pinned (when it was confirmed now) and the
-/// `.part` renamed into place. A refusal from the first write on removes
-/// the `.part` and the interpreter archive.
+/// Neither `root` nor `<root>/<name>` may be a link or a junction. Then
+/// `make_dir` makes `<name>` if it is new and `<version>.part` always —
+/// one that appears meanwhile is another install's, refused and left to it
+/// — the tree is built in the `.part`, its paths and its fingerprint
+/// checked, `manifest.json` and `.package/` written, the `.part` renamed
+/// into place and the publisher pinned (when it was confirmed now): a
+/// rename that fails pins nothing, a pin that fails takes the tree back
+/// out. A refusal from the first write on removes what this install made.
 pub fn install_with(
     layout: &Path,
     root: &Path,
     pins: &Pins,
     tofu: Tofu,
     pinned_by: &str,
-    acl: &dyn Fn(&Path) -> Result<()>,
-    materialiser: &Materialiser,
+    make_dir: &dyn Fn(&Path) -> Result<()>,
+    materialiser: &Materialiser<'_>,
 ) -> Result<InstallReport> {
     let opened = layout::open(layout)?;
     let package = &opened.package;
@@ -195,6 +208,8 @@ pub fn install_with(
     let parent = root.join(&name);
     let target = parent.join(&version);
     let part = parent.join(format!("{version}.part"));
+    not_a_link(root, "the install root")?;
+    not_a_link(&parent, "the install directory of the driver")?;
     if std::fs::symlink_metadata(&target).is_ok() {
         return refuse(
             format!("{spec} is already installed at {}", target.display()),
@@ -221,7 +236,7 @@ pub fn install_with(
                  {MAX_INSTALLED_PATH}",
                 part.display()
             ),
-            "install under a shorter root (VK_DRIVER_INSTALL_ROOT)",
+            SHORTER,
         );
     }
 
@@ -241,13 +256,39 @@ pub fn install_with(
         })?;
     let files = layout::read_layer(&opened, "files")?;
     let wheels = layout::read_layer(&opened, "wheels")?;
-    let made_parent = (!parent.exists()).then(|| parent.clone());
-    std::fs::create_dir_all(&parent)?;
+    std::fs::create_dir_all(root)?;
+    not_a_link(root, "the install root")?;
     let mut guard = Partial {
-        paths: vec![part.clone()],
-        made_parent,
+        paths: vec![],
+        made_parent: None,
         armed: true,
     };
+    let parent_made = match std::fs::symlink_metadata(&parent) {
+        Ok(_) => Err(CapitalError::Io(std::io::ErrorKind::AlreadyExists.into())),
+        Err(_) => make_dir(&parent),
+    };
+    match parent_made {
+        Ok(()) => guard.made_parent = Some(parent.clone()),
+        // An earlier install's, or made meanwhile by another install of the
+        // driver: it must be a plain directory.
+        Err(CapitalError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            not_a_link(&parent, "the install directory of the driver")?
+        }
+        Err(e) => return Err(e),
+    }
+    match make_dir(&part) {
+        Ok(()) => guard.paths.push(part.clone()),
+        Err(CapitalError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return refuse(
+                format!(
+                    "an install of {spec} is under way, or was cut short: {} exists",
+                    part.display()
+                ),
+                &format!("remove {}, then install again", part.display()),
+            )
+        }
+        Err(e) => return Err(e),
+    }
     let archive = parent.join(format!(
         "{version}.python-{}.tar.gz",
         crate::unique_suffix()
@@ -266,7 +307,7 @@ pub fn install_with(
                  {MAX_INSTALLED_PATH}",
                 target.display()
             ),
-            "install under a shorter root (VK_DRIVER_INSTALL_ROOT)",
+            SHORTER,
         );
     }
     let expected = &manifest.program.files_sha256;
@@ -287,11 +328,12 @@ pub fn install_with(
         dot_package.join("signature.json"),
         serde_json::to_vec_pretty(sig)?,
     )?;
-    acl(&part)?;
+    std::fs::rename(&part, &target)?;
+    // In place: from here a refusal takes the installed tree back out.
+    guard.paths = vec![target.clone()];
     if confirmed {
         pins.pin(&publisher, pinned_by)?;
     }
-    std::fs::rename(&part, &target)?;
     guard.armed = false;
     Ok(InstallReport {
         name,
@@ -383,9 +425,14 @@ fn publisher(
 /// Removes `root/name/version`; `mounted` says whether the daemon reports it mounted.
 ///
 /// Refused, with nothing removed, when the name or version is not one (both
-/// become path components), when the version is mounted, when it is not
-/// installed, and when it is not a directory `vk driver install` made (a
-/// link is not followed). The name's directory goes too once it is empty.
+/// become path components), when the version is mounted, when the root or
+/// `<root>/<name>` is a link or a junction, when it is not installed, and
+/// when it is not a directory `vk driver install` made (a link is not
+/// followed). The tree is moved aside to `<version>.removing-<unique>`
+/// before it is deleted: Windows refuses that move while a file in it is
+/// open — a driver still running, a shell, an editor — and the uninstall is
+/// refused with the tree whole, never half removed. The name's directory
+/// goes too once it is empty.
 pub fn uninstall(root: &Path, name: &str, version: &str, mounted: bool) -> Result<()> {
     if !is_driver_name(name) || !is_version(version) {
         return refuse(
@@ -401,8 +448,10 @@ pub fn uninstall(root: &Path, name: &str, version: &str, mounted: bool) -> Resul
     }
     let parent = root.join(name);
     let target = parent.join(version);
+    not_a_link(root, "the install root")?;
+    not_a_link(&parent, "the install directory of the driver")?;
     match std::fs::symlink_metadata(&target) {
-        Ok(m) if m.is_dir() => {}
+        Ok(m) if m.is_dir() && !is_link(&m) => {}
         Ok(_) => {
             return refuse(
                 format!(
@@ -420,10 +469,69 @@ pub fn uninstall(root: &Path, name: &str, version: &str, mounted: bool) -> Resul
         }
         Err(e) => return Err(e.into()),
     }
-    std::fs::remove_dir_all(&target)?;
+    let aside = parent.join(format!("{version}.removing-{}", crate::unique_suffix()));
+    if let Err(e) = std::fs::rename(&target, &aside) {
+        return refuse(
+            format!(
+                "{name}@{version} cannot be moved aside to be removed ({}): a file of it is open \
+                 — a driver still running, a shell, an editor — or this shell may not write \
+                 there",
+                e.kind()
+            ),
+            &format!(
+                "vk driver umount {name} and close what holds its files, from an elevated shell, \
+                 then uninstall again"
+            ),
+        );
+    }
+    if let Err(e) = std::fs::remove_dir_all(&aside) {
+        return refuse(
+            format!(
+                "{name}@{version} was moved aside to {} and could not be removed ({})",
+                aside.display(),
+                e.kind()
+            ),
+            &format!("remove {} by hand", aside.display()),
+        );
+    }
     // Only an empty one: `remove_dir` refuses a directory that holds anything.
     let _ = std::fs::remove_dir(&parent);
     Ok(())
+}
+
+/// Refused when `dir` exists and is a link of any kind — a symlink, or on
+/// Windows a junction or any other reparse point — or not a directory: an
+/// elevated install would write, and an uninstall remove, wherever it
+/// points. An absent `dir` passes: it is made later, by this install.
+fn not_a_link(dir: &Path, what: &str) -> Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if is_link(&m) => refuse(
+            format!("{what} {} is a link or a junction", dir.display()),
+            "make it a plain directory only administrators can write, or install under the \
+             default root (%ProgramFiles%\\Aubier\\drivers, VK_DRIVER_INSTALL_ROOT unset)",
+        ),
+        Ok(m) if !m.is_dir() => refuse(
+            format!("{what} {} is not a directory", dir.display()),
+            "remove it, then install again",
+        ),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Whether `m` (read without following links) is a link: a symlink, or —
+/// on Windows, by its attribute — a junction or any other reparse point.
+fn is_link(m: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    m.file_type().is_symlink()
 }
 
 /// What an install has written and must remove if it is refused: the
@@ -623,21 +731,98 @@ mod tests {
         out
     }
 
-    fn no_acl(_: &Path) -> Result<()> {
+    /// The tree maker of a non-elevated install: a plain directory, which
+    /// must not exist yet.
+    fn plain_dir(dir: &Path) -> Result<()> {
+        std::fs::create_dir(dir)?;
         Ok(())
     }
 
     /// Nothing was installed under `root`: no version, no `.part`, no
-    /// interpreter archive left beside them.
+    /// interpreter archive, not even an empty directory — `root` itself may
+    /// be there, empty.
     fn nothing_under(root: &Path) {
         let left: Vec<PathBuf> = walkdir::WalkDir::new(root)
             .min_depth(1)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
             .map(|e| e.into_path())
             .collect();
         assert!(left.is_empty(), "left under {root:?}: {left:?}");
+    }
+
+    /// `at` made a link to `target`: a junction on Windows (it needs no
+    /// privilege), a symlink elsewhere.
+    fn link(target: &Path, at: &Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(at)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(
+                made.status.success(),
+                "mklink /J: {}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, at).unwrap();
+    }
+
+    /// The tree maker of an elevated install, as `vk driver install` uses
+    /// it: the read-only tree DACL on Windows, mode 0755 elsewhere.
+    #[cfg(windows)]
+    fn protected_dir(dir: &Path) -> Result<()> {
+        vk_store::win_acl::create_readonly_tree_dir(dir).map_err(|e| {
+            match e.downcast_ref::<std::io::Error>().map(std::io::Error::kind) {
+                Some(std::io::ErrorKind::AlreadyExists) => {
+                    CapitalError::Io(std::io::ErrorKind::AlreadyExists.into())
+                }
+                _ => CapitalError::Refused(format!("{e:#}")),
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    fn protected_dir(dir: &Path) -> Result<()> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().mode(0o755).create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+
+    /// `dir` holds exactly the read-only tree DACL, read back by value.
+    #[cfg(windows)]
+    fn assert_protected(dir: &Path) {
+        use vk_store::win_acl::{
+            path_dacl, ADMINISTRATORS_SID, FILE_ALL_ACCESS_MASK, LOCAL_SYSTEM_SID,
+            READ_AND_EXECUTE_MASK, USERS_SID,
+        };
+        let view = path_dacl(dir).unwrap();
+        assert!(view.protected, "{view:?}");
+        let mut held: Vec<(String, u32)> = view
+            .entries
+            .iter()
+            .map(|e| (e.sid.clone(), e.mask))
+            .collect();
+        held.sort();
+        let mut wanted = vec![
+            (ADMINISTRATORS_SID.to_string(), FILE_ALL_ACCESS_MASK),
+            (LOCAL_SYSTEM_SID.to_string(), FILE_ALL_ACCESS_MASK),
+            (USERS_SID.to_string(), READ_AND_EXECUTE_MASK),
+        ];
+        wanted.sort();
+        assert_eq!(held, wanted, "{view:?}");
+    }
+
+    #[cfg(unix)]
+    fn assert_protected(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "{mode:o}");
     }
 
     #[test]
@@ -657,7 +842,7 @@ mod tests {
             &n.pins,
             Tofu::Confirm(&mut yes),
             "S-1-5-21-1",
-            &no_acl,
+            &plain_dir,
             &files_only,
         )
         .unwrap();
@@ -675,7 +860,7 @@ mod tests {
             &n.pins,
             Tofu::Confirm(&mut yes),
             "S-1-5-21-1",
-            &no_acl,
+            &plain_dir,
             &files_only,
         )
         .unwrap();
@@ -697,7 +882,7 @@ mod tests {
             &fresh.pins,
             Tofu::Confirm(&mut no),
             "S-1-5-21-1",
-            &no_acl,
+            &plain_dir,
             &files_only,
         )
         .unwrap_err()
@@ -736,7 +921,7 @@ mod tests {
             &n.pins,
             Tofu::Confirm(&mut ask),
             "S-1-5-21-1",
-            &no_acl,
+            &plain_dir,
             &files_only,
         )
         .unwrap_err()
@@ -774,7 +959,7 @@ mod tests {
             &n.pins,
             Tofu::Confirm(&mut |_| true),
             "S-1-5-21-1",
-            &no_acl,
+            &plain_dir,
             &elsewhere,
         )
         .unwrap_err()
@@ -805,7 +990,7 @@ mod tests {
             &n.pins,
             Tofu::Confirm(&mut ask),
             "S-1-5-21-1",
-            &no_acl,
+            &plain_dir,
             &files_only,
         )
         .unwrap_err()
@@ -827,7 +1012,7 @@ mod tests {
             &n.pins,
             Tofu::Confirm(&mut |_| true),
             "S-1-5-21-1",
-            &no_acl,
+            &plain_dir,
             &files_only,
         )
         .unwrap();
@@ -869,7 +1054,7 @@ mod tests {
             &n.pins,
             Tofu::Confirm(&mut |_| true),
             "S-1-5-21-1",
-            &no_acl,
+            &plain_dir,
             &files_only,
         )
         .unwrap();
@@ -965,7 +1150,7 @@ mod tests {
                 &n.pins,
                 Tofu::Confirm(&mut ask),
                 "S-1-5-21-1",
-                &no_acl,
+                &plain_dir,
                 &files_only,
             )
             .unwrap_err()
@@ -982,7 +1167,7 @@ mod tests {
             &n.pins,
             Tofu::Refuse,
             "S-1-5-21-1",
-            &no_acl,
+            &plain_dir,
             &files_only,
         )
         .unwrap_err()
@@ -993,10 +1178,11 @@ mod tests {
         assert!(n.pins.list().unwrap().is_empty());
     }
 
-    /// An ACL that cannot be set leaves nothing installed and nothing
+    /// A tree maker that fails leaves nothing installed and nothing
     /// pinned; a tree whose paths would pass the 240 characters Windows
     /// tools can be trusted with is refused, before anything is written
-    /// when the interpreter alone would pass them.
+    /// when the interpreter alone would pass them, and the remedy never
+    /// sends the administrator to a root of their own choosing.
     #[test]
     fn an_install_that_fails_late_leaves_nothing_and_a_deep_root_is_refused_early() {
         let n = node();
@@ -1026,13 +1212,14 @@ mod tests {
             &n.pins,
             Tofu::Confirm(&mut |_| true),
             "S-1-5-21-1",
-            &no_acl,
+            &plain_dir,
             &files_only,
         )
         .unwrap_err()
         .to_string();
         assert!(e.contains("240"), "{e}");
         assert!(e.contains("; remedy: "), "{e}");
+        assert!(!e.contains("VK_DRIVER_INSTALL_ROOT"), "{e}");
         assert!(!deep.exists(), "refused before anything was written");
 
         let deeper = |root: &Path,
@@ -1057,12 +1244,279 @@ mod tests {
             &n.pins,
             Tofu::Confirm(&mut |_| true),
             "S-1-5-21-1",
-            &no_acl,
+            &plain_dir,
             &deeper,
         )
         .unwrap_err()
         .to_string();
         assert!(e.contains("240"), "{e}");
+        assert!(!e.contains("VK_DRIVER_INSTALL_ROOT"), "{e}");
         nothing_under(&n.root);
+    }
+
+    /// Neither the install root nor `<root>/<name>` may be a link or a
+    /// junction: an elevated install would write, and an elevated uninstall
+    /// remove, wherever it points. Both are refused, and nothing goes
+    /// through (review fix 1).
+    #[test]
+    fn a_link_at_the_root_or_the_name_is_refused_and_nothing_goes_through_it() {
+        let n = node();
+        let k = key(n.t.path(), "k");
+        let layout = pack(n.t.path(), pack_of("fake", "1.0.0", &k));
+        let elsewhere = n.t.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("1.0.0")).unwrap();
+        std::fs::write(elsewhere.join("1.0.0").join("driver.py"), b"theirs").unwrap();
+        let untouched = || {
+            let all: Vec<PathBuf> = walkdir::WalkDir::new(&elsewhere)
+                .min_depth(1)
+                .into_iter()
+                .map(|e| e.unwrap().into_path())
+                .collect();
+            assert_eq!(
+                all,
+                [
+                    elsewhere.join("1.0.0"),
+                    elsewhere.join("1.0.0").join("driver.py")
+                ]
+            );
+            assert_eq!(
+                std::fs::read(elsewhere.join("1.0.0").join("driver.py")).unwrap(),
+                b"theirs"
+            );
+        };
+        std::fs::create_dir_all(&n.root).unwrap();
+        link(&elsewhere, &n.root.join("fake"));
+        let linked_root = n.t.path().join("linked-root");
+        link(&elsewhere, &linked_root);
+        for root in [&n.root, &linked_root] {
+            let e = install_with(
+                &layout,
+                root,
+                &n.pins,
+                Tofu::Confirm(&mut |_| true),
+                "S-1-5-21-1",
+                &plain_dir,
+                &files_only,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains("is a link or a junction"), "{e}");
+            assert!(e.contains("; remedy: "), "{e}");
+            untouched();
+        }
+        for root in [&n.root, &linked_root] {
+            let e = uninstall(root, "fake", "1.0.0", false)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("is a link or a junction"), "{e}");
+            untouched();
+        }
+        let e = uninstall(&linked_root, "1.0.0", "1.0.0", false);
+        assert!(e.is_err(), "a version under a linked root is not removed");
+        untouched();
+        assert!(n.pins.list().unwrap().is_empty(), "nothing pinned");
+    }
+
+    /// The tree maker makes `<name>` (when it is new) and `.part` before
+    /// anything is materialised in them: the materialiser finds its root
+    /// made, and empty. A `.part` another install made between the check
+    /// and the making is refused, and left to its maker (review fix 1).
+    #[test]
+    fn the_tree_maker_makes_the_part_first_and_never_adopts_one() {
+        let n = node();
+        let k = key(n.t.path(), "k");
+        let layout = pack(n.t.path(), pack_of("fake", "1.0.0", &k));
+        let made = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let maker = |dir: &Path| -> Result<()> {
+            std::fs::create_dir(dir)?;
+            made.borrow_mut().push(dir.to_path_buf());
+            Ok(())
+        };
+        let part = n.root.join("fake").join("1.0.0.part");
+        let checked = |root: &Path,
+                       files: &[u8],
+                       python: &Path,
+                       sha: &str,
+                       wheels: &[u8],
+                       lock: &[Locked]|
+         -> Result<Materialised> {
+            assert_eq!(*made.borrow(), [n.root.join("fake"), part.clone()]);
+            assert_eq!(root, part);
+            assert_eq!(std::fs::read_dir(root)?.count(), 0, "made, and empty");
+            files_only(root, files, python, sha, wheels, lock)
+        };
+        install_with(
+            &layout,
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut |_| true),
+            "S-1-5-21-1",
+            &maker,
+            &checked,
+        )
+        .unwrap();
+
+        let second = pack(n.t.path(), pack_of("fake", "1.1.0", &k));
+        let racing = |dir: &Path| -> Result<()> {
+            // The other install makes it first; this one finds it there.
+            std::fs::create_dir(dir)?;
+            std::fs::write(dir.join("theirs"), b"x")?;
+            std::fs::create_dir(dir)?;
+            Ok(())
+        };
+        let e = install_with(
+            &second,
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut |_| true),
+            "S-1-5-21-1",
+            &racing,
+            &files_only,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("under way"), "{e}");
+        assert!(e.contains("; remedy: "), "{e}");
+        assert!(
+            n.root
+                .join("fake")
+                .join("1.1.0.part")
+                .join("theirs")
+                .is_file(),
+            "left to its maker"
+        );
+    }
+
+    /// Elevated, `.part` is born with the tree's protection — the read-only
+    /// DACL on Windows, mode 0755 elsewhere — so the interpreter and pip,
+    /// run as an administrator, never run from a directory another account
+    /// can write into (review fix 1).
+    #[test]
+    fn the_part_is_protected_before_the_interpreter_runs() {
+        let n = node();
+        let k = key(n.t.path(), "k");
+        let layout = pack(n.t.path(), pack_of("fake", "1.0.0", &k));
+        // `<name>` is the test's own: this account, no administrator, may
+        // then remove the `.part` it is not allowed to write into.
+        std::fs::create_dir_all(n.root.join("fake")).unwrap();
+        let checked = |root: &Path,
+                       _: &[u8],
+                       _: &Path,
+                       _: &str,
+                       _: &[u8],
+                       _: &[Locked]|
+         -> Result<Materialised> {
+            assert_protected(root);
+            refuse("checked", "none")
+        };
+        let e = install_with(
+            &layout,
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut |_| true),
+            "S-1-5-21-1",
+            &protected_dir,
+            &checked,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.starts_with("checked"), "{e}");
+        assert!(
+            !n.root.join("fake").join("1.0.0.part").exists(),
+            "removed with the refusal"
+        );
+    }
+
+    /// The publisher is pinned only once the tree is in place: a rename
+    /// that fails — another install of the version got there first — leaves
+    /// no pin and the other tree as it was; a pin that cannot be written
+    /// takes the installed tree back out.
+    #[test]
+    fn the_publisher_is_pinned_only_once_the_tree_is_in_place() {
+        let n = node();
+        let k = key(n.t.path(), "k");
+        let layout = pack(n.t.path(), pack_of("fake", "1.0.0", &k));
+        let target = n.root.join("fake").join("1.0.0");
+        let beaten = |root: &Path,
+                      files: &[u8],
+                      python: &Path,
+                      sha: &str,
+                      wheels: &[u8],
+                      lock: &[Locked]|
+         -> Result<Materialised> {
+            let built = files_only(root, files, python, sha, wheels, lock)?;
+            std::fs::create_dir_all(&target)?;
+            std::fs::write(target.join("theirs"), b"x")?;
+            Ok(built)
+        };
+        let e = install_with(
+            &layout,
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut |_| true),
+            "S-1-5-21-1",
+            &plain_dir,
+            &beaten,
+        );
+        assert!(e.is_err());
+        assert!(n.pins.list().unwrap().is_empty(), "nothing pinned");
+        assert!(!n.root.join("fake").join("1.0.0.part").exists());
+        assert_eq!(std::fs::read(target.join("theirs")).unwrap(), b"x");
+
+        let fresh = node();
+        let blocked = fresh.t.path().join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("capital"), b"a file where a directory goes").unwrap();
+        let e = install_with(
+            &layout,
+            &fresh.root,
+            &Pins::at(&blocked),
+            Tofu::Confirm(&mut |_| true),
+            "S-1-5-21-1",
+            &plain_dir,
+            &files_only,
+        );
+        assert!(e.is_err());
+        nothing_under(&fresh.root);
+    }
+
+    /// A tree with a file open in it — a driver still running, a shell, an
+    /// editor — is refused whole rather than half removed: it is moved aside
+    /// before it is deleted, and Windows refuses to move a directory while a
+    /// file in it is open (review fix 4).
+    #[cfg(windows)]
+    #[test]
+    fn uninstall_refuses_a_tree_with_an_open_file_and_leaves_it_whole() {
+        let n = node();
+        let k = key(n.t.path(), "k");
+        let layout = pack(n.t.path(), pack_of("fake", "1.0.0", &k));
+        let r = install_with(
+            &layout,
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut |_| true),
+            "S-1-5-21-1",
+            &plain_dir,
+            &files_only,
+        )
+        .unwrap();
+        let held = std::fs::File::open(r.target.join("driver.py")).unwrap();
+        let e = uninstall(&n.root, "fake", "1.0.0", false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cannot be moved aside"), "{e}");
+        assert!(e.contains("; remedy: "), "{e}");
+        assert_eq!(
+            std::fs::read(r.target.join("driver.py")).unwrap(),
+            b"print('hello')\n"
+        );
+        let beside: Vec<_> = std::fs::read_dir(n.root.join("fake"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(beside, ["1.0.0"], "nothing moved, nothing left aside");
+        drop(held);
+        uninstall(&n.root, "fake", "1.0.0", false).unwrap();
+        assert!(!n.root.join("fake").exists());
     }
 }

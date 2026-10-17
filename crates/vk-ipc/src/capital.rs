@@ -1203,13 +1203,9 @@ mod tests {
     /// above the driver means there is no repository to vendor from.
     #[test]
     fn a_pack_json_that_names_what_it_may_not_is_refused() {
-        for (pack_json, says) in [
+        let mut cases = vec![
             (
                 r#"{"vendor": ["../outside.py"]}"#,
-                "stays inside the repository",
-            ),
-            (
-                r#"{"vendor": ["C:/Windows/win.ini"]}"#,
                 "stays inside the repository",
             ),
             (
@@ -1226,7 +1222,16 @@ mod tests {
             ),
             (r#"{"vendor": ["Cargo.toml"]}"#, "inside a directory"),
             (r#"{"vendr": []}"#, "pack.json does not parse"),
-        ] {
+        ];
+        // A drive is a path component only on Windows: elsewhere `C:` is a
+        // plain name, and `/etc/passwd` is the absolute case.
+        if cfg!(windows) {
+            cases.push((
+                r#"{"vendor": ["C:/Windows/win.ini"]}"#,
+                "stays inside the repository",
+            ));
+        }
+        for (pack_json, says) in cases {
             let t = tempfile::tempdir().unwrap();
             let drv = repository(t.path(), pack_json);
             let dest = t.path().join("stage").join("files");

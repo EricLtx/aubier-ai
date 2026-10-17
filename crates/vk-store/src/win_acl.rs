@@ -49,14 +49,13 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    ConvertStringSidToSidW, GetNamedSecurityInfoW, GetSecurityInfo, SetNamedSecurityInfoW,
-    SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    ConvertStringSidToSidW, GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows::Win32::Security::{
     AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorControl,
-    GetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
-    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED,
+    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED,
 };
 use windows::Win32::Storage::FileSystem::CreateDirectoryW;
 
@@ -66,6 +65,26 @@ pub const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 pub const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
 /// `BUILTIN\Users`: every local account.
 pub const USERS_SID: &str = "S-1-5-32-545";
+/// `Everyone`.
+pub const EVERYONE_SID: &str = "S-1-1-0";
+/// `NT AUTHORITY\Authenticated Users`.
+pub const AUTHENTICATED_USERS_SID: &str = "S-1-5-11";
+/// `NT AUTHORITY\INTERACTIVE`: whoever is logged on at the console.
+pub const INTERACTIVE_SID: &str = "S-1-5-4";
+/// Every access bit that changes a directory or what is in it: write and
+/// append data (add a file, add a subdirectory), write extended attributes
+/// and attributes, delete a child, delete, write the DACL, take ownership,
+/// and the generic all and write an inherit-only entry keeps unmapped.
+const WRITE_BITS: u32 = 0x0000_0002
+    | 0x0000_0004
+    | 0x0000_0010
+    | 0x0000_0040
+    | 0x0000_0100
+    | 0x0001_0000
+    | 0x0004_0000
+    | 0x0008_0000
+    | 0x1000_0000
+    | 0x4000_0000;
 /// What `0x1200a9` holds: `READ_CONTROL | SYNCHRONIZE | FILE_READ_DATA |
 /// FILE_READ_EA | FILE_EXECUTE | FILE_READ_ATTRIBUTES` — read and execute
 /// (list and traverse, on a directory), nothing that writes.
@@ -157,43 +176,16 @@ pub fn create_protected_dir(dir: &Path, allowed: &[&str]) -> Result<()> {
         .with_context(|| format!("the state directory {} was created wrong", dir.display()))
 }
 
-/// Give `dir` — an installed driver's tree, before it is renamed into
-/// place — [`READONLY_TREE_SDDL`]: created with it when it is not there,
-/// otherwise set on it, which the OS carries down to every file and
-/// directory already under it (`SetNamedSecurityInfoW` re-applies the
-/// inheritable entries to the whole subtree). Read back afterwards, by
-/// value: protected, and exactly those three accounts with those masks.
+/// Create `dir` — an installed driver's `<name>` or `<version>.part`
+/// directory, before anything is materialised in it — with
+/// [`READONLY_TREE_SDDL`], so that every file an elevated install writes
+/// under it is born with that DACL (packaging Task 9, review fix 1). Never
+/// an existing directory: one that is there already, made by another
+/// install or planted, is refused with an `AlreadyExists` I/O error and left
+/// untouched. Read back afterwards, by value: protected, and exactly those
+/// three accounts with those masks. Its parent must exist.
 pub fn create_readonly_tree_dir(dir: &Path) -> Result<()> {
-    if dir.exists() {
-        set_dacl(dir, READONLY_TREE_SDDL)?;
-    } else {
-        if let Some(parent) = dir.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        let wide_sddl = wide(READONLY_TREE_SDDL);
-        let wide_path = wide_os(dir);
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: both strings are NUL-terminated and outlive the calls; the
-        // descriptor the conversion allocates is freed once.
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                PCWSTR(wide_sddl.as_ptr()),
-                SDDL_REVISION_1,
-                &mut psd,
-                None,
-            )
-            .context("the read-only tree descriptor is not valid")?;
-            let attrs = SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: psd.0,
-                bInheritHandle: false.into(),
-            };
-            let made = CreateDirectoryW(PCWSTR(wide_path.as_ptr()), Some(&attrs));
-            LocalFree(Some(HLOCAL(psd.0)));
-            made.with_context(|| format!("create {} read-only", dir.display()))?;
-        }
-    }
+    create_tree_dir(dir, READONLY_TREE_SDDL)?;
     let view = path_dacl(dir)?;
     let mut held: Vec<(String, u32)> = view
         .entries
@@ -215,10 +207,94 @@ pub fn create_readonly_tree_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Creates `dir`, which must not exist, with `sddl`'s descriptor: an
+/// existing path is an `AlreadyExists` I/O error (checked first, and again
+/// by `CreateDirectoryW` itself, which never opens an existing directory).
+fn create_tree_dir(dir: &Path, sddl: &str) -> Result<()> {
+    let exists = || {
+        anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+            .context(format!("{} exists already", dir.display()))
+    };
+    if std::fs::symlink_metadata(dir).is_ok() {
+        return Err(exists());
+    }
+    let wide_sddl = wide(sddl);
+    let wide_path = wide_os(dir);
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: both strings are NUL-terminated and outlive the calls; the
+    // descriptor the conversion allocates is freed once.
+    let made = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(wide_sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut psd,
+            None,
+        )
+        .with_context(|| format!("the descriptor {sddl:?} is not valid"))?;
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: psd.0,
+            bInheritHandle: false.into(),
+        };
+        let made = CreateDirectoryW(PCWSTR(wide_path.as_ptr()), Some(&attrs));
+        LocalFree(Some(HLOCAL(psd.0)));
+        made
+    };
+    made.map_err(|e| {
+        // A Win32 error comes back as the HRESULT `0x8007xxxx`.
+        let code = e.code().0 as u32;
+        let io = if code & 0xFFFF_0000 == 0x8007_0000 {
+            std::io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+        } else {
+            std::io::Error::other(e.to_string())
+        };
+        if io.kind() == std::io::ErrorKind::AlreadyExists {
+            exists()
+        } else {
+            anyhow::Error::new(io).context(format!("create {} read-only", dir.display()))
+        }
+    })
+}
+
+/// The first broad group — Everyone, Authenticated Users, the built-in
+/// Users, INTERACTIVE — that owns `path` or that an allow entry of its DACL
+/// lets change it or what is under it, by SID and name; `None` when only
+/// narrower accounts can. An entry counts whether it applies to `path`
+/// itself or only to what is created under it: either lets a
+/// non-administrator put something where an elevated install will run it.
+pub fn non_admin_writer(path: &Path) -> Result<Option<(String, &'static str)>> {
+    const BROAD: [(&str, &str); 4] = [
+        (EVERYONE_SID, "Everyone"),
+        (AUTHENTICATED_USERS_SID, "Authenticated Users"),
+        (USERS_SID, "Users"),
+        (INTERACTIVE_SID, "INTERACTIVE"),
+    ];
+    let named = |sid: &str| {
+        BROAD
+            .iter()
+            .find(|(s, _)| *s == sid)
+            .map(|(s, n)| (s.to_string(), *n))
+    };
+    let view = path_dacl(path)?;
+    if let Some(owner) = named(&view.owner) {
+        return Ok(Some(owner));
+    }
+    Ok(view
+        .entries
+        .iter()
+        .filter(|e| e.kind == ACE_ALLOW && e.mask & WRITE_BITS != 0)
+        .find_map(|e| named(&e.sid)))
+}
+
 /// Sets `sddl`'s DACL on the file or directory `path`, protected when the
 /// SDDL says `P`, and lets the OS carry its inheritable entries down to
-/// everything under it.
+/// everything under it. The tests' way to give a tree back to its owner.
+#[cfg(test)]
 fn set_dacl(path: &Path, sddl: &str) -> Result<()> {
+    use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
     let wide_sddl = wide(sddl);
     let wide_path = wide_os(path);
     let mut psd = PSECURITY_DESCRIPTOR::default();
@@ -799,57 +875,113 @@ mod tests {
         assert_eq!(canonical_sid(&sid).unwrap(), sid, "already canonical");
     }
 
-    /// The DACL an installed driver's tree is given (packaging Task 9):
-    /// protected, the administrators and SYSTEM in full, the built-in users
-    /// read and execute, every entry inheritable — and what was already in
-    /// the tree takes it too, so a driver's files are read-only to every
-    /// account that is not an administrator. A directory not there yet is
-    /// created with it.
+    /// The DACL an installed driver's tree is born with (packaging Task 9,
+    /// review fix 1): protected, the administrators and SYSTEM in full, the
+    /// built-in users read and execute, every entry inheritable — set when
+    /// the directory is created, never on one that exists, so that what an
+    /// elevated install materialises under it is read-only to every other
+    /// account from its first byte, and a directory somebody else made
+    /// first is refused rather than adopted.
     #[test]
-    fn an_installed_tree_is_read_only_to_users_and_whole_to_the_administrators() {
+    fn an_installed_tree_is_born_read_only_and_never_adopts_a_directory() {
         let expected = set_of_entries([
             (ADMINISTRATORS_SID, FILE_ALL_ACCESS_MASK),
             (LOCAL_SYSTEM_SID, FILE_ALL_ACCESS_MASK),
             (USERS_SID, READ_AND_EXECUTE_MASK),
         ]);
+        let fresh = temp_path("fresh");
+        create_readonly_tree_dir(&fresh).unwrap();
+        let view = path_dacl(&fresh).unwrap();
+        assert!(view.protected, "{view:?}");
+        assert_eq!(entries_of(&view), expected, "{view:?}");
+        for e in &view.entries {
+            assert_eq!(e.kind, ACE_ALLOW, "{e:?}");
+            assert_eq!(
+                e.flags & ACE_OBJECT_AND_CONTAINER_INHERIT,
+                ACE_OBJECT_AND_CONTAINER_INHERIT,
+                "inheritable: {e:?}"
+            );
+            assert_eq!(e.flags & ACE_INHERITED, 0, "set here: {e:?}");
+        }
+        let exists = |dir: &Path| {
+            let e = create_readonly_tree_dir(dir).unwrap_err();
+            assert_eq!(
+                e.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+                Some(std::io::ErrorKind::AlreadyExists),
+                "{e:#}"
+            );
+        };
+        exists(&fresh);
+        let planted = temp_path("planted");
+        std::fs::create_dir(&planted).unwrap();
+        let before = path_dacl(&planted).unwrap();
+        exists(&planted);
+        assert_eq!(path_dacl(&planted).unwrap(), before, "untouched");
+
+        // What is made under it takes its entries. This process is no
+        // administrator, so the tree it makes here names it too, to write.
+        let me = current_process_sid().unwrap();
         let tree = temp_path("tree");
+        create_tree_dir(&tree, &format!("{READONLY_TREE_SDDL}(A;OICI;FA;;;{me})")).unwrap();
         std::fs::create_dir_all(tree.join("python")).unwrap();
         std::fs::write(tree.join("python").join("python.exe"), b"MZ").unwrap();
         std::fs::write(tree.join("driver.py"), b"print(1)").unwrap();
-        create_readonly_tree_dir(&tree).unwrap();
-        let fresh = temp_path("fresh");
-        create_readonly_tree_dir(&fresh).unwrap();
-        for dir in [&tree, &fresh] {
-            let view = path_dacl(dir).unwrap();
-            assert!(view.protected, "{view:?}");
-            assert_eq!(entries_of(&view), expected, "{view:?}");
-            for e in &view.entries {
-                assert_eq!(e.kind, ACE_ALLOW, "{e:?}");
-                assert_eq!(
-                    e.flags & ACE_OBJECT_AND_CONTAINER_INHERIT,
-                    ACE_OBJECT_AND_CONTAINER_INHERIT,
-                    "inheritable: {e:?}"
-                );
-                assert_eq!(e.flags & ACE_INHERITED, 0, "set here: {e:?}");
-            }
-        }
         for child in [
             tree.join("driver.py"),
             tree.join("python"),
             tree.join("python").join("python.exe"),
         ] {
             let view = path_dacl(&child).unwrap();
-            assert_eq!(entries_of(&view), expected, "{child:?}: {view:?}");
+            assert!(
+                entries_of(&view).is_superset(&expected),
+                "{child:?}: {view:?}"
+            );
             assert!(
                 view.entries.iter().all(|e| e.flags & ACE_INHERITED != 0),
                 "{child:?} takes the tree's entries: {view:?}"
             );
         }
         // Its owner may always rewrite a DACL: give the test its trees back.
-        let me = current_process_sid().unwrap();
-        for dir in [&tree, &fresh] {
-            set_dacl(dir, &format!("D:P(A;OICI;FA;;;{me})")).unwrap();
+        set_dacl(&fresh, &format!("D:P(A;OICI;FA;;;{me})")).unwrap();
+        for dir in [&fresh, &planted, &tree] {
             std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// The root an elevated install writes under must be the
+    /// administrators' alone: an allow entry that lets Everyone,
+    /// Authenticated Users, the built-in Users or INTERACTIVE change it — on
+    /// the root itself or only on what is created under it — is named.
+    #[test]
+    fn a_root_a_broad_group_may_write_is_named() {
+        let me = current_process_sid().unwrap();
+        for (sddl, writer) in [
+            (
+                format!("D:P(A;OICI;FA;;;{me})(A;OICI;0x1301bf;;;AU)"),
+                Some((AUTHENTICATED_USERS_SID, "Authenticated Users")),
+            ),
+            (
+                format!("D:P(A;OICI;FA;;;{me})(A;;0x4;;;BU)"),
+                Some((USERS_SID, "Users")),
+            ),
+            (
+                format!("D:P(A;OICI;FA;;;{me})(A;OICIIO;GW;;;WD)"),
+                Some((EVERYONE_SID, "Everyone")),
+            ),
+            (
+                format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"),
+                None,
+            ),
+        ] {
+            let dir = temp_path("root");
+            create_with_sddl(&dir, &sddl);
+            let named = non_admin_writer(&dir).unwrap();
+            assert_eq!(
+                named,
+                writer.map(|(sid, name)| (sid.to_string(), name)),
+                "{sddl}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
         }
     }
 
