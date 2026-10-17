@@ -19,8 +19,8 @@ ready when the question left). Trigger words in the request body:
                   once the action is over (the verdict must still see it);
   LEAK            the « Chiffré » popover shows the text unmasked (a leak).
 
-The page side (index.html) draws each answer behind the stream and ends about a
-second after the server; shows the « Votre avis » survey after a generation left
+The page side (index.html) draws each answer behind the stream and ends about
+1.5 s after the server; shows the « Votre avis » survey after a generation left
 in flight; steers the attachment chip by file name (« fail », « slowidx »,
 « instant »).
 

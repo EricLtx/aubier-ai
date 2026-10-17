@@ -858,8 +858,8 @@ class DriverV2OnFixture(FixtureBench):
         self.assertEqual(res["answer"], "BONJOUR, QUELLE HEURE EST-IL ? — pièces jointes : aucune")
 
     def test_the_answer_is_read_once_the_screen_stops_moving(self):
-        """D6: the bench draws the answer about a second after the server's end, with a 700 ms
-        pause and the stop button already gone. v2 waits for 2 s of stillness: the answer is
+        """D6: the bench draws the answer about 1.5 s after the server's end, with a 1.2 s pause
+        and the stop button already gone. v2 waits for 2 s of stillness: the answer is
         whole. The same bench read after 0.3 s of stillness (the old reader's) is cut: the
         bench does discriminate."""
         drv, recette, A = self.make()

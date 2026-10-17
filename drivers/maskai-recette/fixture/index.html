@@ -39,7 +39,7 @@
      listbox), the web-search button (`data-mode`), and the « Chiffré » popover
      trigger whose dialog shows the text sent to the model. The textarea only takes
      a value through input events (annexe B). The answer is drawn on screen after
-     the stream, with a pause, and ends about a second after the server's end. A
+     the stream, with a pause, and ends about 1.5 s after the server's end. A
      generation left in flight by a new conversation brings the « Votre avis »
      survey (a Radix dialog); a stopped one does not. One known modal of v1 stays:
      the cookie banner. See serve.py for the server side and its trigger words. -->
@@ -302,9 +302,9 @@ function addAnswer(tokens, model) {
 }
 
 // The answer is drawn behind the stream: two characters every 50 ms while it streams,
-// then the rest in a few ticks, with one 700 ms pause halfway, so the screen still moves
-// about a second after the server's end (a reader that stops at the end of the stream, or
-// at the first 300 ms of quiet, captures it cut).
+// then the rest in a few ticks, with one 1.2 s pause halfway, so the screen still moves
+// about a second and a half after the server's end (a reader that stops at the end of the
+// stream, or at the first 300 ms of quiet, captures it cut; 2 s of quiet waits it out).
 function typewriter(el) {
   let html = "", shown = 0, ended = false, paused = false, pauseUntil = 0, resolve;
   const done = new Promise((r) => { resolve = r; });
@@ -320,7 +320,7 @@ function typewriter(el) {
       if (ended) { clearInterval(timer); resolve(); }
       return;
     }
-    if (ended && !paused && shown >= html.length / 2) { paused = true; pauseUntil = Date.now() + 700; }
+    if (ended && !paused && shown >= html.length / 2) { paused = true; pauseUntil = Date.now() + 1200; }
     if (Date.now() < pauseUntil) return;
     shown = cut(Math.min(html.length, shown + (ended ? Math.max(2, Math.ceil(html.length / 8)) : 2)));
     el.innerHTML = html.slice(0, shown);
