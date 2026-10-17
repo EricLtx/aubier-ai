@@ -860,6 +860,28 @@ async fn an_installed_tree_that_is_not_what_was_signed_is_refused_before_anythin
         "{err}"
     );
 
+    // A pin this node cannot read is said to be unreadable, not taken for
+    // a signature that names no well-formed key (Task 8 review).
+    std::fs::remove_dir_all(&root).unwrap();
+    install_by_hand(&node.install_root, "fake", "1.0.0", &key);
+    let hex = key.key_id().trim_start_matches("sha256:").to_string();
+    let pin = node
+        .d
+        .path()
+        .join("capital")
+        .join("publishers")
+        .join(format!("{hex}.pub"));
+    std::fs::remove_file(&pin).unwrap();
+    std::fs::create_dir(&pin).unwrap();
+    let err = mount().await.unwrap_err();
+    let why = &call_error(&err).message;
+    assert!(
+        why.contains("cannot be read") && why.contains("; remedy: "),
+        "{err}"
+    );
+    assert!(!why.contains("well-formed"), "{err}");
+    std::fs::remove_dir(&pin).unwrap();
+
     assert!(!node.pool.has_host("fake"), "nothing runs");
     assert!(!starts.exists(), "nothing ever ran");
     assert!(node.events("driver.mounted").is_empty());

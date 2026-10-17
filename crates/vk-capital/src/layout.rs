@@ -80,7 +80,8 @@ pub fn blob_path(layout: &Path, digest: &str) -> PathBuf {
 
 /// Writes `oci-layout`, the five blobs, the image manifest blob and `index.json`
 /// (one entry). Returns the image manifest and its digest. Rejects an existing
-/// non-empty `out`.
+/// non-empty `out`. A write that fails midway removes what it wrote, so
+/// `out` is left as it was found: absent, or an empty directory.
 pub fn write(out: &Path, layers: &Layers, ann: &Annotations) -> Result<(DriverPackage, String)> {
     if out.exists() && (!out.is_dir() || fs::read_dir(out)?.next().is_some()) {
         return refuse(
@@ -88,9 +89,44 @@ pub fn write(out: &Path, layers: &Layers, ann: &Annotations) -> Result<(DriverPa
             "choose a new --out directory, or empty that one",
         );
     }
-    fs::create_dir_all(out.join("blobs").join("sha256"))?;
-    fs::write(out.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#)?;
-    let config = put_blob(out, OCI_EMPTY_TYPE, EMPTY)?;
+    // Armed before the first write: whatever happens next, a layout is
+    // written whole or not at all.
+    let mut undo = Undo::new();
+    let written = write_layout(out, layers, ann, &mut undo)?;
+    undo.disarm();
+    Ok(written)
+}
+
+/// [`write`]'s writes, each one noted in `undo` before it is made.
+fn write_layout(
+    out: &Path,
+    layers: &Layers,
+    ann: &Annotations,
+    undo: &mut Undo,
+) -> Result<(DriverPackage, String)> {
+    let blobs = out.join("blobs").join("sha256");
+    let mut missing: Vec<&Path> = blobs.ancestors().take_while(|d| !d.exists()).collect();
+    missing.reverse();
+    for dir in missing {
+        undo.dirs.push(dir.to_path_buf());
+        fs::create_dir(dir)?;
+    }
+    put_file(
+        undo,
+        &out.join("oci-layout"),
+        br#"{"imageLayoutVersion":"1.0.0"}"#,
+    )?;
+    let mut put_blob = |media_type: &str, bytes: &[u8]| -> Result<Descriptor> {
+        let digest = digest_of(bytes);
+        put_file(undo, &blob_path(out, &digest), bytes)?;
+        Ok(Descriptor {
+            media_type: media_type.into(),
+            digest,
+            size: bytes.len() as u64,
+            annotations: BTreeMap::new(),
+        })
+    };
+    let config = put_blob(OCI_EMPTY_TYPE, EMPTY)?;
     let blobs: [(&str, &[u8]); 5] = [
         (MEDIA_MANIFEST, &layers.manifest),
         (MEDIA_FILES, &layers.files),
@@ -100,7 +136,7 @@ pub fn write(out: &Path, layers: &Layers, ann: &Annotations) -> Result<(DriverPa
     ];
     let mut descriptors = Vec::with_capacity(blobs.len());
     for (component, (media_type, bytes)) in COMPONENTS.into_iter().zip(blobs) {
-        let mut d = put_blob(out, media_type, bytes)?;
+        let mut d = put_blob(media_type, bytes)?;
         d.annotations.insert(ANN_COMPONENT.into(), component.into());
         if component == "python" {
             d.annotations
@@ -124,17 +160,75 @@ pub fn write(out: &Path, layers: &Layers, ann: &Annotations) -> Result<(DriverPa
             (ANN_PUBLISHER.into(), ann.publisher_key_id.clone()),
         ]),
     };
-    let manifest = put_blob(
-        out,
-        OCI_MANIFEST_TYPE,
-        &serde_json::to_vec_pretty(&package)?,
-    )?;
+    let manifest = put_blob(OCI_MANIFEST_TYPE, &serde_json::to_vec_pretty(&package)?)?;
     let index = json!({
         "schemaVersion": 2,
         "manifests": [index_entry(&manifest, DRIVER_ARTIFACT_TYPE)],
     });
-    fs::write(out.join("index.json"), serde_json::to_vec_pretty(&index)?)?;
+    put_file(
+        undo,
+        &out.join("index.json"),
+        &serde_json::to_vec_pretty(&index)?,
+    )?;
     Ok((package, manifest.digest))
+}
+
+/// What a [`write`] under way has made, removed on drop unless it was
+/// disarmed: the files (two blobs with one digest are one file), then the
+/// directories it created — `out` and its missing ancestors among them —
+/// deepest first. Nothing it did not make is touched, so an `out` that was
+/// an empty directory stays one.
+struct Undo {
+    files: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+    armed: bool,
+}
+
+impl Undo {
+    fn new() -> Undo {
+        Undo {
+            files: vec![],
+            dirs: vec![],
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Undo {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for file in &self.files {
+            let _ = fs::remove_file(file);
+        }
+        for dir in self.dirs.iter().rev() {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
+/// Writes one file of a layout, noted in `undo` first so that a write that
+/// fails halfway is removed too.
+fn put_file(undo: &mut Undo, path: &Path, bytes: &[u8]) -> Result<()> {
+    if !undo.files.iter().any(|f| f == path) {
+        undo.files.push(path.to_path_buf());
+    }
+    #[cfg(test)]
+    tests::FAULT.with(|f| match f.get() {
+        Some(0) => Err(std::io::Error::other("a write the test made fail")),
+        Some(n) => {
+            f.set(Some(n - 1));
+            Ok(())
+        }
+        None => Ok(()),
+    })?;
+    fs::write(path, bytes)?;
+    Ok(())
 }
 
 /// Appends the signature referrer: the signature blob, a second image manifest
@@ -303,7 +397,8 @@ pub fn read_layer(opened: &Opened, component: &str) -> Result<Vec<u8>> {
     )
 }
 
-/// Writes `bytes` as a blob; its descriptor, without annotations.
+/// Writes `bytes` as a blob of a layout already written; its descriptor,
+/// without annotations.
 fn put_blob(layout: &Path, media_type: &str, bytes: &[u8]) -> Result<Descriptor> {
     let digest = digest_of(bytes);
     fs::write(blob_path(layout, &digest), bytes)?;
@@ -403,6 +498,45 @@ fn read_blob(layout: &Path, digest: &str, size: u64, what: &str) -> Result<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// How many of `write`'s file writes succeed before the next one
+        /// fails, on this test's thread; `None`: none fails.
+        pub(super) static FAULT: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// A layout whose write fails midway — at each of its nine file writes
+    /// in turn — leaves `out` as it was found: absent, or an empty
+    /// directory (Task 8 review).
+    #[test]
+    fn a_write_that_fails_midway_leaves_out_as_it_found_it() {
+        for written in 0..9 {
+            let t = tempfile::tempdir().unwrap();
+            let out = t.path().join("pkg");
+            FAULT.with(|f| f.set(Some(written)));
+            let absent = write(&out, &layers(), &ann());
+            FAULT.with(|f| f.set(None));
+            assert!(absent.is_err(), "write {written} failed");
+            assert!(!out.exists(), "after {written} writes: {out:?} is gone");
+
+            std::fs::create_dir(&out).unwrap();
+            FAULT.with(|f| f.set(Some(written)));
+            let empty = write(&out, &layers(), &ann());
+            FAULT.with(|f| f.set(None));
+            assert!(empty.is_err(), "write {written} failed");
+            assert!(
+                std::fs::read_dir(&out).unwrap().next().is_none(),
+                "after {written} writes: {out:?} is empty again"
+            );
+        }
+        let t = tempfile::tempdir().unwrap();
+        FAULT.with(|f| f.set(Some(9)));
+        let whole = write(&t.path().join("pkg"), &layers(), &ann());
+        FAULT.with(|f| f.set(None));
+        whole.expect("nine writes make a layout");
+    }
+
     fn layers() -> Layers {
         Layers {
             manifest: b"{\"name\":\"x\"}".to_vec(),

@@ -846,7 +846,7 @@ async fn files_hash_mismatch_is_refused() {
     assert!(e.message.contains("driver files hash"), "{err}");
     assert!(
         e.message
-            .contains("regenerate the manifest with drivers/vkdriver/hash_dir.py"),
+            .contains("; remedy: regenerate the manifest with drivers/vkdriver/hash_dir.py"),
         "{err}"
     );
 
@@ -1323,6 +1323,7 @@ async fn the_script_is_held_to_root() {
             ),
             "{script}: {err}"
         );
+        assert!(e.message.contains("; remedy: "), "{script}: {err}");
     }
     assert!(!node.pool.has_host("fake"), "nothing ran");
     assert_eq!(node.events("driver.mounted"), 0);

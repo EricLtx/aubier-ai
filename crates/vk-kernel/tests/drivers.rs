@@ -1721,7 +1721,7 @@ fn a_degraded_driver_can_be_remounted_after_umount() {
     assert!(matches!(err, KernelError::Gate(_)), "{err}");
     assert!(
         err.to_string()
-            .contains("run `vk driver umount maskai-1` first"),
+            .contains("; remedy: vk driver umount maskai-1 first"),
         "{err}"
     );
     assert_eq!(k.driver("maskai-1").unwrap().unwrap().state, degraded);

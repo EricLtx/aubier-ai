@@ -332,8 +332,8 @@ impl DriverFailure {
             DriverFailure::WouldNotStart(why) => why.clone(),
             DriverFailure::Panicked => "the driver act panicked".into(),
             DriverFailure::Tampered => {
-                "the installed tree no longer matches its fingerprint; reinstall the package, \
-                 then remount"
+                "the installed tree no longer matches its fingerprint; remedy: reinstall the \
+                 package, then remount"
                     .into()
             }
         }
@@ -473,9 +473,11 @@ impl RealKernel {
                 ))
             }
         };
-        manifest
-            .validate()
-            .map_err(|e| KernelError::Gate(e.to_string()))?;
+        manifest.validate().map_err(|e| {
+            KernelError::Gate(format!(
+                "{e}; remedy: correct the manifest, then mount it again"
+            ))
+        })?;
         // The root the rules are checked on is the root the row keeps: a
         // link retargeted after this call cannot move the tree it names.
         let root = resolved(&root);
@@ -496,7 +498,7 @@ impl RealKernel {
             if row.driver_id != driver_id {
                 return Err(KernelError::Gate(format!(
                     "driver {name} is already mounted with a different manifest; \
-                     run `vk driver umount {name}` first"
+                     remedy: vk driver umount {name} first"
                 )));
             }
             if row.state == DriverState::Ready {
@@ -1207,6 +1209,13 @@ mod tests {
         assert_eq!(spawn.detail(), leak, "the detail is kept, for the log");
         assert_eq!(DriverFailure::Panicked.reason(), "panicked");
         assert_eq!(DriverFailure::Tampered.reason(), "tampered");
+        assert!(
+            DriverFailure::Tampered
+                .detail()
+                .ends_with("; remedy: reinstall the package, then remount"),
+            "{}",
+            DriverFailure::Tampered.detail()
+        );
         for w in ["would not start", "panicked", "tampered"] {
             assert!(DRIVER_FAILURE_REASONS.contains(&w), "{w}");
         }

@@ -499,14 +499,20 @@ struct MountParams {
 /// anything else: the manifest validates and `root` is an absolute directory
 /// (Ruling R6).
 fn checked_mount(manifest: &DriverManifest, root: &Path) -> anyhow::Result<()> {
-    manifest.validate()?;
+    manifest
+        .validate()
+        .map_err(|e| anyhow!("{e}; remedy: correct the manifest, then mount it again"))?;
     anyhow::ensure!(
         root.is_absolute(),
-        "root {} is not absolute: give the directory the manifest's command resolves against \
-         by its absolute path (vk mount driver sends the manifest file's own directory)",
+        "root {} is not absolute; remedy: give the directory the manifest's command resolves \
+         against by its absolute path (vk mount driver sends the manifest file's own directory)",
         root.display()
     );
-    anyhow::ensure!(root.is_dir(), "root {} is not a directory", root.display());
+    anyhow::ensure!(
+        root.is_dir(),
+        "root {} is not a directory; remedy: name the directory that holds the driver's files",
+        root.display()
+    );
     Ok(())
 }
 
@@ -520,8 +526,8 @@ pub(crate) struct Tampered;
 impl std::fmt::Display for Tampered {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            "the installed tree no longer hashes to its manifest's files_sha256; reinstall the \
-             package, then remount",
+            "the installed tree no longer hashes to its manifest's files_sha256; remedy: \
+             reinstall the package, then remount",
         )
     }
 }
@@ -568,29 +574,34 @@ pub(crate) fn development_hold(manifest: &DriverManifest, root: &Path) -> anyhow
         .ok_or_else(|| {
             anyhow!(
                 "program.command names no `.py` script, so there are no driver files to hold \
-                 to files_sha256"
+                 to files_sha256; remedy: name the driver's script in program.command"
             )
         })?;
     anyhow::ensure!(
         under_root(Path::new(script)),
         "program.command paths must be relative to the manifest's directory, without `..`: \
-         `{script}` is not"
+         `{script}` is not; remedy: name the script by its path under the manifest's directory"
     );
     let named = script.clone();
     let script = root.join(script);
     anyhow::ensure!(
         script.is_file(),
-        "the driver script {} is not a file",
+        "the driver script {} is not a file; remedy: correct program.command, or put the \
+         script beside the manifest",
         script.display()
     );
-    let dir = script
-        .parent()
-        .ok_or_else(|| anyhow!("the driver script {} has no directory", script.display()))?;
+    let dir = script.parent().ok_or_else(|| {
+        anyhow!(
+            "the driver script {} has no directory; remedy: name the script by its path under \
+             the manifest's directory",
+            script.display()
+        )
+    })?;
     let actual = hash_dir(dir).with_context(|| format!("hash {}", dir.display()))?;
     anyhow::ensure!(
         actual == manifest.program.files_sha256,
-        "driver files hash {actual} (of {}) is not the manifest's files_sha256 {}; regenerate \
-         the manifest with drivers/vkdriver/hash_dir.py",
+        "driver files hash {actual} (of {}) is not the manifest's files_sha256 {}; remedy: \
+         regenerate the manifest with drivers/vkdriver/hash_dir.py",
         dir.display(),
         manifest.program.files_sha256
     );
@@ -626,8 +637,9 @@ pub(crate) fn mount(
 ) -> Result<Value, RpcError> {
     const FORMS: &str =
         "driver.mount takes {manifest, root} or {installed: \"name@version\"}, nothing else";
+    const REMEDY: &str = "remedy: vk mount driver --manifest FILE, or vk mount driver NAME@VERSION";
     let params: MountParams =
-        serde_json::from_value(p).map_err(|e| bad(&format!("{FORMS}: {e}")))?;
+        serde_json::from_value(p).map_err(|e| bad(&format!("{FORMS} ({e}); {REMEDY}")))?;
     let (manifest, root, package_digest, version) =
         match (params.manifest, params.root, params.installed) {
             (Some(manifest), Some(root), None) => {
@@ -658,7 +670,7 @@ pub(crate) fn mount(
                     Some(tree.version),
                 )
             }
-            _ => return Err(bad(FORMS)),
+            _ => return Err(bad(&format!("{FORMS}; {REMEDY}"))),
         };
     let name = manifest.name.clone();
     let driver_id = manifest.driver_id();
@@ -863,5 +875,88 @@ fn report_failure(plan: &DriverActPlan, failure: &DriverFailure) {
         .and_then(|mut log| std::io::Write::write_all(&mut log, line.as_bytes()));
     if let Err(e) = written {
         tracing::warn!(path = %path.display(), error = %e, "a failed act's detail could not be appended to driver.log");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(command: &[&str], files_sha256: &str) -> DriverManifest {
+        serde_json::from_value(json!({
+            "name": "fake",
+            "kind": "browser",
+            "program": {
+                "runtime": "python",
+                "command": command,
+                "files_sha256": files_sha256,
+                "browser_channel": null,
+                "headless": true
+            },
+            "hosts": ["example.invalid"],
+            "actions": [{
+                "name": "echo",
+                "reversible": true,
+                "args": {"type": "object"},
+                "evidence": [],
+                "to_register": false
+            }],
+            "min_interval_ms": 0,
+            "max_action_ms": 60_000,
+            "clearance": {"max_scope": "business", "third_party_allowed": true},
+            "source": "development",
+            "governed": false
+        }))
+        .unwrap()
+    }
+
+    fn one_line_with_a_remedy(e: &anyhow::Error) {
+        let text = format!("{e:#}");
+        assert!(text.contains("; remedy: "), "{text}");
+        assert_eq!(text.lines().count(), 1, "{text}");
+    }
+
+    /// Every refusal on the mount path names its remedy with the literal
+    /// `remedy:` token (Task 8 review): the manifest's own checks reused
+    /// here, a root that is not an absolute directory, and each way the
+    /// script's directory can fail to be what `files_sha256` names.
+    #[test]
+    fn every_mount_refusal_names_its_remedy() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("driver.py"), "print(1)").unwrap();
+        let good_hash = hash_dir(t.path()).unwrap();
+        let good = manifest(&["python", "-I", "driver.py"], &good_hash);
+        checked_mount(&good, t.path()).unwrap();
+        development_hold(&good, t.path()).unwrap();
+
+        let invalid = manifest(&[], &good_hash);
+        one_line_with_a_remedy(&checked_mount(&invalid, t.path()).unwrap_err());
+        one_line_with_a_remedy(&checked_mount(&good, Path::new("relative")).unwrap_err());
+        one_line_with_a_remedy(&checked_mount(&good, &t.path().join("driver.py")).unwrap_err());
+
+        for (command, hash) in [
+            (vec!["python", "-I", "-c", "print(1)"], good_hash.as_str()),
+            (vec!["python", "-I", "../driver.py"], good_hash.as_str()),
+            (vec!["python", "-I", "absent.py"], good_hash.as_str()),
+            (
+                vec!["python", "-I", "driver.py"],
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ] {
+            let m = manifest(&command, hash);
+            one_line_with_a_remedy(&development_hold(&m, t.path()).unwrap_err());
+        }
+    }
+
+    /// A tree changed after its install is refused with the one remedy
+    /// there is.
+    #[test]
+    fn tampered_names_its_remedy() {
+        assert!(
+            Tampered
+                .to_string()
+                .ends_with("; remedy: reinstall the package, then remount"),
+            "{Tampered}"
+        );
     }
 }

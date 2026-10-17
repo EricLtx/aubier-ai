@@ -115,7 +115,10 @@ pub(crate) fn pack(
         out,
         python_cache,
     } = serde_json::from_value(p).map_err(|_| {
-        bad("driver.pack takes manifest, version, out and python_cache, nothing else")
+        bad(
+            "driver.pack takes manifest, version, out and python_cache, nothing else; remedy: \
+             vk driver pack --manifest FILE --version V --out DIR",
+        )
     })?;
     if !is_version(&version) {
         return Err(bad(&format!(
@@ -143,9 +146,9 @@ pub(crate) fn pack(
         )));
     }
     let mut manifest = read_manifest(&manifest_file)?;
-    let driver_dir = manifest_file
-        .parent()
-        .ok_or_else(|| bad("--manifest names no directory"))?;
+    let driver_dir = manifest_file.parent().ok_or_else(|| {
+        bad("--manifest names no directory; remedy: name the manifest.json beside the driver's files")
+    })?;
     let script = crate::drivers::development_hold(&manifest, driver_dir)
         .map_err(|e| bad(&format!("{e:#}")))?;
     manifest.source = DriverSource::Installed;
@@ -314,7 +317,12 @@ fn read_manifest(file: &Path) -> Result<DriverManifest, RpcError> {
             e.column()
         ))
     })?;
-    manifest.validate().map_err(|e| bad(&e.to_string()))?;
+    manifest.validate().map_err(|e| {
+        bad(&format!(
+            "the manifest {} does not validate: {e}; remedy: correct it, then pack again",
+            file.display()
+        ))
+    })?;
     Ok(manifest)
 }
 
@@ -719,16 +727,35 @@ pub(crate) fn installed(kernel: &Shared, spec: &str) -> Result<Installed, RpcErr
     })?;
     let sig: Signature = serde_json::from_slice(&signature_bytes)
         .map_err(|e| tree_refused(spec, &unparsed(".package/signature.json", &e)))?;
-    let pinned = Pins::at(&state_dir)
-        .get(&sig.key_id)
-        .map_err(|_| tree_refused(spec, "its signature names no well-formed publisher key"))?
-        .ok_or_else(|| {
-            // `get` checked the id's shape: `sha256:` and 64 hex digits.
-            gate(format!(
+    if !is_key_id(&sig.key_id) {
+        return Err(tree_refused(
+            spec,
+            "its signature names no well-formed publisher key",
+        ));
+    }
+    let pinned = match Pins::at(&state_dir).get(&sig.key_id) {
+        Ok(Some(pinned)) => pinned,
+        Ok(None) => {
+            return Err(gate(format!(
                 "publisher {} is not pinned on this node; remedy: vk driver install pins it",
                 sig.key_id
-            ))
-        })?;
+            )))
+        }
+        // The pin is there and is not a key: its own refusal says so, and how.
+        Err(CapitalError::Refused(why)) => return Err(gate(why)),
+        Err(e) => {
+            let kind = match &e {
+                CapitalError::Io(e) => e.kind().to_string(),
+                _ => "not readable".into(),
+            };
+            return Err(gate(format!(
+                "the pin of publisher {} on this node cannot be read ({kind}); remedy: check the \
+                 permissions of {}, or pin the publisher again with vk driver install",
+                sig.key_id,
+                state_dir.join("capital").join("publishers").display()
+            )));
+        }
+    };
     signature::verify(&pinned, &package_digest, &sig).map_err(refused)?;
     if package.name() != name || package.version() != version {
         return Err(tree_refused(
@@ -864,7 +891,9 @@ pub(crate) fn listing(rows: Vec<DriverRow>, install_root: &Path) -> Result<Value
 /// version `MAJOR.MINOR.PATCH`, that holds a `manifest.json`, the versions in
 /// numeric order. Anything else there — a file, a link, an install still
 /// under way (`<version>.part`) — is not a version. An absent root installs
-/// nothing.
+/// nothing; a root that cannot be read is an error. An entry under it that
+/// cannot be read is logged and skipped: one bad directory does not hide
+/// every other driver from `driver.ls`.
 fn installed_versions(install_root: &Path) -> std::io::Result<BTreeMap<String, Vec<String>>> {
     let mut out = BTreeMap::new();
     let entries = match std::fs::read_dir(install_root) {
@@ -872,33 +901,65 @@ fn installed_versions(install_root: &Path) -> std::io::Result<BTreeMap<String, V
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(e) => return Err(e),
     };
+    let skipped = |path: &Path, e: &std::io::Error| {
+        tracing::warn!(path = %path.display(), error = %e, "an entry under the install root cannot be read; driver.ls leaves it out");
+    };
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                skipped(install_root, &e);
+                continue;
+            }
+        };
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if !entry.file_type()?.is_dir() || !is_driver_name(&name) {
-            continue;
-        }
-        let mut versions = vec![];
-        for version in std::fs::read_dir(entry.path())? {
-            let version = version?;
-            let Some(v) = version.file_name().to_str().map(str::to_string) else {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() && is_driver_name(&name) => {}
+            Ok(_) => continue,
+            Err(e) => {
+                skipped(&entry.path(), &e);
                 continue;
-            };
-            if version.file_type()?.is_dir()
-                && is_version(&v)
-                && version.path().join("manifest.json").is_file()
-            {
-                versions.push(v);
             }
         }
-        if !versions.is_empty() {
-            versions.sort_by_key(|v| version_key(v));
-            out.insert(name, versions);
+        match versions_of(&entry.path()) {
+            Ok(versions) if versions.is_empty() => {}
+            Ok(mut versions) => {
+                versions.sort_by_key(|v| version_key(v));
+                out.insert(name, versions);
+            }
+            Err(e) => skipped(&entry.path(), &e),
         }
     }
     Ok(out)
+}
+
+/// The version directories of one name under the install root (see
+/// [`installed_versions`]), in no order.
+fn versions_of(name_dir: &Path) -> std::io::Result<Vec<String>> {
+    let mut versions = vec![];
+    for version in std::fs::read_dir(name_dir)? {
+        let version = version?;
+        let Some(v) = version.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if version.file_type()?.is_dir()
+            && is_version(&v)
+            && version.path().join("manifest.json").is_file()
+        {
+            versions.push(v);
+        }
+    }
+    Ok(versions)
+}
+
+/// `sha256:` and 64 lowercase hex digits: the shape of a publisher key id,
+/// which also names its pin file.
+fn is_key_id(id: &str) -> bool {
+    id.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// A `MAJOR.MINOR.PATCH` as a key that sorts numerically, at any length.
@@ -1197,6 +1258,65 @@ mod tests {
                 "driver.py",
                 "--quiet"
             ]
+        );
+    }
+
+    /// A manifest that does not validate is refused at pack with the
+    /// literal `remedy:` token after the manifest's own words.
+    #[test]
+    fn a_manifest_that_does_not_validate_is_refused_with_a_remedy() {
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join("manifest.json");
+        write(
+            &file,
+            r#"{"name": "Not A Name", "kind": "browser",
+                "program": {"runtime": "python", "command": ["python", "driver.py"],
+                            "files_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                            "browser_channel": null, "headless": true},
+                "hosts": ["example.invalid"],
+                "actions": [{"name": "echo", "reversible": true, "args": {"type": "object"},
+                             "evidence": [], "to_register": false}],
+                "min_interval_ms": 0, "max_action_ms": 60000,
+                "clearance": {"max_scope": "business", "third_party_allowed": true},
+                "source": "development", "governed": false}"#,
+        );
+        let e = read_manifest(&file).unwrap_err();
+        assert!(e.message.contains("does not validate"), "{}", e.message);
+        assert!(e.message.contains("; remedy: "), "{}", e.message);
+        assert_eq!(e.message.lines().count(), 1, "{}", e.message);
+    }
+
+    /// One install-root entry that cannot be read is logged and skipped:
+    /// `driver.ls` still lists every other version (Task 8 review).
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_entry_under_the_install_root_is_skipped_not_fatal() {
+        let t = tempfile::tempdir().unwrap();
+        write(&t.path().join("good/1.0.0/manifest.json"), "{}");
+        let locked = t.path().join("locked");
+        write(&locked.join("1.0.0/manifest.json"), "{}");
+        // No inherited entry and none of its own: nobody may list it.
+        let icacls = |args: &[&str]| {
+            let ok = std::process::Command::new("icacls")
+                .arg(&locked)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "icacls {args:?}");
+        };
+        icacls(&["/inheritance:r"]);
+        assert!(
+            std::fs::read_dir(&locked).is_err(),
+            "the entry is unreadable"
+        );
+        let listed = installed_versions(t.path());
+        icacls(&["/reset"]);
+        let listed = listed.unwrap();
+        assert_eq!(
+            listed,
+            BTreeMap::from([("good".to_string(), vec!["1.0.0".to_string()])])
         );
     }
 
