@@ -155,6 +155,7 @@ pub const DRIVER_FAILURE_REASONS: &[&str] = &[
     "evidence too large",
     "would not start",
     "panicked",
+    "tampered",
 ];
 
 /// The ledger's word for a host failure, from the variant and its fault
@@ -343,6 +344,8 @@ impl RealKernel {
                 profile_dir_hash,
                 governed: observed_governed,
                 by,
+                package_digest: None,
+                source: vk_contracts::driver::DriverSource::Development,
             },
         )?;
         self.store
@@ -1010,7 +1013,7 @@ mod tests {
         assert_eq!(spawn.reason(), "would not start");
         assert_eq!(spawn.detail(), leak, "the detail is kept, for the log");
         assert_eq!(DriverFailure::Panicked.reason(), "panicked");
-        for w in ["would not start", "panicked"] {
+        for w in ["would not start", "panicked", "tampered"] {
             assert!(DRIVER_FAILURE_REASONS.contains(&w), "{w}");
         }
     }

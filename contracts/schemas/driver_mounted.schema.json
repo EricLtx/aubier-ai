@@ -19,9 +19,21 @@
     "name": {
       "type": "string"
     },
+    "package_digest": {
+      "description": "The digest of the package this mount was installed from; absent for a\ndevelopment mount and on every row written before packaging.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "profile_dir_hash": {
       "description": "SHA-256 (`sha256:` + hex) of the profile directory's **path** as the\nkernel composes it (`<state_dir>/drivers/<name>/profile`), not of its\ncontents (Ruling R11): a browser profile changes on every run and a\npopulated one is hundreds of MB with locked files, so a content hash\nwould be meaningless and could fail the remount a degraded driver's\nremedy asks for. It says which profile this mount drove.",
       "type": "string"
+    },
+    "source": {
+      "description": "Where the mounted tree came from; `development` on every row written\nbefore packaging.",
+      "$ref": "#/$defs/DriverSource",
+      "default": "development"
     }
   },
   "required": [
@@ -31,5 +43,15 @@
     "profile_dir_hash",
     "governed",
     "by"
-  ]
+  ],
+  "$defs": {
+    "DriverSource": {
+      "description": "Where the tree the kernel mounts comes from. Verified by path, never\ntrusted as declared; not part of `driver_id`.",
+      "type": "string",
+      "enum": [
+        "development",
+        "installed"
+      ]
+    }
+  }
 }

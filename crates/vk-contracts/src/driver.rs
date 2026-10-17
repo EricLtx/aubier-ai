@@ -211,9 +211,9 @@ impl DriverManifest {
     }
 
     /// Every refusal names its remedy. Checked in this order: name, command,
-    /// `files_sha256`, the memory cap's floor, hosts, actions (count,
-    /// duplicates, names, `args`, evidence), the interval ceiling, and last
-    /// the credential-shaped keys.
+    /// `files_sha256`, the memory cap's floor, the service context's headless
+    /// requirement, hosts, actions (count, duplicates, names, `args`,
+    /// evidence), the interval ceiling, and last the credential-shaped keys.
     pub fn validate(&self) -> Result<(), DriverError> {
         let name_ok = !self.name.is_empty()
             && self.name.len() <= 32
@@ -396,6 +396,14 @@ pub struct DriverMounted {
     pub profile_dir_hash: String,
     pub governed: bool,
     pub by: String,
+    /// The digest of the package this mount was installed from; absent for a
+    /// development mount and on every row written before packaging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_digest: Option<String>,
+    /// Where the mounted tree came from; `development` on every row written
+    /// before packaging.
+    #[serde(default)]
+    pub source: DriverSource,
 }
 
 /// Ledger payload of `driver.acted`: one action, by hashes only — what was asked
@@ -484,7 +492,13 @@ mod tests {
                 "\"kind\": \"browser\", \"source\": \"packaged\"",
                 1,
             );
-        assert!(serde_json::from_str::<DriverManifest>(&text).is_err());
+        let msg = serde_json::from_str::<DriverManifest>(&text)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("unknown variant `packaged`"),
+            "the refusal names the word: {msg}"
+        );
     }
 
     #[test]

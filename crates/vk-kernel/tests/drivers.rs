@@ -351,6 +351,8 @@ fn mount_is_a_human_act_and_is_idempotent() {
             profile_dir_hash: vk_contracts::hash_bytes(dirs.profile.to_string_lossy().as_bytes()),
             governed: true,
             by: "phone-1".into(),
+            package_digest: None,
+            source: vk_contracts::driver::DriverSource::Development,
         }),
         "the mounted event names the identity and who mounted it"
     );

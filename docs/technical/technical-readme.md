@@ -419,12 +419,13 @@ under `WindowsApps`, refuses an existing `.venv` whose `pyvenv.cfg` names
 one, and without `-Python` takes the standalone CPython 3.13 that `uv`
 manages (pilot ruling R27).
 
-Three ledger kinds record a driver, each with its own schema:
+Four ledger kinds record a driver, each with its own schema:
 
 | kind | what it carries |
 |---|---|
-| `driver.mounted` | `driver_id`, `name`, `manifest_hash`, `profile_dir_hash`, `governed`, and `by`, the device key that signed the mount |
+| `driver.mounted` | `driver_id`, `name`, `manifest_hash`, `profile_dir_hash`, `governed`, and `by`, the device key that signed the mount; `package_digest` when the tree was installed from a package, and `source` (`development` or `installed`; rows written before packaging read as `development`) |
 | `driver.acted` | `task_id`, `step_index`, `driver_id`, `action`, `args_hash`, `result_hash`, `ok`, `reason` when it failed — a host or daemon failure's word from a closed vocabulary (`timeout`, `dead`, `protocol: malformed response`, `would not start`, …), a driver refusal's word from the protocol's five (`dialog`, `timeout`, `host`, `precondition`, `internal`; anything else is pinned to `internal`), or a kernel refusal composed of plain tokens and byte counts — `duration_ms`, `evidence` (the blob hashes), `evidence_bytes`, `hosts_seen` |
+| `driver.packed` | `driver_id`, `name`, `version`, `package_digest` (the OCI image manifest's digest), `files_sha256`, `publisher_key_id`, and `by`, the node that packed — a human act |
 | `driver.unmounted` | `driver_id` and the reason: the operator, what degraded it (a word of the same vocabulary), or `row unreadable at boot` |
 
 `driver.acted` carries hashes and sizes, never text (Ruling 28): what the

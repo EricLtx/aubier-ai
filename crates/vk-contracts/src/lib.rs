@@ -11,6 +11,7 @@ pub mod labels;
 pub mod ledger;
 pub mod locks;
 pub mod module;
+pub mod package;
 pub mod principal;
 pub mod recipe;
 pub mod register;
@@ -68,6 +69,14 @@ pub fn schema_registry() -> Vec<(&'static str, schemars::Schema)> {
         (
             "driver_unmounted",
             schemars::schema_for!(driver::DriverUnmounted),
+        ),
+        (
+            "driver_package",
+            schemars::schema_for!(package::DriverPackage),
+        ),
+        (
+            "driver_packed",
+            schemars::schema_for!(package::DriverPacked),
         ),
         ("task_recipe", schemars::schema_for!(recipe::TaskRecipe)),
     ]

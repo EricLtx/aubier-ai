@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "artifactType": "application/vnd.aubier.driver.v1",
+  "config": {
+    "mediaType": "application/vnd.oci.empty.v1+json",
+    "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "size": 2
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.aubier.driver.manifest.v1+json",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 1024,
+      "annotations": { "org.aubier.component": "manifest" }
+    },
+    {
+      "mediaType": "application/vnd.aubier.driver.files.v1.tar",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 20480,
+      "annotations": { "org.aubier.component": "files" }
+    },
+    {
+      "mediaType": "application/vnd.aubier.driver.lock.v1+json",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 512,
+      "annotations": { "org.aubier.component": "lock" }
+    },
+    {
+      "mediaType": "application/vnd.aubier.driver.wheels.v1.tar",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 4194304,
+      "annotations": { "org.aubier.component": "wheels" }
+    },
+    {
+      "mediaType": "application/vnd.aubier.driver.python.v1.tar",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 25165824,
+      "annotations": {
+        "org.aubier.component": "python",
+        "org.aubier.python.upstream_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "org.aubier.python.release": "3.13.1"
+      }
+    }
+  ],
+  "annotations": {
+    "org.aubier.driver.name": "maskai-fixture",
+    "org.aubier.driver.version": "0.1.0",
+    "org.aubier.driver.id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "org.aubier.package.created": "2026-10-17T00:00:00Z",
+    "org.aubier.publisher.key_id": "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}
