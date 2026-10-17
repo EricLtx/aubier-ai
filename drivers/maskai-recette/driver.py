@@ -2129,6 +2129,7 @@ class Recette:
             if obs.get("sent_to_model") is not None:
                 seen["sent"] = obs["sent_to_model"]
             r = evaluer.evaluate_case(oracle, seen, budget_of(case))
+            nfr = nfr_union(nfr, r.get("nfr") or [])  # a leak to the model is KO sécurité
             if r["verdict"] == "NON TESTÉ" and not dialog and not offlist:  # échec silencieux
                 r["verdict"] = "KO"
                 r["notes"].append("réponse vide : échec silencieux"

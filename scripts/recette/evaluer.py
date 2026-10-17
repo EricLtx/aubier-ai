@@ -11,11 +11,15 @@ ORACLES.json : le fichier d'oracles du corpus (clé "cases", chaque cas ayant "i
 OBSERVATIONS.json : { "<id du cas>": { "answer": "...", "sent": "...", "timing_s": 12.3 } }
     answer : la réponse affichée à l'utilisateur ;
     sent   : le texte réellement envoyé au modèle, s'il est observable (sinon omettre) ;
+    sent_json : à défaut de sent, le chemin d'un sent.json du driver maskai-recette (relatif au
+             fichier d'observations) ; son texte compte quand il vient du popover « Chiffré » ou
+             du panneau du 13/10 (`source`) et n'a pas été écarté (`rejected`) ;
     timing_s : optionnel, durée totale.
 
 Verdict par cas : OK, PARTIEL, KO, NON TESTÉ.
     KO       : une valeur attendue manque, une valeur interdite apparaît, ou une donnée
-               identifiante de l'inventaire part en clair vers le modèle ;
+               identifiante de l'inventaire part en clair vers le modèle (KO sécurité :
+               `nfr` porte alors « securite ») ;
     PARTIEL  : tout est là mais un contrôle secondaire échoue (débordement de masque, latence
                hors budget) ;
     OK       : tout passe.
@@ -26,12 +30,17 @@ Aucune dépendance hors bibliothèque standard.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import unicodedata
 
 SPAN_LEAK = re.compile(r"<[A-Z_]+_\d+>[^\s<,.;:)\]\"']")  # un masque collé à un caractère de mot
-BROKEN_TOKEN = re.compile(r"(?<![<A-Z])[A-Z]+_\d+>")  # jeton dont le '<' a été avalé
+# Jeton dont le '<' a été avalé. Le type peut porter des '_' (<CREDIT_CARD_1>) : le regard arrière
+# exclut '_', pour qu'un jeton bien formé ne se lise pas « CARD_1> », et le type se lit en entier.
+BROKEN_TOKEN = re.compile(r"(?<![<A-Z_])[A-Z]+(?:_[A-Z]+)*_\d+>")
+# Les textes de sent.json qui sont le texte envoyé (le popover « Chiffré », le panneau du 13/10).
+SENT_SOURCES = ("popover", "panel")
 
 
 def fold(s: str) -> str:
@@ -45,6 +54,31 @@ def find(pattern: str, text: str) -> bool:
     return re.search(fold(pattern), fold(text)) is not None
 
 
+def pii_in(value: str, sent: str) -> bool:
+    """Une valeur de l'inventaire `pii` est-elle dans le texte envoyé ? Littéralement, aux accents,
+    à la casse et aux espaces près ; ou comme motif (les inventaires du corpus v3 n'ont pas de
+    métacaractère hors '.' et '-', et se lisent aussi comme des motifs). Un motif qui ne compile pas
+    ne compte que littéralement."""
+    if fold(value) in fold(sent):
+        return True
+    try:
+        return find(value, sent)
+    except re.error:
+        return False
+
+
+def sent_from_json(path: str) -> str | None:
+    """Le texte envoyé que porte un sent.json du driver, s'il en porte un ; sinon None."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if data.get("source") in SENT_SOURCES and not data.get("rejected") and data.get("text"):
+        return data["text"]
+    return None
+
+
 def evaluate_case(case: dict, obs: dict | None, latency_budget_s: float | None = None) -> dict:
     out = {"id": case["id"], "verdict": "NON TESTÉ", "missing": [], "forbidden": [], "leaks": [],
            "span_issues": [], "timing_s": None, "notes": []}
@@ -52,6 +86,8 @@ def evaluate_case(case: dict, obs: dict | None, latency_budget_s: float | None =
         return out
     answer = obs["answer"]
     sent = obs.get("sent")
+    if sent is None and obs.get("sent_json"):
+        sent = sent_from_json(obs["sent_json"])
     out["timing_s"] = obs.get("timing_s")
 
     out["missing"] = [p for p in case.get("must", []) if not find(p, answer)]
@@ -61,13 +97,16 @@ def evaluate_case(case: dict, obs: dict | None, latency_budget_s: float | None =
         for value in case.get("pii", []):
             if value.startswith("("):
                 continue  # inventaire descriptif, pas une valeur
-            if fold(value) in fold(sent):
+            if pii_in(value, sent):
                 out["leaks"].append(value)
         out["span_issues"] = [m.group(0) for m in SPAN_LEAK.finditer(sent)]
         out["span_issues"] += [m.group(0) for m in BROKEN_TOKEN.finditer(sent)]
     else:
         out["notes"].append("texte envoyé non observé : fuite de PII non vérifiable")
 
+    if out["leaks"]:  # une donnée de l'inventaire en clair vers le modèle : KO sécurité
+        out["nfr"] = ["securite"]
+        out["notes"].append("KO sécurité : donnée identifiante en clair dans le texte envoyé")
     if out["missing"] or out["forbidden"] or out["leaks"]:
         out["verdict"] = "KO"
     elif out["span_issues"] or (latency_budget_s and out["timing_s"] and out["timing_s"] > latency_budget_s):
@@ -122,6 +161,10 @@ def main(argv: list[str]) -> int:
         oracles = json.load(f)
     with open(argv[2], encoding="utf-8") as f:
         observations = json.load(f)
+    base = os.path.dirname(os.path.abspath(argv[2]))
+    for obs in observations.values():  # sent.json paths are relative to the observations file
+        if isinstance(obs, dict) and obs.get("sent_json") and not os.path.isabs(obs["sent_json"]):
+            obs["sent_json"] = os.path.join(base, obs["sent_json"])
     results = evaluate(oracles, observations)
     if "--json" in argv:
         print(json.dumps(results, ensure_ascii=False, indent=2))

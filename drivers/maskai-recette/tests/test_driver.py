@@ -1011,6 +1011,9 @@ class DriverV2OnFixture(FixtureBench):
         self.act(A, "poser_question", {"case": "v2-leak"})
         res, _ = self.act(A, "verdict_oracle", {"case": "v2-leak"})
         self.assertEqual((res["verdict"], res["leaks"]), ("KO", ["Hugo Bernard"]))
+        line = journal_lines(recette.work)[-1]
+        self.assertIn("securite", line["nfr"], "a leak to the model is KO sécurité")
+        self.assertIn("KO sécurité : donnée identifiante en clair", line["evidence"])
 
     def test_a_popover_that_shows_a_status_is_not_taken_for_the_sent_text(self):
         """If the live popover only says « no PII detected », the leak oracle must say it could not
