@@ -228,6 +228,19 @@ class GuardParseTest(unittest.TestCase):
         self.assertEqual(g["header"], "")
 
 
+class SentTextTest(unittest.TestCase):
+    """Which popover text counts as the sent text (no browser needed)."""
+
+    def test_the_popover_must_carry_the_question(self):
+        drv = load_driver()
+        q = "Rédige une relance courtoise pour M. Hugo Bernard au sujet du loyer."
+        self.assertTrue(drv.looks_like_sent("Rédige une relance courtoise pour <PERSON_1> au sujet du loyer.", q))
+        self.assertTrue(drv.looks_like_sent(q, q))
+        self.assertFalse(drv.looks_like_sent("Encrypted — no PII detected", q))
+        self.assertFalse(drv.looks_like_sent("", q))
+        self.assertFalse(drv.looks_like_sent(None, q))
+
+
 class KindChecksTest(unittest.TestCase):
     """What the cases model, web and long check beyond their oracle (no browser needed)."""
 
@@ -952,6 +965,25 @@ class DriverV2OnFixture(FixtureBench):
         self.act(A, "poser_question", {"case": "v2-leak"})
         res, _ = self.act(A, "verdict_oracle", {"case": "v2-leak"})
         self.assertEqual((res["verdict"], res["leaks"]), ("KO", ["Hugo Bernard"]))
+
+    def test_a_popover_that_shows_a_status_is_not_taken_for_the_sent_text(self):
+        """If the live popover only says « no PII detected », the leak oracle must say it could not
+        see the sent text, never judge the status as if it were the text (a false « no leak »)."""
+        drv, recette, A = self.make()
+        recette.open()
+        recette.cases["v2-status"] = {"id": "v2-status", "level": "N9", "kind": "message",
+                                      "question": "Relance pour M. Hugo Bernard POPOVER_STATUS", "budget_s": 5,
+                                      "nfr": ["conformite"], "must": ["relance"], "must_not": [],
+                                      "pii": ["Hugo Bernard"]}
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "poser_question", {"case": "v2-status"})
+        sent = self.evidence_json(ev, "sent.json")
+        self.assertIsNone(sent["source"])
+        self.assertEqual(sent["rejected"], "le popover ne montre pas le texte de la question")
+        self.assertEqual(sent["text"], "Chiffré de bout en bout, aucune PII détectée", "kept as read, for the debrief")
+        self.assertNotIn("sent_to_model", res)
+        self.act(A, "verdict_oracle", {"case": "v2-status"})
+        self.assertIn("texte envoyé non observé", journal_lines(recette.work)[-1]["evidence"])
 
     def test_the_popover_is_known_only_when_the_driver_opened_it(self):
         drv, recette, A = self.make()

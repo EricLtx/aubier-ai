@@ -141,8 +141,9 @@ $("stop").onclick = () => {
 };
 
 // -- the « Chiffré » popover: what is sent to the model ---------------------------------
-function renderSent() {
-  $("enc-text").textContent = /LEAK/.test(state.text) ? state.text : mask(state.text).masked;
+function renderSent() {  // POPOVER_STATUS: a popover that only says a status, no text
+  $("enc-text").textContent = /POPOVER_STATUS/.test(state.text) ? "Chiffré de bout en bout, aucune PII détectée"
+    : /LEAK/.test(state.text) ? state.text : mask(state.text).masked;
 }
 function openPopover() {
   renderSent();

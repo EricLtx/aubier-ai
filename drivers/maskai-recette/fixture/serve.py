@@ -17,7 +17,8 @@ ready when the question left). Trigger words in the request body:
   UNKNOWN_MODAL   the page shows a [role=dialog] nobody catalogued;
   LATE_DIALOG     the page opens a confirm() 3.5 s after the answer is drawn,
                   once the action is over (the verdict must still see it);
-  LEAK            the « Chiffré » popover shows the text unmasked (a leak).
+  LEAK            the « Chiffré » popover shows the text unmasked (a leak);
+  POPOVER_STATUS  the « Chiffré » popover shows a status line, not the text.
 
 The page side (index.html) draws each answer behind the stream and ends about
 1.5 s after the server; shows the « Votre avis » survey after a generation left

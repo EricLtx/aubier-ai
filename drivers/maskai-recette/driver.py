@@ -705,6 +705,19 @@ def turn_summary(i: int, question: str, obs: dict) -> dict:
             "sent_to_model": (obs.get("sent_to_model") or "")[:4000] or None, "pipeline_ms": obs.get("pipeline_ms")}
 
 
+def looks_like_sent(shown: str | None, question: str) -> bool:
+    """Le texte du popover est-il le message envoyé (masqué ou non), et pas un simple statut
+    (« Encrypted — no PII detected ») ? Au moins la moitié des mots de quatre lettres ou plus de la
+    question doivent s'y retrouver (un mot masqué est remplacé par un jeton, les autres restent).
+    Sinon la fuite de PII n'est pas vérifiable, et le verdict le dit, plutôt que de juger un
+    statut comme si c'était le texte envoyé."""
+    words = set(re.findall(r"\w{4,}", evaluer.fold(question or "")))
+    if not shown or not words:
+        return False
+    seen = evaluer.fold(shown)
+    return sum(w in seen for w in words) * 2 >= len(words)
+
+
 def chip_label(reading: dict | None) -> str:
     if not reading:
         return ""
@@ -1435,7 +1448,7 @@ class Recette:
         # stop_before: the stop selectors already match something before anything is sent; that is
         # no generation indicator (a guessed selector on a permanent button): ignored, never clicked.
         turn = {"page": page, "n0": st["n"], "count0": st["count"], "posts0": len(b.posts),
-                "page_no": b.context.pages.index(page), "stop_before": st["stop"]}
+                "page_no": b.context.pages.index(page), "stop_before": st["stop"], "text": text}
         if not b.call(FILL_JS, {"sel": SELECTORS["textarea"], "text": text}, page=page):
             raise DriverRefusal("precondition", "pas de zone de saisie dans la page")
         page.bring_to_front()
@@ -1663,6 +1676,8 @@ class Recette:
         posts = [p for p in b.posts[turn["posts0"]:] if p["page"] in (turn["page_no"], -1)]
         panel = b.call(SENT_JS, {"label": SELECTORS["sent_label"]}, page=page)
         sent_info = dict(turn.get("sent_popover") or {"source": None})
+        if sent_info.get("source") == "popover" and not looks_like_sent(sent_info.get("text"), turn.get("text", "")):
+            sent_info.update(source=None, rejected="le popover ne montre pas le texte de la question")
         if sent_info.get("source") == "popover":
             sent_to_model = sent_info["text"]
         elif panel is not None:
