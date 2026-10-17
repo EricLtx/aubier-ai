@@ -43,11 +43,15 @@ Ce que la v2 ajoute (debrief du 2026-10-17, docs/technical/debriefs/) :
 - trois actions de plus : choisir_modele et recherche_web règlent le compositeur
   et relisent ce qu'il affiche ; conversation_longue pose n questions dans la
   même conversation. Les cas `model`, `web` et `long` les utilisent ;
-- `ui_profile_sha256`, l'empreinte de `SELECTORS` et `KNOWN_MODALS`, est sur
-  chaque ligne de journal : un changement de sélecteur s'y voit, ce que
-  `inputs_sha256` ne montre pas (D12) ;
+- `ui_profile_sha256`, l'empreinte de `SELECTORS`, `KNOWN_MODALS`, du motif du
+  flux et des constantes de fin de réponse, est sur chaque ligne de journal : un
+  changement de sélecteur s'y voit, ce que `inputs_sha256` ne montre pas (D12) ;
 - les captures masquent la barre latérale (l'historique) et le bloc du compte ;
-- un cas sans `budget_s` prend le budget de sa classe (`CLASS_BUDGET_S`).
+- un cas sans `budget_s` prend le budget de sa classe (`CLASS_BUDGET_S`) ;
+- la seconde recette (PROCEDURE-2.md, grille M0–M7) : cas de configuration jugés sur `@model` et
+  `@web`, configuration épinglée réappliquée par nouvelle_conversation si l'interface l'a perdue,
+  modèle et mode web lus sur chaque ligne, document joint cherché dans le texte envoyé,
+  empreinte du texte envoyé pour comparer les passages a et b (`replay_of`).
 
 Environnement (posé par l'hôte) : VK_DRIVER_PROFILE_DIR, VK_DRIVER_WORK_DIR,
 VK_DRIVER_HEADLESS, VK_DRIVER_CHANNEL, VK_DRIVER_HOSTS ; MASKAI_ENTRY_URL
@@ -236,6 +240,7 @@ DEFAULT_BUDGET_S = 60
 # les classes du debrief du 17/10 (§3) ; une pièce jointe sans budget prend celui des lourdes.
 CLASS_BUDGET_S = {"load": 3, "message": 10, "model": 10, "web": 10, "long": 10, "list": 10,
                   "attach_question": 60, "concurrent": 60}
+PASTED_PII_BUDGET_S = 20
 # La couleur des zones masquées sur les captures.
 MASK_COLOR = "#FF00FF"
 # Fin de réponse (D6) : après la fin du flux, le corps de la nouvelle réponse immobile
@@ -539,17 +544,27 @@ def clean(value):
 
 
 def ui_profile_sha256() -> str:
-    """L'empreinte du profil d'interface du driver : SELECTORS et KNOWN_MODALS en JSON canonique
-    (clés triées, sans espaces, UTF-8). Sur chaque ligne de journal : deux lignes qui la portent
-    ont été lues avec les mêmes adresses de page et les mêmes modales connues (D12)."""
-    profile = {"known_modals": KNOWN_MODALS, "selectors": SELECTORS}
+    """L'empreinte du profil d'interface du driver : SELECTORS et KNOWN_MODALS, avec le motif du
+    flux et les constantes de fin de réponse (proposition 9 du debrief, que la recette 2 annonce
+    au juge), en JSON canonique (clés triées, sans espaces, UTF-8). Sur chaque ligne de journal :
+    deux lignes qui la portent ont été lues avec les mêmes adresses de page, les mêmes modales
+    connues et la même règle de fin de réponse (D12)."""
+    profile = {"known_modals": KNOWN_MODALS, "selectors": SELECTORS, "stream_pattern": STREAM_PATTERN,
+               "end_of_answer": {"display_stable_s": DISPLAY_STABLE_S, "display_cap_s": DISPLAY_CAP_S,
+                                 "no_answer_wait_s": NO_ANSWER_WAIT_S}}
     data = json.dumps(profile, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
 def budget_of(case: dict) -> float:
-    """Le budget de latence d'un cas : le sien, sinon celui de sa classe, sinon DEFAULT_BUDGET_S."""
-    return case.get("budget_s") or CLASS_BUDGET_S.get(case.get("kind"), DEFAULT_BUDGET_S)
+    """Le budget de latence d'un cas : le sien, sinon celui de sa classe, sinon DEFAULT_BUDGET_S. Un
+    message qui porte des données identifiantes collées (un inventaire `pii`) est de la classe
+    « document collé » (PROCEDURE-2 §5 : `detect_pii` jusqu'à 11 s le 17/10)."""
+    if case.get("budget_s"):
+        return case["budget_s"]
+    if case.get("kind") == "message" and case.get("pii"):
+        return PASTED_PII_BUDGET_S
+    return CLASS_BUDGET_S.get(case.get("kind"), DEFAULT_BUDGET_S)
 
 
 def parse_guard(card: str, body: str, body_found: bool) -> dict:
@@ -706,12 +721,47 @@ def web_field(post_body: str | None) -> str | None:
 
 
 def long_questions(case: dict, turns: int) -> list:
-    """Les questions d'un cas `long` : `first`, puis `filler` pour chaque tour du milieu ({i} est
-    le rang du tour), puis `last`."""
+    """Les questions d'un cas `long` : ses `messages`, les `turns` premiers (PROCEDURE-2) ; ou
+    `first`, puis `filler` pour chaque tour du milieu ({i} est le rang du tour), puis `last`."""
+    messages = case.get("messages")
+    if messages:
+        if not 2 <= turns <= len(messages):
+            raise ValueError(f"case {case['id']}: turns must be 2 to {len(messages)}, the messages it has")
+        return list(messages[:turns])
     first, filler, last = case.get("first"), case.get("filler"), case.get("last")
     if turns < 2 or not first or not last or (turns > 2 and not filler):
         raise ValueError(f"case {case['id']}: a long case needs first, last, filler and turns >= 2")
     return [first] + [filler.format(i=i) for i in range(2, turns)] + [last]
+
+
+def is_placeholder(model: str | None) -> bool:
+    """« <modele-B> » : un modèle que le harnais lit dans le sélecteur à l'exécution (PROCEDURE-2)."""
+    return bool(model) and model.strip().startswith("<") and model.strip().endswith(">")
+
+
+def sent_digest(text: str | None) -> str | None:
+    """L'empreinte du texte envoyé, à la numérotation des jetons près (<PERSON_2> vaut <PERSON_1>)
+    et aux blancs près : deux passages d'un même cas se comparent par elle (replay_of)."""
+    if text is None:
+        return None
+    norm = re.sub(r"\s+", " ", re.sub(r"<([A-Z][A-Z_]*)_\d+>", r"<\1>", text)).strip()
+    return "sha256:" + hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+TEXT_SUFFIXES = (".txt", ".md", ".json", ".csv")
+
+
+def document_in_sent(path: Path, sent: str | None) -> bool | None:
+    """Le document joint figure-t-il dans le texte envoyé (PROCEDURE-2 §8.8) ? True si au moins 30 %
+    de ses mots de six lettres ou plus s'y retrouvent ; None quand on ne peut pas le dire (rien
+    d'envoyé observé, ou un format que le driver ne lit pas en texte : PDF, DOCX, image…)."""
+    if sent is None or path.suffix.lower() not in TEXT_SUFFIXES:
+        return None
+    words = set(re.findall(r"\w{6,}", evaluer.fold(path.read_text(encoding="utf-8", errors="replace"))))
+    if not words:
+        return None
+    seen = evaluer.fold(sent)
+    return sum(w in seen for w in words) * 10 >= len(words) * 3
 
 
 def turn_summary(i: int, question: str, obs: dict) -> dict:
@@ -759,7 +809,7 @@ def abort_text(p: dict) -> str:
     return ", ".join(parts)
 
 
-ORACLE_FILES = ("corpus-v2/oracles-v2.json", "corpus/oracles.json")
+ORACLE_FILES = ("corpus-v2/oracles-v2.json", "corpus/oracles.json", "corpus-v3/oracles-v3.json")
 CASES_REL = "drivers/maskai-recette/cases.json"
 
 
@@ -1246,6 +1296,9 @@ class Recette:
         self._mark = None  # where the action in hand began, in the browser's event sequence
         self._last_asked = None  # {"case", "mark"} of the last poser_question
         self._in_flight = False  # an abandon whose stop click did not end the generation
+        # The composer configuration last set by choisir_modele / recherche_web: nouvelle_conversation
+        # sets it again when the interface lost it (PROCEDURE-2 §8.6).
+        self.pinned = {}
 
     def actions(self) -> dict:
         browser = ["mesurer_chargement", "nouvelle_conversation", "joindre_document", "poser_question",
@@ -1892,8 +1945,27 @@ class Recette:
         how = "bouton" if clicked else "retour à la page d'entrée"
         if stopped:
             how += ", génération en vol arrêtée d'abord"
-        return {"conversation": page.url, "stopped_first": stopped,
+        reapplied = self._reapply_pinned(page)
+        if reapplied:
+            how += ", configuration épinglée réappliquée (" + ", ".join(f"{k} {v}" for k, v in reapplied.items()) + ")"
+        return {"conversation": page.url, "stopped_first": stopped, "reapplied": reapplied or None,
                 "text": f"nouvelle conversation ({how}) : {short_url(page.url)}"}
+
+    def _reapply_pinned(self, page) -> dict:
+        """La configuration épinglée, remise si l'interface l'a perdue (un modèle ou un mode web
+        revenu à son défaut). Rend ce qui a été remis, ou l'échec ; n'arrête jamais l'action."""
+        if not self.pinned:
+            return {}
+        now, done = self._composer_now(page), {}
+        try:
+            if self.pinned.get("model") and not model_matches(self.pinned["model"], now["model"]):
+                done["modèle"] = self._set_model(page, self.pinned["model"])["read_back"]
+            if self.pinned.get("web") and now["web"] != self.pinned["web"]:
+                done["web"] = self._set_web(page, self.pinned["web"])["read_back"]
+        except (DriverRefusal, PWError) as e:
+            done["échec"] = one_line(getattr(e, "detail", "") or str(e), 120)
+            log.warning("pinned configuration not set again: %s", done["échec"])
+        return done
 
     def joindre_document(self, args: dict, ev: Evidence) -> dict:
         """Joindre le fichier du cas par le champ caché derrière le trombone, puis suivre la puce
@@ -1962,13 +2034,22 @@ class Recette:
         armé ; abandon à 3 × le budget du cas, journalisé KO disponibilité."""
         cid = args["case"]
         case = self._case(cid)
+        if case["kind"] in ("model", "web") and "question" not in case:
+            # A configuration case (PROCEDURE-2 §8.2): nothing to send, it is judged on what
+            # choisir_modele or recherche_web observed; poser_question hands that back.
+            key, action = ("@model", "choisir_modele") if case["kind"] == "model" else ("@web", "recherche_web")
+            seen = self.observations.get(key)
+            if not seen:
+                raise DriverRefusal("precondition", f"cas de configuration {cid} : {action} d'abord, puis verdict_oracle")
+            return {"case": cid, "configuration": True, "answer": seen["answer"], "text": f"{cid} : {seen['answer']}"}
         if case["kind"] not in ("message", "attach_question", "model", "web") or "question" not in case:
             hint = " : conversation_longue" if case["kind"] == "long" else ""
             raise DriverRefusal("precondition", f"le cas {cid} ({case['kind']}) n'a pas de question{hint}")
-        composer = None
-        if case["kind"] in ("model", "web"):  # the composer as it is now, read on screen
-            composer = self._composer_now(self.browser.page())
-            if case["kind"] == "model" and not model_matches(case["model"], composer["model"]):
+        # The composer as it is now, read on screen: every line carries the model and web mode read.
+        composer = self._composer_now(self.browser.page())
+        if case["kind"] in ("model", "web"):
+            if (case["kind"] == "model" and not is_placeholder(case["model"])
+                    and not model_matches(case["model"], composer["model"])):
                 raise DriverRefusal("precondition", f"choisir_modele {case['model']} d'abord "
                                                     f"(modèle du compositeur : {composer['model']})")
             if case["kind"] == "web" and composer["web"] != case["web"]:
@@ -2002,8 +2083,13 @@ class Recette:
                                                                 **t.profile}
             raise DriverRefusal("timeout", t.why, extra={"journal": line, "abort": t.profile}) from None
         self.conv["asked"].append(cid)
+        if case["kind"] == "attach_question" and obs.get("sent_info") is not None:
+            # In an attachment, the sent text may not hold the document: then a leak cannot be
+            # seen on this channel (PROCEDURE-2 §8.8).
+            obs["sent_info"]["document_in_sent"] = document_in_sent(self._resolve(case["file"]),
+                                                                    obs.get("sent_to_model"))
         self.observations[cid] = {**obs, "html": None, **({"attach": attach} if attach else {}),
-                                  **({"composer": composer} if composer else {})}
+                                  "composer": composer}
         self._answer_evidence(ev, obs, mark)
         return self._answer_result(obs, cid)
 
@@ -2100,6 +2186,8 @@ class Recette:
                     "span_issues": r.get("span_issues", []), "replayed": True,
                     "text": json.dumps(done, ensure_ascii=False)}
         key = {"load": "@load", "list": "@list"}.get(case["kind"], cid)
+        if case["kind"] in ("model", "web") and "question" not in case:  # a configuration case
+            key = "@model" if case["kind"] == "model" else "@web"
         obs = self.observations.get(key) or {}
         asked = "answer" in obs
         attach = obs.get("attach") or {}
@@ -2122,11 +2210,13 @@ class Recette:
         elif not asked and not dialog and not offlist:
             hint = {"load": "mesurer_chargement", "list": "lister_conversations",
                     "concurrent": "charge_concurrente", "long": "conversation_longue"}.get(case["kind"], "poser_question")
+            hint = {"@model": "choisir_modele", "@web": "recherche_web"}.get(key, hint)
             raise DriverRefusal("precondition", f"aucune observation pour {cid} : {hint} d'abord")
         elif asked:
             oracle = {"id": cid, "must": case["must"], "must_not": case["must_not"], "pii": case["pii"]}
             seen = {"answer": obs.get("answer"), "timing_s": obs.get("timing_s")}
-            if obs.get("sent_to_model") is not None:
+            in_doc = (obs.get("sent_info") or {}).get("document_in_sent", True)
+            if obs.get("sent_to_model") is not None and in_doc is True:
                 seen["sent"] = obs["sent_to_model"]
             r = evaluer.evaluate_case(oracle, seen, budget_of(case))
             nfr = nfr_union(nfr, r.get("nfr") or [])  # a leak to the model is KO sécurité
@@ -2139,7 +2229,13 @@ class Recette:
                 r["notes"].append("corps de réponse introuvable : texte de la carte entière, en-tête compris")
             if obs.get("display_stable") is False:
                 r["notes"].append("affichage encore en mouvement à la capture")
+            if obs.get("sent_to_model") is not None and in_doc is not True:
+                r["notes"].append("le texte envoyé ne montre pas le document joint : fuite non vérifiable sur ce canal"
+                                  if in_doc is False else
+                                  "document joint illisible en texte par le driver : fuite non vérifiable sur ce canal")
             nfr = self._kind_checks(case, obs, r, nfr)
+            if case.get("replay_of"):
+                self._replay_note(case, obs, r)
         else:
             r = {"verdict": "KO", "notes": []}
         for key_ in ("missing", "forbidden", "leaks", "span_issues", "notes"):
@@ -2157,8 +2253,7 @@ class Recette:
             o = obs["offlist_after"]
             r["notes"].append(f"navigation hors périmètre après la réponse : {o['host']} (+{o['after_s']:g} s)")
         line = self._journal_add(cid, r["verdict"], obs.get("timing_s"), self._summary(r, obs), nfr,
-                                 obs.get("pipeline_ms"),
-                                 {"display_s": obs["display_s"]} if obs.get("display_s") is not None else None)
+                                 obs.get("pipeline_ms"), self._line_extra(obs))
         self.observations.setdefault(key, obs)["verdict"] = {k: r[k] for k in ("verdict", "missing", "forbidden", "leaks", "span_issues", "notes")}
         if key != cid:
             self.observations[cid] = {"verdict": self.observations[key]["verdict"], "from": key}
@@ -2167,13 +2262,47 @@ class Recette:
                 "leaks": r["leaks"], "span_issues": r["span_issues"], "replayed": False, "text": line}
 
     @staticmethod
+    def _line_extra(obs: dict) -> dict:
+        """Ce que porte une ligne en plus du format : la fin d'affichage, le modèle et le mode web lus
+        (PROCEDURE-2 §8.4), l'empreinte du texte envoyé (replay_of)."""
+        extra = {}
+        if obs.get("display_s") is not None:
+            extra["display_s"] = obs["display_s"]
+        composer, guard = obs.get("composer"), obs.get("guard") or {}
+        if composer or guard.get("model"):
+            extra["config"] = {"model": (composer or {}).get("model"), "web": (composer or {}).get("web"),
+                               "banner": guard.get("model")}
+        if obs.get("sent_to_model") is not None:
+            extra["sent_sha256"] = sent_digest(obs["sent_to_model"])
+        return extra
+
+    def _replay_note(self, case: dict, obs: dict, r: dict) -> None:
+        """Le second passage d'un cas (replay_of) : le verdict du premier, et si le texte envoyé est
+        le même à la numérotation des jetons près (un écart signe un masquage non déterministe)."""
+        first = self._journaled(case["replay_of"])
+        if first is None:
+            r["notes"].append(f"passage a ({case['replay_of']}) pas encore journalisé")
+            return
+        note = f"passage a ({case['replay_of']}) : {first['verdict']}"
+        mine = sent_digest(obs.get("sent_to_model"))
+        if mine and first.get("sent_sha256"):
+            note += (" ; texte envoyé identique" if mine == first["sent_sha256"]
+                     else " ; texte envoyé différent (masquage non déterministe ?)")
+        r["notes"].append(note)
+
+    @staticmethod
     def _kind_checks(case: dict, obs: dict, r: dict, nfr: list) -> list:
-        """Ce que les cas model, web et long vérifient en plus de l'oracle (v2) ; rend les ENF."""
+        """Ce que les cas model, web et long vérifient en plus de l'oracle (v2) ; rend les ENF. Un
+        cas de configuration (sans question) n'a que son oracle, sur `@model` ou `@web`."""
         kind = case["kind"]
+        if kind in ("model", "web") and "question" not in case:
+            return nfr
         if kind == "model":
             seen = (obs.get("guard") or {}).get("model")
             chosen = (obs.get("composer") or {}).get("model") or case["model"]
-            if not model_matches(case["model"], seen):
+            # the model read on the composer when the question left: the label the harness chose,
+            # even for « <modele-B> », a model read in the list at run time
+            if not model_matches(chosen, seen):
                 r["verdict"] = "KO"
                 r["notes"].insert(0, f"réponse signée « {seen or 'sans bannière'} », modèle choisi « {chosen} »")
                 nfr = nfr_union(nfr, ["conformite"])
@@ -2199,8 +2328,9 @@ class Recette:
                 r["verdict"] = "KO"
                 r["notes"].insert(0, f"tours sans réponse : {', '.join(empty)}")
                 nfr = nfr_union(nfr, ["disponibilite"])
-            r["notes"].append(f"{len(turns)} tours ; tour 1 en {turns[0]['total_s']} s, tour {len(turns)} en "
-                              f"{turns[-1]['total_s']} s")
+            slowest = max(turns, key=lambda t: t["total_s"] or 0)
+            r["notes"].append(f"{len(turns)} tours ; tour le plus lent : {slowest['turn']} en {slowest['total_s']} s ; "
+                              f"tour 1 en {turns[0]['total_s']} s, tour {len(turns)} en {turns[-1]['total_s']} s")
         return nfr
 
     @staticmethod
@@ -2255,6 +2385,14 @@ class Recette:
             out, turns = {}, []
             for page, case in ((first, cases[0]), (second, cases[1])):
                 out[case["id"]] = {}
+                # The pinned web mode in each tab, read for each (PROCEDURE-2 §8.5).
+                if self.pinned.get("web"):
+                    try:
+                        out[case["id"]]["web"] = self._set_web(page, self.pinned["web"])["read_back"]
+                    except DriverRefusal as r:
+                        out[case["id"]]["web"] = r.extra.get("read_back")
+                else:
+                    out[case["id"]]["web"] = web_mode_of(self._control(page, SELECTORS["web_button"]))
                 if case.get("file"):
                     att = self._attach(page, self._resolve(case["file"]), budget_of(case))
                     out[case["id"]]["attach"] = {k: att[k] for k in ("state", "label", "seconds", "ready_by")}
@@ -2311,6 +2449,8 @@ class Recette:
                 parts.append(f"{c['id']} : onglet sorti du périmètre avant la fin de la réponse")
             else:
                 parts.append(f"{c['id']} : {o.get('total_s')} s, {len(o.get('answer') or '')} car.")
+            if o.get("web"):
+                parts[-1] += f", recherche web {o['web']}"
         if "gap_s" in out:
             parts.append(f"écart d'envoi {out['gap_s']} s")
         timing = max([o.get("total_s") or o.get("timeout_s") or 0 for k, o in out.items() if k != "gap_s"] or [0])
@@ -2349,63 +2489,91 @@ class Recette:
                 page.keyboard.press("Escape")
         return False
 
-    def choisir_modele(self, args: dict, ev: Evidence) -> dict:
-        """Choisir le modèle du compositeur : le bouton « Model: … » ouvre une liste ; l'option qui
-        correspond à `model` (choose_option) est cliquée, puis le modèle est relu sur le bouton
-        (model.json). Le changement reste : l'action ne restaure rien (reversible: false)."""
-        want = args["model"]
+    def _set_model(self, page, want: str) -> dict:
+        """Ouvrir la liste du bouton « Model: … », toujours (ses options sont relevées, PROCEDURE-2
+        §8.3), cliquer l'option qui correspond (choose_option), relire le modèle sur le bouton. Rend
+        l'enregistrement de model.json ; refus `precondition` (l'enregistrement dans `extra`) quand
+        aucune option ne correspond ou que la relecture diffère."""
         b = self.browser
-        page = b.page()
-        self._ensure_on_app(page)
+        t0 = time.monotonic()
         button = self._control(page, SELECTORS["model_button"])
         if button is None:
             raise DriverRefusal("precondition", "pas de bouton de modèle (« Model: … ») dans le compositeur")
         previous = model_of(button)
         record = {"asked": want, "previous": previous, "options": [], "picked": None, "candidates": [],
-                  "read_back": previous, "changed": False, "list_closed": None}
-        if not model_matches(want, previous):
-            page.locator(button["sel"]).nth(button["index"]).click(timeout=5000)
-            arg = {"list": SELECTORS["listbox"], "option": SELECTORS["option"]}
-            options, deadline = None, time.monotonic() + 5
-            while not options and time.monotonic() < deadline:
-                page.wait_for_timeout(150)
-                options = b.call(OPTIONS_JS, arg, page=page)
-            record["options"] = [o["text"] or o["value"] for o in options or []][:50]
-            pick, candidates = choose_option(want, options or [])
-            record["candidates"] = [o["text"] for o in candidates][:10]
-            if pick is None:
-                record["list_closed"] = self._close_list(page, SELECTORS["listbox"])
-                ev.json("model.json", record)
-                why = ("la liste des modèles ne s'ouvre pas" if not options
-                       else f"aucun modèle « {want} » dans la liste : {', '.join(record['options'][:10])}")
-                raise DriverRefusal("precondition", why, extra={"options": record["options"]})
-            record["picked"] = {"text": pick["text"], "value": pick["value"]}
-            page.locator(f'{SELECTORS["listbox"]} >> visible=true').last.locator(
-                SELECTORS["option"]).nth(pick["index"]).click(timeout=5000)
+                  "read_back": previous, "changed": False, "list_opened": False, "list_closed": None}
+        page.locator(button["sel"]).nth(button["index"]).click(timeout=5000)
+        arg = {"list": SELECTORS["listbox"], "option": SELECTORS["option"]}
+        options, deadline = None, time.monotonic() + 5
+        while not options and time.monotonic() < deadline:
+            page.wait_for_timeout(150)
+            options = b.call(OPTIONS_JS, arg, page=page)
+        record["list_opened"] = bool(options)
+        record["options"] = [o["text"] or o["value"] for o in options or []][:50]
+        pick, candidates = choose_option(want, options or [])
+        record["candidates"] = [o["text"] for o in candidates][:10]
+        if pick is None:
             record["list_closed"] = self._close_list(page, SELECTORS["listbox"])
-            deadline = time.monotonic() + 3
-            while True:  # read back on the button, once it shows the change
-                record["read_back"] = model_of(self._control(page, SELECTORS["model_button"]))
-                if model_matches(want, record["read_back"]) or time.monotonic() >= deadline:
-                    break
-                page.wait_for_timeout(150)
-            record["changed"] = record["read_back"] != previous
-        ev.json("model.json", record)
-        if not model_matches(want, record["read_back"]):
+            if not options and model_matches(want, previous):  # no list to read, but already shown
+                record["seconds"] = round(time.monotonic() - t0, 1)
+                return record
+            why = ("la liste des modèles ne s'ouvre pas" if not options
+                   else f"aucun modèle « {want} » dans la liste : {', '.join(record['options'][:10])}")
+            raise DriverRefusal("precondition", why, extra={"options": record["options"], "record": record})
+        record["picked"] = {"text": pick["text"], "value": pick["value"]}
+        page.locator(f'{SELECTORS["listbox"]} >> visible=true').last.locator(
+            SELECTORS["option"]).nth(pick["index"]).click(timeout=5000)
+        record["list_closed"] = self._close_list(page, SELECTORS["listbox"])
+        deadline = time.monotonic() + 3
+        while True:  # read back on the button, once it shows the change
+            record["read_back"] = model_of(self._control(page, SELECTORS["model_button"]))
+            if (model_matches(want, record["read_back"]) or model_matches(pick["text"], record["read_back"])
+                    or time.monotonic() >= deadline):
+                break
+            page.wait_for_timeout(150)
+        record["changed"] = record["read_back"] != previous
+        record["seconds"] = round(time.monotonic() - t0, 1)
+        if not (model_matches(want, record["read_back"]) or model_matches(pick["text"], record["read_back"])
+                or (pick["value"] and model_matches(pick["value"], record["read_back"]))):
             raise DriverRefusal("precondition", f"modèle relu « {record['read_back']} » au lieu de « {want} »",
-                                extra={"read_back": record["read_back"]})
-        return {"model": record["read_back"], "previous": previous, "changed": record["changed"],
-                "text": f"modèle du compositeur : {record['read_back']} (avant : {previous})"}
+                                extra={"read_back": record["read_back"], "record": record})
+        return record
 
-    def recherche_web(self, args: dict, ev: Evidence) -> dict:
-        """Régler la recherche web du compositeur : le bouton « Web search: … » (data-mode) est
-        cliqué jusqu'à afficher `mode` (un cycle, quatre clics au plus) ; s'il ouvre un menu, l'entrée
-        du mode est choisie. Le mode est relu sur le bouton (web.json). Le réglage reste : l'action
-        ne restaure rien (reversible: false)."""
-        want = args["mode"]
-        b = self.browser
-        page = b.page()
+    @staticmethod
+    def model_text(record: dict) -> str:
+        """Le texte d'un choix de modèle, celui que juge un cas de configuration `model`
+        (PROCEDURE-2 §4) : « options : A | B | C ; choisi : X ; relu : Y »."""
+        chosen = (record.get("picked") or {}).get("text") or record.get("read_back")
+        return (f"options : {' | '.join(record.get('options') or []) or 'non relevées'} ; choisi : {chosen} ; "
+                f"relu : {record.get('read_back')}")
+
+    def choisir_modele(self, args: dict, ev: Evidence) -> dict:
+        """Choisir le modèle du compositeur (_set_model) ; model.json, et l'observation `@model` qui
+        juge un cas de configuration `model`. Le choix reste et devient la configuration épinglée :
+        l'action ne restaure rien (reversible: false)."""
+        want = args["model"]
+        page = self.browser.page()
         self._ensure_on_app(page)
+        try:
+            record = self._set_model(page, want)
+        except DriverRefusal as r:
+            if r.extra.get("record"):
+                ev.json("model.json", r.extra["record"])
+            raise
+        ev.json("model.json", record)
+        text = self.model_text(record)
+        self.observations["@model"] = {"answer": text, "timing_s": record.get("seconds"), "model": record["read_back"],
+                                       "options": record["options"], "t": now_iso()}
+        self.pinned["model"] = (record.get("picked") or {}).get("text") or want
+        return {"model": record["read_back"], "previous": record["previous"], "changed": record["changed"],
+                "options": record["options"], "picked": (record.get("picked") or {}).get("text"), "text": text}
+
+    def _set_web(self, page, want: str) -> dict:
+        """Cliquer le bouton « Web search: … » (data-mode) jusqu'à afficher `want` (un cycle, quatre
+        clics au plus) ; s'il ouvre un menu, choisir l'entrée du mode. Rend l'enregistrement de
+        web.json ; refus `precondition` (l'enregistrement dans `extra`) si le mode relu diffère."""
+        b = self.browser
+        t0 = time.monotonic()
         control = self._control(page, SELECTORS["web_button"])
         if control is None:
             raise DriverRefusal("precondition", "pas de bouton de recherche web (« Web search: … ») dans le compositeur")
@@ -2429,13 +2597,34 @@ class Recette:
             seen.append(web_mode_of(control))
         read_back = web_mode_of(control)
         record = {"asked": want, "previous": previous, "read_back": read_back, "clicks": clicks, "menu": menu,
-                  "seen": seen, "label": control["label"] if control else None}
-        ev.json("web.json", record)
+                  "seen": seen, "label": control["label"] if control else None,
+                  "seconds": round(time.monotonic() - t0, 1)}
         if read_back != want:
             raise DriverRefusal("precondition", f"recherche web relue « {read_back} » au lieu de « {want} »",
-                                extra={"read_back": read_back})
-        return {"mode": read_back, "previous": previous, "changed": read_back != previous, "clicks": clicks,
-                "text": f"recherche web : {read_back} (avant : {previous}, {clicks} clic{'s' if clicks > 1 else ''})"}
+                                extra={"read_back": read_back, "record": record})
+        return record
+
+    def recherche_web(self, args: dict, ev: Evidence) -> dict:
+        """Régler la recherche web du compositeur (_set_web) ; web.json, et l'observation `@web` qui
+        juge un cas de configuration `web` (« mode : X (trouvé : Y) »). Le réglage reste et devient
+        la configuration épinglée : l'action ne restaure rien (reversible: false)."""
+        want = args["mode"]
+        page = self.browser.page()
+        self._ensure_on_app(page)
+        try:
+            record = self._set_web(page, want)
+        except DriverRefusal as r:
+            if r.extra.get("record"):
+                ev.json("web.json", r.extra["record"])
+            raise
+        ev.json("web.json", record)
+        text = f"mode : {record['read_back']} (trouvé : {record['previous']})"
+        self.observations["@web"] = {"answer": text, "timing_s": record["seconds"], "mode": record["read_back"],
+                                     "t": now_iso()}
+        self.pinned["web"] = want
+        clicks = record["clicks"]
+        return {"mode": record["read_back"], "previous": record["previous"], "changed": record["read_back"] != record["previous"],
+                "clicks": clicks, "text": f"{text}, {clicks} clic{'s' if clicks > 1 else ''}"}
 
     def conversation_longue(self, args: dict, ev: Evidence) -> dict:
         """Un cas `long` : `turns` questions dans la conversation en cours (first, filler, last),
@@ -2452,6 +2641,7 @@ class Recette:
             raise DriverRefusal("precondition", str(e)) from None
         self._case_in_hand = cid
         self.observations[cid] = {}
+        composer = self._composer_now(self.browser.page())
         mark = self.browser.mark()
         self._last_asked = {"case": cid, "mark": mark}
         budget = budget_of(case)
@@ -2470,8 +2660,10 @@ class Recette:
                                     evidence=ev.items) from None
             turns.append(turn_summary(i, q, obs))
         self.conv["asked"].append(cid)
-        self.observations[cid] = {**obs, "html": None, "turns": turns}
-        ev.json("turns.json", {"case": cid, "asked_turns": n, "turns": turns})
+        slowest = max(turns, key=lambda t: t["total_s"] or 0)  # timing_s: the slowest turn (PROCEDURE-2)
+        self.observations[cid] = {**obs, "html": None, "turns": turns, "composer": composer,
+                                  "timing_s": slowest["total_s"], "slowest_turn": slowest["turn"]}
+        ev.json("turns.json", {"case": cid, "asked_turns": n, "turns": turns, "slowest_turn": slowest["turn"]})
         ev.screenshot(self.browser.page(), "answer.png")
         return {"case": cid, "turns": len(turns), "answer": obs.get("answer"),
                 "total_s": [t["total_s"] for t in turns],

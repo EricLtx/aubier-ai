@@ -480,8 +480,9 @@ covers the evaluator, the journal script, the cases, the oracles and the
 corpus the verdicts depend on, which `driver_id` does not. It is in the hello's
 `version` (`0.2.0+<12 hex>`) and on every line of the journal (pilot ruling
 R18), so two runs judged by different rules show it. Since the driver's v2,
-every line also carries `ui_profile_sha256`, the hash of the selectors and
-known modals the page was read with: a selector fix shows on the line, which
+every line also carries `ui_profile_sha256`, the hash of the selectors, the
+known modals, the stream pattern and the end-of-answer constants the page was
+read with: a selector fix shows on the line, which
 `inputs_sha256` cannot show (debrief of 2026-10-17, D12).
 
 A task that uses a driver is submitted from a recipe, not from flags:

@@ -290,7 +290,7 @@
     }
   ],
   "min_interval_ms": 2000,
-  "max_action_ms": 240000,
+  "max_action_ms": 300000,
   "clearance": {
     "max_scope": "business",
     "third_party_allowed": true

@@ -186,4 +186,4 @@ Une ligne JSON par événement : `ts`, `step` (reconnaissance, instrumentation, 
 jugement, rapport, rejeu, correction), `case`, `verdict` (OK, PARTIEL, KO, NON TESTÉ),
 `timing_s`, `pipeline_ms` (étape → ms), `nfr` (liste), `evidence`. Une correction est une
 nouvelle ligne avec `supersedes` = index de la ligne corrigée ; on n'édite jamais.
-Les lignes écrites par le driver `maskai-recette` portent aussi `inputs_sha256`, l'empreinte des entrées du verdict (évaluateur, journal, cas, oracles, corpus), et depuis sa v2 `ui_profile_sha256`, l'empreinte des sélecteurs et des modales connues avec lesquels la page a été lue.
+Les lignes écrites par le driver `maskai-recette` portent aussi `inputs_sha256`, l'empreinte des entrées du verdict (évaluateur, journal, cas, oracles, corpus), et depuis sa v2 `ui_profile_sha256`, l'empreinte des sélecteurs, des modales connues et de la règle de fin de réponse avec lesquels la page a été lue.

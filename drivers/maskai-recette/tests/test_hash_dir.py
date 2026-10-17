@@ -80,7 +80,9 @@ class HashDirTest(unittest.TestCase):
         self.assertEqual(fixture["actions"], live["actions"])
         self.assertEqual((fixture["hosts"], fixture["program"]["headless"]), (["127.0.0.1"], True))
         self.assertEqual(live["hosts"], ["app.maskai.fr"])
-        self.assertEqual((live["max_action_ms"], fixture["max_action_ms"]), (240_000, 240_000))  # R17
+        # R17 set 240 s; PROCEDURE-2 §8.7 raises it to 300 s: conversation_longue plays eight turns
+        # of up to 30 s each before its answer is read
+        self.assertEqual((live["max_action_ms"], fixture["max_action_ms"]), (300_000, 300_000))
         self.assertEqual(example, live, "the contract example is a copy of manifest.json")
 
     def test_the_command_line_prints_the_hash(self):

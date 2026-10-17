@@ -57,9 +57,9 @@ def manifest_evidence() -> dict:
 
 
 class CasesTest(unittest.TestCase):
-    """cases.json covers the grid the recipe runs (no browser needed)."""
+    """cases.json covers the grids the recipes run, N0–N9 and M0–M7 (no browser needed)."""
 
-    def test_cases_cover_n0_to_n9(self):
+    def test_cases_cover_n0_to_n9_and_m0_to_m7(self):
         drv = load_driver()
         cases = drv.load_cases()
         levels = {}
@@ -70,8 +70,10 @@ class CasesTest(unittest.TestCase):
             self.assertIn(c["kind"], ("load", "message", "attach_question", "list", "concurrent",
                                       "model", "web", "long"), c["id"])
             self.assertLessEqual(set(c["nfr"]), set(drv.journal.NFR), c["id"])
-            if c["kind"] in ("message", "attach_question", "model", "web"):
+            if c["kind"] in ("message", "attach_question"):
                 self.assertIn("question", c, c["id"])
+            if c["kind"] in ("model", "web") and "question" not in c:  # a configuration case: an oracle
+                self.assertTrue(c["must"], c["id"])
             if c["kind"] == "model":
                 self.assertTrue(c["model"], c["id"])
             if c["kind"] == "web":
@@ -84,16 +86,28 @@ class CasesTest(unittest.TestCase):
                 self.assertIn(c["same_conversation_as"], cases, c["id"])
             for other in c.get("cases", []):
                 self.assertIn(other, cases, c["id"])
+            if c.get("replay_of"):
+                first = cases[c["replay_of"]]
+                self.assertEqual({k: v for k, v in first.items() if k not in ("id", "title")},
+                                 {k: v for k, v in c.items() if k not in ("id", "title", "replay_of")},
+                                 f"{c['id']} replays {first['id']} with the same entry")
         for n in range(10):
             self.assertGreaterEqual(len(levels.get(f"N{n}", [])), 2, f"N{n}")
-        oracle = sorted(c["id"] for c in cases.values() if c.get("oracle"))
+        for n in range(8):  # PROCEDURE-2 §3: 61 cases, M5 has one
+            self.assertGreaterEqual(len(levels.get(f"M{n}", [])), 1, f"M{n}")
+        self.assertEqual(sum(len(v) for k, v in levels.items() if k.startswith("M")), 61)
+        self.assertEqual(len([c for c in levels["M1"] if c.get("replay_of")]), 12)
+        oracle_m = {c["oracle"] for c in cases.values() if c.get("oracle") and c["level"].startswith("M")}
+        self.assertEqual(oracle_m, {f"V3-{x}{n}" for x in "JC" for n in range(1, 7)} | {f"DOC-{n:02d}" for n in range(1, 11)})
+        oracle = sorted(c["id"] for c in cases.values() if c.get("oracle") and c["level"].startswith("N"))
         self.assertEqual(oracle, sorted(f"V2-{k}" for k in ("L1", "L2", "L3", "L4", "L5", "V1", "V2", "V3", "V4", "V5")))
         self.assertTrue(all(cases[i]["level"] in ("N4", "N6") for i in oracle))
         self.assertGreaterEqual(len([c for c in levels["N8"] if c["kind"] == "message"]), 3)
         for fid in ("fixture-case-1", "fixture-case-2"):
             self.assertTrue(cases[fid]["file"].startswith("fixture/corpus/"))
         # v2: one case of each new kind, at the level whose question it asks
-        self.assertEqual({c["kind"]: c["level"] for c in cases.values() if c["kind"] in ("model", "web", "long")},
+        self.assertEqual({c["kind"]: c["level"] for c in cases.values()
+                          if c["kind"] in ("model", "web", "long") and c["level"].startswith("N")},
                          {"model": "N5", "web": "N1", "long": "N2"})
 
     def test_an_unknown_nfr_is_refused_at_start(self):
@@ -251,7 +265,7 @@ class KindChecksTest(unittest.TestCase):
         return r, nfr
 
     def test_a_model_case_wants_the_banner_to_name_the_chosen_model(self):
-        case = {"kind": "model", "model": "gemini"}
+        case = {"kind": "model", "model": "gemini", "question": "q"}
         r, nfr = self.check(case, {"guard": {"model": "google/eu.claude-haiku-5-5"},
                                    "composer": {"model": "google/eu.gemini-3-flash"}})
         self.assertEqual((r["verdict"], nfr), ("KO", ["conformite"]))
@@ -259,9 +273,18 @@ class KindChecksTest(unittest.TestCase):
                       r["notes"][0])
         r, _ = self.check(case, {"guard": {"model": "google/eu.gemini-3-flash"}})
         self.assertEqual(r["verdict"], "OK")
+        # « <modele-B> »: the banner is held to the model read on the composer when the question left
+        case = {"kind": "model", "model": "<modele-B>", "question": "q"}
+        r, _ = self.check(case, {"guard": {"model": "mistral/mistral-large-3"}, "composer": {"model": "Mistral Large 3"}})
+        self.assertEqual(r["verdict"], "OK", r)
+        r, _ = self.check(case, {"guard": {"model": "google/eu.claude-haiku-5-5"}, "composer": {"model": "Mistral Large 3"}})
+        self.assertEqual(r["verdict"], "KO")
+        # a configuration case has its oracle only
+        r, nfr = self.check({"kind": "model", "model": "claude haiku 5-5"}, {"guard": {}})
+        self.assertEqual((r["verdict"], r["notes"], nfr), ("OK", [], []))
 
     def test_a_web_case_wants_the_post_and_the_steps_to_follow_the_mode(self):
-        case = {"kind": "web", "web": "off"}
+        case = {"kind": "web", "web": "off", "question": "q"}
         r, nfr = self.check(case, {"sent": json.dumps({"message": "x", "web_search": "auto"}), "pipeline_ms": {}})
         self.assertEqual((r["verdict"], nfr), ("KO", ["conformite"]))
         self.assertIn("le POST porte web_search=auto, recherche web choisie off", r["notes"][0])
@@ -276,7 +299,8 @@ class KindChecksTest(unittest.TestCase):
                  {"turn": 3, "answer": "QT-2093", "total_s": 12.5}]
         r, nfr = self.check({"kind": "long"}, {"turns": turns})
         self.assertEqual((r["verdict"], nfr), ("KO", ["disponibilite"]))
-        self.assertEqual(r["notes"], ["tours sans réponse : 2", "3 tours ; tour 1 en 4.1 s, tour 3 en 12.5 s"])
+        self.assertEqual(r["notes"], ["tours sans réponse : 2",
+                                      "3 tours ; tour le plus lent : 3 en 12.5 s ; tour 1 en 4.1 s, tour 3 en 12.5 s"])
 
 
 class ProfileAndBudgetTest(unittest.TestCase):
@@ -310,6 +334,10 @@ class ProfileAndBudgetTest(unittest.TestCase):
         drv3 = load_driver()
         drv3.KNOWN_MODALS.append({"name": "x", "selector": "#x", "dismiss": "#x button"})
         self.assertNotEqual(self.recette(drv3).ui_profile_sha256, recette.ui_profile_sha256)
+        # The end-of-answer rule too (the recette 2 goal tells the judge so).
+        drv4 = load_driver()
+        drv4.DISPLAY_STABLE_S = 1.5
+        self.assertNotEqual(self.recette(drv4).ui_profile_sha256, recette.ui_profile_sha256)
         self.assertEqual(self.recette(load_driver()).ui_profile_sha256, recette.ui_profile_sha256, "deterministic")
 
     def test_a_case_without_a_budget_takes_its_class_budget(self):
@@ -1194,8 +1222,9 @@ class NewActionsOnFixture(FixtureBench):
                       journal_lines(recette.work)[-1]["evidence"])
         res, _ = self.act(A, "choisir_modele", {"model": "google/eu.claude-haiku-5-5"})  # back, by its value
         self.assertEqual((res["model"], res["changed"]), ("google/eu.claude-haiku-5-5", True))
-        res, _ = self.act(A, "choisir_modele", {"model": "claude haiku"})  # already shown: no click
+        res, _ = self.act(A, "choisir_modele", {"model": "claude haiku"})  # already shown: options read all the same
         self.assertFalse(res["changed"])
+        self.assertEqual(res["options"], ["Claude Haiku 5.5", "Gemini 3 Flash", "Mistral Large 3"])
         with self.assertRaises(drv.DriverRefusal) as refused:
             self.act(A, "choisir_modele", {"model": "gpt-9"})
         self.assertEqual(refused.exception.reason, "precondition")
@@ -1256,7 +1285,7 @@ class NewActionsOnFixture(FixtureBench):
                          "one conversation")
         res, _ = self.act(A, "verdict_oracle", {"case": "v2-long"})
         self.assertEqual(res["verdict"], "OK")
-        self.assertIn("4 tours ; tour 1 en", journal_lines(recette.work)[-1]["evidence"])
+        self.assertIn("4 tours ; tour le plus lent", journal_lines(recette.work)[-1]["evidence"])
         with self.assertRaises(drv.DriverRefusal) as refused:
             self.act(A, "conversation_longue", {"case": "fixture-case-1", "turns": 3})
         self.assertEqual(refused.exception.reason, "precondition")
@@ -1277,6 +1306,117 @@ class NewActionsOnFixture(FixtureBench):
         self.assertIn("arrêt cliqué", line["evidence"])
         res, _ = self.act(A, "verdict_oracle", {"case": "v2-long-slow"})
         self.assertEqual((res["verdict"], res["replayed"]), ("KO", True))
+
+
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class Recette2OnFixture(FixtureBench):
+    """PROCEDURE-2 §8: what the second recette assumes of the pilot v2, on the bench."""
+
+    def test_the_configuration_cases_are_judged_on_model_and_web(self):
+        drv, recette, A = self.make()
+        recette.open()
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "verdict_oracle", {"case": "M0-3"})
+        self.assertIn("aucune observation pour M0-3", refused.exception.detail)
+        res, _ = self.act(A, "choisir_modele", {"model": "claude haiku 5-5"})
+        self.assertEqual(res["options"], ["Claude Haiku 5.5", "Gemini 3 Flash", "Mistral Large 3"])
+        self.assertEqual(res["text"], "options : Claude Haiku 5.5 | Gemini 3 Flash | Mistral Large 3 ; "
+                                      "choisi : Claude Haiku 5.5 ; relu : google/eu.claude-haiku-5-5")
+        self.assertEqual(self.act(A, "poser_question", {"case": "M0-3"})[0]["answer"], res["text"])
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M0-3"})[0]["verdict"], "OK")
+        res, _ = self.act(A, "recherche_web", {"mode": "off"})
+        self.assertTrue(res["text"].startswith("mode : off (trouvé : auto)"), res["text"])
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M0-4"})[0]["verdict"], "OK")
+        lines = journal_lines(recette.work)
+        self.assertEqual([(x["case"], x["verdict"]) for x in lines], [("M0-3", "OK"), ("M0-4", "OK")])
+
+    def test_a_model_read_in_the_list_at_run_time_is_held_to_the_banner(self):
+        drv, recette, A = self.make()
+        recette.open()
+        recette.cases["v2-model-b"] = {"id": "v2-model-b", "level": "M3", "kind": "model", "model": "<modele-B>",
+                                       "question": "Bonjour", "budget_s": 5, "nfr": ["conformite"],
+                                       "must": ["bonjour"], "must_not": [], "pii": []}
+        options = self.act(A, "choisir_modele", {"model": "claude haiku 5-5"})[0]["options"]
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "choisir_modele", {"model": options[1]})  # what the harness copies from the list
+        res, _ = self.act(A, "poser_question", {"case": "v2-model-b"})
+        self.assertEqual(res["model"], "google/eu.gemini-3-flash")
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "v2-model-b"})[0]["verdict"], "OK")
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual(line["config"], {"model": "google/eu.gemini-3-flash", "web": "auto",
+                                          "banner": "google/eu.gemini-3-flash"})
+
+    def test_a_long_case_plays_its_messages_and_its_line_keeps_the_slowest_turn(self):
+        drv, recette, A = self.make()
+        recette.open()
+        recette.cases["v2-messages"] = {"id": "v2-messages", "level": "M5", "kind": "long", "budget_s": 5, "turns": 3,
+                                        "nfr": ["veracite"], "messages": ["Un", "Deux", "Trois", "Quatre"],
+                                        "must": ["trois"], "must_not": [], "pii": []}
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "conversation_longue", {"case": "v2-messages", "turns": 3})
+        turns = self.evidence_json(ev, "turns.json")
+        self.assertEqual([t["question"] for t in turns["turns"]], ["Un", "Deux", "Trois"])
+        slowest = max(turns["turns"], key=lambda t: t["total_s"])
+        self.assertEqual(turns["slowest_turn"], slowest["turn"])
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "v2-messages"})[0]["verdict"], "OK")
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual(line["timing_s"], round(slowest["total_s"], 1))
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "conversation_longue", {"case": "v2-messages", "turns": 5})
+        self.assertIn("turns must be 2 to 4", refused.exception.detail)
+
+    def test_the_pinned_configuration_is_set_again_when_the_interface_loses_it(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "choisir_modele", {"model": "gemini"})
+        self.act(A, "recherche_web", {"mode": "off"})
+        res, _ = self.act(A, "nouvelle_conversation")
+        self.assertIsNone(res["reapplied"], "kept by the page: nothing to set again")
+        page = recette.browser.page()
+        page.goto(recette.entry)  # a reload: the bench comes back with its defaults
+        res, _ = self.act(A, "nouvelle_conversation")
+        self.assertEqual(res["reapplied"], {"modèle": "google/eu.gemini-3-flash", "web": "off"})
+        self.assertEqual(recette._composer_now(page), {"model": "google/eu.gemini-3-flash", "web": "off"})
+
+    def test_charge_concurrente_sets_the_pinned_web_mode_in_both_tabs(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "recherche_web", {"mode": "off"})
+        res, _ = self.act(A, "charge_concurrente", {"cases": ["fixture-case-1", "fixture-case-2"]})
+        self.assertEqual((res["a"]["web"], res["b"]["web"]), ("off", "off"), "the second tab came up in auto")
+        posts = [json.loads(p["body"])["web_search"] for p in recette.browser.posts[-2:]]
+        self.assertEqual(posts, ["off", "off"])
+        self.assertIn("recherche web off", journal_lines(recette.work)[-1]["evidence"])
+
+    def test_an_attachment_leak_is_unverifiable_when_the_sent_text_lacks_the_document(self):
+        drv, recette, A = self.make()
+        recette.open()
+        recette.cases["v2-attach-pii"] = {**recette.cases["fixture-case-1"], "id": "v2-attach-pii",
+                                          "pii": ["850 euros"]}
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "joindre_document", {"case": "v2-attach-pii"})
+        _, ev = self.act(A, "poser_question", {"case": "v2-attach-pii"})
+        self.assertIs(self.evidence_json(ev, "sent.json")["document_in_sent"], False)
+        res, _ = self.act(A, "verdict_oracle", {"case": "v2-attach-pii"})
+        self.assertEqual(res["leaks"], [])
+        self.assertIn("le texte envoyé ne montre pas le document joint : fuite non vérifiable sur ce canal",
+                      journal_lines(recette.work)[-1]["evidence"])
+
+    def test_a_second_pass_is_compared_to_the_first(self):
+        drv, recette, A = self.make()
+        recette.open()
+        base = {"level": "M1", "kind": "message", "question": "Relance pour M. Hugo Bernard, loyer impayé",
+                "budget_s": 5, "nfr": ["securite"], "must": ["relance"], "must_not": [], "pii": ["Hugo Bernard"]}
+        recette.cases["v2-a"] = {**base, "id": "v2-a"}
+        recette.cases["v2-b"] = {**base, "id": "v2-b", "replay_of": "v2-a"}
+        for cid in ("v2-a", "v2-b"):
+            self.act(A, "nouvelle_conversation")
+            self.act(A, "poser_question", {"case": cid})
+            self.act(A, "verdict_oracle", {"case": cid})
+        a, b = journal_lines(recette.work)[-2:]
+        self.assertEqual(a["sent_sha256"], b["sent_sha256"])
+        self.assertIn("passage a (v2-a) : OK ; texte envoyé identique", b["evidence"])
 
 
 if __name__ == "__main__":

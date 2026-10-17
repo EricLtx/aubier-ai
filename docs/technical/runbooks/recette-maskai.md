@@ -5,6 +5,7 @@ Pour le fondateur, sur son nœud Windows, dans sa session interactive. Version d
 - Recette exécutée : `recipes/recette-maskai.json`, seize pas.
 - Procédure suivie : `docs/functional/use-cases/recettage-chat-ia/PROCEDURE.md`.
 - Répétition à blanc : `recipes/recette-fixture.json`, huit pas, sur le banc d'essai local.
+- Seconde recette, « MaskAI en profondeur » : `recipes/recette-maskai-2.json`, huit niveaux M0–M7 (`docs/functional/use-cases/recettage-chat-ia/PROCEDURE-2.md`). Elle se déroule comme celle-ci, de §6 à §12, avec ses propres niveaux.
 
 Chaque étape donne la commande exacte, puis la ligne attendue (« Attendu »). Toutes les commandes se tapent dans PowerShell, à la racine du dépôt. Si la sortie ne ressemble pas à la ligne attendue, on s'arrête et on lit le §11 avant d'aller plus loin.
 
@@ -234,7 +235,7 @@ Le profil Chrome est conservé au démontage, et la session MaskAI avec lui.
 |---|---|---|
 | `choisir_modele {model}` | Ouvre la liste du bouton « Model: … » du compositeur, clique l'option qui correspond (texte ou valeur, sans tenir compte de la casse ni des séparateurs), puis relit le modèle sur le bouton. Refus `precondition` si aucune option ne correspond ou si la relecture diffère. | `model.json` |
 | `recherche_web {mode}` | Clique le bouton « Web search: … » jusqu'à ce que son `data-mode` vaille `off`, `auto` ou `on` (quatre clics au plus ; si un menu s'ouvre, son entrée est choisie), puis relit le mode. | `web.json` |
-| `conversation_longue {case, turns}` | Pose `turns` questions (2 à 20) dans la conversation en cours : `first`, `filler` pour chaque tour du milieu, puis `last`. Chaque tour est lu comme `poser_question`. L'abandon d'un tour est journalisé KO disponibilité. | `turns.json`, `answer.png` |
+| `conversation_longue {case, turns}` | Pose `turns` questions (2 à 20) dans la conversation en cours : les `messages` du cas, ou `first`, `filler` pour chaque tour du milieu, puis `last`. Chaque tour est lu comme `poser_question` ; la ligne garde le tour le plus lent. L'abandon d'un tour est journalisé KO disponibilité. Cette action peut durer : `max_action_ms` vaut 300 s. | `turns.json`, `answer.png` |
 
 Les deux premières changent le compositeur et ne restaurent rien (`reversible: false`) : la recette lui rend son réglage d'origine avec le champ `previous` du premier appel. Elles servent trois cas nouveaux : N1-4 (recherche web coupée, même question que N1-1, pour une latence comparable au 13/10), N2-3 (six tours, le fait du premier retrouvé au dernier) et N5-3 (`gemini` choisi, la réponse doit être signée par ce modèle).
 
@@ -529,7 +530,7 @@ Le verdict d'un cas ne dépend pas seulement du code du driver. Il dépend aussi
 
 Deux exécutions dont les lignes portent la même `inputs_sha256` ont été jugées avec les mêmes règles. Si elle diffère, c'est un oracle, un document ou l'évaluateur qui a changé, et le delta entre les deux exécutions doit le dire. Le `driver_id`, lui, ne couvre que le dossier `drivers/maskai-recette/`.
 
-Depuis la v2, chaque ligne porte aussi `ui_profile_sha256` : l'empreinte de `SELECTORS` et de `KNOWN_MODALS`, c'est-à-dire des adresses avec lesquelles la page a été lue. Le 17/10, l'essai au sélecteur faux et le passage corrigé portaient la même `inputs_sha256` (debrief, D12). Deux lignes de `ui_profile_sha256` différentes ont été lues avec des sélecteurs différents.
+Depuis la v2, chaque ligne porte aussi `ui_profile_sha256` : l'empreinte de `SELECTORS`, de `KNOWN_MODALS`, du motif du flux et des constantes de fin de réponse, c'est-à-dire des adresses et de la règle avec lesquelles la page a été lue. Le 17/10, l'essai au sélecteur faux et le passage corrigé portaient la même `inputs_sha256` (debrief, D12). Deux lignes de `ui_profile_sha256` différentes ont été lues avec des sélecteurs différents.
 
 ---
 
