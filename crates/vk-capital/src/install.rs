@@ -120,9 +120,12 @@ pub fn install(
 /// publisher annotation; the manifest layer against the annotations (name,
 /// driver id, `source: installed`); the interpreter the package names
 /// against the one this build pins; the target and an install under way;
-/// the deepest path the interpreter would reach; then the signature — under
-/// the pinned key with no prompt, or under the key the package carries
-/// (its id the signature's) before the administrator is asked to pin it.
+/// the deepest path the interpreter would reach; the publisher the name is
+/// bound to on this node ([`bound_publisher`], ruling R-F1: every version
+/// of the name already installed was signed by this package's key); then
+/// the signature — under the pinned key with no prompt, or under the key
+/// the package carries (its id the signature's) before the administrator is
+/// asked to pin it.
 /// Neither `root` nor `<root>/<name>` may be a link or a junction. Then
 /// `make_dir` makes `<name>` if it is new and `<version>.part` always —
 /// one that appears meanwhile is another install's, refused and left to it
@@ -240,6 +243,7 @@ pub fn install_with(
         );
     }
 
+    bound_publisher(&parent, &spec, &name, &sig.key_id)?;
     let (publisher, confirmed) = publisher(&opened, &spec, pins, tofu)?;
 
     // From here on something is written: the guard removes it on any refusal.
@@ -344,6 +348,81 @@ pub fn install_with(
         publisher_key_id: publisher.key_id,
         pinned_now: confirmed,
     })
+}
+
+/// The publisher a driver name is bound to on this node (ruling R-F1): a
+/// name already installed — at least one `MAJOR.MINOR.PATCH` directory
+/// under `name_dir`, `<root>/<name>`; not a `.part`, not a tree moved
+/// aside — takes a new version only from the key that signed it, read off
+/// each version's `.package/signature.json`. Another key is refused before
+/// the administrator is asked anything and with nothing written, even a
+/// key this node pins for another driver: pinning a key is trusting a
+/// publisher, not handing it every name. A version whose signature cannot
+/// be read cannot be shown to be the same publisher's, and binds the name
+/// too. The remedy is the administrator's: uninstall every version.
+fn bound_publisher(name_dir: &Path, spec: &str, name: &str, key_id: &str) -> Result<()> {
+    let remedy = format!("vk driver uninstall every version of {name} first");
+    let entries = match std::fs::read_dir(name_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut versions = vec![];
+    for entry in entries {
+        let entry = entry?;
+        let Some(version) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if is_version(&version) && entry.file_type()?.is_dir() {
+            versions.push(version);
+        }
+    }
+    versions.sort();
+    for version in versions {
+        let file = name_dir
+            .join(&version)
+            .join(".package")
+            .join("signature.json");
+        match signed_by(&file) {
+            Some(signer) if signer == key_id => {}
+            Some(_) => {
+                return refuse(
+                    format!(
+                        "the publisher of {spec} differs from the one that signed {name}@{version}"
+                    ),
+                    &remedy,
+                )
+            }
+            None => {
+                return refuse(
+                    format!(
+                        "the publisher that signed {name}@{version} cannot be read from {}",
+                        file.display()
+                    ),
+                    &remedy,
+                )
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The key id a `.package/signature.json` names, or `None` when the file
+/// cannot be read (past 64 KiB included) or is not a signature.
+fn signed_by(file: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut bytes = vec![];
+    std::fs::File::open(file)
+        .ok()?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    serde_json::from_slice::<vk_contracts::package::Signature>(&bytes)
+        .ok()
+        .map(|s| s.key_id)
 }
 
 /// The publisher key the signature of `opened` verifies under, and whether
@@ -892,6 +971,147 @@ mod tests {
         assert_eq!(asked.get(), 2);
         nothing_under(&fresh.root);
         assert!(fresh.pins.list().unwrap().is_empty(), "nothing pinned");
+    }
+
+    /// A driver name installed on a node binds its publisher (ruling R-F1):
+    /// a package of that name signed by another key is refused before any
+    /// prompt, with nothing written and nothing pinned — even when this
+    /// node already pins that other key for another driver; the same key
+    /// installs the next version; once every version of the name is
+    /// uninstalled, another publisher may install it again.
+    #[test]
+    fn a_name_installed_from_one_publisher_refuses_another_publishers_package() {
+        let n = node();
+        let k1 = key(n.t.path(), "k1");
+        let k2 = key(n.t.path(), "k2");
+        let mut yes = |_: &PinnedKey| true;
+        install_with(
+            &pack(n.t.path(), pack_of("fake", "1.0.0", &k1)),
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut yes),
+            "S-1-5-21-1",
+            &plain_dir,
+            &files_only,
+        )
+        .unwrap();
+
+        let other = pack(n.t.path(), pack_of("fake", "1.1.0", &k2));
+        let asked = Cell::new(0);
+        let mut ask = |_: &PinnedKey| {
+            asked.set(asked.get() + 1);
+            true
+        };
+        let e = install_with(
+            &other,
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut ask),
+            "S-1-5-21-1",
+            &plain_dir,
+            &files_only,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            e,
+            "the publisher of fake@1.1.0 differs from the one that signed fake@1.0.0; remedy: \
+             vk driver uninstall every version of fake first"
+        );
+        assert_eq!(asked.get(), 0, "no prompt");
+        assert!(!n.root.join("fake").join("1.1.0").exists());
+        assert!(!n.root.join("fake").join("1.1.0.part").exists());
+        assert!(
+            n.pins.get(&k2.key_id()).unwrap().is_none(),
+            "nothing pinned"
+        );
+
+        // A key this node pins for another driver is no key for this name.
+        install_with(
+            &pack(n.t.path(), pack_of("other", "1.0.0", &k2)),
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut ask),
+            "S-1-5-21-1",
+            &plain_dir,
+            &files_only,
+        )
+        .unwrap();
+        assert_eq!(asked.get(), 1, "k2 was pinned for `other`");
+        let e = install_with(
+            &other,
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut ask),
+            "S-1-5-21-1",
+            &plain_dir,
+            &files_only,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("differs from the one that signed fake@1.0.0"),
+            "{e}"
+        );
+        assert_eq!(asked.get(), 1, "still no prompt for fake");
+
+        // The same publisher installs the next version, unprompted.
+        install_with(
+            &pack(n.t.path(), pack_of("fake", "1.2.0", &k1)),
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut ask),
+            "S-1-5-21-1",
+            &plain_dir,
+            &files_only,
+        )
+        .unwrap();
+        assert_eq!(asked.get(), 1);
+
+        // The remedy: every version of the name gone, another publisher may.
+        uninstall(&n.root, "fake", "1.0.0", false).unwrap();
+        uninstall(&n.root, "fake", "1.2.0", false).unwrap();
+        install_with(
+            &other,
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut ask),
+            "S-1-5-21-1",
+            &plain_dir,
+            &files_only,
+        )
+        .unwrap();
+    }
+
+    /// A version of the name whose signature cannot be read cannot be shown
+    /// to be the same publisher's: the install is refused, naming it.
+    #[test]
+    fn a_version_whose_publisher_cannot_be_read_binds_the_name_too() {
+        let n = node();
+        let k = key(n.t.path(), "k");
+        let stray = n.root.join("fake").join("1.0.0");
+        std::fs::create_dir_all(&stray).unwrap();
+        let mut ask = |_: &PinnedKey| true;
+        let e = install_with(
+            &pack(n.t.path(), pack_of("fake", "1.1.0", &k)),
+            &n.root,
+            &n.pins,
+            Tofu::Confirm(&mut ask),
+            "S-1-5-21-1",
+            &plain_dir,
+            &files_only,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("the publisher that signed fake@1.0.0 cannot be read"),
+            "{e}"
+        );
+        assert!(
+            e.ends_with("; remedy: vk driver uninstall every version of fake first"),
+            "{e}"
+        );
+        assert!(!n.root.join("fake").join("1.1.0").exists());
     }
 
     #[test]
