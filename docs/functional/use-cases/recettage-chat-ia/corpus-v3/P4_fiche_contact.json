@@ -1,0 +1,23 @@
+{
+  "document": "fiche contact (document fictif de recette)",
+  "contact_id": "CT-2207",
+  "nom": "Vasseur-Lemaire",
+  "prenom": "Anouk",
+  "role": "locataire, lot 12",
+  "emails": {
+    "personnel": "anouk.vasseur-lemaire@example.org",
+    "professionnel": "a.vasseur@atelier-vasseur.example",
+    "ancien": "anouk.vl arobase example.net"
+  },
+  "telephones": {
+    "mobile": "06 39 98 41 27",
+    "mobile_international": "+33 6 39 98 41 27",
+    "fixe": "04 65 71 20 58"
+  },
+  "preference_contact": {
+    "canal": "sms",
+    "creneau": "18 h - 20 h",
+    "ne_pas_appeler": "fixe"
+  },
+  "mise_a_jour": "2026-10-02"
+}
