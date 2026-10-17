@@ -2930,6 +2930,15 @@ fn vk_env(sh: &Shell, env: &[(&str, &std::path::Path)], args: &[&str], input: &s
 /// root, or one under a read-only directory — is refused with the one line
 /// an administrator who forgot to elevate needs, before the package is
 /// read, and writes nothing.
+///
+/// Unless this process writes the read-only root anyway (CI-2): an elevated
+/// administrator whose token has the backup and restore privileges enabled
+/// — GitHub's runner under its Git Bash step, whose MSYS2 runtime enables
+/// them — passes the DACL, and the install is then refused for the next
+/// reason, deterministically: the package (`has no index.json`), with
+/// nothing written but the empty `installed` directory the writability
+/// probe makes. The test probes the root itself, with the call `vk` makes,
+/// and says on stderr which of the two it asserts.
 #[test]
 fn vk_driver_install_refuses_without_elevation_message_when_the_root_is_read_only() {
     if !cfg!(windows) {
@@ -2954,6 +2963,36 @@ fn vk_driver_install_refuses_without_elevation_message_when_the_root_is_read_onl
     #[cfg(not(windows))]
     let me = String::new();
     icacls(&["/inheritance:r", "/grant:r", &format!("*{me}:(OI)(CI)RX")]);
+    #[cfg(windows)]
+    let elevated = vk_store::win_acl::process_is_elevated().unwrap();
+    #[cfg(not(windows))]
+    let elevated = false;
+    // The probe `vk driver install` runs, run here by the process whose
+    // token `vk` inherits.
+    let probe = ro.join(".vk-smoke-probe");
+    let writes_anyway = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            std::fs::remove_file(&probe).unwrap();
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(e) => panic!("probe {}: {e}", probe.display()),
+    };
+    assert!(
+        !writes_anyway || elevated,
+        "only an elevated process writes past a DACL that grants it read and execute"
+    );
+    if writes_anyway {
+        eprintln!(
+            "this process writes the read-only root anyway (elevated: {elevated}; its token's \
+             backup and restore privileges pass the DACL): asserting the refusal that follows, \
+             the package's"
+        );
+    }
     let sh = Shell {
         endpoint: vk_ipc::transport::test_endpoint().0,
         node_key: dir.path().join("node.key"),
@@ -2968,18 +3007,43 @@ fn vk_driver_install_refuses_without_elevation_message_when_the_root_is_read_onl
         );
         let why = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{why}");
-        assert_eq!(
-            why.trim_end(),
+        let refusal = if writes_anyway {
+            format!(
+                "vk: {} has no index.json; remedy: point at a directory written by vk driver pack",
+                path_of(&package)
+            )
+        } else {
             format!(
                 "vk: vk driver install writes under {}: run it from an elevated shell",
                 path_of(&root)
             )
+        };
+        assert_eq!(
+            why.trim_end().lines().last(),
+            Some(refusal.as_str()),
+            "{why}"
         );
         assert!(out.stdout.is_empty());
     }
-    let written: Vec<_> = std::fs::read_dir(&ro).unwrap().collect();
+    let written: Vec<_> = std::fs::read_dir(&ro)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    let installed_left = std::fs::read_dir(ro.join("installed"))
+        .map(|d| d.count())
+        .unwrap_or(0);
     icacls(&["/reset"]);
-    assert!(written.is_empty(), "nothing written: {written:?}");
+    if writes_anyway {
+        // The probe of the second root made it; nothing went into it.
+        assert_eq!(
+            written,
+            [ro.join("installed")],
+            "only the probe's directory"
+        );
+        assert_eq!(installed_left, 0, "and nothing in it");
+    } else {
+        assert!(written.is_empty(), "nothing written: {written:?}");
+    }
 }
 
 /// The whole chantier on two nodes, with the pinned CPython release

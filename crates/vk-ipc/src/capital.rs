@@ -1299,31 +1299,37 @@ mod tests {
 
     /// One install-root entry that cannot be read is logged and skipped:
     /// `driver.ls` still lists every other version (Task 8 review).
+    ///
+    /// Unreadable by a sharing violation, not by an ACL (CI-3): this test
+    /// holds the entry open with no `FILE_SHARE_*` flag, so every other open
+    /// of it fails until the handle goes. A sharing mode is not an access
+    /// check — no administrator and no backup privilege reads past it —
+    /// where the deny-all DACL of this test's first version was read
+    /// through on GitHub's elevated runner.
     #[cfg(windows)]
     #[test]
     fn an_unreadable_entry_under_the_install_root_is_skipped_not_fatal() {
+        use std::os::windows::fs::OpenOptionsExt;
+        /// Opening a directory takes this flag (`CreateFileW`).
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         let t = tempfile::tempdir().unwrap();
         write(&t.path().join("good/1.0.0/manifest.json"), "{}");
         let locked = t.path().join("locked");
         write(&locked.join("1.0.0/manifest.json"), "{}");
-        // No inherited entry and none of its own: nobody may list it.
-        let icacls = |args: &[&str]| {
-            let ok = std::process::Command::new("icacls")
-                .arg(&locked)
-                .args(args)
-                .stdout(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "icacls {args:?}");
-        };
-        icacls(&["/inheritance:r"]);
-        assert!(
-            std::fs::read_dir(&locked).is_err(),
-            "the entry is unreadable"
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&locked)
+            .unwrap();
+        let unreadable = std::fs::read_dir(&locked).map(|_| ()).unwrap_err();
+        assert_eq!(
+            unreadable.raw_os_error(),
+            Some(32),
+            "the entry is unreadable, by a sharing violation: {unreadable}"
         );
         let listed = installed_versions(t.path());
-        icacls(&["/reset"]);
+        drop(held);
         let listed = listed.unwrap();
         assert_eq!(
             listed,
