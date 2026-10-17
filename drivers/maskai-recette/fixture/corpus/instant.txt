@@ -1,0 +1,1 @@
+Pièce jointe du banc d'essai prête aussitôt, sans état d'attente affiché (son nom contient « instant »).

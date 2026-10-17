@@ -5,126 +5,358 @@
 <title>Banc d'essai maskai-recette</title>
 <style>
   body { margin: 0; display: flex; font: 14px/1.4 system-ui, sans-serif; height: 100vh; }
-  aside { width: 220px; border-right: 1px solid #ccc; padding: 8px; }
+  aside { width: 220px; border-right: 1px solid #ccc; padding: 8px; display: flex; flex-direction: column; background: #f4f4f8; }
+  aside nav { flex: 1; }
+  [data-slot="sidebar-footer"] { border-top: 1px solid #ccc; padding-top: 6px; }
   main { flex: 1; display: flex; flex-direction: column; }
   #messages { flex: 1; overflow: auto; padding: 8px; }
-  .message { margin: 6px 0; padding: 6px; border-radius: 6px; }
-  .message.user { background: #eef; }
-  .message.assistant { background: #efe; }
+  [data-role="user"] { margin: 6px 0; padding: 6px; border-radius: 6px; background: #eef; }
+  article { margin: 6px 0; padding: 6px; border-radius: 6px; background: #efe; }
+  article .head { font-size: 11px; color: #555; display: flex; gap: 6px; flex-wrap: wrap; }
   #composer { border-top: 1px solid #ccc; padding: 8px; display: flex; gap: 6px; align-items: flex-end; flex-wrap: wrap; }
-  #chips { width: 100%; }
-  .chip { display: inline-block; padding: 2px 6px; border: 1px solid #999; border-radius: 10px; }
-  .chip.failed { border-color: #c00; color: #c00; }
+  #chips { width: 100%; display: flex; gap: 6px; }
+  #chips > div { display: inline-flex; gap: 4px; padding: 2px 6px; border: 1px solid #999; border-radius: 10px; }
+  .animate-spin { width: 10px; height: 10px; }
   textarea { flex: 1; min-height: 40px; }
+  [role="listbox"] { position: fixed; bottom: 70px; left: 260px; background: #fff; border: 1px solid #999; padding: 4px; }
+  [role="option"] { padding: 2px 6px; cursor: pointer; }
+  [data-slot="popover-content"] { position: fixed; bottom: 70px; right: 20px; width: 320px; background: #fff; border: 1px solid #999; padding: 8px; }
+  [data-slot="dialog-content"], #mystery { position: fixed; top: 30%; left: 35%; width: 300px; background: #fff; border: 2px solid #333; padding: 12px; }
   #cookies { position: fixed; bottom: 0; left: 0; right: 0; background: #333; color: #fff; padding: 12px; }
 </style>
 </head>
 <body>
-<!-- A stand-in for MaskAI's chat page: the textarea that only takes a value
-     through input events (annexe B), the hidden file input behind the paper
-     clip with its attachment chip, the streamed answer on /chat/stream
-     (annexe A), the conversation sidebar and one known modal (the cookie
-     banner). See serve.py for the server side and its trigger words. -->
-<aside>
-  <button id="new" aria-label="Nouvelle conversation">Nouvelle conversation</button>
-  <ul id="conversations"></ul>
+<!-- A stand-in for MaskAI's chat page, in the shapes of the 2026-10-17 UI
+     (debrief 2026-10-17): the sidebar `nav[aria-label="Main navigation"]` in an
+     `aside`, with the `a[href="/new"][data-slot="button"]` link, the
+     `/conversation/<id>` links and the account block at the bottom; each answer an
+     `article[aria-label="MASKAI response"]` whose header carries the guard panel
+     (« Aucune donnée personnelle détectée / L'Aiguilleur : PASS » or « Anonymisé →
+     <PERSON_1> ») and the model banner (« maskai google/eu.claude-haiku-5-5 »), and
+     whose body is `.pl-6 > .prose-llm`; the composer with the paper clip and its
+     hidden file input, the attachment chip (uploading → indexing → ready, with a
+     « Retirer <file> » button), the model button (`aria-label="Model: …"`, a
+     listbox), the web-search button (`data-mode`), and the « Chiffré » popover
+     trigger whose dialog shows the text sent to the model. The textarea only takes
+     a value through input events (annexe B). The answer is drawn on screen after
+     the stream, with a pause, and ends about a second after the server's end. A
+     generation left in flight by a new conversation brings the « Votre avis »
+     survey (a Radix dialog); a stopped one does not. One known modal of v1 stays:
+     the cookie banner. See serve.py for the server side and its trigger words. -->
+<aside data-slot="sidebar">
+  <nav aria-label="Main navigation">
+    <a href="/new" data-slot="button" aria-label="Nouvelle conversation">Nouvelle conversation</a>
+    <ul id="conversations"></ul>
+  </nav>
+  <div data-slot="sidebar-footer" id="account"><span data-slot="avatar">CT</span> compte.test@exemple.fr</div>
 </aside>
 <main>
   <div id="messages"></div>
-  <div id="composer">
+  <form id="composer" onsubmit="return false">
     <div id="chips"></div>
-    <button id="clip" aria-label="Joindre un fichier" title="Joindre un fichier">&#128206;</button>
+    <button type="button" id="clip" aria-label="Joindre un fichier" title="Joindre un fichier">&#128206;</button>
     <input type="file" id="file" hidden>
+    <button type="button" id="model" aria-haspopup="listbox" aria-expanded="false"></button>
+    <button type="button" id="web" data-mode="auto" aria-label="Web search: Auto">Web</button>
+    <button type="button" id="enc" aria-haspopup="dialog" aria-expanded="false" data-slot="popover-trigger"
+            aria-label="Chiffré — aucune PII détectée">Chiffré</button>
     <textarea id="prompt" placeholder="Votre message"></textarea>
-    <button id="send" aria-label="Envoyer">Envoyer</button>
-    <button id="stop" aria-label="Stop generating" hidden>Stop</button>
-  </div>
+    <button type="button" id="send" aria-label="Envoyer">Envoyer</button>
+    <button type="button" id="stop" aria-label="Stop generating" hidden>Stop</button>
+  </form>
 </main>
+<div id="model-list" role="listbox" hidden></div>
+<div id="enc-pop" role="dialog" data-slot="popover-content" hidden>
+  <p>Ce qui part au modèle</p>
+  <pre data-slot="sent-text" id="enc-text"></pre>
+  <button type="button" data-slot="popover-close" aria-label="Fermer">&times;</button>
+</div>
+<div id="mystery" role="dialog" hidden>Une fenêtre que personne n'a annoncée. <button type="button">OK</button></div>
+<div id="avis" role="dialog" data-slot="dialog-content" aria-modal="true" hidden>
+  <h2>Votre avis</h2>
+  <div role="radiogroup" data-slot="radio-group">
+    <button type="button" role="radio" data-slot="radio-group-item" value="suggestion" aria-checked="false">Suggestion</button>
+    <button type="button" role="radio" data-slot="radio-group-item" value="probleme" aria-checked="false">Problème</button>
+  </div>
+  <textarea id="avis-text" aria-label="Votre message"></textarea>
+  <button type="button" id="avis-send">Envoyer</button>
+  <button type="button" data-slot="dialog-close" aria-label="Fermer">&times;</button>
+</div>
 <div id="cookies" role="dialog" hidden>Ce site utilise des cookies. <button id="accept">Accepter</button></div>
 <script>
 "use strict";
-const state = { text: "", attachments: [], conversation: null, count: 0 };
+const MODELS = [
+  { value: "google/eu.claude-haiku-5-5", label: "Claude Haiku 5.5" },
+  { value: "google/eu.gemini-3-flash", label: "Gemini 3 Flash" },
+  { value: "mistral/mistral-large-3", label: "Mistral Large 3" },
+];
+const WEB_NEXT = { auto: "on", on: "off", off: "auto" };
+const WEB_LABEL = { auto: "Auto", on: "On", off: "Off" };
+const state = { text: "", chips: [], conversation: null, count: 0, model: MODELS[0].value, web: "auto",
+                generating: null };
 const $ = (id) => document.getElementById(id);
 window.__dialog_answered = false;
+window.__survey_shown = 0;
+window.__survey_answered = false;
 
 if (!localStorage.getItem("cookies-ok")) $("cookies").hidden = false;
 $("accept").onclick = () => { localStorage.setItem("cookies-ok", "1"); $("cookies").hidden = true; };
 
-// The editor's model is `state.text`, which only an input event updates: a
-// value set without one is not sent (annexe B).
-$("prompt").addEventListener("input", () => { state.text = $("prompt").value; });
+// -- the guard's stand-in: what the page masks before sending ---------------------------
+const PII = [
+  [/\b(?:M\.|Mme|Mr)\s+[A-ZÉ][a-zé]+\s+[A-ZÉ][a-zé]+/g, "PERSON"],
+  [/\bFR\d{2}(?:\s?\d{4}){5}\s?\d{3}\b/g, "IBAN"],
+];
+function mask(text) {
+  const tokens = [], counts = {};
+  let masked = text;
+  for (const [re, kind] of PII) {
+    masked = masked.replace(re, () => {
+      counts[kind] = (counts[kind] || 0) + 1;
+      const token = "<" + kind + "_" + counts[kind] + ">";
+      tokens.push(token);
+      return token;
+    });
+  }
+  return { masked, tokens };
+}
+
+// -- the editor: its model is `state.text`, which only an input event updates ----------
+let encTimer = null;
+$("prompt").addEventListener("input", () => {
+  state.text = $("prompt").value;
+  clearTimeout(encTimer);  // the « Chiffré » label follows the text a moment later
+  encTimer = setTimeout(() => {
+    const n = mask(state.text).tokens.length;
+    $("enc").setAttribute("aria-label", n ? "Chiffré — " + n + " PII masquée(s)" : "Chiffré — aucune PII détectée");
+    if (!$("enc-pop").hidden) renderSent();
+  }, 300);
+});
 $("prompt").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
 $("send").onclick = send;
+$("stop").onclick = () => {
+  if (state.generating) { state.generating.stopped = true; state.generating.controller.abort(); }
+};
 
+// -- the « Chiffré » popover: what is sent to the model ---------------------------------
+function renderSent() {
+  $("enc-text").textContent = /LEAK/.test(state.text) ? state.text : mask(state.text).masked;
+}
+function openPopover() {
+  renderSent();
+  $("enc-pop").hidden = false;
+  $("enc").setAttribute("aria-expanded", "true");
+  $("enc").setAttribute("aria-controls", "enc-pop");
+  $("enc-pop").querySelector("button").focus();  // as Radix does: the focus enters the popover
+}
+function closePopover() {
+  $("enc-pop").hidden = true;
+  $("enc").setAttribute("aria-expanded", "false");
+  $("enc").removeAttribute("aria-controls");
+  $("enc").focus();  // and goes back to its trigger
+}
+$("enc").onclick = () => ($("enc-pop").hidden ? openPopover() : closePopover());
+$("enc-pop").querySelector("[data-slot=popover-close]").onclick = closePopover;
+
+// -- the model listbox and the web-search button -----------------------------------------
+function renderModel() {
+  const m = MODELS.find((x) => x.value === state.model);
+  $("model").setAttribute("aria-label", "Model: " + m.value);
+  $("model").textContent = m.label;
+}
+renderModel();
+function closeModels() { $("model-list").hidden = true; $("model").setAttribute("aria-expanded", "false"); }
+$("model").onclick = () => {
+  if (!$("model-list").hidden) { closeModels(); return; }
+  const list = $("model-list");
+  list.innerHTML = "";
+  for (const m of MODELS) {
+    const o = document.createElement("div");
+    o.setAttribute("role", "option");
+    o.dataset.value = m.value;
+    o.setAttribute("aria-selected", String(m.value === state.model));
+    o.textContent = m.label;
+    o.onclick = () => { state.model = m.value; renderModel(); closeModels(); };
+    list.appendChild(o);
+  }
+  list.hidden = false;
+  $("model").setAttribute("aria-expanded", "true");
+};
+$("web").onclick = () => {
+  state.web = WEB_NEXT[state.web];
+  $("web").dataset.mode = state.web;
+  $("web").setAttribute("aria-label", "Web search: " + WEB_LABEL[state.web]);
+};
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!$("enc-pop").hidden) closePopover();
+  if (!$("model-list").hidden) closeModels();
+});
+
+// -- attachments: a chip per file, uploading → indexing → ready (or failed) -------------
+// The chip carries no state word when ready, as MaskAI's « Retirer <file> » chip of 17/10;
+// the file names steer the bench: « fail » fails, « slowidx » indexes for 8 s, « instant »
+// is ready at once (no pending state ever shown).
 $("clip").onclick = () => $("file").click();
 $("file").addEventListener("change", (e) => {
   for (const f of e.target.files) attach(f.name);
   e.target.value = "";
 });
-
+const SPIN = '<svg class="animate-spin" viewBox="0 0 10 10" aria-hidden="true"><circle cx="5" cy="5" r="4" fill="none" stroke="#666"/></svg>';
 function attach(name) {
-  const chip = document.createElement("span");
-  chip.className = "chip";
-  chip.textContent = name;
-  chip.setAttribute("aria-label", "Indexing: " + name);
-  $("chips").appendChild(chip);
+  const chip = { name, state: "uploading", el: document.createElement("div") };
+  chip.el.className = "flex items-center gap-1 rounded-md border px-2";
+  const status = (html) => {
+    chip.el.innerHTML = '<span class="truncate">' + name.replace(/</g, "&lt;") + "</span>" + html
+      + '<button type="button" aria-label="Retirer ' + name.replace(/"/g, "&quot;") + '">&times;</button>';
+    chip.el.querySelector("button").onclick = () => {
+      chip.el.remove();
+      state.chips = state.chips.filter((c) => c !== chip);
+    };
+  };
+  state.chips.push(chip);
+  $("chips").appendChild(chip.el);
+  if (/instant/i.test(name)) { chip.state = "ready"; status(""); return; }
+  status('<span class="text-xs">Uploading…</span>' + SPIN);
   setTimeout(() => {
     if (/fail/i.test(name)) {
-      chip.setAttribute("aria-label", "Failed");
-      chip.classList.add("failed");
-    } else {
-      chip.setAttribute("aria-label", "Attached: " + name);
-      state.attachments.push(name);
+      chip.state = "failed";
+      status('<span class="text-xs text-red-600" aria-label="Failed">Failed</span>');
+      return;
     }
-  }, 300);
+    chip.state = "indexing";
+    status('<span class="text-xs">Indexing in progress</span>' + SPIN);
+    setTimeout(() => { chip.state = "ready"; status('<svg aria-hidden="true" viewBox="0 0 10 10"><path d="M1 5l3 3 5-6"/></svg>'); },
+               /slowidx/i.test(name) ? 8000 : 500);
+  }, 150);
 }
 
-$("new").onclick = () => {
+// -- conversations, and the survey that follows a generation left in flight -------------
+function showSurvey() { window.__survey_shown += 1; $("avis").hidden = false; }
+for (const r of $("avis").querySelectorAll("[role=radio]")) r.onclick = () => { window.__survey_answered = true; };
+$("avis-send").onclick = () => { window.__survey_answered = true; $("avis").hidden = true; };
+$("avis").querySelector("[data-slot=dialog-close]").onclick = () => { $("avis").hidden = true; };
+if (sessionStorage.getItem("survey-pending")) {
+  sessionStorage.removeItem("survey-pending");
+  setTimeout(showSurvey, 400);
+}
+window.addEventListener("pagehide", () => {
+  if (state.generating && !state.generating.stopped) sessionStorage.setItem("survey-pending", "1");
+});
+
+document.querySelector('a[href="/new"]').addEventListener("click", (e) => {
+  e.preventDefault();
+  if (state.generating && !state.generating.stopped) {  // abandoned in flight: the survey follows
+    state.generating.controller.abort();
+    state.generating = null;
+    setTimeout(showSurvey, 400);
+  }
   state.conversation = null;
-  state.attachments = [];
+  state.chips = [];
   state.text = "";
   $("prompt").value = "";
   $("messages").innerHTML = "";
   $("chips").innerHTML = "";
-  history.pushState({}, "", "/");
-};
+  $("stop").hidden = true;
+  history.pushState({}, "", "/new");
+});
 
-function addMessage(role, html) {
+function addUser(text) {
   const div = document.createElement("div");
-  div.className = "message " + role;
-  div.dataset.role = role;
-  div.innerHTML = html;
+  div.dataset.role = "user";
+  div.textContent = text;
   $("messages").appendChild(div);
-  return div;
 }
 
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function addAnswer(tokens, model) {
+  const art = document.createElement("article");
+  art.setAttribute("aria-label", "MASKAI response");
+  const guard = document.createElement("div");
+  guard.className = "head";
+  if (tokens.length) {
+    const masked = document.createElement("span");
+    masked.textContent = "Anonymisé → " + tokens.join(" ");
+    const verdicts = document.createElement("span");
+    verdicts.textContent = "L'Aiguilleur : PASS·Le Chirurgien : " + tokens.length + " PII détectées";
+    const details = document.createElement("button");
+    details.type = "button";
+    details.setAttribute("aria-haspopup", "dialog");
+    details.dataset.slot = "popover-trigger";
+    details.textContent = "Détails";
+    guard.append(masked, verdicts, details);
+  } else {
+    guard.innerHTML = "<span>Aucune donnée personnelle détectée</span><span>L'Aiguilleur : PASS</span>";
+  }
+  const banner = document.createElement("div");
+  banner.className = "head";
+  banner.innerHTML = '<span>maskai</span><span class="model"></span><span class="live">· en direct</span>';
+  banner.querySelector(".model").textContent = model;
+  const body = document.createElement("div");
+  body.className = "pl-6";
+  body.innerHTML = '<div class="prose-llm"></div>';
+  art.append(guard, banner, body);
+  $("messages").appendChild(art);
+  return art;
+}
+
+// The answer is drawn behind the stream: two characters every 50 ms while it streams,
+// then the rest in a few ticks, with one 700 ms pause halfway, so the screen still moves
+// about a second after the server's end (a reader that stops at the end of the stream, or
+// at the first 300 ms of quiet, captures it cut).
+function typewriter(el) {
+  let html = "", shown = 0, ended = false, paused = false, pauseUntil = 0, resolve;
+  const done = new Promise((r) => { resolve = r; });
+  const cut = (n) => {  // never inside a tag or an entity
+    const lt = html.lastIndexOf("<", n - 1), gt = html.lastIndexOf(">", n - 1);
+    if (lt > gt) { const e = html.indexOf(">", n); n = e < 0 ? html.length : e + 1; }
+    const amp = html.lastIndexOf("&", n - 1), semi = html.lastIndexOf(";", n - 1);
+    if (amp > semi && n - amp < 10) { const e = html.indexOf(";", n); n = e < 0 ? html.length : e + 1; }
+    return n;
+  };
+  const timer = setInterval(() => {
+    if (shown >= html.length) {
+      if (ended) { clearInterval(timer); resolve(); }
+      return;
+    }
+    if (ended && !paused && shown >= html.length / 2) { paused = true; pauseUntil = Date.now() + 700; }
+    if (Date.now() < pauseUntil) return;
+    shown = cut(Math.min(html.length, shown + (ended ? Math.max(2, Math.ceil(html.length / 8)) : 2)));
+    el.innerHTML = html.slice(0, shown);
+  }, 50);
+  return { push(s) { html += s; }, end() { ended = true; return done; } };
 }
 
 async function send() {
   const text = state.text;
-  if (!text.trim()) return;
+  if (!text.trim() || state.generating) return;
   if (!state.conversation) {
     state.conversation = "c" + (++state.count) + "-" + Date.now();
-    history.pushState({}, "", "/c/" + state.conversation);
+    history.pushState({}, "", "/conversation/" + state.conversation);
     const li = document.createElement("li");
-    li.textContent = text.trim().slice(0, 40);
+    const a = document.createElement("a");
+    a.href = "/conversation/" + state.conversation;
+    a.textContent = text.trim().slice(0, 40);
+    li.appendChild(a);
     $("conversations").prepend(li);
   }
-  addMessage("user", escapeHtml(text));
+  addUser(text);
   $("prompt").value = "";
   state.text = "";
-  const body = JSON.stringify({ conversation: state.conversation, message: text, attachments: state.attachments });
+  const ready = state.chips.filter((c) => c.state === "ready").map((c) => c.name);
+  const body = JSON.stringify({ conversation: state.conversation, message: text, attachments: ready,
+                                model: state.model, web_search: state.web });
   $("chips").innerHTML = "";
-  state.attachments = [];
+  state.chips = [];
   $("stop").hidden = false;
-  const answer = addMessage("assistant", "");
-  let html = "";
+  const art = addAnswer(mask(text).tokens, state.model);
+  const typer = typewriter(art.querySelector(".prose-llm"));
+  const gen = { controller: new AbortController(), stopped: false };
+  state.generating = gen;
   try {
-    const res = await fetch("/chat/stream", { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    const res = await fetch("/chat/stream", { method: "POST", headers: { "Content-Type": "application/json" },
+                                              body, signal: gen.controller.signal });
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
@@ -138,19 +370,26 @@ async function send() {
         buf = buf.slice(i + 2);
         try {
           const o = JSON.parse(event);
-          if (o.delta !== undefined) { html += o.delta; answer.innerHTML = html; }
+          if (o.delta !== undefined) typer.push(o.delta);
         } catch (e) { /* not an answer chunk */ }
       }
     }
   } catch (e) {
-    answer.textContent = "Erreur : " + e.message;
+    typer.push(gen.stopped ? " [génération arrêtée]" : " Erreur : " + e.message);
   }
-  $("stop").hidden = true;
+  if (state.generating === gen) state.generating = null;
   // The unexpected dialog: true only if someone accepts it.
   if (/TRIGGER_DIALOG/.test(text)) window.__dialog_answered = confirm("unexpected");
-  if (/LATE_DIALOG/.test(text)) setTimeout(() => { window.__dialog_answered = confirm("late"); }, 2000);
   // The page leaves for another host (the driver's list holds 127.0.0.1 only).
   if (/NAVIGATE_AWAY/.test(text)) location.assign(location.protocol + "//localhost:" + location.port + "/away");
+  // A dialog nobody catalogued (the guard must refuse it, never close it).
+  if (/UNKNOWN_MODAL/.test(text)) $("mystery").hidden = false;
+  await typer.end();
+  const live = art.querySelector(".live");
+  if (live) live.remove();
+  if (!state.generating) $("stop").hidden = true;
+  // A dialog well after the answer, once the action that asked is over.
+  if (/LATE_DIALOG/.test(text)) setTimeout(() => { window.__dialog_answered = confirm("late"); }, 3500);
 }
 </script>
 </body>

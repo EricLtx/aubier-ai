@@ -1,19 +1,28 @@
 """The driver's test bench: a local stand-in for MaskAI (pilot spec §7, "Driver").
 
-GET on any path serves `index.html` (the page pushes `/c/<id>` URLs as MaskAI
-does). POST `/chat/stream` answers a server-sent-event stream: two pipeline
-steps, `{"node": "retrieve"}` then `{"node": "generate"}`, then the answer in
-three `{"delta": ...}` chunks. The answer echoes the question upper-cased and
-names the attachments the page declared. Trigger words in the request body:
+GET on any path serves `index.html` (the page pushes `/conversation/<id>` URLs as
+MaskAI does since 2026-10-17). POST `/chat/stream` answers a server-sent-event
+stream: the pipeline steps, `{"node": "retrieve"}`, then `{"node": "web_search"}`
+when the request's `web_search` is "on", then `{"node": "generate"}`, then the
+answer in three `{"delta": ...}` chunks. The answer echoes the question
+upper-cased and names the attachments the page declared (the chips that were
+ready when the question left). Trigger words in the request body:
 
   SLOW            sleep 8 s before the first event (abandon deadline tests);
   EXTERNAL_IMG    append <img src="http://example.invalid/x"> to the answer
                   (a third-party host, recorded and not blocked);
-  TRIGGER_DIALOG  the page opens a confirm() after the answer (dialog guard);
+  TRIGGER_DIALOG  the page opens a confirm() at the end of the stream (dialog guard);
   NAVIGATE_AWAY   the page then navigates to http://localhost:<port>/away, a
                   host outside a 127.0.0.1-only list (navigation guard);
-  LATE_DIALOG     the page opens a confirm() 2 s after the answer, once the
-                  action is over (the verdict must still see it).
+  UNKNOWN_MODAL   the page shows a [role=dialog] nobody catalogued;
+  LATE_DIALOG     the page opens a confirm() 3.5 s after the answer is drawn,
+                  once the action is over (the verdict must still see it);
+  LEAK            the « Chiffré » popover shows the text unmasked (a leak).
+
+The page side (index.html) draws each answer behind the stream and ends about a
+second after the server; shows the « Votre avis » survey after a generation left
+in flight; steers the attachment chip by file name (« fail », « slowidx »,
+« instant »).
 
 Other paths: /busy (requests, then a popup after 3 s; /stats says when the popup
 was announced and when its request arrived), /redirect-unreachable (a 302 to an
@@ -102,7 +111,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if "SLOW" in body:
                 time.sleep(8)
-            for step in ("retrieve", "generate"):
+            steps = ["retrieve"] + (["web_search"] if msg.get("web_search") == "on" else []) + ["generate"]
+            for step in steps:
                 self.event({"node": step})
                 time.sleep(0.05)
             third = -(-len(answer) // 3)
