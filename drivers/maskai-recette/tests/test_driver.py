@@ -1046,6 +1046,29 @@ class DriverV2OnFixture(FixtureBench):
         self.act(A, "capture_ecran")
         self.assertEqual(recette.browser.call("() => window.__survey_shown"), 0)
 
+    def test_a_stop_lookalike_visible_before_sending_is_neither_waited_for_nor_clicked(self):
+        """The stop selectors are a guess: one that matches a permanent button (« Stop sharing »)
+        must not hold every answer 30 s, nor be clicked at an abandon."""
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "nouvelle_conversation")
+        page = recette.browser.page()
+        page.evaluate("""() => { const b = document.createElement('button');
+            b.setAttribute('aria-label', 'Stop sharing'); b.textContent = 'Stop sharing';
+            b.onclick = () => { window.__lookalike = (window.__lookalike || 0) + 1; };
+            document.querySelector('main').prepend(b); }""")
+        self.message_case(recette, "v2-lookalike", "Bonjour")
+        t0 = time.monotonic()
+        _, ev = self.act(A, "poser_question", {"case": "v2-lookalike"})
+        self.assertLess(time.monotonic() - t0, 10, "no 30 s wait on a stop button that never goes")
+        self.assertTrue(self.evidence_json(ev, "guard.json")["display_stable"])
+        self.slow_case(recette)
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "poser_question", {"case": "v2-slow"})
+        self.assertTrue(refused.exception.extra["abort"]["stop_skipped"])
+        self.assertIsNone(page.evaluate("() => window.__lookalike"), "never clicked")
+        self.assertIn("arrêt non cliqué", journal_lines(recette.work)[-1]["evidence"])
+
     def test_without_the_stop_the_survey_follows_and_is_closed_never_answered(self):
         """The counter-proof, v1's behaviour: no stop click, the generation is left in flight, the
         « Votre avis » survey follows (5/5 on 17/10, D2); the guard closes it by its cross."""

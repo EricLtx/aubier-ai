@@ -719,7 +719,9 @@ def abort_text(p: dict) -> str:
              "flux ouvert" if p.get("stream_started") else "flux non ouvert"]
     if p.get("last_node"):
         parts.append(f"dernier nœud {p['last_node']} à {p['last_node_s']:g} s")
-    if p.get("stop_clicked"):
+    if p.get("stop_skipped"):
+        parts.append("arrêt non cliqué : le sélecteur d'arrêt désignait un bouton déjà visible avant l'envoi")
+    elif p.get("stop_clicked"):
         parts.append("arrêt cliqué" + ("" if p.get("stop_gone") else ", bouton encore visible"))
     else:
         parts.append("pas de bouton d'arrêt visible")
@@ -1195,6 +1197,7 @@ class Recette:
         self._case_in_hand = None
         self._mark = None  # where the action in hand began, in the browser's event sequence
         self._last_asked = None  # {"case", "mark"} of the last poser_question
+        self._in_flight = False  # an abandon whose stop click did not end the generation
 
     def actions(self) -> dict:
         browser = ["mesurer_chargement", "nouvelle_conversation", "joindre_document", "poser_question",
@@ -1429,8 +1432,10 @@ class Recette:
         d'envoi si Entrée n'a rien envoyé). Rend le tour à surveiller."""
         b = self.browser
         st = b.call(POLL_JS, self._poll_arg(0), page=page)
+        # stop_before: the stop selectors already match something before anything is sent; that is
+        # no generation indicator (a guessed selector on a permanent button): ignored, never clicked.
         turn = {"page": page, "n0": st["n"], "count0": st["count"], "posts0": len(b.posts),
-                "page_no": b.context.pages.index(page)}
+                "page_no": b.context.pages.index(page), "stop_before": st["stop"]}
         if not b.call(FILL_JS, {"sel": SELECTORS["textarea"], "text": text}, page=page):
             raise DriverRefusal("precondition", "pas de zone de saisie dans la page")
         page.bring_to_front()
@@ -1597,6 +1602,7 @@ class Recette:
                 lines = [line for _, line in st["ev"]]
                 now = time.monotonic()
                 fresh = st["count"] > t["count0"]  # a new answer card is on screen
+                stop = st["stop"] and not t.get("stop_before")
                 text = st["text"] if fresh else None
                 if text != t["last_text"] or t["changed_at"] is None:
                     t["last_text"], t["changed_at"] = text, now
@@ -1604,7 +1610,7 @@ class Recette:
                     ended = None
                     if any(line.startswith(("<END>", "<ABORT>")) for line in lines):
                         ended = next(x for x in lines if x.startswith(("<END>", "<ABORT>")))
-                    elif st["stop"]:
+                    elif stop:
                         t["saw_stop"], t["stop_gone"] = True, None
                     elif t["saw_stop"]:
                         t["stop_gone"] = t["stop_gone"] or now
@@ -1618,7 +1624,7 @@ class Recette:
                         t["total_s"] = round(now - t["t_send"], 2)
                 if t["end_at"] is not None:
                     since_end = now - t["end_at"]
-                    if fresh and now - t["changed_at"] >= DISPLAY_STABLE_S and not st["stop"]:
+                    if fresh and now - t["changed_at"] >= DISPLAY_STABLE_S and not stop:
                         t.update(done=True, display_stable=True,
                                  display_s=round(max(t["changed_at"] - t["t_send"], 0.0), 2))
                     elif not fresh and since_end >= NO_ANSWER_WAIT_S:
@@ -1714,7 +1720,14 @@ class Recette:
                    "stream_started": "<START>" in lines, "events": len(lines),
                    "last_node": nodes[-1][1] if nodes else None,
                    "last_node_s": round(nodes[-1][0] / 1000, 1) if nodes else None}
-        profile.update(self._stop_generation(turn["page"]))
+        if turn.get("stop_before"):  # the stop selectors match a button that was there before: no click
+            profile.update(stop_clicked=False, stop_skipped=True)
+            log.warning("abandon: stop not clicked, the stop selectors matched before sending")
+        else:
+            profile.update(self._stop_generation(turn["page"]))
+            # clicked but still visible, or nothing to click: maybe still in flight; the next
+            # nouvelle_conversation tries again
+            self._in_flight = not profile.get("stop_gone")
         return profile
 
     def _ask(self, text: str, budget_s: float) -> dict:
@@ -1802,12 +1815,13 @@ class Recette:
         page = b.page()
         self._ensure_on_app(page)
         stopped = None
-        try:  # a generation still in flight is stopped first, never left behind (D2)
-            if b.call(POLL_JS, self._poll_arg(0), page=page, timeout_ms=3000)["stop"]:
+        try:  # a generation an abandon could not stop is stopped first, never left behind (D2)
+            if self._in_flight and b.call(POLL_JS, self._poll_arg(0), page=page, timeout_ms=3000)["stop"]:
                 stopped = self._stop_generation(page)
         except PWTimeout:
             if b.pending():
                 raise
+        self._in_flight = False
         clicked = False
         for sel in SELECTORS["new_conversation"]:
             loc = page.locator(sel).first
