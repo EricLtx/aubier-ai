@@ -361,13 +361,16 @@ fn call_error(err: &anyhow::Error) -> &CallError {
 }
 
 /// A development driver as `vk driver pack` takes one, under
-/// `<dir>/drivers/maskai-fixture/`, beside the shared `vkdriver/` library it
-/// imports the way `drivers/maskai-recette/driver.py` does — its parent
-/// directory put first on `sys.path`. Its one requirement is a small pure
-/// wheel with a console script (the one `vk-capital`'s materialise test
+/// `<dir>/drivers/maskai-fixture/` in a repository (`<dir>/Cargo.toml`),
+/// beside the shared `vkdriver/` library it imports. Its `pack.json`
+/// vendors that library (ruling R-T8a), and the driver looks for it under
+/// `vendor/` first and in its parent directory otherwise — the way
+/// `drivers/maskai-recette/driver.py` will. Its one requirement is a small
+/// pure wheel with a console script (the one `vk-capital`'s materialise test
 /// uses). Debris a pack must leave out sits in both: a `.venv`, `tests`,
 /// bytecode, the library's own test.
 fn fixture_driver_dir(dir: &Path) -> PathBuf {
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
     let drivers = dir.join("drivers");
     let src = drivers.join("maskai-fixture");
     for sub in [".venv/Scripts", "tests", "__pycache__"] {
@@ -377,13 +380,15 @@ fn fixture_driver_dir(dir: &Path) -> PathBuf {
         src.join("driver.py"),
         "import sys\nfrom pathlib import Path\n\
          DRIVER_DIR = Path(__file__).resolve().parent\n\
-         sys.path.insert(0, str(DRIVER_DIR.parent))\n\
+         VENDOR = DRIVER_DIR / \"vendor\"\n\
+         sys.path.insert(0, str(VENDOR if VENDOR.is_dir() else DRIVER_DIR.parent))\n\
          from vkdriver.protocol import MARK  # noqa: E402\n\
          import pycodestyle  # noqa: E402\n\
          print(MARK, pycodestyle.__version__)\n",
     )
     .unwrap();
     std::fs::write(src.join("requirements.txt"), "pycodestyle==2.12.1\n").unwrap();
+    std::fs::write(src.join("pack.json"), r#"{"vendor": ["drivers/vkdriver"]}"#).unwrap();
     std::fs::write(src.join(".venv/Scripts/python.exe"), b"MZ").unwrap();
     std::fs::write(src.join("tests/test_driver.py"), "").unwrap();
     std::fs::write(src.join("__pycache__/driver.cpython-313.pyc"), b"pyc").unwrap();
@@ -509,7 +514,7 @@ async fn the_publisher_key_is_made_by_a_human_and_shown() {
 /// The whole pack, with the pinned CPython release and PyPI: a signed
 /// layout, the manifest layer `source: installed` with the packed command
 /// and the tree's fingerprint, the files layer the driver's files plus the
-/// shared `vkdriver` and none of the debris, the lock the one wheel; the
+/// `vkdriver` its `pack.json` vendors and none of the debris, the lock the one wheel; the
 /// tree materialises again in another directory to the same fingerprint
 /// and runs, `vkdriver` and the wheel found; `driver.packed` is the last
 /// event, naming what was packed; and nothing is left in the stage.
@@ -562,11 +567,12 @@ async fn pack_writes_a_signed_layout_and_a_driver_packed_row() {
         tar_paths(&files),
         [
             "driver.py",
+            "pack.json",
             "requirements.txt",
-            "vkdriver/__init__.py",
-            "vkdriver/protocol.py"
+            "vendor/vkdriver/__init__.py",
+            "vendor/vkdriver/protocol.py"
         ],
-        "the driver's files and the shared library, no debris, no manifest"
+        "the driver's files and what pack.json vendors, no debris, no manifest"
     );
     let lock: Vec<vk_capital::wheels::Locked> =
         serde_json::from_slice(&layout::read_layer(&opened, "lock").unwrap()).unwrap();

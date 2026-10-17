@@ -56,6 +56,25 @@ struct PackParams {
     python_cache: Option<PathBuf>,
 }
 
+/// `pack.json`, beside a driver's manifest (ruling R-T8a): the repository
+/// files outside the driver's directory that it needs at run time, each a
+/// path relative to the repository root — the nearest directory above the
+/// driver's that holds a `Cargo.toml`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackJson {
+    #[serde(default)]
+    vendor: Vec<String>,
+}
+
+/// One path `pack.json` vendors: where it is, and where under the files
+/// layer it lands (`vendor/…`).
+struct Vendored {
+    from: PathBuf,
+    to: PathBuf,
+    is_dir: bool,
+}
+
 /// What a pack built in its stage, ready to be laid out.
 struct Built {
     files_tar: Vec<u8>,
@@ -302,17 +321,28 @@ fn read_manifest(file: &Path) -> Result<DriverManifest, RpcError> {
 /// What the files layer carries: every regular file of the driver's
 /// directory that `hash_dir` hashes — nothing under a `.venv`,
 /// `__pycache__`, `tests` or `fixture` directory at any depth, no top-level
-/// `manifest*.json` (the packed manifest is a layer of its own) — and, when
-/// the directory has a sibling `vkdriver/`, that protocol library's `.py`
-/// files, without its tests, under `vkdriver/` beside the driver's own.
+/// `manifest*.json` (the packed manifest is a layer of its own) — then the
+/// repository files the driver needs from outside its directory:
 ///
-/// Why beside: `drivers/maskai-recette/driver.py` puts its parent directory
-/// first on `sys.path` and imports `vkdriver` from there. In an installed
-/// tree that parent is `<install_root>/<name>`, which holds versions, not
-/// libraries; but the script's own directory is on `sys.path` too (the
-/// packed command runs without `-I`), so the library is found there, inside
-/// the fingerprinted tree, with no change to the driver.
+/// - with a `pack.json` beside the manifest, exactly what it names
+///   ([`vendor_plan`]), under `vendor/`: a directory as `vendor/<its
+///   name>/` without tests or bytecode, a file as `vendor/<its directory's
+///   name>/<file>`. The driver looks for them under `vendor/` first;
+/// - without one, as before `pack.json` existed: when the directory has a
+///   sibling `vkdriver/`, that protocol library's `.py` files, without its
+///   tests, under `vkdriver/` beside the driver's own.
+///
+/// Why beside, in the second case: `drivers/maskai-recette/driver.py` puts
+/// its parent directory first on `sys.path` and imports `vkdriver` from
+/// there. In an installed tree that parent is `<install_root>/<name>`, which
+/// holds versions, not libraries; but the script's own directory is on
+/// `sys.path` too (the packed command runs without `-I`), so the library is
+/// found there, inside the fingerprinted tree, with no change to the driver.
+///
+/// Everything `pack.json` can be refused for is refused before a file is
+/// copied.
 fn stage_files(driver_dir: &Path, dest: &Path) -> Result<(), RpcError> {
+    let plan = vendor_plan(driver_dir)?;
     let failed = |e: std::io::Error| io_failed("copy the driver's files into the stage", &e);
     copy_tree(driver_dir, dest, &|rel, is_dir| {
         let skipped = rel.components().any(|c| {
@@ -329,6 +359,9 @@ fn stage_files(driver_dir: &Path, dest: &Path) -> Result<(), RpcError> {
         !skipped && !top_manifest
     })
     .map_err(failed)?;
+    if let Some(plan) = plan {
+        return vendor(&plan, dest);
+    }
     let shared = driver_dir.parent().map(|p| p.join("vkdriver"));
     let Some(shared) = shared.filter(|s| std::fs::symlink_metadata(s).is_ok_and(|m| m.is_dir()))
     else {
@@ -349,6 +382,153 @@ fn stage_files(driver_dir: &Path, dest: &Path) -> Result<(), RpcError> {
         }
     })
     .map_err(failed)
+}
+
+/// The paths `<driver_dir>/pack.json` vendors, every one checked: `None`
+/// when there is no `pack.json`. Each entry is relative to the repository
+/// root (the nearest directory above the driver's holding a `Cargo.toml`),
+/// made of plain names only, there, and — links resolved — still inside the
+/// repository; a file must sit in a directory, whose name it lands under;
+/// no two entries may land on one place, nor one inside another (compared
+/// as Windows compares names, case folded).
+fn vendor_plan(driver_dir: &Path) -> Result<Option<Vec<Vendored>>, RpcError> {
+    const REMEDY: &str = "correct pack.json beside the manifest, then pack again";
+    let file = driver_dir.join("pack.json");
+    let bytes = match read_bounded(&file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(bad(&format!(
+                "{} cannot be read ({}); remedy: {REMEDY}",
+                file.display(),
+                e.kind()
+            )))
+        }
+    };
+    let spec: PackJson = serde_json::from_slice(&bytes).map_err(|e| {
+        bad(&format!(
+            "{} does not parse (line {}, column {}): it holds {{\"vendor\": [paths]}} and \
+             nothing else; remedy: {REMEDY}",
+            file.display(),
+            e.line(),
+            e.column()
+        ))
+    })?;
+    let Some(repo) = driver_dir
+        .ancestors()
+        .skip(1)
+        .find(|d| d.join("Cargo.toml").is_file())
+    else {
+        return Err(bad(&format!(
+            "pack.json vendors repository files, and no directory above {} holds a Cargo.toml; \
+             remedy: pack from a checkout of the repository, or remove pack.json",
+            driver_dir.display()
+        )));
+    };
+    let repo_resolved =
+        std::fs::canonicalize(repo).map_err(|e| io_failed("resolve the repository root", &e))?;
+    let mut plan: Vec<Vendored> = vec![];
+    for entry in &spec.vendor {
+        let rel = Path::new(entry);
+        let outside = || {
+            bad(&format!(
+                "pack.json names {entry:?}, which is not a path that stays inside the repository \
+                 {}; remedy: name it relative to the repository root, without `..`",
+                repo.display()
+            ))
+        };
+        if entry.is_empty()
+            || !rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(outside());
+        }
+        let from = repo.join(rel);
+        let resolved = match std::fs::canonicalize(&from) {
+            Ok(resolved) => resolved,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(bad(&format!(
+                    "pack.json names {entry:?}, which is not there under {}; remedy: {REMEDY}",
+                    repo.display()
+                )))
+            }
+            Err(e) => return Err(io_failed("resolve a path pack.json names", &e)),
+        };
+        if !resolved.starts_with(&repo_resolved) {
+            return Err(outside());
+        }
+        let is_dir = resolved.is_dir();
+        let name = rel.file_name().expect("plain names only");
+        let to = if is_dir {
+            Path::new("vendor").join(name)
+        } else {
+            let Some(parent) = rel.parent().and_then(Path::file_name) else {
+                return Err(bad(&format!(
+                    "pack.json names {entry:?}, a file at the top of the repository: a vendored \
+                     file lands under its directory's name, so it must be inside a directory; \
+                     remedy: vendor a file inside a directory"
+                )));
+            };
+            Path::new("vendor").join(parent).join(name)
+        };
+        let folded = |p: &Path| PathBuf::from(p.to_string_lossy().to_ascii_lowercase());
+        if plan.iter().any(|v| {
+            let (a, b) = (folded(&v.to), folded(&to));
+            a.starts_with(&b) || b.starts_with(&a)
+        }) {
+            return Err(bad(&format!(
+                "pack.json vendors two paths to {}; remedy: keep one of the two",
+                to.display()
+            )));
+        }
+        plan.push(Vendored {
+            from: resolved,
+            to,
+            is_dir,
+        });
+    }
+    Ok(Some(plan))
+}
+
+/// Copies what [`vendor_plan`] checked into the files under `dest`: a
+/// directory without tests, bytecode or a `.venv`, a file as it is. A
+/// driver whose own files already hold one of the places is refused before
+/// anything is copied.
+fn vendor(plan: &[Vendored], dest: &Path) -> Result<(), RpcError> {
+    if let Some(taken) = plan
+        .iter()
+        .find(|v| std::fs::symlink_metadata(dest.join(&v.to)).is_ok())
+    {
+        return Err(bad(&format!(
+            "the driver directory has a {} of its own, where pack.json vendors a repository \
+             path; remedy: keep one of the two",
+            taken.to.display()
+        )));
+    }
+    let failed = |e: std::io::Error| io_failed("copy what pack.json vendors into the stage", &e);
+    for v in plan {
+        let to = dest.join(&v.to);
+        if v.is_dir {
+            copy_tree(&v.from, &to, &|rel, is_dir| {
+                let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                if is_dir {
+                    !matches!(name, "__pycache__" | ".venv" | "tests" | "fixture")
+                } else {
+                    let test = (name.starts_with("test_") && name.ends_with(".py"))
+                        || name.ends_with("_test.py");
+                    !test && !name.ends_with(".pyc") && !name.ends_with(".pyo")
+                }
+            })
+            .map_err(failed)?;
+        } else {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent).map_err(failed)?;
+            }
+            std::fs::copy(&v.from, &to).map_err(failed)?;
+        }
+    }
+    Ok(())
 }
 
 /// Copies every regular file under `src` that `keep` accepts (given its
@@ -896,6 +1076,108 @@ mod tests {
             "{}",
             e.message
         );
+    }
+
+    /// A repository laid out the way `pack.json` names it (ruling R-T8a):
+    /// `<repo>/Cargo.toml`, the driver at `<repo>/drivers/d/`, the shared
+    /// library at `<repo>/drivers/vkdriver/` and two scripts at
+    /// `<repo>/scripts/recette/`, each beside debris a pack leaves out.
+    fn repository(t: &Path, pack_json: &str) -> PathBuf {
+        write(&t.join("Cargo.toml"), "[workspace]\n");
+        let drv = t.join("drivers").join("d");
+        write(&drv.join("driver.py"), "print(1)");
+        write(&drv.join("pack.json"), pack_json);
+        write(&drv.join("manifest.json"), "{}");
+        for rel in [
+            "__init__.py",
+            "protocol.py",
+            "test_protocol.py",
+            "__pycache__/protocol.cpython-313.pyc",
+            "tests/test_more.py",
+        ] {
+            write(&t.join("drivers").join("vkdriver").join(rel), "");
+        }
+        for rel in ["evaluer.py", "journal.py", "test_evaluer.py"] {
+            write(&t.join("scripts").join("recette").join(rel), "");
+        }
+        drv
+    }
+
+    /// `pack.json` beside the manifest vendors repository files into the
+    /// files layer: a directory under `vendor/<its name>/`, without tests or
+    /// bytecode, a file under `vendor/<its directory's name>/`; the shared
+    /// `vkdriver` is then copied only as `pack.json` says, never beside.
+    #[test]
+    fn a_pack_json_vendors_repository_files_under_vendor() {
+        let t = tempfile::tempdir().unwrap();
+        let drv = repository(
+            t.path(),
+            r#"{"vendor": ["drivers/vkdriver", "scripts/recette/evaluer.py", "scripts/recette/journal.py"]}"#,
+        );
+        let dest = t.path().join("stage").join("files");
+        stage_files(&drv, &dest).unwrap();
+        assert_eq!(
+            files_under(&dest),
+            [
+                "driver.py",
+                "pack.json",
+                "vendor/recette/evaluer.py",
+                "vendor/recette/journal.py",
+                "vendor/vkdriver/__init__.py",
+                "vendor/vkdriver/protocol.py",
+            ]
+        );
+    }
+
+    /// What `pack.json` may not name, refused in one line with its remedy
+    /// before anything is copied: a path out of the repository, an absolute
+    /// one, one that is not there, two entries that land on one place, a
+    /// file at the repository's top, an unknown key; and no `Cargo.toml`
+    /// above the driver means there is no repository to vendor from.
+    #[test]
+    fn a_pack_json_that_names_what_it_may_not_is_refused() {
+        for (pack_json, says) in [
+            (
+                r#"{"vendor": ["../outside.py"]}"#,
+                "stays inside the repository",
+            ),
+            (
+                r#"{"vendor": ["C:/Windows/win.ini"]}"#,
+                "stays inside the repository",
+            ),
+            (
+                r#"{"vendor": ["/etc/passwd"]}"#,
+                "stays inside the repository",
+            ),
+            (
+                r#"{"vendor": ["scripts/recette/absent.py"]}"#,
+                "is not there",
+            ),
+            (
+                r#"{"vendor": ["drivers/vkdriver", "drivers/vkdriver"]}"#,
+                "keep one of the two",
+            ),
+            (r#"{"vendor": ["Cargo.toml"]}"#, "inside a directory"),
+            (r#"{"vendr": []}"#, "pack.json does not parse"),
+        ] {
+            let t = tempfile::tempdir().unwrap();
+            let drv = repository(t.path(), pack_json);
+            let dest = t.path().join("stage").join("files");
+            let e = stage_files(&drv, &dest).unwrap_err();
+            assert!(e.message.contains(says), "{pack_json}: {}", e.message);
+            assert!(e.message.contains("; remedy: "), "{}", e.message);
+            assert_eq!(e.message.lines().count(), 1, "{}", e.message);
+            assert!(
+                !dest.join("vendor").exists(),
+                "{pack_json}: nothing vendored"
+            );
+        }
+        let t = tempfile::tempdir().unwrap();
+        let drv = repository(t.path(), r#"{"vendor": ["drivers/vkdriver"]}"#);
+        std::fs::remove_file(t.path().join("Cargo.toml")).unwrap();
+        let e = stage_files(&drv, &t.path().join("files")).unwrap_err();
+        assert!(e.message.contains("Cargo.toml"), "{}", e.message);
+        assert!(e.message.contains("; remedy: "), "{}", e.message);
     }
 
     /// The packed command is the packed interpreter and its flags, then the
