@@ -4,6 +4,16 @@
 //! every byte of the tree must depend on the layers alone, never on where the
 //! tree sits or who builds it.
 //!
+//! The layers stay apart. The release is checked against its SHA-256 and
+//! extracted first, and what it ships under `python/Scripts/` is read from it
+//! alone. The wheels are installed next, by that interpreter, before the
+//! driver's files exist. The driver's files land last: the whole layer is
+//! refused before a byte of it lands if an entry names `python` or a
+//! `pyvenv.cfg` at the root (in any case, with Windows' trailing dots and
+//! spaces ignored); a `pyvenv.cfg` there would move `sys.prefix` to the root
+//! and run its `.pth` files inside the pip of an elevated install. Then an
+//! entry that would land on a path already in the tree is refused.
+//!
 //! The reproducibility rules (each one a difference observed or ruled out
 //! between two trees built from the same layers in two directories):
 //!
@@ -16,7 +26,8 @@
 //! 2. **pip runs isolated:** `python -I -m pip --isolated`, `PIP_CONFIG_FILE`
 //!    set to the null device: no user site, no `PIP_*` variable, no pip
 //!    configuration file of the node can change what is installed or where.
-//!    `--no-compile`: no bytecode is written at install.
+//!    `--no-compile`: no bytecode is written at install; `--no-cache-dir`:
+//!    nothing is read from or written to the cache of the user who installs.
 //! 3. **Console-script launchers are purged.** pip writes
 //!    `python/Scripts/<script>.exe`, which embeds the absolute path of the
 //!    interpreter: every file under `python/Scripts/` that the pristine release
@@ -39,9 +50,8 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::error::{refuse, Result};
 use crate::wheels::Locked;
@@ -55,19 +65,24 @@ pub struct Materialised {
 }
 
 /// Builds the installed tree under `root` (absent or empty, else refused):
-/// extracts `files` (tar) at the root, extracts the python archive to
-/// `root/python`, checks the wheels against the lock and installs them with
+/// checks every entry of `files` (tar) without writing (none may name the
+/// interpreter), extracts the python archive to `root/python` once its
+/// SHA-256 is `python_sha256` (every real caller passes
+/// [`python::PINNED`]`.sha256`), checks the wheels against the lock in a
+/// scratch directory beside `root` and installs them with
 /// `python/python.exe -I -m pip --isolated install --no-index --no-compile
-/// --no-warn-script-location --find-links <wheels> <name==version in lock order>`
-/// (offline), deletes every file under `python/Scripts/` not in
-/// `pristine_scripts`, every `__pycache__`, and every row of an installed
-/// distribution's `RECORD` naming a deleted file, then returns
-/// `hash_tree(root)`. On a refusal the partial tree stays for the caller to
-/// remove.
+/// --no-cache-dir --no-warn-script-location --find-links <wheels>
+/// <name==version in lock order>` (offline), deletes every file under
+/// `python/Scripts/` not in `pristine_scripts`, extracts `files` at the root
+/// (an entry on an existing path refused), deletes every `__pycache__` and
+/// every row of an installed distribution's `RECORD` naming a deleted file,
+/// then returns `hash_tree(root)`. On a refusal after the release check the
+/// partial tree stays for the caller to remove.
 pub fn materialise(
     root: &Path,
     files_tar: &[u8],
     python_archive: &Path,
+    python_sha256: &str,
     wheels_tar: &[u8],
     lock: &[Locked],
 ) -> Result<Materialised> {
@@ -77,14 +92,31 @@ pub fn materialise(
             "materialise into a new directory",
         );
     }
+    wheels::scan(files_tar, |path| {
+        if on_interpreter(path) {
+            return refuse(
+                "files layer: an entry would land on the interpreter",
+                "rename the driver's python/ directory or pyvenv.cfg",
+            );
+        }
+        Ok(())
+    })?;
     fs::create_dir_all(root)?;
-    wheels::untar_into(files_tar, root)?;
-    let python = python::extract(python_archive, root)?;
+    let python = python::extract(python_archive, root, python_sha256)?;
     let pristine = python::pristine_scripts(&python)?;
     let site_packages = python.join("Lib").join("site-packages");
     let shipped = dist_infos(&site_packages)?;
-    install_wheels(&python, wheels_tar, lock)?;
+    install_wheels(root, &python, wheels_tar, lock)?;
     purge_scripts(&python, &pristine)?;
+    wheels::unpack(files_tar, root, |path, _| {
+        if fs::symlink_metadata(root.join(path)).is_ok() {
+            return refuse(
+                "files layer: an entry would land on an existing path",
+                "repack the driver: its files layer writes one path twice",
+            );
+        }
+        Ok(())
+    })?;
     purge_pycache(root)?;
     prune_records(&site_packages, &shipped)?;
     Ok(Materialised {
@@ -93,10 +125,25 @@ pub fn materialise(
     })
 }
 
-/// Unpacks `wheels_tar` into a scratch directory outside the tree, checks it
-/// against `lock`, and installs the lock with pip, offline and isolated.
-fn install_wheels(python: &Path, wheels_tar: &[u8], lock: &[Locked]) -> Result<()> {
-    let scratch = Scratch::new()?;
+/// Whether a files-layer entry's first component is, as Windows resolves it
+/// (case folded, trailing dots and spaces dropped), `python` or `pyvenv.cfg`.
+fn on_interpreter(path: &Path) -> bool {
+    path.components()
+        .find_map(|c| match c {
+            Component::Normal(n) => Some(n.to_string_lossy()),
+            _ => None,
+        })
+        .is_some_and(|first| {
+            let first = first.trim_end_matches(['.', ' ']);
+            first.eq_ignore_ascii_case("python") || first.eq_ignore_ascii_case("pyvenv.cfg")
+        })
+}
+
+/// Unpacks `wheels_tar` into a scratch directory beside `root` (same parent,
+/// outside the tree), checks it against `lock`, and installs the lock with
+/// pip, offline and isolated.
+fn install_wheels(root: &Path, python: &Path, wheels_tar: &[u8], lock: &[Locked]) -> Result<()> {
+    let scratch = Scratch::beside(root)?;
     wheels::untar_into(wheels_tar, &scratch.0)?;
     wheels::check_lock(&scratch.0, lock)?;
     if lock.is_empty() {
@@ -111,7 +158,13 @@ fn install_wheels(python: &Path, wheels_tar: &[u8], lock: &[Locked]) -> Result<(
             "--isolated",
             "--disable-pip-version-check",
         ])
-        .args(["--no-input", "install", "--no-index", "--no-compile"])
+        .args([
+            "--no-input",
+            "install",
+            "--no-index",
+            "--no-compile",
+            "--no-cache-dir",
+        ])
         .args(["--no-warn-script-location", "--find-links"])
         .arg(&scratch.0)
         .args(lock.iter().map(|l| format!("{}=={}", l.name, l.version)))
@@ -233,22 +286,19 @@ fn record_path(row: &str) -> Option<String> {
     Some(out)
 }
 
-/// A fresh directory under the system temp directory, removed on drop: where
-/// the wheels wait for pip, outside the tree being fingerprinted.
+/// A fresh directory `<root>.wheels-<unique>` beside `root` (same parent:
+/// under the install root at install, where the user's `%TEMP%` cannot slip a
+/// wheel in between `check_lock` and pip), removed on drop: where the wheels
+/// wait for pip, outside the tree being fingerprinted.
 struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new() -> std::io::Result<Self> {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
+    fn beside(root: &Path) -> std::io::Result<Self> {
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let dir = std::env::temp_dir().join(format!(
-            "vk-capital-wheels-{}-{nanos}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let dir = root.with_file_name(format!("{name}.wheels-{}", crate::unique_suffix()));
         fs::create_dir(&dir)?;
         Ok(Self(dir))
     }
@@ -338,7 +388,149 @@ mod tests {
     fn a_root_that_is_not_empty_is_refused() {
         let t = tempfile::tempdir().unwrap();
         fs::write(t.path().join("stale.py"), b"").unwrap();
-        let e = materialise(t.path(), &[], Path::new("absent.tar.gz"), &[], &[]).unwrap_err();
+        let e = materialise(
+            t.path(),
+            &[],
+            Path::new("absent.tar.gz"),
+            python::PINNED.sha256,
+            &[],
+            &[],
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("not an empty directory"), "{e}");
+    }
+
+    /// A tar of `entries` in the order given (duplicates kept).
+    fn tar_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for (path, data) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            b.append_data(&mut h, path, *data).unwrap();
+        }
+        b.into_inner().unwrap()
+    }
+
+    /// A stand-in release (no working interpreter: tests that reach pip use
+    /// the real one) and its SHA-256.
+    fn fake_release(dir: &Path) -> (PathBuf, String) {
+        let tar = tar_of(&[
+            ("python/python.exe", b"MZ"),
+            ("python/Scripts/.empty", b""),
+            ("python/Lib/site-packages/README.txt", b"r"),
+        ]);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &tar).unwrap();
+        let archive = dir.join("release.tar.gz");
+        fs::write(&archive, gz.finish().unwrap()).unwrap();
+        let sha = crate::python::sha256_file(&archive).unwrap();
+        (archive, sha)
+    }
+
+    fn materialise_files(dir: &Path, files: &[(&str, &[u8])]) -> (PathBuf, Result<Materialised>) {
+        let (archive, sha) = fake_release(dir);
+        let root = dir.join("tree");
+        let empty = tar_of(&[]);
+        let r = materialise(&root, &tar_of(files), &archive, &sha, &empty, &[]);
+        (root, r)
+    }
+
+    fn assert_on_interpreter_and_nothing_written(name: &str) {
+        let t = tempfile::tempdir().unwrap();
+        let (root, r) = materialise_files(t.path(), &[("driver.py", b"print(1)"), (name, b"x")]);
+        let e = r.unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "files layer: an entry would land on the interpreter; \
+             remedy: rename the driver's python/ directory or pyvenv.cfg",
+            "{name}"
+        );
+        assert!(!root.exists(), "{name}: something was written under root");
+    }
+
+    #[test]
+    fn a_pyvenv_cfg_beside_the_interpreter_is_refused_before_anything_is_written() {
+        for name in ["pyvenv.cfg", "PyVenv.CFG", "pyvenv.cfg. ", "./pyvenv.cfg"] {
+            assert_on_interpreter_and_nothing_written(name);
+        }
+    }
+
+    #[test]
+    fn a_python_directory_in_any_spelling_is_refused_before_anything_is_written() {
+        for name in [
+            "Python/x.py",
+            "PYTHON/Lib/site.py",
+            "python./x.py",
+            "python /x.py",
+        ] {
+            assert_on_interpreter_and_nothing_written(name);
+        }
+    }
+
+    #[test]
+    fn a_files_entry_on_a_release_path_is_refused_before_anything_is_written() {
+        for name in ["python/python.exe", "python/Scripts/.empty"] {
+            assert_on_interpreter_and_nothing_written(name);
+        }
+    }
+
+    #[test]
+    fn a_files_layer_that_writes_one_path_twice_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let (root, r) = materialise_files(t.path(), &[("driver.py", b"1"), ("driver.py", b"2")]);
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("files layer: an entry would land on an existing path"),
+            "{e}"
+        );
+        assert_eq!(fs::read(root.join("driver.py")).unwrap(), b"1");
+    }
+
+    #[test]
+    fn a_release_that_is_not_the_expected_one_is_refused_before_it_is_extracted() {
+        let t = tempfile::tempdir().unwrap();
+        let (archive, _) = fake_release(t.path());
+        let root = t.path().join("tree");
+        let empty = tar_of(&[]);
+        let e = materialise(&root, &empty, &archive, python::PINNED.sha256, &empty, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("python release: sha256 mismatch"), "{e}");
+        assert!(!root.join("python").exists());
+    }
+
+    #[test]
+    fn the_release_lands_first_and_the_driver_files_beside_it() {
+        let t = tempfile::tempdir().unwrap();
+        let (root, r) =
+            materialise_files(t.path(), &[("driver.py", b"print(1)"), ("lib/m.py", b"M")]);
+        let m = r.unwrap();
+        assert_eq!(fs::read(root.join("driver.py")).unwrap(), b"print(1)");
+        assert_eq!(fs::read(root.join("lib/m.py")).unwrap(), b"M");
+        assert!(root.join("python/python.exe").is_file());
+        assert_eq!(m.fingerprint, fingerprint::hash_tree(&root).unwrap());
+        // the wheels scratch was beside the root and is gone
+        let left: Vec<_> = fs::read_dir(t.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            left.iter().all(|n| !n.starts_with("tree.wheels")),
+            "{left:?}"
+        );
+    }
+
+    #[test]
+    fn the_wheels_scratch_is_created_beside_the_root_and_removed_on_drop() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("tree");
+        let s = Scratch::beside(&root).unwrap();
+        let dir = s.0.clone();
+        assert_eq!(dir.parent(), root.parent());
+        assert!(dir.is_dir());
+        assert_ne!(dir, Scratch::beside(&root).unwrap().0);
+        drop(s);
+        assert!(!dir.exists());
     }
 }

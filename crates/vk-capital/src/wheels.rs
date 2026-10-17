@@ -175,40 +175,23 @@ fn executable(_: &Path) -> std::io::Result<bool> {
 /// regular file or a directory (a link, a device, a FIFO). What was extracted
 /// before it stays. No entry's path is ever echoed.
 pub fn untar_into(bytes: &[u8], dest: &Path) -> Result<()> {
-    unpack(bytes, dest, None)
+    unpack(bytes, dest, |_, _| Ok(()))
 }
 
-/// [`untar_into`]'s rules over any reader; with `top`, every entry must also
-/// lie under the directory `top/`.
-pub(crate) fn unpack<R: Read>(reader: R, dest: &Path, top: Option<&str>) -> Result<()> {
+/// [`untar_into`] over any reader, with `rule` run on each entry's checked
+/// path and header before the entry is written: its refusal stops the
+/// extraction there.
+pub(crate) fn unpack<R: Read>(
+    reader: R,
+    dest: &Path,
+    mut rule: impl FnMut(&Path, &tar::Header) -> Result<()>,
+) -> Result<()> {
     fs::create_dir_all(dest)?;
     let mut archive = tar::Archive::new(reader);
     for entry in archive.entries().or_else(unreadable)? {
         let mut entry = entry.or_else(unreadable)?;
-        let kind = entry.header().entry_type();
-        let path = entry.path().or_else(unreadable)?.into_owned();
-        let plain = path.components().all(|c| match c {
-            Component::Normal(n) => !n.to_string_lossy().contains(':'),
-            Component::CurDir => true,
-            _ => false, // `..`, a root, a drive prefix
-        });
-        if !plain || !(kind.is_file() || kind.is_dir()) {
-            return refuse(
-                "tar entry would escape the destination, or is a link or a special file",
-                ALTERED,
-            );
-        }
-        if let Some(top) = top {
-            let first = path
-                .components()
-                .find(|c| matches!(c, Component::Normal(_)));
-            if first.is_none_or(|c| c.as_os_str() != top) {
-                return refuse(
-                    format!("archive has an entry outside {top}/"),
-                    "use a python-build-standalone install_only archive for Windows x86_64",
-                );
-            }
-        }
+        let path = checked_path(&entry)?;
+        rule(&path, entry.header())?;
         match entry.unpack_in(dest) {
             Ok(true) => {}
             Ok(false) => {
@@ -223,6 +206,35 @@ pub(crate) fn unpack<R: Read>(reader: R, dest: &Path, top: Option<&str>) -> Resu
         }
     }
     Ok(())
+}
+
+/// Runs [`untar_into`]'s checks and `rule` on every entry of `bytes`, writing
+/// nothing: a layer is refused whole before its first byte lands.
+pub(crate) fn scan(bytes: &[u8], mut rule: impl FnMut(&Path) -> Result<()>) -> Result<()> {
+    let mut archive = tar::Archive::new(bytes);
+    for entry in archive.entries().or_else(unreadable)? {
+        rule(&checked_path(&entry.or_else(unreadable)?)?)?;
+    }
+    Ok(())
+}
+
+/// The entry's path, refused unless it is relative, has no `..`, no drive and
+/// no stream (`:`), and the entry is a regular file or a directory.
+fn checked_path<R: Read>(entry: &tar::Entry<'_, R>) -> Result<PathBuf> {
+    let kind = entry.header().entry_type();
+    let path = entry.path().or_else(unreadable)?.into_owned();
+    let plain = path.components().all(|c| match c {
+        Component::Normal(n) => !n.to_string_lossy().contains(':'),
+        Component::CurDir => true,
+        _ => false, // `..`, a root, a drive prefix
+    });
+    if !plain || !(kind.is_file() || kind.is_dir()) {
+        return refuse(
+            "tar entry would escape the destination, or is a link or a special file",
+            ALTERED,
+        );
+    }
+    Ok(path)
 }
 
 /// A tar (or gzip) stream that does not parse: the kind of error, never its

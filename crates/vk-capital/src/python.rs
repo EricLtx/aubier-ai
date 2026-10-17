@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -41,12 +41,14 @@ pub const PINNED: PythonRelease = PythonRelease {
 /// The most a download may write: the archive is ~48 MB; a server that
 /// streams more is cut off here and the hash check refuses what it sent.
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+/// The most the release may write once extracted (it holds ~155 MB).
+const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
 const ALTERED: &str = "the download was altered or the table is stale; do not use it";
 
 /// `<cache>/<file>` of [`PINNED`], downloaded if absent (reqwest blocking,
-/// 10 min timeout) to `<file>.part`, hashed while written, renamed only when
-/// the SHA-256 matches. A cached copy is hashed again on every call: one whose
-/// SHA-256 differs is deleted and refused, never used.
+/// 10 min timeout) to `<file>.<unique>.part`, hashed while written, renamed
+/// only when the SHA-256 matches. A cached copy is hashed again on every call:
+/// one whose SHA-256 differs is deleted and refused, never used.
 pub fn fetch(cache: &Path) -> Result<PathBuf> {
     fs::create_dir_all(cache)?;
     let dest = cache.join(PINNED.file);
@@ -60,7 +62,7 @@ pub fn fetch(cache: &Path) -> Result<PathBuf> {
             "it was deleted; pack again to download it afresh",
         );
     }
-    let part = cache.join(format!("{}.part", PINNED.file));
+    let part = part_path(cache);
     let digest = download(&part).inspect_err(|_| {
         let _ = fs::remove_file(&part);
     })?;
@@ -73,6 +75,11 @@ pub fn fetch(cache: &Path) -> Result<PathBuf> {
     }
     fs::rename(&part, &dest)?;
     Ok(dest)
+}
+
+/// `<cache>/<file>.<unique>.part`: two downloads at once never share one.
+fn part_path(cache: &Path) -> PathBuf {
+    cache.join(format!("{}.{}.part", PINNED.file, crate::unique_suffix()))
 }
 
 /// GET [`PINNED`]`.url` into `part`; the hex SHA-256 of the bytes written.
@@ -139,13 +146,46 @@ pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 /// Extracts the `.tar.gz` whose top-level directory is `python/` into
-/// `dest/python/` and returns that path. Every entry must lie under `python/`
-/// and be a regular file or a directory (`wheels::unpack`'s rules); the first
-/// that is not is refused, and what was extracted before it stays.
-pub fn extract(archive: &Path, dest: &Path) -> Result<PathBuf> {
-    let gz = flate2::read::GzDecoder::new(std::io::BufReader::new(fs::File::open(archive)?));
-    fs::create_dir_all(dest)?;
-    crate::wheels::unpack(gz, dest, Some("python"))?;
+/// `dest/python/` and returns that path. The archive is read once, into
+/// memory (at most 512 MiB), and its SHA-256 compared with `expected_sha256`
+/// (64 lowercase hex digits; [`PINNED`]`.sha256` for every real caller)
+/// before anything is written: the bytes extracted are the bytes hashed.
+/// Every entry must lie under `python/` and be a regular file or a directory
+/// (`untar_into`'s rules), and the entries may not add up to more than 1 GiB;
+/// the first that breaks a rule is refused, and what was extracted before it
+/// stays.
+pub fn extract(archive: &Path, dest: &Path, expected_sha256: &str) -> Result<PathBuf> {
+    let mut bytes = Vec::new();
+    fs::File::open(archive)?
+        .take(MAX_ARCHIVE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if format!("{:x}", Sha256::digest(&bytes)) != expected_sha256 {
+        return refuse(
+            "python release: sha256 mismatch",
+            "the archive is not the pinned release; do not use it",
+        );
+    }
+    let mut extracted = 0u64;
+    let gz = flate2::read::GzDecoder::new(bytes.as_slice());
+    crate::wheels::unpack(gz, dest, |path, header| {
+        let first = path
+            .components()
+            .find(|c| matches!(c, Component::Normal(_)));
+        if first.is_none_or(|c| c.as_os_str() != "python") {
+            return refuse(
+                "archive has an entry outside python/",
+                "use a python-build-standalone install_only archive for Windows x86_64",
+            );
+        }
+        extracted = extracted.saturating_add(header.size().unwrap_or(u64::MAX));
+        if extracted > MAX_EXTRACTED_BYTES {
+            return refuse(
+                "python release: more than 1 GiB once extracted",
+                "the archive is not the pinned release; do not use it",
+            );
+        }
+        Ok(())
+    })?;
     let python = dest.join("python");
     if !python.join("python.exe").is_file() {
         return refuse(
@@ -189,6 +229,10 @@ pub(crate) fn scripts_rel(scripts: &Path, path: &Path) -> String {
 mod tests {
     use super::*;
 
+    fn sha(path: &Path) -> String {
+        sha256_file(path).unwrap()
+    }
+
     fn tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
         for (path, data) in entries {
@@ -218,7 +262,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        let py = extract(&archive, &t.path().join("stage")).unwrap();
+        let py = extract(&archive, &t.path().join("stage"), &sha(&archive)).unwrap();
         assert_eq!(py, t.path().join("stage").join("python"));
         assert_eq!(fs::read(py.join("Lib/os.py")).unwrap(), b"x");
         let scripts: Vec<_> = pristine_scripts(&py).unwrap().into_iter().collect();
@@ -234,7 +278,7 @@ mod tests {
             tar_gz(&[("python/python.exe", b"MZ"), ("other/x.py", b"x")]),
         )
         .unwrap();
-        let e = extract(&archive, &t.path().join("stage")).unwrap_err();
+        let e = extract(&archive, &t.path().join("stage"), &sha(&archive)).unwrap_err();
         assert!(e.to_string().contains("outside python/"), "{e}");
         assert!(!t.path().join("stage/other").exists());
     }
@@ -244,8 +288,52 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let archive = t.path().join("r.tar.gz");
         fs::write(&archive, tar_gz(&[("python/Lib/os.py", b"x")])).unwrap();
-        let e = extract(&archive, &t.path().join("stage")).unwrap_err();
+        let e = extract(&archive, &t.path().join("stage"), &sha(&archive)).unwrap_err();
         assert!(e.to_string().contains("no python/python.exe"), "{e}");
+    }
+
+    #[test]
+    fn extract_refuses_an_archive_that_is_not_the_expected_one_before_writing_anything() {
+        let t = tempfile::tempdir().unwrap();
+        let archive = t.path().join("r.tar.gz");
+        fs::write(&archive, tar_gz(&[("python/python.exe", b"MZ")])).unwrap();
+        let stage = t.path().join("stage");
+        let e = extract(&archive, &stage, PINNED.sha256).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "python release: sha256 mismatch; remedy: the archive is not the pinned release; do not use it"
+        );
+        assert!(!stage.exists());
+    }
+
+    #[test]
+    fn extract_refuses_a_release_past_one_gib_once_extracted() {
+        // A header that claims 2 GiB with no data behind it: refused on the
+        // claim, before a byte of it is read or written.
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(2 << 30);
+        h.set_mode(0o644);
+        h.set_path("python/huge.bin").unwrap();
+        h.set_cksum();
+        b.append(&h, std::io::empty()).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&b.into_inner().unwrap()).unwrap();
+        let t = tempfile::tempdir().unwrap();
+        let archive = t.path().join("r.tar.gz");
+        fs::write(&archive, gz.finish().unwrap()).unwrap();
+        let e = extract(&archive, &t.path().join("stage"), &sha(&archive)).unwrap_err();
+        assert!(e.to_string().contains("1 GiB"), "{e}");
+        assert!(!t.path().join("stage/python/huge.bin").exists());
+    }
+
+    #[test]
+    fn two_downloads_into_one_cache_write_two_part_files() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (part_path(t.path()), part_path(t.path()));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(t.path()));
+        assert!(a.to_string_lossy().ends_with(".part"));
     }
 
     #[test]

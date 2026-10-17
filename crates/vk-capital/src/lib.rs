@@ -14,3 +14,19 @@ pub mod signature;
 pub mod wheels;
 
 pub use error::CapitalError;
+
+/// `<pid>-<nanos>-<n>`: a file-name suffix that no other call, in this
+/// process or in another one running beside it, returns.
+pub(crate) fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}

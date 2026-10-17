@@ -26,7 +26,8 @@ fn the_same_inputs_materialise_to_one_fingerprint_in_two_directories() {
     .unwrap();
     std::fs::write(src.join("requirements.txt"), b"pycodestyle==2.12.1\n").unwrap();
     let files_tar = vk_capital::wheels::tar_dir(&src).unwrap();
-    let py = vk_capital::python::extract(&archive, &t.path().join("stage")).unwrap();
+    let pinned = vk_capital::python::PINNED.sha256;
+    let py = vk_capital::python::extract(&archive, &t.path().join("stage"), pinned).unwrap();
     let wheels_dir = t.path().join("wheels");
     let lock = vk_capital::wheels::resolve(
         &py.join("python.exe"),
@@ -40,6 +41,7 @@ fn the_same_inputs_materialise_to_one_fingerprint_in_two_directories() {
         &t.path().join("a"),
         &files_tar,
         &archive,
+        pinned,
         &wheels_tar,
         &lock,
     )
@@ -48,6 +50,7 @@ fn the_same_inputs_materialise_to_one_fingerprint_in_two_directories() {
         &t.path().join("b"),
         &files_tar,
         &archive,
+        pinned,
         &wheels_tar,
         &lock,
     )
