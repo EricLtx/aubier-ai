@@ -10,7 +10,8 @@ Two checks, both over the files git tracks:
    placeholder (`<...>`, `...`, `*`, `YYYY`), a private path (git-ignored, so
    absent on CI), `docs/superpowers` (named only as the place not to use), and
    anything named by a historical record (`docs/archive/`, recorded demo runs)
-   or by an implementation plan (`docs/technical/plans/`, files still to create).
+   or by a design spec or an implementation plan (`docs/technical/specs/`,
+   `docs/technical/plans/`: they name files still to create).
 
 Exit 1 with one line per finding; exit 0 when clean. Stdlib only.
 """
@@ -25,9 +26,9 @@ PATH_RE = re.compile(
 )
 # Named as the place a document must NOT go; not a path to resolve.
 DEPRECATED = {"docs/superpowers"}
-# Historical records are not kept in step with the code they name, and a plan
-# names the files its tasks will create.
-RECORDS = ("docs/archive/", "docs/functional/demo/runs/", "docs/technical/plans/")
+# Historical records are not kept in step with the code they name; a spec or a
+# plan names the files its tasks will create.
+RECORDS = ("docs/archive/", "docs/functional/demo/runs/", "docs/technical/plans/", "docs/technical/specs/")
 PRIVATE_PREFIXES = (
     "docs/strategy/",
     "docs/archive/strategy/",
