@@ -100,7 +100,10 @@ impl RealKernel {
     ///
     /// What is packed is an installed manifest, so the context rules are
     /// checked on a copy that says `source: installed`, at the path it will
-    /// have once installed, `<install_root>/<name>/<version>`. The version is
+    /// have once installed, `<install_root>/<name>/<version>`, with the
+    /// command rule's interpreter and script looked for in `tree`, the copy
+    /// of the installed tree the pack materialised (ruling R-F2,
+    /// [`RealKernel::check_context_with`]). The version is
     /// `MAJOR.MINOR.PATCH` in digits, refused otherwise before it becomes a
     /// path or a field. The digests are the caller's, recorded as given: the
     /// ledger carries the payload's hash, and the package they name is
@@ -113,6 +116,7 @@ impl RealKernel {
         version: &str,
         package_digest: &str,
         publisher_key_id: &str,
+        tree: &std::path::Path,
     ) -> Result<DriverPacked, KernelError> {
         let by = match &ctx.principal {
             Principal::Human { device_id } => device_id.clone(),
@@ -134,7 +138,7 @@ impl RealKernel {
         let mut installed = manifest.clone();
         installed.source = DriverSource::Installed;
         let root = self.install_root.join(&manifest.name).join(version);
-        self.check_context(&installed, &root)?;
+        self.check_context_with(&installed, &root, Some(tree))?;
         let row = DriverPacked {
             driver_id: manifest.driver_id(),
             name: manifest.name.clone(),

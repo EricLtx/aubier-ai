@@ -590,7 +590,10 @@ site, write no bytecode; not `-I`, which would drop the script's directory from
 named by `VK_DRIVER_INSTALL_ROOT`; the kernel reads it once when it is built
 and `vk status` prints it (`install root`). The kernel refuses a manifest that
 says `source: installed` outside it, and a development tree inside it, and a
-root that is not exactly `<name>/<MAJOR.MINOR.PATCH>` below it. `vk driver
+root that is not exactly `<name>/<MAJOR.MINOR.PATCH>` below it, and an
+installed manifest whose command is not the interpreter its package carries
+(`python/python.exe`, flags with `-B`, a `.py` script under the tree, both
+regular files there; ruling R-F2), at pack and at mount. `vk driver
 install` writes under the same root, with no daemon, and writes nothing before
 its checks pass: every digest of the layout; the annotations against
 the manifest (a name and a version are path components); the signature, under

@@ -265,6 +265,87 @@ fn installed_at(rel: &Path, name: &str) -> bool {
         if *n == name && v.to_str().is_some_and(crate::capital::is_version))
 }
 
+/// What an installed tree's `program.command` starts with: the interpreter
+/// its package carries, relative to the tree (`vk driver pack` writes it).
+pub const PACKED_INTERPRETER: &str = "python/python.exe";
+
+/// The interpreter flags an installed command may give before its script:
+/// CPython's options that take no argument and change nothing of *what*
+/// runs (`-B` no bytecode, `-E` no `PYTHON*`, `-s` no user site, `-I`, `-P`,
+/// `-S`, `-u`, `-O`, `-b`, `-d`, `-q`, `-R`, `-v`). Not `-c` and `-m`, which
+/// run something other than the script; not `-W` and `-X`, which take the
+/// next word; not `-i`, `-h`, `-V`, `-x` or a long option.
+const SCRIPT_FLAGS: &str = "BEsIPSuObdqRv";
+
+/// The command rule of [`RealKernel::check_context`] for `source: installed`
+/// (ruling R-F2): `command` is [`PACKED_INTERPRETER`], then one or more
+/// flags of [`SCRIPT_FLAGS`] (single or combined, `-sEB`) among which `B`,
+/// then a script — relative, plain names only, ending in `.py` — and
+/// whatever arguments follow it. With a `tree`, the interpreter and the
+/// script must be regular files under it (read without following a link).
+/// One I1 line, ending in the remedy: repack, since only `vk driver pack`
+/// writes such a command and a signed manifest cannot be edited.
+fn installed_command(command: &[String], tree: Option<&Path>) -> Result<(), KernelError> {
+    let refuse = |why: String| {
+        Err(KernelError::I1(format!(
+            "an installed driver runs the interpreter its package carries, and {why}; remedy: \
+             repack the driver with vk driver pack"
+        )))
+    };
+    if command.first().map(String::as_str) != Some(PACKED_INTERPRETER) {
+        return refuse(format!(
+            "its program.command does not start with {PACKED_INTERPRETER}"
+        ));
+    }
+    let rest = &command[1..];
+    let at = rest
+        .iter()
+        .position(|a| !a.starts_with('-'))
+        .unwrap_or(rest.len());
+    let flags = &rest[..at];
+    let known =
+        |flag: &String| flag.len() > 1 && flag[1..].chars().all(|c| SCRIPT_FLAGS.contains(c));
+    if !flags.iter().all(known) || !flags.iter().any(|f| f[1..].contains('B')) {
+        return refuse(format!(
+            "the flags before its script are not among -{SCRIPT_FLAGS} with -B"
+        ));
+    }
+    let script = match rest.get(at) {
+        Some(script) if script.ends_with(".py") && plain_relative(Path::new(script)) => script,
+        _ => {
+            return refuse(
+                "its program.command names no .py script under the tree after its flags".into(),
+            )
+        }
+    };
+    let Some(tree) = tree else {
+        return Ok(());
+    };
+    for (what, file) in [
+        (PACKED_INTERPRETER, tree.join("python").join("python.exe")),
+        (script.as_str(), tree.join(script)),
+    ] {
+        let regular = std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_file());
+        if !regular {
+            return refuse(format!(
+                "{what} is not a regular file under {}",
+                tree.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Relative and made of plain names only (`driver.py`, `sub/driver.py`,
+/// `./driver.py`), as the daemon's `under_root` reads a development
+/// command: no root, no drive, no `..`, and at least one name.
+fn plain_relative(path: &Path) -> bool {
+    path.components().any(|c| matches!(c, Component::Normal(_)))
+        && path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 /// `path` made absolute, with `.` dropped and `..` folded into its parent,
 /// without touching the disk.
 fn lexical(path: &Path) -> PathBuf {
@@ -389,11 +470,35 @@ impl RealKernel {
     ///   the manifest's and the version `MAJOR.MINOR.PATCH`;
     /// - a `development` root must not be: an installed tree mounts by
     ///   `name@version`, so it is fingerprinted whole and never hashed as a
-    ///   development directory.
+    ///   development directory;
+    /// - `source: installed` runs the interpreter its package carries
+    ///   (ruling R-F2, [`installed_command`]): `program.command` is
+    ///   `python/python.exe`, flags that change nothing of what runs among
+    ///   which `-B`, then a `.py` script under the tree, and
+    ///   `root/python/python.exe` and the script are regular files. A command
+    ///   naming `python` would run whatever PATH finds while the ledger says
+    ///   `source: installed`, outside the fingerprint and the signature.
     ///
     /// The two paths are compared as [`within`] does. Each refusal is I1 and
     /// names its remedy.
     pub fn check_context(&self, manifest: &DriverManifest, root: &Path) -> Result<(), KernelError> {
+        self.check_context_with(manifest, root, Some(root))
+    }
+
+    /// [`RealKernel::check_context`] for a tree that is not at `root` yet:
+    /// the path rules hold on `root`, where it will be installed, and the
+    /// command rule looks for the interpreter and the script under `tree`,
+    /// where the files are now — the copy `driver.pack` materialised in its
+    /// stage, which [`RealKernel::driver_packed`] is handed. `None` before
+    /// that copy exists: everything but those two files is checked, which is
+    /// the daemon's early refusal before a pack downloads anything; the pack
+    /// is checked again, whole, at `driver_packed`.
+    pub fn check_context_with(
+        &self,
+        manifest: &DriverManifest,
+        root: &Path,
+        tree: Option<&Path>,
+    ) -> Result<(), KernelError> {
         if manifest.execution_context == ExecutionContext::Service {
             return Err(KernelError::I1(
                 "the service mode ships with vk-agent; remedy: execution_context interactive"
@@ -426,7 +531,8 @@ impl RealKernel {
                     manifest.name
                 )))
             }
-            _ => Ok(()),
+            (DriverSource::Installed, _) => installed_command(&manifest.program.command, tree),
+            (DriverSource::Development, None) => Ok(()),
         }
     }
 

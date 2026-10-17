@@ -82,6 +82,9 @@ struct Built {
     lock: Vec<wheels::Locked>,
     fingerprint: String,
     archive: PathBuf,
+    /// The installed tree, materialised in the stage: what `driver_packed`
+    /// holds the packed command to.
+    tree: PathBuf,
 }
 
 /// `driver.pack {manifest, version, out, python_cache}`, for a principal
@@ -151,11 +154,16 @@ pub(crate) fn pack(
     })?;
     let script = crate::drivers::development_hold(&manifest, driver_dir)
         .map_err(|e| bad(&format!("{e:#}")))?;
+    // The installed copy, as far as it is known before the build: its
+    // source and its command. Held to the context rules now, all but the
+    // interpreter's file, which `driver_packed` checks in the built tree.
     manifest.source = DriverSource::Installed;
+    manifest.program.command = packed_command(&manifest.program.command, &script);
     let (key_source, state_dir) = {
         let k = lock(kernel)?;
         let installed_at = k.install_root().join(&manifest.name).join(&version);
-        k.check_context(&manifest, &installed_at).map_err(kerr)?;
+        k.check_context_with(&manifest, &installed_at, None)
+            .map_err(kerr)?;
         (k.publisher_key_source(), k.store().state_dir.clone())
     };
     // Loaded with the kernel lock released: a keyring read can block.
@@ -173,7 +181,6 @@ pub(crate) fn pack(
     )?;
     let mut packed = manifest;
     packed.program.files_sha256 = built.fingerprint.clone();
-    packed.program.command = packed_command(&packed.program.command, &script);
     packed
         .validate()
         .map_err(|e| internal(&format!("the packed manifest does not validate: {e}")))?;
@@ -228,7 +235,14 @@ pub(crate) fn pack(
         ..ctx
     };
     let row = lock(kernel)?
-        .driver_packed(&ctx, &packed, &version, &package_digest, &key.key_id())
+        .driver_packed(
+            &ctx,
+            &packed,
+            &version,
+            &package_digest,
+            &key.key_id(),
+            &built.tree,
+        )
         .map_err(kerr)?;
     written.keep();
     Ok(json!({
@@ -285,6 +299,7 @@ fn build(
         lock,
         fingerprint: tree.fingerprint,
         archive,
+        tree: tree.root,
     })
 }
 

@@ -21,9 +21,13 @@
 //! The installed trees here are laid out by hand, as `vk driver install`
 //! will: the driver's files, `manifest.json` (the package's manifest layer),
 //! and `.package/{manifest.json,signature.json}` (the image manifest and the
-//! publisher's signature over its digest). Their command is the test
-//! runner's own `python`, so a mount runs without the pinned release; when
-//! there is none on PATH a test says so on stderr and returns.
+//! publisher's signature over its digest). Their command is the packed one,
+//! `python/python.exe -E -s -B fake_driver.py` — the kernel refuses any
+//! other for an installed tree (ruling R-F2) — and their
+//! `python/python.exe` is a stand-in for the pinned release that runs the
+//! test runner's own Python ([`stand_in_interpreter`]), so a mount runs
+//! without the release; when there is no Python on PATH a test says so on
+//! stderr and returns.
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -100,29 +104,82 @@ fn manifest(name: &str, command: &[&str], files_sha256: &str, source: &str) -> V
     })
 }
 
+/// The command `vk driver pack` writes for [`FAKE_DRIVER`].
+const PACKED_COMMAND: [&str; 5] = ["python/python.exe", "-E", "-s", "-B", "fake_driver.py"];
+
+/// `<tree>/python/python.exe`, a stand-in for the pinned release that runs
+/// the test runner's own Python, so a hand-installed tree runs without the
+/// release. On Windows it is the venv launcher: the `python.exe` that
+/// `python -m venv --without-pip` writes, copied with the `pyvenv.cfg` it
+/// reads from its own directory, which runs the base interpreter that
+/// `pyvenv.cfg` names. Elsewhere, a shell script that runs `python3`. Both
+/// are regular files, as the kernel's command rule asks.
+fn stand_in_interpreter(tree: &Path) {
+    let dir = tree.join("python");
+    std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(windows)]
+    {
+        let scratch = tempfile::tempdir().unwrap();
+        let venv = scratch.path().join("v");
+        let made = Command::new(PYTHON)
+            .args(["-m", "venv", "--without-pip"])
+            .arg(&venv)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{PYTHON} -m venv: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        std::fs::copy(
+            venv.join("Scripts").join("python.exe"),
+            dir.join("python.exe"),
+        )
+        .unwrap();
+        std::fs::copy(venv.join("pyvenv.cfg"), dir.join("pyvenv.cfg")).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("python.exe");
+        std::fs::write(&exe, format!("#!/bin/sh\nexec {PYTHON} \"$@\"\n")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 /// An installed tree laid out by hand under `install_root`, as
-/// `vk driver install` lays one out: the driver's script, `manifest.json`
-/// (`source: installed`, its `files_sha256` the tree's fingerprint), and
-/// `.package/` holding the image manifest whose manifest layer is that very
-/// file and `key`'s signature over the image manifest's digest. Returns the
-/// tree and the package digest.
+/// `vk driver install` lays one out: the driver's script, the stand-in
+/// interpreter, `manifest.json` (`source: installed`, the packed command,
+/// its `files_sha256` the tree's fingerprint), and `.package/` holding the
+/// image manifest whose manifest layer is that very file and `key`'s
+/// signature over the image manifest's digest. Returns the tree and the
+/// package digest.
 fn install_by_hand(
     install_root: &Path,
     name: &str,
     version: &str,
     key: &PublisherKey,
 ) -> (PathBuf, String) {
+    install_by_hand_with(install_root, name, version, key, &PACKED_COMMAND)
+}
+
+/// [`install_by_hand`], the manifest naming `command`: a package its
+/// publisher signed whatever its command says.
+fn install_by_hand_with(
+    install_root: &Path,
+    name: &str,
+    version: &str,
+    key: &PublisherKey,
+    command: &[&str],
+) -> (PathBuf, String) {
     let root = install_root.join(name).join(version);
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("fake_driver.py"), FAKE_DRIVER).unwrap();
+    stand_in_interpreter(&root);
     let fingerprint = vk_capital::fingerprint::hash_tree(&root).unwrap();
-    let m: DriverManifest = serde_json::from_value(manifest(
-        name,
-        &[PYTHON, "-I", "fake_driver.py"],
-        &fingerprint,
-        "installed",
-    ))
-    .unwrap();
+    let m: DriverManifest =
+        serde_json::from_value(manifest(name, command, &fingerprint, "installed")).unwrap();
     let manifest_bytes = serde_json::to_vec(&m).unwrap();
     std::fs::write(root.join("manifest.json"), &manifest_bytes).unwrap();
     let scratch = tempfile::tempdir().unwrap();
@@ -882,6 +939,43 @@ async fn an_installed_tree_that_is_not_what_was_signed_is_refused_before_anythin
     assert!(!why.contains("well-formed"), "{err}");
     std::fs::remove_dir(&pin).unwrap();
 
+    assert!(!node.pool.has_host("fake"), "nothing runs");
+    assert!(!starts.exists(), "nothing ever ran");
+    assert!(node.events("driver.mounted").is_empty());
+    node.shutdown().await;
+}
+
+/// The kernel's command rule at mount (ruling R-F2): an installed tree
+/// whose signed manifest runs another interpreter than the one its package
+/// carries — here `python` from PATH, the hole the final review found — is
+/// refused before anything runs, though its signature, its manifest and
+/// its fingerprint all hold.
+#[tokio::test]
+async fn an_installed_manifest_that_runs_another_interpreter_is_refused_before_anything_runs() {
+    if !python_available() {
+        return;
+    }
+    let node = Node::start().await;
+    let key = node.publisher_key().await;
+    install_by_hand_with(
+        &node.install_root,
+        "fake",
+        "1.0.0",
+        &key,
+        &[PYTHON, "-I", "fake_driver.py"],
+    );
+    let starts = node.d.path().join("drivers/fake/work/starts.txt");
+    let err = node
+        .call_human("driver.mount", json!({"installed": "fake@1.0.0"}))
+        .await
+        .unwrap_err();
+    let e = call_error(&err);
+    assert_eq!(e.code, vk_ipc::E_INVARIANT, "{err}");
+    assert!(
+        e.message
+            .ends_with("; remedy: repack the driver with vk driver pack"),
+        "{err}"
+    );
     assert!(!node.pool.has_host("fake"), "nothing runs");
     assert!(!starts.exists(), "nothing ever ran");
     assert!(node.events("driver.mounted").is_empty());

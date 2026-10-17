@@ -115,6 +115,172 @@ fn open_installed(dir: &Path, install_root: &Path) -> RealKernel {
     common::open(dir).with_install_root(install_root)
 }
 
+/// The packed copy of [`common::maskai_like`], as `vk driver pack` writes
+/// it: `source: installed`, run by the interpreter its package carries.
+fn packed_like() -> vk_contracts::driver::DriverManifest {
+    let mut m = common::maskai_like();
+    m.source = DriverSource::Installed;
+    m.program.command = ["python/python.exe", "-E", "-s", "-B", "driver.py"]
+        .map(String::from)
+        .to_vec();
+    m
+}
+
+/// `tree` made to hold what [`packed_like`]'s command names, as regular
+/// files: the interpreter at `python/python.exe` and the script. Returns
+/// `tree`.
+fn interpreter_in(tree: &Path) -> PathBuf {
+    std::fs::create_dir_all(tree.join("python")).unwrap();
+    std::fs::write(tree.join("python").join("python.exe"), b"MZ").unwrap();
+    std::fs::write(tree.join("driver.py"), b"print('hello')\n").unwrap();
+    tree.to_path_buf()
+}
+
+/// The command rule for `source: installed` (ruling R-F2): the kernel
+/// refuses, at mount, an installed manifest whose command is not the
+/// interpreter its package carries — `python/python.exe`, flags that
+/// change nothing of what runs and include `-B`, then a script under the
+/// tree — or whose tree holds no such interpreter or script as a regular
+/// file. A command that names `python` would run whatever PATH finds while
+/// the ledger said `source: installed`.
+#[test]
+fn an_installed_driver_runs_the_interpreter_its_package_carries() {
+    let t = tempfile::tempdir().unwrap();
+    let install_root = t.path().join("installed");
+    let mut k = open_installed(t.path(), &install_root);
+    let installed = interpreter_in(&install_root.join("maskai-1").join("1.0.0"));
+    let absolute = installed.join("driver.py").display().to_string();
+    let mount = |k: &mut RealKernel, command: &[&str]| {
+        let mut m = packed_like();
+        m.program.command = command.iter().map(|s| s.to_string()).collect();
+        k.mount_driver(
+            &common::human(1),
+            m,
+            installed.clone(),
+            true,
+            Some("sha256:dd".into()),
+        )
+    };
+    for command in [
+        &["python", "-I", "driver.py"][..],
+        &["python/python.exe", "-E", "-s", "driver.py"],
+        &["python/python.exe", "-B", "-c", "import os", "driver.py"],
+        &["python/python.exe", "-B", "-m", "driver"],
+        &["python/python.exe", "-B", "-i", "driver.py"],
+        &["python/python.exe", "-B", "../driver.py"],
+        &["python/python.exe", "-B", absolute.as_str()],
+        &["python/python.exe", "-B", "driver.txt"],
+        &["python/python.exe", "-B", "absent.py"],
+        &["python/python.exe", "-B"],
+        &["python\\python.exe", "-B", "driver.py"],
+        &["./python/python.exe", "-B", "driver.py"],
+    ] {
+        let e = mount(&mut k, command).unwrap_err();
+        assert!(matches!(e, KernelError::I1(_)), "{command:?}: {e}");
+        let e = e.to_string();
+        assert!(
+            e.ends_with("; remedy: repack the driver with vk driver pack"),
+            "{command:?}: {e}"
+        );
+        assert_eq!(e.lines().count(), 1, "{command:?}: {e}");
+    }
+    // The interpreter must be in the tree, as a regular file.
+    let python = installed.join("python").join("python.exe");
+    std::fs::remove_file(&python).unwrap();
+    let packed = ["python/python.exe", "-E", "-s", "-B", "driver.py"];
+    let e = mount(&mut k, &packed).unwrap_err().to_string();
+    assert!(e.contains("python.exe"), "{e}");
+    assert!(
+        e.ends_with("; remedy: repack the driver with vk driver pack"),
+        "{e}"
+    );
+    std::fs::create_dir(&python).unwrap();
+    let e = mount(&mut k, &packed).unwrap_err().to_string();
+    assert!(
+        e.ends_with("; remedy: repack the driver with vk driver pack"),
+        "{e}"
+    );
+    assert!(k.drivers().unwrap().is_empty(), "nothing was mounted");
+    assert!(
+        k.ledger()
+            .events()
+            .iter()
+            .all(|e| e.kind != "driver.mounted"),
+        "a refusal logs nothing"
+    );
+    std::fs::remove_dir(&python).unwrap();
+    std::fs::write(&python, b"MZ").unwrap();
+
+    // The command pack writes is accepted, and so are other flags that
+    // change nothing of what runs, combined or not, beside -B.
+    mount(
+        &mut k,
+        &["python/python.exe", "-sEB", "-u", "driver.py", "--arg"],
+    )
+    .unwrap();
+    k.unmount_driver(&common::human(2), "maskai-1", "operator")
+        .unwrap();
+    let row = mount(&mut k, &packed).unwrap();
+    assert_eq!(row.manifest.program.command, packed);
+}
+
+/// The same rule holds at pack time (ruling R-F2): `driver.packed` is
+/// refused for a command that is not the packed interpreter's, or for a
+/// tree — the copy the pack materialised — that holds no interpreter.
+#[test]
+fn driver_packed_holds_the_command_to_the_interpreter_in_the_packed_tree() {
+    let t = tempfile::tempdir().unwrap();
+    let mut k = common::open(t.path());
+    let tree = interpreter_in(&t.path().join("stage").join("tree"));
+    let mut dev_command = packed_like();
+    dev_command.program.command = ["python", "-I", "driver.py"].map(String::from).to_vec();
+    let e = k
+        .driver_packed(
+            &common::human(1),
+            &dev_command,
+            "1.0.0",
+            "sha256:a",
+            "sha256:b",
+            &tree,
+        )
+        .unwrap_err();
+    assert!(matches!(e, KernelError::I1(_)), "{e}");
+    assert!(
+        e.to_string()
+            .ends_with("; remedy: repack the driver with vk driver pack"),
+        "{e}"
+    );
+    let empty = t.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let e = k
+        .driver_packed(
+            &common::human(2),
+            &packed_like(),
+            "1.0.0",
+            "sha256:a",
+            "sha256:b",
+            &empty,
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("python.exe"), "{e}");
+    assert!(
+        k.ledger()
+            .events()
+            .iter()
+            .all(|e| e.kind != "driver.packed"),
+        "a refusal logs nothing"
+    );
+    k.driver_packed(
+        &common::human(3),
+        &packed_like(),
+        "1.0.0",
+        "sha256:a",
+        "sha256:b",
+        &tree,
+    )
+    .unwrap();
+}
+
 /// `<state_dir>/drivers/<name>/profile`, hashed as the mounted event does.
 fn profile_dir_hash(k: &RealKernel, name: &str) -> String {
     vk_contracts::hash_bytes(k.driver_dirs(name).profile.to_string_lossy().as_bytes())
@@ -147,9 +313,17 @@ fn the_publisher_key_is_created_once_self_pinned_and_shown() {
 fn driver_packed_is_a_human_act_on_the_ledger_with_the_six_hashes() {
     let t = tempfile::tempdir().unwrap();
     let mut k = common::open(t.path());
-    let m = common::maskai_like();
+    let m = packed_like();
+    let tree = interpreter_in(&t.path().join("tree"));
     let row = k
-        .driver_packed(&common::human(1), &m, "1.0.0", "sha256:aaaa", "sha256:bbbb")
+        .driver_packed(
+            &common::human(1),
+            &m,
+            "1.0.0",
+            "sha256:aaaa",
+            "sha256:bbbb",
+            &tree,
+        )
         .unwrap();
     assert_eq!(row.driver_id, m.driver_id());
     assert_eq!(row.name, "maskai-1");
@@ -164,7 +338,14 @@ fn driver_packed_is_a_human_act_on_the_ledger_with_the_six_hashes() {
 
     let before = k.ledger().events().len();
     let e = k
-        .driver_packed(&common::machine(2), &m, "1.0.0", "sha256:a", "sha256:b")
+        .driver_packed(
+            &common::machine(2),
+            &m,
+            "1.0.0",
+            "sha256:a",
+            "sha256:b",
+            &tree,
+        )
         .unwrap_err();
     assert!(matches!(e, KernelError::I1(_)), "{e}");
     assert!(
@@ -174,15 +355,22 @@ fn driver_packed_is_a_human_act_on_the_ledger_with_the_six_hashes() {
     );
     // The context rules hold at pack too, and a version that is not
     // MAJOR.MINOR.PATCH never becomes a path or a ledger field.
-    let mut service = common::maskai_like();
+    let mut service = packed_like();
     service.execution_context = ExecutionContext::Service;
     let e = k
-        .driver_packed(&common::human(3), &service, "1.0.0", "sha256:a", "sha256:b")
+        .driver_packed(
+            &common::human(3),
+            &service,
+            "1.0.0",
+            "sha256:a",
+            "sha256:b",
+            &tree,
+        )
         .unwrap_err();
     assert!(e.to_string().contains("ships with vk-agent"), "{e}");
     for bad in ["", "1.0", "1.0.0-rc1", "../../x", "1..0"] {
         let e = k
-            .driver_packed(&common::human(4), &m, bad, "sha256:a", "sha256:b")
+            .driver_packed(&common::human(4), &m, bad, "sha256:a", "sha256:b", &tree)
             .unwrap_err();
         assert!(matches!(e, KernelError::Gate(_)), "{bad:?}: {e}");
         assert!(e.to_string().contains("remedy:"), "{bad:?}: {e}");
@@ -277,10 +465,8 @@ fn an_installed_mount_records_the_package_digest_and_source() {
     let t = tempfile::tempdir().unwrap();
     let install_root = t.path().join("drivers-installed");
     let mut k = open_installed(t.path(), &install_root);
-    let installed = install_root.join("maskai-1").join("1.0.0");
-    std::fs::create_dir_all(&installed).unwrap();
-    let mut m = common::maskai_like();
-    m.source = DriverSource::Installed;
+    let installed = interpreter_in(&install_root.join("maskai-1").join("1.0.0"));
+    let m = packed_like();
     let row = k
         .mount_driver(
             &common::human(1),
@@ -320,8 +506,7 @@ fn an_installed_mount_records_the_package_digest_and_source() {
 
     // The same package again is the same mount (Ruling 13); another package
     // of the same driver is refused while this one is ready.
-    let mut m = common::maskai_like();
-    m.source = DriverSource::Installed;
+    let m = packed_like();
     let again = k
         .mount_driver(
             &common::human(2),

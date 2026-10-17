@@ -2533,11 +2533,52 @@ fn fake_manifest(name: &str, files_sha256: &str, source: &str) -> Value {
     })
 }
 
+/// `<tree>/python/python.exe`, a stand-in for the pinned release that runs
+/// the `python` on PATH (the same as `vk-ipc/tests/capital.rs`'s, copied):
+/// on Windows the venv launcher `python -m venv --without-pip` writes,
+/// copied with the `pyvenv.cfg` it reads beside it; elsewhere a shell script
+/// running `python3`. Both are regular files, as the kernel's command rule
+/// for an installed tree asks (ruling R-F2).
+fn stand_in_interpreter(tree: &std::path::Path) {
+    let dir = tree.join("python");
+    std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(windows)]
+    {
+        let scratch = tempfile::tempdir().unwrap();
+        let venv = scratch.path().join("v");
+        let made = Command::new("python")
+            .args(["-m", "venv", "--without-pip"])
+            .arg(&venv)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "python -m venv: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        std::fs::copy(
+            venv.join("Scripts").join("python.exe"),
+            dir.join("python.exe"),
+        )
+        .unwrap();
+        std::fs::copy(venv.join("pyvenv.cfg"), dir.join("pyvenv.cfg")).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("python.exe");
+        std::fs::write(&exe, "#!/bin/sh\nexec python3 \"$@\"\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 /// An installed tree laid out by hand, as `vk driver install` lays one out
 /// (the same as `vk-ipc/tests/capital.rs`'s, copied): the driver's script,
-/// `manifest.json` — `source: installed`, its `files_sha256` the tree's
-/// fingerprint — and `.package/` holding the image manifest whose manifest
-/// layer is that very file, and `key`'s signature over its digest.
+/// the stand-in interpreter, `manifest.json` — `source: installed`, the
+/// packed command, its `files_sha256` the tree's fingerprint — and
+/// `.package/` holding the image manifest whose manifest layer is that very
+/// file, and `key`'s signature over its digest.
 fn install_by_hand(
     install_root: &std::path::Path,
     name: &str,
@@ -2548,9 +2589,12 @@ fn install_by_hand(
     let root = install_root.join(name).join(version);
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("fake_driver.py"), FAKE_DRIVER).unwrap();
+    stand_in_interpreter(&root);
     let fingerprint = vk_capital::fingerprint::hash_tree(&root).unwrap();
-    let m: vk_contracts::driver::DriverManifest =
-        serde_json::from_value(fake_manifest(name, &fingerprint, "installed")).unwrap();
+    let mut manifest = fake_manifest(name, &fingerprint, "installed");
+    manifest["program"]["command"] =
+        serde_json::json!(["python/python.exe", "-E", "-s", "-B", "fake_driver.py"]);
+    let m: vk_contracts::driver::DriverManifest = serde_json::from_value(manifest).unwrap();
     let manifest_bytes = serde_json::to_vec(&m).unwrap();
     std::fs::write(root.join("manifest.json"), &manifest_bytes).unwrap();
     let scratch = tempfile::tempdir().unwrap();
