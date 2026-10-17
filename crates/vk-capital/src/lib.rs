@@ -6,5 +6,6 @@
 //! will hash and run, nothing that depends on the board.
 
 pub mod error;
+pub mod fingerprint;
 
 pub use error::CapitalError;
