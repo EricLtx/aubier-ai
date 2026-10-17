@@ -6,7 +6,7 @@
 
 .DESCRIPTION
   L'option du mode quotidien (spec P7, condition (b)). Pour le pilote, la façon documentée
-  reste le terminal dédié du runbook (docs/runbooks/recette-maskai.md, §3.2). La tâche lance
+  reste le terminal dédié du runbook (docs/technical/runbooks/recette-maskai.md, §3.2). La tâche lance
   la même ligne, à l'identique :
     vkd --auto-enroll-node --harness-timeout-secs 2700
 

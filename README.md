@@ -97,4 +97,4 @@ Proprietary — all rights reserved. See `LICENSE`.
 
 ---
 
-**Technical documentation (SP0 to the pilot: state directory, arches, harness, passkeys, Windows service, drivers, demo, recovery):** see `docs/technical-readme.md`. **Running a governed process on a node:** `docs/runbooks/`.
+**Technical documentation (SP0 to the pilot: state directory, arches, harness, passkeys, Windows service, drivers, demo, recovery):** see `docs/technical/technical-readme.md`. **Running a governed process on a node:** `docs/technical/runbooks/`.

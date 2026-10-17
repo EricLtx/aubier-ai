@@ -3,7 +3,7 @@
 Pour le fondateur, sur son nœud Windows, dans sa session interactive. Version du 2026-10-15.
 
 - Recette exécutée : `recipes/recette-maskai.json`, seize pas.
-- Procédure suivie : `docs/use-cases/recettage-chat-ia/PROCEDURE.md`.
+- Procédure suivie : `docs/functional/use-cases/recettage-chat-ia/PROCEDURE.md`.
 - Répétition à blanc : `recipes/recette-fixture.json`, huit pas, sur le banc d'essai local.
 
 Chaque étape donne la commande exacte, puis la ligne attendue (« Attendu »). Toutes les commandes se tapent dans PowerShell, à la racine du dépôt. Si la sortie ne ressemble pas à la ligne attendue, on s'arrête et on lit le §11 avant d'aller plus loin.
@@ -54,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File drivers\maskai-recette\setup.ps1
 ```
 Attendu, en première ligne, `python de base : ` suivi du chemin du 1.1, puis en dernières lignes :
 ```
-files_sha256 : sha256:cbb66e658807314c9211c91b29fd623609e20e9c9bc93a192a5934a12ebf9b39
+files_sha256 : sha256:94bb464d6e6dbe8559e02339952fb013e910e5e36f8209ccea2c7d21b6b0386e
 manifest.json : à jour
 manifest-fixture.json : à jour
 ```
@@ -415,7 +415,7 @@ Chaque ligne trouvée se remplace par un marqueur (`<IP-INTERNE>`, `<COMPTE>`), 
 
 Les PNG ne se cherchent pas par texte. Regardez-les un par un : le nom du compte apparaît-il dans l'en-tête de MaskAI ? Retirez du dossier ceux que vous ne publiez pas, et dites-le dans la section Traçabilité du rapport.
 ```powershell
-git add docs/use-cases/recettage-chat-ia/runs
+git add docs/functional/use-cases/recettage-chat-ia/runs
 git commit -m "recette(maskai): première recette gouvernée, rapport publié (version expurgée)"
 ```
 
@@ -537,7 +537,7 @@ Pour finir : Ctrl+C sur ce `vkd`, et fermez la fenêtre de `serve.py`. Puis `Rem
   - 2 `approval.recorded` pour la tâche qui publie : 1 de plus pour chaque verdict signé dans une tâche abandonnée ensuite ;
   - 1 `artefact.released` pour la publication de la tâche, plus 1 par lecture `vk artefact cat` (destination `terminal:…`), soit au moins 3.
 - [ ] Les 34 cas de N0 à N9 (`cases.json`, hors banc d'essai) ont chacun une ligne au journal, ou bien sont nommés NON TESTÉ dans le rapport avec la raison.
-- [ ] Le rapport, le journal et les preuves expurgés sont sous `docs/use-cases/recettage-chat-ia/runs/<date>/`. S'il reste un KO sécurité non corrigé, ils sont gardés privés et la raison est notée.
+- [ ] Le rapport, le journal et les preuves expurgés sont sous `docs/functional/use-cases/recettage-chat-ia/runs/<date>/`. S'il reste un KO sécurité non corrigé, ils sont gardés privés et la raison est notée.
 - [ ] Le delta avec `2026-10-13-maskai-benchmark.md` est écrit (notes par ENF, cinq défauts majeurs).
 - [ ] Le garde-dialogue s'est déclenché au moins une fois en test : `test_dialog_guard_reports_and_never_answers`, déjà vert.
 - [ ] La CI est verte.

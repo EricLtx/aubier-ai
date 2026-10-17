@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust workspace as today (`serde`, `schemars`, `jsonschema 0.30` already in `vk-contracts`, `windows` crate Job Objects via `vk-harness::confine`); Python 3.13 with `playwright` (Chromium/Chrome channel) for the driver and its fixture; `unittest` for Python tests.
 
-**Spec:** `docs/superpowers/specs/2026-10-14-device-driver-contract-and-recette-pilot-design.md`. Executors read both. **Two refinements the plan makes to the spec**, both recorded in the spec's status line at Task 0: (1) the word is **driver**, not device — `/drivers`, `DriverManifest`, `driver.act`, `driver.mounted|acted|unmounted`, `vk mount driver`, `vk_driver_act` — because `/devices` and `device.enrolled` already name the enrolled *human* devices (founder, 2026-10-14); (2) a complete N0–N9 recette needs **eleven** business actions, not eight (page-load measurement, free-text message, conversation listing, concurrent load join the list).
+**Spec:** `docs/technical/specs/2026-10-14-device-driver-contract-and-recette-pilot-design.md`. Executors read both. **Two refinements the plan makes to the spec**, both recorded in the spec's status line at Task 0: (1) the word is **driver**, not device — `/drivers`, `DriverManifest`, `driver.act`, `driver.mounted|acted|unmounted`, `vk mount driver`, `vk_driver_act` — because `/devices` and `device.enrolled` already name the enrolled *human* devices (founder, 2026-10-14); (2) a complete N0–N9 recette needs **eleven** business actions, not eight (page-load measurement, free-text message, conversation listing, concurrent load join the list).
 
 ## Order of work — the live recette comes first
 
@@ -85,9 +85,9 @@ drivers/maskai-recette/manifest.json     NEW: the DriverManifest the founder mou
 drivers/maskai-recette/fixture/index.html, fixture/serve.py   NEW: the local stand-in chat page
 drivers/maskai-recette/tests/test_driver.py                   NEW: 10/10 replay on the fixture, dialog guard, host refusal
 recipes/recette-maskai.json              NEW: the sixteen-step TaskRecipe
-docs/runbooks/recette-maskai.md          NEW: the founder's runbook for the live run
+docs/technical/runbooks/recette-maskai.md          NEW: the founder's runbook for the live run
 .github/workflows/ci.yml                 modified (Task 6): driver-browser job
-docs/technical-readme.md, contracts/tcb.md, contracts/README.md   modified (Task 6)
+docs/technical/technical-readme.md, contracts/tcb.md, contracts/README.md   modified (Task 6)
 ```
 
 ---
@@ -316,7 +316,7 @@ Expected: five new schema files written; all tests PASS including `schema_drift`
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/vk-contracts contracts docs/superpowers/specs
+git add crates/vk-contracts contracts docs/technical/specs
 git commit -m "feat(contracts): DriverManifest, driver.mounted/acted/unmounted payloads, TaskRecipe; three ledger kinds; hash_dir"
 ```
 
@@ -660,7 +660,7 @@ git commit -m "feat(daemon,mcp,cli): driver pool and driver.* syscalls outside t
 - Modify: `.gitignore` (`drivers/**/__pycache__/`, `drivers/**/.venv/`)
 
 **Interfaces:**
-- Consumes: protocol 1 of Task 1; `scripts/recette/evaluer.py` (`evaluate_case(case, obs, latency_budget_s)`), `scripts/recette/journal.py` (`add`, `effective`); oracles `docs/use-cases/recettage-chat-ia/corpus-v2/oracles-v2.json` and corpus files; the procedure's annexes A (stream interceptor on `/chat/stream`), B (textarea setter + `input` event + a typed space), and the paper-clip `input[type=file]`.
+- Consumes: protocol 1 of Task 1; `scripts/recette/evaluer.py` (`evaluate_case(case, obs, latency_budget_s)`), `scripts/recette/journal.py` (`add`, `effective`); oracles `docs/functional/use-cases/recettage-chat-ia/corpus-v2/oracles-v2.json` and corpus files; the procedure's annexes A (stream interceptor on `/chat/stream`), B (textarea setter + `input` event + a typed space), and the paper-clip `input[type=file]`.
 - Produces: the manifest the founder mounts and the eleven actions, each returning `result` with at least `{"text": "<one-line summary>"}` so `to_register` actions feed the register:
 
 | Action | args | Does | result | evidence |
@@ -746,8 +746,8 @@ git commit -m "feat(drivers): maskai-recette driver — protocol loop, eleven co
 ### Task 5: Recipe, runbook, and the first live recette (Opus; founder in the loop)
 
 **Files:**
-- Create: `recipes/recette-maskai.json`, `docs/runbooks/recette-maskai.md`
-- Create after the run: `docs/use-cases/recettage-chat-ia/runs/<date>/` (released by the kernel, then copied in by the runbook's last step)
+- Create: `recipes/recette-maskai.json`, `docs/technical/runbooks/recette-maskai.md`
+- Create after the run: `docs/functional/use-cases/recettage-chat-ia/runs/<date>/` (released by the kernel, then copied in by the runbook's last step)
 
 **Interfaces:**
 - Consumes: everything above. The recipe:
@@ -787,7 +787,7 @@ git commit -m "feat(drivers): maskai-recette driver — protocol loop, eleven co
 
 - [ ] **Step 2: Write the recipe** with all sixteen steps spelled out (no ellipsis in the committed file) and `TaskRecipe::validate` green: `vk task submit --steps recipes/recette-maskai.json` against the smoke daemon with mock arches creates a 16-step task (add this as a `vk-cli` smoke test with the arch ids replaced by the mock's).
 
-- [ ] **Step 3: Write the runbook** `docs/runbooks/recette-maskai.md` (French, embedded-engineer register, numbered, each step with the exact command and the expected output line):
+- [ ] **Step 3: Write the runbook** `docs/technical/runbooks/recette-maskai.md` (French, embedded-engineer register, numbered, each step with the exact command and the expected output line):
   1. Prerequisites per mount (spec P8): Python 3.13 + `pip install -r drivers/maskai-recette/requirements.txt` + `playwright install chromium` (or Chrome channel); `claude` on PATH if `claude-code` arches; `vk secret set anthropic` if API arch; no Docker needed.
   2. Build: `cargo build --release -p vk-cli -p vkd -p vk-mcp`.
   3. Start the interactive daemon: `vkd --foreground` in its own terminal (Task 7 adds the logon scheduled task; for the pilot a terminal is the documented way).
@@ -797,7 +797,7 @@ git commit -m "feat(drivers): maskai-recette driver — protocol loop, eleven co
   7. `vk task submit --steps recipes/recette-maskai.json` → task id.
   8. `vk task step <id>` (plan) → `vk harness run <id>` **ten times**, reading `vk task show <id>` between runs; on `waiting_human` (dialog), resolve in Chrome and re-run.
   9. `vk task step <id>` (judge) → `vk approve <id>` (KO sécurité + verdict) → `vk task step <id>` (draft) → `vk approve <id>` → `vk task step <id>` (release).
-  10. `vk ls /ledger` and `vk task show <id>`: the release path; copy the released directory into `docs/use-cases/recettage-chat-ia/runs/<date>/`, redact per constraint 5, commit.
+  10. `vk ls /ledger` and `vk task show <id>`: the release path; copy the released directory into `docs/functional/use-cases/recettage-chat-ia/runs/<date>/`, redact per constraint 5, commit.
   11. What to do on each failure mode of spec §6.
 
 - [ ] **Step 4: Dry run on the fixture** — a second recipe `recipes/recette-fixture.json` (N0 + one N4 step, mock arches) against `serve.py` with a `manifest-fixture.json` (`hosts: ["127.0.0.1"]`, `headless: true`) proves the whole chain end to end on the developer machine: plan → harness → judge → approve → draft → approve → release, `vk ls /ledger` shows `driver.mounted`, ≥ 4 `driver.acted`, 2 `approval.recorded`, 1 `artefact.released`. Record the ledger tail in the task report.
@@ -807,7 +807,7 @@ git commit -m "feat(drivers): maskai-recette driver — protocol loop, eleven co
 - [ ] **Step 6: Commit** — recipe, runbook, the fixture recipe, the smoke test, and the run directory.
 
 ```bash
-git add recipes docs/runbooks crates/vk-cli/tests docs/use-cases/recettage-chat-ia/runs
+git add recipes docs/runbooks crates/vk-cli/tests docs/functional/use-cases/recettage-chat-ia/runs
 git commit -m "feat(recette): sixteen-step MaskAI recipe, founder runbook, fixture dry run; first governed recette released"
 ```
 
@@ -820,7 +820,7 @@ git commit -m "feat(recette): sixteen-step MaskAI recipe, founder runbook, fixtu
 ### Task 6: CI `driver-browser` job, Windows containment test, documentation (Sonnet)
 
 **Files:**
-- Modify: `.github/workflows/ci.yml`, `docs/technical-readme.md`, `contracts/tcb.md`, `contracts/README.md`
+- Modify: `.github/workflows/ci.yml`, `docs/technical/technical-readme.md`, `contracts/tcb.md`, `contracts/README.md`
 - Test: the CI job itself; `crates/vk-driver/tests/fake_driver.rs::tree_is_contained_on_windows` already runs in `test` on `windows-latest`
 
 - [ ] **Step 1: CI job** — after `arch-ollama`, add:
@@ -839,7 +839,7 @@ git commit -m "feat(recette): sixteen-step MaskAI recipe, founder runbook, fixtu
       - run: python -I -m unittest discover -s drivers/maskai-recette/tests -t .
 ```
 
-- [ ] **Step 2: README** — in `docs/technical-readme.md` add after the arches sections "### Drivers: a browser this kernel controls" — what a driver is, `vk mount driver`, `vk driver ls|show|umount`, `vk ls /drivers`, the three ledger kinds, what `driver.acted` carries, the evidence as artefacts, `vk task submit --steps`, and the recette runbook link. Keep the register's voice (one fact per sentence).
+- [ ] **Step 2: README** — in `docs/technical/technical-readme.md` add after the arches sections "### Drivers: a browser this kernel controls" — what a driver is, `vk mount driver`, `vk driver ls|show|umount`, `vk ls /drivers`, the three ledger kinds, what `driver.acted` carries, the evidence as artefacts, `vk task submit --steps`, and the recette runbook link. Keep the register's voice (one fact per sentence).
 - [ ] **Step 3: TCB** — `contracts/tcb.md` gains "## Drivers (pilot)" with spec §11's text verbatim, plus the env variables the host passes and the fact that the driver's Python runs with `-I`.
 - [ ] **Step 4: contracts/README** — mention the five new schemas and that `driver_manifest.program.files_sha256` is `hash_dir`.
 - [ ] **Step 5: Push, arm a CI watcher (Windows job ≈ 45–60 min), fix what it says, commit.**
@@ -854,7 +854,7 @@ git commit -m "ci(driver-browser): fixture-driven driver tests on every push; do
 **Files:**
 - Modify: `crates/vk-kernel/tests/drivers.rs`, `crates/vk-ipc/tests/drivers.rs`, `crates/vk-driver/tests/fake_driver.rs`
 - Create: `scripts/vkd-logon-task.ps1` (registers a Windows scheduled task "Aubier vkd" at logon, `vkd --foreground`, restart on failure every minute up to 3 times — spec P7 condition (b))
-- Modify: `docs/runbooks/recette-maskai.md` step 3 to point at the script
+- Modify: `docs/technical/runbooks/recette-maskai.md` step 3 to point at the script
 
 - [ ] **Step 1: Tests to add** (each written failing first, then made green):
   - kernel: `hosts_seen_from_the_host_lands_on_driver_acted`; `evidence_bytes_count_toward_the_run_cap_and_oversize_fails_settle` (per-run 16 MiB via `bytes_attached`); `a_degraded_driver_can_be_remounted_after_umount`; `boot_marks_a_manifest_that_no_longer_validates_degraded`.

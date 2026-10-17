@@ -209,6 +209,8 @@ jobs:
         run: |
           pip install -r drivers/maskai-recette/requirements.txt
           python -m playwright install --with-deps chromium
+      - name: The documentation tree (docs/README.md filing rule, every named path exists)
+        run: python -I scripts/docs/check_docs.py
       - name: The driver contract tests (hello, framing, hash_dir)
         run: python -I -m unittest discover -s drivers -p "test_*.py" -t .
       - name: The MaskAI driver against its fixture page

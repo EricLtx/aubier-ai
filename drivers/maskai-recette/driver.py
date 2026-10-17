@@ -46,7 +46,7 @@ from urllib.parse import urlsplit
 
 DRIVER_DIR = Path(__file__).resolve().parent
 REPO = DRIVER_DIR.parent.parent
-RECETTE_DIR = REPO / "docs" / "use-cases" / "recettage-chat-ia"
+RECETTE_DIR = REPO / "docs" / "functional" / "use-cases" / "recettage-chat-ia"
 SCRIPTS_DIR = REPO / "scripts" / "recette"
 sys.path.insert(0, str(DRIVER_DIR.parent))
 
@@ -360,7 +360,7 @@ def verdict_inputs(cases: dict, cases_path: Path) -> list:
         files["scripts/recette/" + name] = SCRIPTS_DIR / name
     for rel in ORACLE_FILES:
         if (RECETTE_DIR / rel).exists():
-            files["docs/use-cases/recettage-chat-ia/" + rel] = RECETTE_DIR / rel
+            files["docs/functional/use-cases/recettage-chat-ia/" + rel] = RECETTE_DIR / rel
     for c in cases.values():
         if c.get("file"):
             p = case_file(c["file"])

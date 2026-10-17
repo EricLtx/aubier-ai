@@ -1,8 +1,8 @@
 # VerticalAI
 
 Self-improving, peer-to-peer, local-first orchestration runtime for businesses.
-Design: `docs/superpowers/specs/2026-09-22-verticalai-design.md`.
-Plan for this stage: `docs/superpowers/plans/2026-09-22-sp0-contracts-and-kernel-boundary.md`.
+Design: `docs/technical/specs/2026-09-22-verticalai-design.md`.
+Plan for this stage: `docs/archive/technical/plans/2026-09-22-sp0-contracts-and-kernel-boundary.md`.
 
 ## SP0 — contracts and kernel boundary
 
@@ -499,7 +499,7 @@ the flag-built task (`--goal`, `--artefact`, `--plan`, `--draft`, `--harness`,
 
 The first use is the MaskAI recette, sixteen steps. The procedure for the
 founder, in French, from the first boot to the release, is
-[`docs/runbooks/recette-maskai.md`](runbooks/recette-maskai.md). The driver's
+[`docs/technical/runbooks/recette-maskai.md`](runbooks/recette-maskai.md). The driver's
 tests run in CI (`driver-browser`) against a local fixture page in headless
 Chromium, with no network.
 
@@ -698,8 +698,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo-sp1.ps1
 Twelve minutes, a throwaway state directory, file keys, a private endpoint and
 an OS-chosen web port, so it never touches the node you already have. The
 recorded runs — both orders, the harness variant, the two proposals, the
-ledgers and the H1 verdict — are in `docs/demo/runs/2026-09-25/`, and
-`docs/demo/README.md` says what to expect, what it needs, and how to run the
+ledgers and the H1 verdict — are in `docs/functional/demo/runs/2026-09-25/`, and
+`docs/functional/demo/README.md` says what to expect, what it needs, and how to run the
 Windows Hello variant by hand.
 
 ### Installing on Windows
@@ -722,7 +722,7 @@ info`, and `claude` is on PATH — and warns rather than failing if either is
 missing, because installing the node and being ready to mount every arch are
 two different moments. If the binaries it is copying are not signed, it says
 so loudly: Smart App Control and SmartScreen will not be quiet about it
-either (`docs/sp1-gate-checklist.md`, item 1).
+either (`docs/archive/technical/sp1-gate-checklist.md`, item 1).
 
 `-Service` additionally registers and starts `vkd` as the `NT SERVICE\vkd`
 Windows service the next section describes — `vkd-service install`, then
@@ -1030,7 +1030,7 @@ with that set.
 
 ## The SP1 gate
 
-`docs/sp1-gate-checklist.md` is this stage's acceptance gate: eight items, run
+`docs/archive/technical/sp1-gate-checklist.md` is this stage's acceptance gate: eight items, run
 on a stock Windows 11 VirtualBox image with Smart App Control on, covering
 signed installation, the service identity, the store surviving a restart, the
 harness's fence and its network egress, the passkey ceremony under replay and

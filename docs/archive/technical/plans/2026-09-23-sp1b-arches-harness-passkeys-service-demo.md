@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Prerequisite:** SP1a complete (tag `sp1a`, master `6057c53`): the `vk` shell works against the mock arch, the whole-branch review is clean, CI is green on Windows/Ubuntu/macOS.
 
-**Revision note (2026-09-24).** The founder decided on 2026-09-24: (1) the local arch is a Gemma-class model served by **Ollama in a Docker container**, llama-server stays optional as the Vulkan iGPU path; (2) Claude joins through **the founder's Claude subscription**, i.e. a Claude Code adapter, while the Anthropic API adapters remain for customers and the EU-hosted case when keys exist; (3) a **`boot.forced` ledger event** is added (event-set change approved); (4) `policies_version` keeps being written as `"0"` on first boot; (5) no free cloud node for now. The SP1a final review's backlog (docs/superpowers/reviews/2026-09-24-sp1a-final-review.md: M1–M11, M13, M14, M16, N1–N4 and recommendations 1–8) is folded into Tasks 0, 1, 5, 8 and the new Task 10. Tasks 3–6 and 9 are unchanged from rev. 1 except where noted.
+**Revision note (2026-09-24).** The founder decided on 2026-09-24: (1) the local arch is a Gemma-class model served by **Ollama in a Docker container**, llama-server stays optional as the Vulkan iGPU path; (2) Claude joins through **the founder's Claude subscription**, i.e. a Claude Code adapter, while the Anthropic API adapters remain for customers and the EU-hosted case when keys exist; (3) a **`boot.forced` ledger event** is added (event-set change approved); (4) `policies_version` keeps being written as `"0"` on first boot; (5) no free cloud node for now. The SP1a final review's backlog (docs/archive/technical/reviews/2026-09-24-sp1a-final-review.md: M1–M11, M13, M14, M16, N1–N4 and recommendations 1–8) is folded into Tasks 0, 1, 5, 8 and the new Task 10. Tasks 3–6 and 9 are unchanged from rev. 1 except where noted.
 
 **Goal:** Replace the mock with governed real arches (Gemma in an Ollama container; Claude via the subscription; API arches when keys exist), run Claude Code as a confined harness through an MCP façade, make the human ceremony a WebAuthn passkey (Windows Hello now, iPhone later), install the kernel as a Windows service, sign the binaries, harden what the SP1a review flagged, and pass the SP1 demo: a client proposal drafted from a brief by Gemma and Claude co-working through the IR, approved with a passkey, with the roles swapped in a second run (H1).
 
@@ -10,7 +10,7 @@
 
 **Tech Stack:** SP1a stack plus `reqwest` (rustls, blocking, json), `sha2`, the `docker` CLI (no Docker crate), `windows` crate (Job Objects, security descriptors), `windows-service`, `webauthn-rs` 0.5, `axum`, `zeroize`; `aws-sdk-bedrockruntime` + `aws-config` only in Task 2b; signtool / Azure Trusted Signing in CI.
 
-**Spec:** design spec §3.3 (governor), §3.6 (ceremony), §3.7 (arches, manifests, learning modes), §3.8 (nodes, Windows packaging), §3.11, §5; SP1 design approved 2026-09-23 (§4 arches, §5 harness confinement with its stated caveat, §6 ceremony, §8 demo, §9 out of scope). Companion: `2026-09-23-sp1a-kernel-core-store-ipc-cli.md`; review: `docs/superpowers/reviews/2026-09-24-sp1a-final-review.md`.
+**Spec:** design spec §3.3 (governor), §3.6 (ceremony), §3.7 (arches, manifests, learning modes), §3.8 (nodes, Windows packaging), §3.11, §5; SP1 design approved 2026-09-23 (§4 arches, §5 harness confinement with its stated caveat, §6 ceremony, §8 demo, §9 out of scope). Companion: `2026-09-23-sp1a-kernel-core-store-ipc-cli.md`; review: `docs/archive/technical/reviews/2026-09-24-sp1a-final-review.md`.
 
 ## Execution tiering
 
@@ -55,8 +55,8 @@ crates/vk-store/src/*         modified (Task 10): DEK AAD, payload-tier modes, H
 crates/vk-cli/src/main.rs     modified: `vk mount ollama|claude-code|anthropic|bedrock|mock …`, `vk arch show`, `vk fsck`, `vk passkey enroll`, `vk approve --passkey`, `vk harness …`, `vk secret set`
 .github/workflows/ci.yml      modified: `arch-ollama` job (ubuntu, docker, test model), sign job, artifacts
 scripts/demo-sp1.ps1          the demo, end to end, both role orders (Ollama Gemma ↔ Claude)
-docs/demo/                    brief, README, recorded runs
-docs/sp1-gate-checklist.md    the VM gate
+docs/functional/demo/                    brief, README, recorded runs
+docs/archive/technical/sp1-gate-checklist.md    the VM gate
 ```
 
 ---
@@ -245,7 +245,7 @@ Unchanged from rev. 1. Applies to kernel-launched processes: the harness (Task 4
 - `JobGovernor::new(max_memory_bytes: u64, cpu_rate_percent: Option<u32>) -> Result<JobGovernor>` implementing `Governor::contain(&Child)`; `Drop` closes the handle (which kills the job). On Linux/macOS `NoopGovernor` logs "ungoverned" and the manifest sets `governed: false` until SP4 (cgroups / `sandbox-exec`).
 
 - [ ] **Step 1: Failing test** (Windows-only, `#[cfg(windows)]`): spawn `cmd /c ping -n 30 127.0.0.1` under a `JobGovernor`, drop the governor, assert the child exits within 2 s (`child.try_wait()` loop). Second test: a 64 MiB cap makes `powershell -c "$a = New-Object byte[] 268435456"` fail (non-zero exit) while the same command without the cap succeeds.
-- [ ] **Step 2: Implement** (the rev. 1 code block is in git history at `9da7859:docs/superpowers/plans/2026-09-23-sp1b-arches-harness-passkeys-service-demo.md` lines 246–279; field and constant names are from `windows` 0.5x–0.6x, expect a short compile-fix loop — that is what spike 3a is for).
+- [ ] **Step 2: Implement** (the rev. 1 code block is in git history at `9da7859:docs/archive/technical/plans/2026-09-23-sp1b-arches-harness-passkeys-service-demo.md` lines 246–279; field and constant names are from `windows` 0.5x–0.6x, expect a short compile-fix loop — that is what spike 3a is for).
 - [ ] **Step 3: Run, commit** — `feat(governor): Job Object containment for kernel-launched processes (Windows)`.
 
 ---
@@ -369,11 +369,11 @@ Installing, starting or controlling a Windows service needs an elevated prompt, 
 ### Task 7: The demo, both role orders (H1), scripted
 
 **Files:**
-- Create: `scripts/demo-sp1.ps1`, `docs/demo/brief/acme-brief.md` (a realistic two-page client brief for a freelance designer), `docs/demo/README.md`
+- Create: `scripts/demo-sp1.ps1`, `docs/functional/demo/brief/acme-brief.md` (a realistic two-page client brief for a freelance designer), `docs/functional/demo/README.md`
 
 **Interfaces:**
 - `demo-sp1.ps1 [-Roles gemma-plans|claude-plans|harness] [-Model <VK_DEMO_MODEL>]`: starts `vkd` (or uses the service), mounts Ollama (`vk mount ollama --model $Model`) and Claude Code (`vk mount claude-code`), creates the task with steps `[Plan(A), Draft(B), Judge(B), Approve, Release out]` where A/B are the Gemma and Claude arch ids in the chosen order (`harness` mode replaces Draft with `Harness(claude-code)`), drives `vk task step --all`, opens the passkey page, waits, verifies `<export_root>/out/*.proposal` exists, prints `vk dmesg -n 40` and `vk ledger verify`; then runs the swapped order and asserts the register's decisions from run 1 are absent in run 2's register (fresh task) but that run 2's plan (by Claude) and draft (by Gemma) both raised into the same IR fields — the H1 check is that `vk task show` for run 2 lists both arch ids on consecutive steps with a non-empty `decisions` after each. Every model call's measured `tokens_in`/`tokens_out` must appear in `vk task show` and `vk top` (the ledger shown by `vk dmesg` carries the infer events and payload hashes only — spec §3.9; Ruling 29). The "non-empty `decisions` after each" check reads the per-step `decisions` summary that `task.show` exposes as metadata under the I2 check (Ruling 28).
-- [ ] **Step 1: Write the brief and the script**; **Step 2: Run both orders on this machine**, save the two `vk dmesg` outputs under `docs/demo/runs/<date>/`; **Step 3: Commit** — `docs(demo): SP1 demo script, brief and recorded runs`.
+- [ ] **Step 1: Write the brief and the script**; **Step 2: Run both orders on this machine**, save the two `vk dmesg` outputs under `docs/functional/demo/runs/<date>/`; **Step 3: Commit** — `docs(demo): SP1 demo script, brief and recorded runs`.
 
 ---
 
@@ -390,7 +390,7 @@ Installing, starting or controlling a Windows service needs an elevated prompt, 
 
 **Files:**
 - Modify: `.github/workflows/ci.yml` (`sign` job: `azure/trusted-signing-action` when `AZURE_*` secrets exist, else `signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f cert.pfx` when `SIGNING_CERT_B64` exists; uploads `vk.exe`, `vkd.exe`, `vk-mcp.exe`, `vkd-service.exe` as artifacts), `.github/workflows/release.yml` (same binaries), `README.md`
-- Create: `docs/sp1-gate-checklist.md`, `scripts/install-windows.ps1` (copies signed binaries to `%LOCALAPPDATA%\Programs\VerticalAI`, adds to user PATH, checks Docker Desktop, runs `vkd-service install`)
+- Create: `docs/archive/technical/sp1-gate-checklist.md`, `scripts/install-windows.ps1` (copies signed binaries to `%LOCALAPPDATA%\Programs\VerticalAI`, adds to user PATH, checks Docker Desktop, runs `vkd-service install`)
 
 **Gate checklist (all must be ticked on the VirtualBox stock Windows 11 image with Smart App Control on):**
 1. Signed binaries install without SmartScreen/SAC prompts.
@@ -408,7 +408,7 @@ Installing, starting or controlling a Windows service needs an elevated prompt, 
 
 ### Task 10: SP1a review backlog — storage and kernel hardening
 
-From `docs/superpowers/reviews/2026-09-24-sp1a-final-review.md`. One commit per group; every item has a test that fails before the change.
+From `docs/archive/technical/reviews/2026-09-24-sp1a-final-review.md`. One commit per group; every item has a test that fails before the change.
 
 **Group A — key material (M4, N4; recommendation 6):** `zeroize` on `MasterKey`, DEKs, the node seed and their base64 strings (`ZeroizeOnDrop`, no `Clone` on key types); DEK wrapping uses the subject id as AEAD associated data so a `.dek` file renamed to another subject is detected on open; `shred` verifies the subject before destroying.
 **Group B — payload tier modes (N2):** blob directories 0700 and blob/DEK files 0600 on Unix, set explicitly.
