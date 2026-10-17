@@ -71,8 +71,26 @@ from urllib.parse import urlsplit
 DRIVER_DIR = Path(__file__).resolve().parent
 REPO = DRIVER_DIR.parent.parent
 RECETTE_DIR = REPO / "docs" / "functional" / "use-cases" / "recettage-chat-ia"
-SCRIPTS_DIR = REPO / "scripts" / "recette"
-sys.path.insert(0, str(DRIVER_DIR.parent))
+# Les dépendances hors du dossier du driver (règle R-T8a du chantier de paquetage). Installé, le
+# driver vit seul sous <racine>/<nom>/<version>/, sans dépôt autour : le paquet porte vkdriver,
+# evaluer.py et journal.py sous vendor/ (pack.json les nomme). vendor/ d'abord, le dépôt ensuite
+# (le développement, inchangé). inputs_sha256 les nomme par leur chemin dans le dépôt, d'où qu'ils
+# soient chargés : les mêmes octets donnent la même empreinte.
+VENDOR_DIR = DRIVER_DIR / "vendor"
+
+
+def _first_dir(candidates: tuple, needs: tuple) -> Path:
+    """Le premier dossier qui porte tous les fichiers `needs` ; à défaut le dernier (le dépôt), pour
+    que l'erreur d'import nomme le chemin du développement."""
+    for d in candidates:
+        if all((d / n).is_file() for n in needs):
+            return d
+    return candidates[-1]
+
+
+VKDRIVER_DIR = _first_dir((VENDOR_DIR / "vkdriver", DRIVER_DIR.parent / "vkdriver"), ("protocol.py", "hash_dir.py"))
+SCRIPTS_DIR = _first_dir((VENDOR_DIR / "recette", REPO / "scripts" / "recette"), ("evaluer.py", "journal.py"))
+sys.path.insert(0, str(VKDRIVER_DIR.parent))
 
 from vkdriver.hash_dir import hash_files, list_files  # noqa: E402
 from vkdriver.protocol import DriverRefusal, remaining_s, serve  # noqa: E402
@@ -784,15 +802,32 @@ def case_file(rel: str) -> Path | None:
     return None
 
 
+def calibration_files() -> list:
+    """vkdriver, evaluer.py et journal.py, sous leur chemin dans le dépôt, qu'ils viennent de
+    vendor/ (paquet installé) ou du dépôt (développement)."""
+    files = [("drivers/vkdriver/" + rel, path) for rel, path in list_files(str(VKDRIVER_DIR))]
+    files += [("scripts/recette/" + name, SCRIPTS_DIR / name) for name in ("evaluer.py", "journal.py")]
+    return sorted(files)
+
+
+def repo_key(p: Path) -> str:
+    """Le chemin d'un fichier du driver ou du corpus tel que le dépôt le nomme, où que soit installé
+    le driver."""
+    for base, prefix in ((DRIVER_DIR, "drivers/maskai-recette/"),
+                         (RECETTE_DIR, "docs/functional/use-cases/recettage-chat-ia/")):
+        try:
+            return prefix + p.resolve().relative_to(base.resolve()).as_posix()
+        except ValueError:
+            continue
+    raise ValueError(f"{p} is neither under the driver nor under the corpus")
+
+
 def verdict_inputs(cases: dict, cases_path: Path) -> list:
     """Ce qui fait un verdict sans être dans le dossier haché du driver (Ruling R18) :
     drivers/vkdriver, evaluer.py, journal.py, cases.json, les oracles et les fichiers du corpus
     que les cas joignent, en chemins relatifs à la racine du dépôt."""
     files = {CASES_REL: cases_path}
-    for rel, path in list_files(str(DRIVER_DIR.parent / "vkdriver")):
-        files["drivers/vkdriver/" + rel] = path
-    for name in ("evaluer.py", "journal.py"):
-        files["scripts/recette/" + name] = SCRIPTS_DIR / name
+    files.update(calibration_files())
     for rel in ORACLE_FILES:
         if (RECETTE_DIR / rel).exists():
             files["docs/functional/use-cases/recettage-chat-ia/" + rel] = RECETTE_DIR / rel
@@ -801,7 +836,7 @@ def verdict_inputs(cases: dict, cases_path: Path) -> list:
             p = case_file(c["file"])
             if p is None:
                 raise ValueError(f"case {c['id']}: file {c['file']} not found")
-            files[p.relative_to(REPO.resolve()).as_posix()] = p
+            files[repo_key(p)] = p
     return sorted(files.items())
 
 

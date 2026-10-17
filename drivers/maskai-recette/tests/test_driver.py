@@ -324,6 +324,52 @@ class ProfileAndBudgetTest(unittest.TestCase):
                                                    "attach_question", "concurrent"})
 
 
+class VendorLookupTest(unittest.TestCase):
+    """Ruling R-T8a: installed, the driver finds vkdriver, evaluer.py and journal.py under vendor/
+    first, the repository second; the calibration hash is the same either way (no browser)."""
+
+    PROBE = "\n".join([
+        "import importlib.util, json, sys",
+        "spec = importlib.util.spec_from_file_location('drv', sys.argv[1])",
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)",
+        "print(json.dumps({'protocol': sys.modules['vkdriver.protocol'].__file__,",
+        "                  'hash_dir': sys.modules['vkdriver.hash_dir'].__file__,",
+        "                  'evaluer': m.evaluer.__file__, 'journal': m.journal.__file__,",
+        "                  'inputs': [[k, str(p)] for k, p in m.calibration_files()]}))",
+    ])
+
+    def test_a_vendored_copy_is_imported_before_the_repository(self):
+        repo = os.path.dirname(os.path.dirname(DRIVER_DIR))
+        root = tempfile.mkdtemp(prefix="maskai-vendor-")
+        self.addCleanup(shutil.rmtree, root, True)
+        installed = os.path.join(root, "maskai-recette", "0.2.0")  # no repository around it
+        vendor = os.path.join(installed, "vendor")
+        shutil.copytree(os.path.join(repo, "drivers", "vkdriver"), os.path.join(vendor, "vkdriver"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        os.makedirs(os.path.join(vendor, "recette"))
+        for name in ("evaluer.py", "journal.py"):
+            shutil.copy(os.path.join(repo, "scripts", "recette", name), os.path.join(vendor, "recette", name))
+        shutil.copy(os.path.join(DRIVER_DIR, "driver.py"), installed)
+        out = subprocess.run([sys.executable, "-I", "-c", self.PROBE, os.path.join(installed, "driver.py")],
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        got = json.loads(out.stdout.splitlines()[-1])
+        for key in ("protocol", "hash_dir", "evaluer", "journal"):
+            self.assertTrue(os.path.realpath(got[key]).startswith(os.path.realpath(vendor)), (key, got[key]))
+        drv = load_driver()  # the repository's layout: no vendor/ beside it
+        self.assertEqual(drv.VKDRIVER_DIR, drv.DRIVER_DIR.parent / "vkdriver")
+        self.assertEqual(drv.SCRIPTS_DIR, drv.REPO / "scripts" / "recette")
+        here = drv.calibration_files()
+        self.assertEqual([k for k, _ in got["inputs"]], [k for k, _ in here], "the same names")
+        self.assertEqual(drv.hash_files([(k, p) for k, p in got["inputs"]]), drv.hash_files(here),
+                         "the same bytes under the same names: the same calibration hash")
+
+    def test_pack_json_names_the_vendored_dependencies(self):
+        with open(os.path.join(DRIVER_DIR, "pack.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"vendor": ["drivers/vkdriver", "scripts/recette/evaluer.py",
+                                                       "scripts/recette/journal.py"]})
+
+
 class FixtureBench(unittest.TestCase):
     """The fixture server and the helpers of the browser tests (no test of its own)."""
 
