@@ -38,20 +38,20 @@
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vk_contracts::driver::{DriverAction, DriverManifest};
 use vk_harness::confine::Governor;
-use vk_harness::launch::kill_tree;
 use vk_harness::netwatch;
 
+pub mod link;
 pub mod protocol;
 
+use link::{open_no_follow, DriverLink, LocalLink, SpawnSpec};
 use protocol::HelloLine;
 pub use protocol::{EvidenceRef, Hello, Request, Response, RESPONSE_REASONS};
 
@@ -64,10 +64,6 @@ pub const PROTOCOL: u32 = 1;
 const POLL_EVERY: Duration = Duration::from_millis(250);
 /// How often the driver's egress is sampled: the harness's own interval.
 const SAMPLE_EVERY: Duration = vk_harness::launch::SAMPLE_EVERY;
-/// How long a driver that closed its stdout gets to finish exiting on its own
-/// before what is left of its tree is killed and the exit read.
-const EXIT_GRACE: Duration = Duration::from_secs(2);
-
 /// The ceilings on what one action may hand back as evidence: per file, and
 /// summed over the action.
 #[derive(Debug, Clone, Copy)]
@@ -167,27 +163,21 @@ fn protocol(fault: ProtocolFault, detail: impl Into<String>) -> HostError {
     }
 }
 
-/// A running driver process and the host's end of its stdio. Owned by the
-/// daemon as a plain value; dropping it kills the tree and reaps the child.
+/// A running driver and the host's end of its link. Owned by the daemon as a
+/// plain value; dropping it kills the tree and reaps the child.
 pub struct DriverHost {
-    child: Child,
-    stdin: ChildStdin,
-    /// Every line the driver prints on stdout, from the reader thread, which
-    /// ends on its own when the pipe closes.
-    lines: Receiver<String>,
+    /// The driver's life and its lines: today a [`LocalLink`], the process
+    /// this daemon spawned. Declared before the governor so it is dropped —
+    /// the kill — first.
+    link: Box<dyn DriverLink>,
+    pid: u32,
     /// The governor the tree is under: asked for its process list at every
-    /// egress sample, and dropped last — after the kill in [`Drop`] — so a
-    /// Job Object closing terminates whatever the driver left running.
+    /// egress sample, and dropped last — after the link's kill — so a Job
+    /// Object closing terminates whatever the driver left running.
     governor: Box<dyn Governor>,
     governed: bool,
-    /// The tree has been signalled and the leader reaped — by a deadline or
-    /// STOP kill, the reap after the driver closed its stdout, or a
-    /// `try_wait` that saw it gone. Nothing signals it again: a reaped
-    /// leader's id is free for reuse, and a group signal sent later could
-    /// reach someone else's group (the harness's M18 rule).
-    swept: bool,
-    /// Every time the host signals the driver's tree ([`signal_tree`]),
-    /// counted; shared with [`TreeSignals`] so a test reads it after the drop.
+    /// Every time the driver's tree is signalled, counted; shared with the
+    /// link and with [`TreeSignals`] so a test reads it after the drop.
     signals: Arc<AtomicU32>,
     next_id: u64,
     hello: Hello,
@@ -286,7 +276,6 @@ impl DriverHost {
         })?;
         let log_path = work_dir.join("driver.log");
         let log = open_log(&log_path)?;
-        let child_stderr = open_log(&log_path)?;
         let evidence_root = std::path::absolute(evidence_root).map_err(|e| {
             host_io(
                 ProtocolFault::NotStarted,
@@ -295,52 +284,58 @@ impl DriverHost {
             )
         })?;
 
-        let mut cmd = Command::new(program);
-        cmd.args(&argv[1..])
-            .current_dir(work_dir)
-            .env("VK_DRIVER_PROFILE_DIR", profile_dir)
-            .env("VK_DRIVER_WORK_DIR", work_dir)
-            .env(
-                "VK_DRIVER_HEADLESS",
-                if manifest.program.headless { "1" } else { "0" },
-            )
-            .env(
-                "VK_DRIVER_CHANNEL",
-                manifest.program.browser_channel.as_deref().unwrap_or(""),
-            )
-            .env("VK_DRIVER_HOSTS", manifest.hosts.join(","))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(child_stderr));
-        #[cfg(unix)]
-        {
-            // The driver leads its own process group, so `kill_tree` can
-            // signal the group: the harness's `spawn` does the same.
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        let mut child = cmd.spawn().map_err(|e| {
+        let spec = SpawnSpec {
+            argv: argv.clone(),
+            work_dir: work_dir.to_path_buf(),
+            env: vec![
+                (
+                    "VK_DRIVER_PROFILE_DIR".into(),
+                    profile_dir.display().to_string(),
+                ),
+                ("VK_DRIVER_WORK_DIR".into(), work_dir.display().to_string()),
+                (
+                    "VK_DRIVER_HEADLESS".into(),
+                    if manifest.program.headless { "1" } else { "0" }.into(),
+                ),
+                (
+                    "VK_DRIVER_CHANNEL".into(),
+                    manifest
+                        .program
+                        .browser_channel
+                        .as_deref()
+                        .unwrap_or("")
+                        .into(),
+                ),
+                ("VK_DRIVER_HOSTS".into(), manifest.hosts.join(",")),
+            ],
+            log_file: log_path.clone(),
+        };
+        let signals = Arc::new(AtomicU32::new(0));
+        let mut link: Box<dyn DriverLink> = Box::new(LocalLink::new(Arc::clone(&signals)));
+        let spawned = link.spawn(spec).map_err(|e| {
             protocol(
                 ProtocolFault::NotStarted,
                 format!(
-                    "`{program}` could not be started in {}: {e}",
-                    work_dir.display()
+                    "`{program}` could not be started in {}: {}",
+                    work_dir.display(),
+                    cause(e)
                 ),
             )
         })?;
 
         // Immediately after spawn, before the child can do much: contain the
         // tree, and remember whether the OS confirmed it.
-        let signals = Arc::new(AtomicU32::new(0));
-        let governed = match governor.contain(&child) {
+        let child = link
+            .child()
+            .expect("a LocalLink holds its child once it has spawned");
+        let governed = match governor.contain(child) {
             Ok(()) => governor.governed(),
             Err(e) => {
                 if cfg!(windows) {
                     // Fail closed: the platform has a governor and it refused,
                     // so the driver does not run at all.
                     tracing::error!(error = %format!("{e:#}"), "driver not contained: killed before it ran");
-                    signal_tree(&mut child, &signals);
-                    let _ = child.wait();
+                    let _ = link.kill();
                     return Err(protocol(
                         ProtocolFault::NotContained,
                         format!("not contained: {e:#}"),
@@ -350,45 +345,32 @@ impl DriverHost {
                 false
             }
         };
+        link.set_governed(governed);
 
-        let stdin = child.stdin.take().expect("stdin was piped");
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let lines = read_lines(stdout);
-
-        let hello = match await_hello(
-            &lines,
-            &mut child,
-            hello_timeout,
-            manifest,
-            governed,
-            &signals,
-        ) {
+        let hello = match await_hello(link.as_mut(), hello_timeout, manifest) {
             Ok(hello) => hello,
             Err(e) => {
                 tracing::warn!(error = %e, "driver refused at hello; tree killed");
                 // A driver that died before its hello was swept, then reaped,
                 // by `await_hello`: its id is not signalled again.
                 if !matches!(e, HostError::Dead(_)) {
-                    signal_tree(&mut child, &signals);
+                    let _ = link.kill();
                 }
-                let _ = child.wait();
                 return Err(e);
             }
         };
         tracing::info!(
             driver = %hello.driver,
             version = %hello.version,
-            pid = child.id(),
+            pid = spawned.pid,
             governed,
             "driver mounted"
         );
         Ok(DriverHost {
-            child,
-            stdin,
-            lines,
+            link,
+            pid: spawned.pid,
             governor,
             governed,
-            swept: false,
             signals,
             next_id: 1,
             hello,
@@ -409,7 +391,7 @@ impl DriverHost {
     /// will signal it again. A test's read-back only.
     #[doc(hidden)]
     pub fn swept(&self) -> bool {
-        self.swept
+        self.link.swept()
     }
 
     /// Every process the governor holds for this driver, as the governor
@@ -438,7 +420,7 @@ impl DriverHost {
     /// leads. What the daemon keeps while an act holds the host, so an
     /// unmount can kill the tree with [`kill_pid_tree`].
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.pid
     }
 
     /// Has the driver process exited? `Some` once it has been reaped — after
@@ -451,15 +433,10 @@ impl DriverHost {
     /// reaping it ([`exited`]), what it left behind swept ([`sweep`]), then
     /// the reap. `shutdown` and `Drop` send nothing more to its id.
     pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        if self.swept {
-            return self.child.try_wait();
-        }
-        if !exited(&mut self.child)? {
-            return Ok(None);
-        }
-        sweep(&mut self.child, self.governed, &self.signals);
-        self.swept = true;
-        self.child.wait().map(Some)
+        self.link.try_wait().map_err(|e| match e {
+            link::LinkError::Io(e) => e,
+            other => std::io::Error::other(other.to_string()),
+        })
     }
 
     /// One act. Creates `<evidence_root>/<id>/`, writes the request line, and
@@ -504,8 +481,7 @@ impl DriverHost {
             deadline_ms: millis(deadline),
             evidence_dir: dir.display().to_string(),
         };
-        let mut line = serde_json::to_string(&request).expect("a request always serialises");
-        line.push('\n');
+        let line = serde_json::to_string(&request).expect("a request always serialises");
 
         let outcome = self
             .exchange(id, &line, deadline, should_stop)
@@ -535,11 +511,11 @@ impl DriverHost {
     }
 
     /// Kill the tree and reap the child. Dropping the host does the same.
-    pub fn shutdown(mut self) {
-        self.terminate();
+    pub fn shutdown(self) {
+        drop(self);
     }
 
-    /// Write the request line and wait for its response, under the deadline,
+    /// Send the request line and wait for its response, under the deadline,
     /// the STOP poll and the egress sampling. Every exit of this wait that
     /// leaves the driver out of step — deadline, STOP, a foreign id, an
     /// unreadable response — kills the tree first.
@@ -551,18 +527,15 @@ impl DriverHost {
         should_stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<Exchange, HostError> {
         let started = Instant::now();
-        if let Err(e) = self
-            .stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| self.stdin.flush())
-        {
+        if let Err(e) = self.link.send_line(line) {
             let exit = self.settle_dead();
             return Err(HostError::Dead(format!(
-                "{exit} (the request could not be written: {e})"
+                "{exit} (the request could not be written: {})",
+                cause(e)
             )));
         }
         let deadline_at = started + deadline;
-        let leader = self.child.id();
+        let leader = self.pid;
         let mut hosts = BTreeSet::new();
         let mut last_sample: Option<Instant> = None;
         let response = loop {
@@ -589,8 +562,8 @@ impl DriverHost {
                 self.kill("deadline");
                 return Err(HostError::Timeout);
             }
-            match self.lines.recv_timeout(POLL_EVERY.min(deadline_at - now)) {
-                Ok(text) => match classify(&text, id) {
+            match self.link.recv_line(now + POLL_EVERY.min(deadline_at - now)) {
+                Ok(Some(text)) => match classify(&text, id) {
                     Line::Response(response) => break response,
                     Line::Other => self.log_line(&text),
                     Line::Foreign(other) => {
@@ -608,10 +581,8 @@ impl DriverHost {
                         ));
                     }
                 },
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(HostError::Dead(self.settle_dead()));
-                }
+                Ok(None) => {}
+                Err(_) => return Err(HostError::Dead(self.settle_dead())),
             }
         };
         Ok(Exchange {
@@ -738,60 +709,14 @@ impl DriverHost {
     /// Kill the driver tree now and reap the child: the signal first, while
     /// the leader still pins its id, then the reap.
     fn kill(&mut self, why: &str) {
-        tracing::warn!(pid = self.child.id(), why, "driver tree killed");
-        signal_tree(&mut self.child, &self.signals);
-        // `kill_tree` ends with this too; said again here so a `taskkill` that
-        // failed cannot leave the wait below open-ended.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.swept = true;
+        tracing::warn!(pid = self.pid, why, "driver tree killed");
+        let _ = self.link.kill();
     }
 
-    /// The driver closed its stdout: its exit, worded for a `Dead` message.
-    /// The first time, [`reap`] sweeps the tree and settles it; a leader
-    /// already swept and reaped — a second act on a dead host — is only read
-    /// back, its id never signalled again.
+    /// The driver closed its stdout: its exit, worded for a `Dead` message
+    /// (see [`DriverLink::settle_dead`]).
     fn settle_dead(&mut self) -> String {
-        if self.swept {
-            return match self.child.try_wait() {
-                Ok(Some(status)) => exit_label(status),
-                Ok(None) => "killed; exit not read".into(),
-                Err(e) => format!("exit unreadable: {e}"),
-            };
-        }
-        let exit = reap(&mut self.child, self.governed, &self.signals);
-        self.swept = true;
-        exit
-    }
-
-    /// Kill what still runs and reap; idempotent, so `shutdown` and `Drop`
-    /// may both run it. A tree already swept — killed at a deadline or a
-    /// STOP, reaped after it closed its stdout, seen gone by `try_wait` — is
-    /// left as it is: its leader is reaped and its id may name another group
-    /// by now. Otherwise in M18's order: a leader seen exited — observed
-    /// without reaping it ([`exited`]) — has what it left behind swept where
-    /// no governor will ([`sweep`]), a leader still running (or whose exit
-    /// cannot be observed) has its tree killed, and only then is it reaped.
-    /// Under the Job Object the drop of the governor, right after this, ends
-    /// what is left.
-    fn terminate(&mut self) {
-        if !self.swept {
-            match exited(&mut self.child) {
-                Ok(true) => sweep(&mut self.child, self.governed, &self.signals),
-                Ok(false) | Err(_) => {
-                    signal_tree(&mut self.child, &self.signals);
-                    let _ = self.child.kill();
-                }
-            }
-            self.swept = true;
-        }
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for DriverHost {
-    fn drop(&mut self) {
-        self.terminate();
+        settle(self.link.as_mut())
     }
 }
 
@@ -840,22 +765,19 @@ pub fn kill_pid_tree(pid: u32) {
 
 /// The driver's first line, within `timeout`: a hello of this protocol whose
 /// actions cover the manifest's. The caller kills the tree on an `Err` other
-/// than `Dead`, which [`reap`] has already settled.
+/// than `Dead`, which the link has already settled.
 fn await_hello(
-    lines: &Receiver<String>,
-    child: &mut Child,
+    link: &mut dyn DriverLink,
     timeout: Duration,
     manifest: &DriverManifest,
-    governed: bool,
-    signals: &AtomicU32,
 ) -> Result<Hello, HostError> {
-    let line = match lines.recv_timeout(timeout) {
-        Ok(line) => line,
-        Err(RecvTimeoutError::Timeout) => return Err(HostError::HelloTimeout(timeout)),
-        Err(RecvTimeoutError::Disconnected) => {
+    let line = match link.recv_line(Instant::now() + timeout) {
+        Ok(Some(line)) => line,
+        Ok(None) => return Err(HostError::HelloTimeout(timeout)),
+        Err(_) => {
             return Err(HostError::Dead(format!(
                 "{} before any hello",
-                reap(child, governed, signals)
+                settle(link)
             )));
         }
     };
@@ -909,157 +831,6 @@ fn classify(text: &str, id: u64) -> Line {
     }
 }
 
-/// The reader thread over the driver's stdout: one `String` per line, bytes
-/// that are not UTF-8 replaced rather than dropped. It ends on its own when
-/// the pipe closes or the host is gone.
-fn read_lines(stdout: impl Read + Send + 'static) -> Receiver<String> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let line = String::from_utf8_lossy(&buf);
-                    let line = line.trim_end_matches(['\n', '\r']);
-                    if tx.send(line.to_owned()).is_err() {
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-    });
-    rx
-}
-
-/// The driver closed its stdout. An exiting process closes its pipes a moment
-/// before it is gone, so it gets [`EXIT_GRACE`] to finish on its own and
-/// report its true exit. In M18's order: its exit is observed without reaping
-/// it ([`exited`]), what it may have left behind is swept ([`sweep`]), and
-/// only then is it reaped. One still running after the grace, or whose exit
-/// cannot be observed, has its tree killed and is then reaped; nothing is
-/// signalled after a reap. The answer is the exit, worded for a `Dead`
-/// message.
-fn reap(child: &mut Child, governed: bool, signals: &AtomicU32) -> String {
-    let until = Instant::now() + EXIT_GRACE;
-    loop {
-        match exited(child) {
-            Ok(true) => {
-                sweep(child, governed, signals);
-                return match child.wait() {
-                    Ok(status) => exit_label(status),
-                    Err(e) => format!("exit unreadable: {e}"),
-                };
-            }
-            Ok(false) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
-            Ok(false) => {
-                tracing::warn!(
-                    pid = child.id(),
-                    "driver closed its stdout but kept running; tree killed"
-                );
-                signal_tree(child, signals);
-                let _ = child.kill();
-                return match child.wait() {
-                    Ok(status) => format!(
-                        "stdout closed while running; killed ({})",
-                        exit_label(status)
-                    ),
-                    Err(e) => {
-                        format!("stdout closed while running; the kill could not be reaped: {e}")
-                    }
-                };
-            }
-            Err(e) => {
-                // Not observable without reaping: killed first, while the
-                // leader — alive or a zombie — still pins its id, then reaped.
-                tracing::warn!(pid = child.id(), error = %e, "driver exit not observable; tree killed");
-                signal_tree(child, signals);
-                let _ = child.kill();
-                return match child.wait() {
-                    Ok(status) => {
-                        format!("exit not observable ({e}); killed ({})", exit_label(status))
-                    }
-                    Err(e2) => format!("exit unreadable: {e}; {e2}"),
-                };
-            }
-        }
-    }
-}
-
-/// Has the leader exited? On Unix observed **without reaping it**
-/// (`vk_harness::launch::exited_unreaped`, `waitid` with `WNOWAIT`): the
-/// zombie still pins its process group's id while the group is signalled
-/// (M18). On Windows there is no process group, and `try_wait` is the
-/// observation; the host's handle keeps the id from being reused anyway.
-fn exited(child: &mut Child) -> std::io::Result<bool> {
-    #[cfg(unix)]
-    {
-        vk_harness::launch::exited_unreaped(child)
-    }
-    #[cfg(not(unix))]
-    {
-        child.try_wait().map(|status| status.is_some())
-    }
-}
-
-/// Signal the driver's whole tree — `taskkill /T /F` on Windows, `SIGKILL`
-/// to the process group it leads on Unix — and count it. Every caller does
-/// this before the leader is reaped.
-fn signal_tree(child: &mut Child, signals: &AtomicU32) {
-    signals.fetch_add(1, Ordering::SeqCst);
-    kill_tree(child);
-}
-
-/// Sweep what a leader that has exited may have left behind, where no
-/// governor will. Called once per host (`swept`), between the observation of
-/// the exit ([`exited`]) and the reap: on Unix the leader is then an unreaped
-/// zombie, which pins its process group's id, so the group signal cannot
-/// reach another group (M18); on Windows an ungoverned tree gets
-/// `taskkill /T` as a best effort (it finds children by parent pid, and
-/// nothing once the parent is gone), while a governed tree is left to the
-/// Job Object, which terminates every member when the governor drops.
-fn sweep(child: &mut Child, governed: bool, signals: &AtomicU32) {
-    if cfg!(unix) || !governed {
-        signal_tree(child, signals);
-    }
-}
-
-fn exit_label(status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("exit code {code}"),
-        None => status.to_string(),
-    }
-}
-
-/// Open `path` for reading without following a link at it: on Windows
-/// `FILE_FLAG_OPEN_REPARSE_POINT` opens a reparse point (a symlink, a
-/// junction) as itself and never as its target; on Unix `O_NOFOLLOW` refuses
-/// a symlink at the final component, and `O_NONBLOCK` keeps a FIFO planted
-/// at the name between the caller's check and this open from blocking the
-/// open for ever (a regular file reads the same with it). What the handle
-/// then is, its metadata says, and the caller refuses anything but a regular
-/// file.
-fn open_no_follow(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    options.open(path)
-}
-
 /// The artefact-kind rule, as `vk_contracts::driver::plain_token` states it
 /// (crate-private there, so re-stated here rather than widening that API):
 /// 1 to 32 bytes of `[A-Za-z0-9._-]`, not starting with `.`.
@@ -1069,6 +840,20 @@ fn plain_token(s: &str) -> bool {
         && !s.starts_with('.')
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A link failure worded for a `detail`: an I/O error as the OS says it, the
+/// rest as the link does.
+fn cause(e: link::LinkError) -> String {
+    match e {
+        link::LinkError::Io(e) => e.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// How the driver ended, once its link is closed ([`DriverLink::settle_dead`]).
+fn settle(link: &mut dyn DriverLink) -> String {
+    link.settle_dead().unwrap_or_else(cause)
 }
 
 fn open_log(path: &Path) -> Result<File, HostError> {
