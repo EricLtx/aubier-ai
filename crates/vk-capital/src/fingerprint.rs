@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -30,7 +31,8 @@ fn excluded(rel: &Path) -> bool {
 
 /// Every regular file under `dir`, keyed by its `/`-joined relative path
 /// (bytes, so the map iterates in the order `hash_dir` sorts). Links are
-/// neither followed nor listed.
+/// neither followed nor listed. Two names with one lossy UTF-8 spelling are
+/// an `InvalidData` error: dropping one would leave a file out of the digest.
 fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<Vec<u8>, PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -49,7 +51,21 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<Vec<u8>, PathBuf>) -> std::i
                 .collect::<Vec<_>>()
                 .join("/")
                 .into_bytes();
-            out.insert(key, path);
+            match out.entry(key) {
+                Entry::Vacant(v) => {
+                    v.insert(path);
+                }
+                Entry::Occupied(o) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "{} and {} have one spelling once made UTF-8; rename one",
+                            o.get().display(),
+                            path.display()
+                        ),
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -265,5 +281,39 @@ mod tests {
             hash_tree(a.path()).unwrap(),
             vk_contracts::driver::hash_dir(a.path()).unwrap()
         );
+    }
+    #[test]
+    fn per_machine_dirs_are_hashed_unlike_hash_dir() {
+        // The documented divergence from `hash_dir`: an installed tree has no
+        // per-machine directory to leave out, so a change under one counts.
+        for dir in [".venv", "tests", "fixture"] {
+            let a = tempfile::tempdir().unwrap();
+            tree(a.path());
+            fs::create_dir_all(a.path().join(dir)).unwrap();
+            fs::write(a.path().join(dir).join("x"), b"1").unwrap();
+            let f1 = hash_tree(a.path()).unwrap();
+            fs::write(a.path().join(dir).join("x"), b"2").unwrap();
+            assert_ne!(hash_tree(a.path()).unwrap(), f1, "{dir}");
+        }
+    }
+    #[cfg(windows)]
+    fn not_unicode() -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xD800]) // a lone surrogate
+    }
+    #[cfg(unix)]
+    fn not_unicode() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![0xFF])
+    }
+    #[test]
+    fn two_names_with_one_lossy_spelling_are_an_error_not_a_dropped_file() {
+        let a = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("\u{FFFD}"), b"A").unwrap();
+        if fs::write(a.path().join(not_unicode()), b"B").is_err() {
+            return; // the file system refuses the name (APFS): nothing can collide
+        }
+        let e = hash_tree(a.path()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
     }
 }

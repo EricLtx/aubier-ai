@@ -7,5 +7,6 @@
 
 pub mod error;
 pub mod fingerprint;
+pub mod layout;
 
 pub use error::CapitalError;
