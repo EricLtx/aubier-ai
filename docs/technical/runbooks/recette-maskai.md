@@ -54,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File drivers\maskai-recette\setup.ps1
 ```
 Attendu, en première ligne, `python de base : ` suivi du chemin du 1.1, puis en dernières lignes :
 ```
-files_sha256 : sha256:94bb464d6e6dbe8559e02339952fb013e910e5e36f8209ccea2c7d21b6b0386e
+files_sha256 : sha256:3cb03ec79992e1146bbbe9d6265a6c4a1ed3d8328b572f842b0090fd550a2cb8
 manifest.json : à jour
 manifest-fixture.json : à jour
 ```

@@ -85,7 +85,8 @@ SELECTORS = {
     "file_input": 'input[type="file"]',
     # Bouton « nouvelle conversation » (sélecteurs Playwright) ; à défaut, retour à ENTRY_URL.
     # À confirmer : l'interface de MaskAI est en anglais (« New chat » ?).
-    "new_conversation": ['[aria-label*="Nouvelle"]', 'button:has-text("Nouvelle conversation")',
+    "new_conversation": ['a[href="/new"][data-slot="button"]',
+                         '[aria-label*="Nouvelle"]', 'button:has-text("Nouvelle conversation")',
                          '[aria-label*="New chat" i]', 'button:has-text("New chat")',
                          'a:has-text("New chat")', '[aria-label*="New conversation" i]'],
     # Bouton d'envoi quand Entrée n'envoie pas (CSS). À confirmer.
@@ -96,7 +97,11 @@ SELECTORS = {
     "stop_button": ['button[aria-label*="Stop" i]', 'button[aria-label*="Arrêter" i]'],
     "stop_text": r"stop generating|arrêter",
     # Messages de l'assistant ; le dernier est la réponse (CSS). À confirmer.
-    "assistant_message": ['[data-role="assistant"]', '[data-message-author-role="assistant"]',
+    # Vu le 17 octobre : <article aria-label="MASKAI response"> contenant <div class="prose-llm">.
+    # Les aria-label sont localisés (anglais ou français selon le profil), donc le sélecteur
+    # structurel passe en premier.
+    "assistant_message": ['article:has(.prose-llm)', 'article[aria-label="MASKAI response"]',
+                          '[data-role="assistant"]', '[data-message-author-role="assistant"]',
                           '.message.assistant', '[data-testid*="assistant-message"]'],
     # Puce de pièce jointe (CSS) et ses états lus dans aria-label ou le texte. « Indexing in
     # progress » puis « Failed » vus les 12 et 13 octobre ; la puce elle-même est à confirmer.
@@ -105,10 +110,11 @@ SELECTORS = {
     "attach_failed": r"failed|échec",
     "attach_pending": r"indexing|uploading|in progress|en cours|processing",
     # Conversations de la barre latérale (CSS). À confirmer.
-    "conversation_items": ['#conversations li', 'nav a[href*="/c/"]', 'nav a[href*="/chat/"]',
+    "conversation_items": ['a[href*="/conversation/"]',
+                           '#conversations li', 'nav a[href*="/c/"]', 'nav a[href*="/chat/"]',
                            '[data-testid*="conversation"]', 'aside li'],
     # Libellé du panneau « texte envoyé au modèle » (« SENT TO THE LLM » vu le 13 octobre).
-    "sent_label": r"sent to the llm|envoyé au modèle",
+    "sent_label": r"sent to the llm|envoy[ée] au mod[èe]le|texte envoy[ée]",
     # Fenêtres modales (CSS).
     "modal": '[role="dialog"], [role="alertdialog"], [aria-modal="true"], .modal',
 }
