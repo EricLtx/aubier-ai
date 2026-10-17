@@ -1,6 +1,6 @@
 # Runbook — recette MaskAI gouvernée (pilote Aubier, jalon A)
 
-Pour le fondateur, sur son nœud Windows, dans sa session interactive. Version du 2026-10-15.
+Pour le fondateur, sur son nœud Windows, dans sa session interactive. Version du 2026-10-17 : driver v2 (debrief `docs/technical/debriefs/2026-10-17-maskai-driver.md`).
 
 - Recette exécutée : `recipes/recette-maskai.json`, seize pas.
 - Procédure suivie : `docs/functional/use-cases/recettage-chat-ia/PROCEDURE.md`.
@@ -18,7 +18,7 @@ Le pilote se lit comme un système embarqué.
 |---|---|
 | `vkd` | Le noyau du RTOS. Il ordonnance les pas et tient le registre de la tâche. Il écrit le ledger : une boîte noire append-only, chaînée par hash. |
 | Une arch (`claude-code/…`) | Un coprocesseur que le noyau appelle pour le plan, le jugement et la rédaction. |
-| Le driver `maskai-1` | Un pilote de périphérique. Le périphérique est Chrome, le bus est Playwright, et les douze actions du manifeste sont l'API du pilote. |
+| Le driver `maskai-1` | Un pilote de périphérique. Le périphérique est Chrome, le bus est Playwright, et les quinze actions du manifeste sont l'API du pilote. |
 | `hosts` du manifeste | La table MPU du pilote. Une navigation hors de la liste est défaite, et l'action rend `host`. |
 | Le harnais (Claude Code confiné) | Une tâche utilisateur sans privilège. Son seul appel système utile est `vk_driver_act`. |
 | `max_actions`, `timeout_s` d'un pas | Le budget d'appels de la tâche, et son chien de garde. |
@@ -54,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File drivers\maskai-recette\setup.ps1
 ```
 Attendu, en première ligne, `python de base : ` suivi du chemin du 1.1, puis en dernières lignes :
 ```
-files_sha256 : sha256:ea7336c6b70ab8775d33090071fc9b64abc87a2253b10f98b15aea3e20289b16
+files_sha256 : sha256:0c63170dfde22c633be5a878498fb7fd61e3e254a5cf44b7ab6665e9ecb8a0a8
 manifest.json : à jour
 manifest-fixture.json : à jour
 ```
@@ -215,6 +215,8 @@ vk driver ls
 ```
 Attendu : `maskai-1  ready  yes  mesurer_chargement,…,exporter_journal  -`
 
+Les quinze actions, dans l'ordre du manifeste : `mesurer_chargement`, `nouvelle_conversation`, `joindre_document`, `poser_question`, `envoyer_message`, `lire_reponse`, `capturer_flux`, `choisir_modele`, `recherche_web`, `conversation_longue`, `verdict_oracle`, `lister_conversations`, `charge_concurrente`, `capture_ecran`, `exporter_journal`. Les trois du milieu sont nouvelles en v2 (§6.4).
+
 `governed: yes` veut dire que le Job Object a confirmé le confinement du processus du driver : le plafond mémoire du manifeste (`program.max_memory_bytes`, 6 Gio), et l'arbre est tué avec le démon. Avec un Python du Store, Chrome est hors du Job (§1.2).
 
 **6.3 Ajouter un hôte à `hosts`, seulement si nécessaire.** La liste ne porte que sur les navigations de la page principale. Les CDN, polices et analytics d'autres hôtes ne sont pas bloqués : ils sont relevés dans `third_party_hosts` (`capturer_flux`, `network.json`). La connexion au montage n'est pas gardée non plus, donc une redirection vers un fournisseur d'identité y fonctionne.
@@ -225,6 +227,23 @@ Il faut ajouter un hôte quand une action rend `host` en nommant un hôte légit
 3. Remontez-le avec la commande du §6.1. Attendu : un **nouveau** `driver_id`, car le manifeste a changé. `files_sha256` est inchangé : les manifestes sont exclus de l'empreinte, rien n'est à régénérer.
 
 Le profil Chrome est conservé au démontage, et la session MaskAI avec lui.
+
+**6.4 Ce que la v2 du driver ajoute (2026-10-17).** Trois actions :
+
+| Action | Ce qu'elle fait | Preuve |
+|---|---|---|
+| `choisir_modele {model}` | Ouvre la liste du bouton « Model: … » du compositeur, clique l'option qui correspond (texte ou valeur, sans tenir compte de la casse ni des séparateurs), puis relit le modèle sur le bouton. Refus `precondition` si aucune option ne correspond ou si la relecture diffère. | `model.json` |
+| `recherche_web {mode}` | Clique le bouton « Web search: … » jusqu'à ce que son `data-mode` vaille `off`, `auto` ou `on` (quatre clics au plus ; si un menu s'ouvre, son entrée est choisie), puis relit le mode. | `web.json` |
+| `conversation_longue {case, turns}` | Pose `turns` questions (2 à 20) dans la conversation en cours : `first`, `filler` pour chaque tour du milieu, puis `last`. Chaque tour est lu comme `poser_question`. L'abandon d'un tour est journalisé KO disponibilité. | `turns.json`, `answer.png` |
+
+Les deux premières changent le compositeur et ne restaurent rien (`reversible: false`) : la recette lui rend son réglage d'origine avec le champ `previous` du premier appel. Elles servent trois cas nouveaux : N1-4 (recherche web coupée, même question que N1-1, pour une latence comparable au 13/10), N2-3 (six tours, le fait du premier retrouvé au dernier) et N5-3 (`gemini` choisi, la réponse doit être signée par ce modèle).
+
+Ce qui change dans les actions existantes :
+- la réponse est le texte du corps `.prose-llm`, jamais la carte entière. L'en-tête (panneau de l'Aiguilleur, bannière du modèle) va dans la preuve `guard.json`. Une réponse est finie quand le flux est fini **et** que son texte n'a plus bougé à l'écran depuis 2 s ;
+- avant d'envoyer, le driver ouvre lui-même le popover « Chiffré » du compositeur, lit ce que MaskAI dit envoyer, puis le referme par Échap (preuve `sent.json`) ;
+- `joindre_document` suit la puce (uploading, indexing, puis ready ou failed) au plus 3 × le budget du cas. `poser_question` relit la puce et refuse `precondition` si elle n'est pas prête : la question ne part pas, et `verdict_oracle` journalise « question non envoyée (précondition) » ;
+- à l'abandon, le driver clique sur le bouton d'arrêt : l'enquête « Votre avis » ne suit plus. La ligne de journal dit ce qui était parti (POST, flux, dernier nœud) ;
+- chaque ligne de journal porte `ui_profile_sha256` (§13), et les captures masquent la barre latérale et le bloc du compte.
 
 ---
 
@@ -278,19 +297,36 @@ Get-Content "$S\drivers\maskai-1\work\journal.jsonl" -Encoding UTF8 | ForEach-Ob
 ```
 Attendu : une ligne par cas joué, par exemple `N1-1     OK       disponibilite,performance`.
 
-**Premier passage : confirmer les SELECTORS.** C'est à faire après N0 et après N1. Sept sélecteurs de `drivers/maskai-recette/driver.py` sont des hypothèses, que seul le banc d'essai a validées :
+**Premier passage : confirmer les SELECTORS.** C'est à faire après N0, N1 et N5. Le banc d'essai imite l'interface du 17/10, mais une partie des `SELECTORS` de `drivers/maskai-recette/driver.py` reste une hypothèse :
 
-| Sélecteur | Rôle |
-|---|---|
-| `assistant_message` | **Le plus important.** La réponse est lue par lui. |
-| `new_conversation` | Le bouton de nouvelle conversation. À défaut, le driver revient à `/new`. |
-| `send_button` | Le bouton d'envoi, utilisé seulement si Entrée n'a rien envoyé. |
-| `stop_button` | Le bouton d'arrêt de la génération. |
-| `attach_chip` | L'élément qui montre l'état de la pièce jointe. |
-| `conversation_items` | Les entrées de l'historique des conversations. |
-| `sent_label` | La disposition du panneau « SENT TO THE LLM ». |
+| Sélecteur | Rôle | Le 17/10 |
+|---|---|---|
+| `assistant_message` | **Le plus important.** La carte de réponse, `article:has(.prose-llm)`. | vu (`article[aria-label="MASKAI response"]`) |
+| `answer_body` | Le corps de la réponse, `.prose-llm` : l'oracle ne lit que lui. | vu (`.pl-6 > .prose-llm`) |
+| `model_banner`, `guard_pii`, `guard_clean` | L'en-tête de la carte lu en texte : bannière du modèle et panneau de garde (`guard.json`). | texte vu ; balisage à confirmer |
+| `new_conversation` | Le bouton de nouvelle conversation. À défaut, le driver revient à `/new`. | vu (`a[href="/new"][data-slot="button"]`) |
+| `conversation_items` | Les entrées de l'historique des conversations. | vu (`a[href*="/conversation/"]`) |
+| `attach_remove` | Le bouton « Retirer <fichier> » ; la puce est son ancêtre qui porte du texte. | vu |
+| `attach_pending`, `attach_uploading`, `attach_failed`, `attach_busy`, `attach_ready` | Les états de la puce. | « Indexing in progress » et « Failed » vus les 12–13/10 ; l'état prêt et l'indicateur d'activité à confirmer |
+| `sent_trigger`, `sent_popover`, `sent_text` | La pastille « Chiffré » du compositeur, son popover et son bloc de texte (`sent.json`). | pastille vue ; contenu à confirmer |
+| `stop_button` | Le bouton d'arrêt de la génération, cliqué à l'abandon. | un bouton vu sur la capture N1-3 ; aria-label à confirmer |
+| `send_button` | Le bouton d'envoi, utilisé seulement si Entrée n'a rien envoyé. | à confirmer |
+| `model_button`, `listbox`, `option` | Le bouton « Model: … » et sa liste (`choisir_modele`). | bouton relevé ; liste à confirmer |
+| `web_button`, `web_words` | Le bouton « Web search: … » et son `data-mode` (`recherche_web`). | bouton relevé ; cycle ou menu à confirmer |
+| `mask` | Les zones masquées des captures : la barre latérale et le bloc du compte. | `nav[aria-label="Main navigation"]` et `aside` vus ; `data-slot` à confirmer |
+| `sent_label` | Le panneau « SENT TO THE LLM » du 13/10, en secours du popover. | disparu |
 
-Le symptôme d'un sélecteur faux est un KO `réponse vide : échec silencieux` alors que la réponse est visible dans Chrome. C'est `assistant_message` qui est faux. Dans ce cas :
+Les symptômes d'un sélecteur faux :
+- un KO `réponse vide : échec silencieux` alors que la réponse est visible dans Chrome : `assistant_message` ;
+- `guard.json` avec `body_found: false`, et la note « corps de réponse introuvable » : `answer_body` ;
+- `sent.json` avec `source: null` : `missing: "trigger"` désigne `sent_trigger`, `missing: "popover"` désigne `sent_popover` ou `sent_text` ;
+- un gros document « prêt » avec `ready_by: quiet` en 2 s : la puce ne montre aucun état reconnu, voir `attach_pending` et `attach_busy` ;
+- toutes les réponses notées « affichage encore en mouvement », ou 30 s d'attente après chaque réponse : `stop_button` désigne un bouton qui ne disparaît pas ;
+- `choisir_modele` ou `recherche_web` refusés `precondition` : `model_button`, `listbox`, `option` ou `web_button`.
+
+Après N5, relisez aussi le `model.json` de `choisir_modele` : sa liste `options` dit les modèles réellement proposés, et `gemini`, le modèle de N5-3, doit y figurer.
+
+Dans tous ces cas :
 1. Ne lancez pas le niveau suivant : entre deux niveaux, rien ne tourne. La tâche en cours est abandonnée telle quelle.
 2. Corrigez `SELECTORS` dans `driver.py`.
 3. Relancez `setup.ps1`, et recopiez le nouveau `files_sha256` qu'il affiche dans les deux manifestes.
@@ -299,16 +335,17 @@ Le symptôme d'un sélecteur faux est un KO `réponse vide : échec silencieux` 
 6. Remontez le driver (§6.1). Attendu : un nouveau `driver_id`, puisque `files_sha256` a changé.
 7. Soumettez de nouveau la recette (§7).
 
-Autre point du premier passage : une modale ordinaire de MaskAI (sélecteur de modèle, menu) qui porterait `role=dialog` fait refuser `dialog`. Ajoutez-la à `KNOWN_MODALS`, puis suivez la même procédure.
+Autre point du premier passage : une modale ordinaire de MaskAI (sélecteur de modèle, menu) qui porterait `role=dialog` fait refuser `dialog`. Ajoutez-la à `KNOWN_MODALS`, puis suivez la même procédure. Une modification de `SELECTORS` ou de `KNOWN_MODALS` change `ui_profile_sha256` sur les lignes suivantes (§13) : le delta le montre.
 
 **8.4 Un dialogue.** C'est attendu en N8, où l'injection HTML/JS est le test. Le harnais appelle `verdict_oracle`, qui journalise le cas en KO sécurité, puis `exporter_journal`, puis il s'arrête. Le niveau se ferme en `done`, et ses cas suivants ne sont pas joués dans cette tâche.
-1. Dans Chrome, fermez le dialogue par **Annuler** ou Échap, jamais par OK. Le driver ne répond jamais lui-même à un dialogue.
+1. Dans Chrome, fermez le dialogue par **Annuler** ou Échap, jamais par OK. Le driver ne répond jamais lui-même à un dialogue. Le popover « Chiffré » du compositeur, ouvert à la main pendant un niveau, fait lui aussi refuser `dialog` : le driver ne referme que ce qu'il a ouvert lui-même. Fermez-le par Échap.
 2. Continuez avec le niveau suivant (§8.2).
 3. Les cas sautés se rattrapent par la reprise (§12).
 
 **8.5 Durées attendues.** Sur le banc d'essai, un niveau a pris 39 s pour 5 actions, et 44 s pour 12. Sur MaskAI :
 - un cas message prend de 5 à 100 s, la garde AI Act de 3,5 s étant le plancher ;
-- un cas pièce jointe peut aller jusqu'à 60 s d'indexation, plus 3 × le budget du cas, soit 180 s au plus pour les gros documents ;
+- la v2 ajoute environ 3 s par question : 2 s d'affichage immobile avant de lire la réponse, et la lecture du popover « Chiffré » avant l'envoi ;
+- un cas pièce jointe attend sa puce prête jusqu'à 3 × le budget du cas, puis la réponse jusqu'à 3 × le budget encore, soit 180 s au plus chacune pour les gros documents ;
 - comptez de 1 h 30 à 2 h 30 pour les dix niveaux.
 
 ---
@@ -487,10 +524,12 @@ Le verdict d'un cas ne dépend pas seulement du code du driver. Il dépend aussi
 - chaque fichier joint du corpus.
 
 `inputs_sha256` est l'empreinte de tout cela.
-- Sa version courte (12 caractères hexadécimaux) est dans le hello du driver : `version=0.1.0+<12 hex>`, dans les traces de `vkd` au montage (`driver mounted … version=…`).
+- Sa version courte (12 caractères hexadécimaux) est dans le hello du driver : `version=0.2.0+<12 hex>`, dans les traces de `vkd` au montage (`driver mounted … version=…`).
 - Sa version complète est sur **chaque ligne** du journal.
 
 Deux exécutions dont les lignes portent la même `inputs_sha256` ont été jugées avec les mêmes règles. Si elle diffère, c'est un oracle, un document ou l'évaluateur qui a changé, et le delta entre les deux exécutions doit le dire. Le `driver_id`, lui, ne couvre que le dossier `drivers/maskai-recette/`.
+
+Depuis la v2, chaque ligne porte aussi `ui_profile_sha256` : l'empreinte de `SELECTORS` et de `KNOWN_MODALS`, c'est-à-dire des adresses avec lesquelles la page a été lue. Le 17/10, l'essai au sélecteur faux et le passage corrigé portaient la même `inputs_sha256` (debrief, D12). Deux lignes de `ui_profile_sha256` différentes ont été lues avec des sélecteurs différents.
 
 ---
 
