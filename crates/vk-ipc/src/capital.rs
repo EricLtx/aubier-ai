@@ -787,3 +787,142 @@ fn io_failed(what: &str, e: &std::io::Error) -> RpcError {
         message: format!("{what}: {e}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every file under `dir`, `/`-joined and sorted.
+    fn files_under(dir: &Path) -> Vec<String> {
+        let mut out = vec![];
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(d) = pending.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let rel = path.strip_prefix(dir).unwrap().to_string_lossy();
+                    out.push(rel.replace(std::path::MAIN_SEPARATOR, "/"));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// The files layer is what `hash_dir` hashes of the driver's directory
+    /// and the shared `vkdriver` library's code beside it: no manifest, no
+    /// `.venv`, no tests, no bytecode, in either.
+    #[test]
+    fn the_files_layer_is_the_hashed_files_and_the_shared_library_beside_them() {
+        let t = tempfile::tempdir().unwrap();
+        let drv = t.path().join("drivers").join("maskai-recette");
+        for (rel, text) in [
+            ("driver.py", "print(1)"),
+            ("cases.json", "{}"),
+            ("requirements.txt", ""),
+            ("sub/helper.py", ""),
+            ("manifest.json", "{}"),
+            ("manifest-fixture.json", "{}"),
+            (".venv/Scripts/python.exe", "MZ"),
+            ("tests/test_driver.py", ""),
+            ("fixture/page.html", ""),
+            ("__pycache__/driver.cpython-313.pyc", ""),
+            ("sub/manifest.json", "{}"),
+        ] {
+            write(&drv.join(rel), text);
+        }
+        let lib = t.path().join("drivers").join("vkdriver");
+        for rel in [
+            "__init__.py",
+            "protocol.py",
+            "hash_dir.py",
+            "test_protocol.py",
+            "protocol_test.py",
+            "README.md",
+            "__pycache__/protocol.cpython-313.pyc",
+            "tests/test_more.py",
+        ] {
+            write(&lib.join(rel), "");
+        }
+        let dest = t.path().join("stage").join("files");
+        stage_files(&drv, &dest).unwrap();
+        assert_eq!(
+            files_under(&dest),
+            [
+                "cases.json",
+                "driver.py",
+                "requirements.txt",
+                "sub/helper.py",
+                "sub/manifest.json",
+                "vkdriver/__init__.py",
+                "vkdriver/hash_dir.py",
+                "vkdriver/protocol.py",
+            ]
+        );
+    }
+
+    /// A driver with no shared library beside it packs its own files alone;
+    /// one that carries a `vkdriver/` of its own beside the shared one is
+    /// refused rather than have one silently overwrite the other.
+    #[test]
+    fn a_driver_with_a_vkdriver_of_its_own_beside_the_shared_one_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let drv = t.path().join("alone");
+        write(&drv.join("driver.py"), "");
+        let dest = t.path().join("files-alone");
+        stage_files(&drv, &dest).unwrap();
+        assert_eq!(files_under(&dest), ["driver.py"]);
+
+        let drv = t.path().join("drivers").join("twice");
+        write(&drv.join("driver.py"), "");
+        write(&drv.join("vkdriver").join("protocol.py"), "");
+        write(
+            &t.path()
+                .join("drivers")
+                .join("vkdriver")
+                .join("protocol.py"),
+            "",
+        );
+        let e = stage_files(&drv, &t.path().join("files-twice")).unwrap_err();
+        assert!(
+            e.message.contains("remedy: keep one of the two"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// The packed command is the packed interpreter and its flags, then the
+    /// script and what followed it; the development interpreter is gone.
+    #[test]
+    fn the_packed_command_keeps_the_script_and_what_followed_it() {
+        let dev: Vec<String> = [".venv/Scripts/python.exe", "-I", "driver.py", "--quiet"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            packed_command(&dev, "driver.py"),
+            [
+                "python/python.exe",
+                "-E",
+                "-s",
+                "-B",
+                "driver.py",
+                "--quiet"
+            ]
+        );
+    }
+
+    /// Versions sort by number, not by text: `0.9.0` before `0.10.0`.
+    #[test]
+    fn versions_sort_numerically() {
+        let mut v = vec!["1.0.0", "0.10.0", "0.9.0", "0.9.10", "0.9.9"];
+        v.sort_by_key(|v| version_key(v));
+        assert_eq!(v, ["0.9.0", "0.9.9", "0.9.10", "0.10.0", "1.0.0"]);
+    }
+}

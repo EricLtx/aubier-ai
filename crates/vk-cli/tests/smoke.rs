@@ -2604,15 +2604,14 @@ fn python_on_path() -> bool {
     found
 }
 
-/// A `vkd` over `dir` with its install root at `<dir>/installed` and its
-/// publisher key in `<dir>/publisher.key` — the two packaging seams, set on
-/// the daemon, never on this test process — and the shell that drives it.
+/// A `vkd` over `dir` — its install root at `<dir>/installed` and its
+/// publisher key in `<dir>/publisher.key`, as [`vkd_cmd`] sets them — with
+/// `extra_env` and no CPython release unless it names one, and the shell
+/// that drives it.
 fn packaging_node(dir: &std::path::Path, extra_env: &[(&str, &str)]) -> (Daemon, Shell) {
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let mut cmd = vkd_cmd(dir, &endpoint, &[]);
-    cmd.env("VK_DRIVER_INSTALL_ROOT", dir.join("installed"))
-        .env("VK_PUBLISHER_KEY_FILE", dir.join("publisher.key"))
-        .env_remove("VK_TEST_PYTHON_RELEASE");
+    cmd.env_remove("VK_TEST_PYTHON_RELEASE");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -2909,9 +2908,14 @@ fn path_of(p: &std::path::Path) -> String {
 }
 
 /// A `vkd` over this state directory, with file-backed keys so no test ever
-/// touches a keyring.
+/// touches a keyring — the publisher key's too — and its install root under
+/// the state directory, so no test lists what this machine has installed
+/// (packaging Task 8). Both seams are the daemon's environment, never this
+/// test process's.
 fn vkd_cmd(dir: &std::path::Path, endpoint: &str, extra: &[&str]) -> Command {
     let mut c = Command::new(vkd_exe());
+    c.env("VK_DRIVER_INSTALL_ROOT", dir.join("installed"))
+        .env("VK_PUBLISHER_KEY_FILE", dir.join("publisher.key"));
     c.arg("--state-dir")
         .arg(dir)
         .args(["--endpoint", endpoint])
