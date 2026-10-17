@@ -756,10 +756,17 @@ pub(crate) fn installed(kernel: &Shared, spec: &str) -> Result<Installed, RpcErr
     }
     let pinned = match Pins::at(&state_dir).get(&sig.key_id) {
         Ok(Some(pinned)) => pinned,
+        // Where it looked, and the daemon's own state dir: an install run
+        // under another account pins into that account's (Important 2).
         Ok(None) => {
             return Err(gate(format!(
-                "publisher {} is not pinned on this node; remedy: vk driver install pins it",
-                sig.key_id
+                "publisher {} is not pinned on this node: no pin in {}; remedy: vk driver install \
+                 pins it, or vk driver install --state-dir {} when the install runs under another \
+                 account than this daemon's (vk driver uninstall the version first: a version is \
+                 never overwritten)",
+                sig.key_id,
+                state_dir.join("capital").join("publishers").display(),
+                state_dir.display()
             )))
         }
         // The pin is there and is not a key: its own refusal says so, and how.

@@ -236,7 +236,7 @@ driver_id  sha256:…
 ```powershell
 vk driver install dist\maskai-recette-1.0.0
 ```
-Si le démon tourne avec `--state-dir X`, ajoutez `--state-dir X` : l'éditeur est épinglé dans le dossier d'état que lit le démon, et c'est le `pins` de la sortie qui dit où. Sur le nœud qui a fait le pack, la clé du pas 1 est déjà épinglée :
+Si le démon tourne avec `--state-dir X`, ajoutez `--state-dir X` : l'éditeur est épinglé dans le dossier d'état que lit le démon, et c'est le `pins` de la sortie qui dit où. **Si vous élevez avec un autre compte que celui qui fait tourner `vkd`** (l'UAC demande le mot de passe d'un autre administrateur), passez `--state-dir` = la ligne `state dir` de `vk status`, lancé dans le PowerShell ordinaire : sinon l'éditeur est épinglé dans le dossier d'état de l'autre compte, que le démon ne lit pas, et le montage du pas 4 est refusé (`is not pinned on this node: no pin in …`). La commande écrit d'abord sur stderr où elle épingle (`pinning publishers in the state dir …`), puis un avertissement (`warning: … is owned by …`) quand ce dossier appartient à un autre compte que celui du shell. Sur le nœud qui a fait le pack, la clé du pas 1 est déjà épinglée :
 ```
 installed  maskai-1@1.0.0
 into       C:\Program Files\Aubier\drivers\maskai-1\1.0.0
@@ -261,7 +261,7 @@ maskai-1  sha256:…    yes       installed  1.0.0
 ```
 Le noyau a, avant de lancer quoi que ce soit : vérifié la signature contre la clé épinglée, relu le manifeste installé contre celui que le paquet signe, et recalculé l'empreinte de tout l'arbre. Chrome s'ouvre ensuite sur **https://app.maskai.fr/new**. Le profil est sous le dossier d'état (`<dossier d'état>\drivers\maskai-1\profile`, le `state_dir` de `vk status`), pas dans l'arbre installé : il est **réutilisé** d'une version à l'autre, et la session MaskAI faite à la main au §6.1 n'est pas à refaire.
 
-Changer de version : `vk driver umount maskai-1`, puis `vk mount driver maskai-1@1.1.0`. Revenir en arrière : les mêmes deux commandes avec `1.0.0`. Retirer une version : `vk driver uninstall maskai-1@1.0.0`, dans un PowerShell élevé, refusé tant qu'elle est montée.
+Changer de version : `vk driver umount maskai-1`, puis `vk mount driver maskai-1@1.1.0`. Revenir en arrière : les mêmes deux commandes avec `1.0.0`. Retirer une version : `vk driver uninstall maskai-1@1.0.0`, dans un PowerShell élevé, refusé tant qu'elle est montée. **Démontez-la avant d'arrêter le démon** : sans démon sur le point d'accès du shell, la désinstallation ne peut pas demander ce qui est monté, n'en tient rien pour monté, et le dit sur stderr (`no daemon on <point d'accès>: nothing is treated as mounted`). Un démon arrêté avec une version montée garde ce montage au redémarrage, et son prochain acte échoue sur un arbre qui n'existe plus.
 
 5. **Les règles de l'arbre installé.**
 - **Ne lancez jamais le `python.exe` installé à la main sans `-B`.** L'arbre est lu seul, et `__pycache__` fait partie de l'empreinte : un `.pyc` écrit par un interpréteur lancé sans `-B`, dans un shell élevé, est un changement, et le driver est `tampered` au démarrage suivant. Le noyau lance `python\python.exe -E -s -B driver.py`. Pour essayer quelque chose à la main, faites-le sur une copie.

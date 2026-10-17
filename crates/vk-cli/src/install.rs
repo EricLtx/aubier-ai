@@ -50,6 +50,12 @@ pub struct UninstallArgs {
 /// [`vk_capital::install::install`], and the publisher pinned in the
 /// daemon's state directory when the administrator confirms it.
 ///
+/// Before that, on stderr: the state directory it pins into
+/// ([`pins_into`]), and a warning when another account owns it
+/// ([`not_this_accounts`]) — an administrator who elevates with another
+/// account than the one running `vkd` pins where that daemon never looks
+/// unless `--state-dir` names the daemon's (final review, Important 2).
+///
 /// Elevated, the root must be the administrators' alone
 /// ([`administrators_only`]), and the tree is read-only to everyone but the
 /// administrators and SYSTEM from its first byte: `<name>` and `.part` are
@@ -67,11 +73,16 @@ pub fn install(cli: &Cli, args: &InstallArgs) -> Result<()> {
     }
     let state_dir = args.state_dir.as_deref().map(absolute).transpose()?;
     let state_dir = vk_store::paths::resolve_state_dir(state_dir)?;
+    eprintln!("{}", pins_into(&state_dir));
+    #[cfg(windows)]
+    if let Some(warning) = state_dir_of_another_account(&state_dir) {
+        eprintln!("{warning}");
+    }
     let pins = Pins::at(&state_dir);
     let package = absolute(&args.package)?;
     let make_dir = |dir: &Path| make_tree_dir(dir, elevated);
     let yes = args.yes;
-    let mut confirm = |key: &PinnedKey| ask(key, yes);
+    let mut confirm = |key: &PinnedKey| ask(key, pins.list().ok().map(|ids| ids.len()), yes);
     let report = vk_capital::install::install(
         &package,
         &root,
@@ -130,12 +141,17 @@ pub async fn uninstall(cli: &Cli, args: &UninstallArgs) -> Result<()> {
 /// Whether the daemon answering on this shell's endpoint reports
 /// `name@version` mounted: one of its `driver.ls` rows names it, in any
 /// state but `installed`. No daemon there — the endpoint does not exist —
-/// means nothing is mounted; a daemon this shell cannot ask is a refusal.
+/// means nothing is mounted, and stderr says so (a driver mounted on a
+/// daemon that was stopped is not seen: umount before stopping it); a
+/// daemon this shell cannot ask is a refusal.
 async fn mounted(cli: &Cli, name: &str, version: &str) -> Result<bool> {
     let ep = endpoint(cli);
     let c = match Client::connect(&ep).await {
         Ok(c) => c,
-        Err(e) if no_daemon(&e) => return Ok(false),
+        Err(e) if no_daemon(&e) => {
+            eprintln!("no daemon on {}: nothing is treated as mounted", ep.0);
+            return Ok(false);
+        }
         Err(e) => bail!(
             "the daemon on {} cannot be asked what is mounted ({e:#}); remedy: start or stop the \
              daemon, then retry",
@@ -232,14 +248,13 @@ fn writable(dir: &Path, verb: &str) -> Result<()> {
     }
 }
 
-/// The TOFU prompt (packaging spec D8): the key's id and its PEM, then a
-/// question answered by one line of stdin — `y` or `yes` pins it, anything
-/// else, an empty line or no input at all refuses it. `--yes` answers for
-/// CI. On stderr, so that `--json` keeps stdout to the report.
-fn ask(key: &PinnedKey, yes: bool) -> bool {
-    eprintln!("publisher key {}", key.key_id);
-    eprintln!("{}", key.pem().trim_end());
-    eprint!("pin this publisher on this node? [y/N] ");
+/// The TOFU prompt (packaging spec D8): [`prompt`], then a question
+/// answered by one line of stdin — `y` or `yes` pins it, anything else, an
+/// empty line or no input at all refuses it. `--yes` answers for CI. On
+/// stderr, so that `--json` keeps stdout to the report. `pinned` is how many
+/// publishers this node pins already (`None` when they cannot be listed).
+fn ask(key: &PinnedKey, pinned: Option<usize>, yes: bool) -> bool {
+    eprint!("{}", prompt(key, pinned));
     if yes {
         eprintln!("y (--yes)");
         return true;
@@ -249,6 +264,65 @@ fn ask(key: &PinnedKey, yes: bool) -> bool {
         return false;
     }
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// What the TOFU prompt shows before its answer: the key's id, its PEM, how
+/// many publishers this node already pins (ruling R-F1: a key is pinned
+/// once for every name it signs, so the count says how much this node
+/// already trusts), and the question.
+fn prompt(key: &PinnedKey, pinned: Option<usize>) -> String {
+    let pinned = match pinned {
+        Some(n) => format!("this node already pins {n} publisher(s)"),
+        None => "the publishers this node pins cannot be listed".to_string(),
+    };
+    format!(
+        "publisher key {}\n{}\n{pinned}\npin this publisher on this node? [y/N] ",
+        key.key_id,
+        key.pem().trim_end()
+    )
+}
+
+/// The stderr line naming where an install pins its publisher: the state
+/// directory a daemon must read for a mount to find the pin.
+fn pins_into(state_dir: &Path) -> String {
+    format!(
+        "pinning publishers in the state dir {}: it must be the daemon's (the state dir line of \
+         its vk status), else pass --state-dir",
+        plain_path(state_dir)
+    )
+}
+
+/// The warning of [`install`] when `state_dir` exists and another account
+/// owns it, by the rule a client applies to a pipe
+/// ([`vk_store::win_acl::owned_by_this_account`]); `None` when it is this
+/// account's, when it does not exist yet (this install makes it), or when
+/// its owner cannot be read.
+#[cfg(windows)]
+fn state_dir_of_another_account(state_dir: &Path) -> Option<String> {
+    let owner = vk_store::win_acl::path_dacl(state_dir).ok()?.owner;
+    let me = vk_store::win_acl::current_process_sid().ok()?;
+    let elevated_admin = vk_store::win_acl::process_is_elevated_admin().unwrap_or(false);
+    not_this_accounts(state_dir, &owner, &me, elevated_admin)
+}
+
+/// The one line of [`state_dir_of_another_account`], or `None` when
+/// `owner` is this account (`me`, or the administrators for an elevated
+/// administrator).
+#[cfg(windows)]
+fn not_this_accounts(
+    state_dir: &Path,
+    owner: &str,
+    me: &str,
+    elevated_admin: bool,
+) -> Option<String> {
+    if vk_store::win_acl::owned_by_this_account(owner, me, elevated_admin) {
+        return None;
+    }
+    Some(format!(
+        "warning: {} is owned by {owner}, not by this shell's account ({me}): the pin is read \
+         only by a daemon whose state dir it is; check --state-dir against that daemon's vk status",
+        plain_path(state_dir)
+    ))
 }
 
 /// Whether this shell runs elevated (Windows). Off Windows a package cannot
@@ -291,6 +365,68 @@ fn refusal(e: CapitalError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_key() -> PinnedKey {
+        let t = tempfile::tempdir().unwrap();
+        let key = vk_capital::signature::PublisherKey::load_or_create(
+            &vk_capital::signature::KeySource::File(t.path().join("k")),
+        )
+        .unwrap();
+        vk_capital::signature::parse_public_pem(&key.public_pem()).unwrap()
+    }
+
+    /// The TOFU prompt (ruling R-F1) shows the key, then how many
+    /// publishers this node already pins, then the question.
+    #[test]
+    fn the_tofu_prompt_says_how_many_publishers_this_node_already_pins() {
+        let key = a_key();
+        let shown = prompt(&key, Some(2));
+        let lines: Vec<&str> = shown.lines().collect();
+        assert_eq!(lines[0], format!("publisher key {}", key.key_id));
+        assert_eq!(lines[1], "-----BEGIN AUBIER PUBLISHER KEY-----");
+        assert_eq!(
+            lines[lines.len() - 2],
+            "this node already pins 2 publisher(s)"
+        );
+        assert_eq!(
+            lines[lines.len() - 1],
+            "pin this publisher on this node? [y/N] "
+        );
+        assert!(prompt(&key, Some(0)).contains("this node already pins 0 publisher(s)"));
+        assert!(prompt(&key, None).contains("the publishers this node pins cannot be listed"));
+    }
+
+    /// Where an install pins (Important 2): the state dir, named on stderr
+    /// with the line of `vk status` it must match.
+    #[test]
+    fn the_install_names_the_state_dir_it_pins_into() {
+        let line = pins_into(Path::new(r"C:\state"));
+        assert!(line.contains(r"C:\state"), "{line}");
+        assert!(line.contains("vk status"), "{line}");
+        assert_eq!(line.lines().count(), 1, "{line}");
+    }
+
+    /// The warning (Important 2): a state dir another account owns is
+    /// named with its owner; this account's — its user SID, or the
+    /// administrators for an elevated administrator — is not.
+    #[cfg(windows)]
+    #[test]
+    fn a_state_dir_another_account_owns_is_warned_about() {
+        let me = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        let other = "S-1-5-21-1111111111-2222222222-3333333333-1002";
+        let dir = Path::new(r"C:\Users\other\AppData\Local\VerticalAI\vk\data");
+        let warning = not_this_accounts(dir, other, me, false).expect("another owner");
+        assert!(warning.starts_with("warning: "), "{warning}");
+        assert!(warning.contains(other) && warning.contains(me), "{warning}");
+        assert!(warning.contains("--state-dir"), "{warning}");
+        assert_eq!(warning.lines().count(), 1, "{warning}");
+        assert_eq!(not_this_accounts(dir, me, me, false), None);
+        assert_eq!(
+            not_this_accounts(dir, vk_store::win_acl::ADMINISTRATORS_SID, me, true),
+            None
+        );
+        assert!(not_this_accounts(dir, vk_store::win_acl::ADMINISTRATORS_SID, me, false).is_some());
+    }
 
     /// Only an endpoint that is not there means no daemon: a refused or
     /// busy connection, or a pipe this shell may not open, is a daemon it

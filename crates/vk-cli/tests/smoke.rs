@@ -3090,6 +3090,41 @@ fn vk_driver_install_refuses_without_elevation_message_when_the_root_is_read_onl
     }
 }
 
+/// `vk driver uninstall` with no daemon on its endpoint treats nothing as
+/// mounted, removes the version, and says on stderr why it did not ask
+/// (final review, Important 2 / minor 7): a driver mounted on a daemon that
+/// was stopped is not seen, so the runbook says to umount first.
+#[test]
+fn vk_driver_uninstall_without_a_daemon_says_nothing_is_treated_as_mounted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("installed");
+    let target = root.join("fake").join("1.0.0");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("manifest.json"), b"{}").unwrap();
+    let sh = Shell {
+        endpoint: vk_ipc::transport::test_endpoint().0,
+        node_key: dir.path().join("node.key"),
+    };
+    let out = vk_env(
+        &sh,
+        &[("VK_DRIVER_INSTALL_ROOT", &root)],
+        &["driver", "uninstall", "fake@1.0.0"],
+        "",
+    );
+    let why = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{why}");
+    assert_eq!(
+        why.trim_end(),
+        format!(
+            "no daemon on {}: nothing is treated as mounted",
+            sh.endpoint
+        )
+    );
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert!(printed.starts_with("uninstalled  fake@1.0.0"), "{printed}");
+    assert!(!target.exists(), "the version is gone");
+}
+
 /// The whole chantier on two nodes, with the pinned CPython release
 /// (`VK_TEST_PYTHON_RELEASE`): node A packs `fake@0.1.0` with its own
 /// publisher key; `vk driver install` on node B shows that key and installs
@@ -3164,6 +3199,17 @@ fn vk_driver_install_then_mount_by_name_end_to_end() {
     );
     assert!(
         asked.contains("pin this publisher on this node? [y/N]"),
+        "{asked}"
+    );
+    assert!(
+        asked.contains("this node already pins 0 publisher(s)"),
+        "{asked}"
+    );
+    assert!(
+        asked.contains(&format!(
+            "pinning publishers in the state dir {}",
+            path_of(b.path())
+        )),
         "{asked}"
     );
     assert!(asked.contains("refused by the administrator"), "{asked}");

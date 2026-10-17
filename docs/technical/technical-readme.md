@@ -614,9 +614,20 @@ shell that is not elevated into a root that user may write is the test seam:
 the tree gets that root's own ACL. The publisher is pinned into the state
 directory the daemon reads (`--state-dir`, else this user's, as `vk boot`
 resolves it): `<state_dir>/capital/publishers/<key_id>.pub`, with a sidecar
-recording who pinned it and when. `vk driver uninstall` moves the version
+recording who pinned it and when. The install names that directory on stderr
+before anything else and warns when another account owns it: an
+administrator who elevates with another account than the one running `vkd`
+passes `--state-dir` = the `state dir` line of that daemon's `vk status`, or
+the mount is refused (`is not pinned on this node: no pin in …`, which names
+the directory the daemon looked in). A name binds its publisher (ruling
+R-F1): while any version of `<name>` is installed, a package of that name
+signed by another key is refused before the prompt (`remedy: vk driver
+uninstall every version of <name> first`), and the prompt says how many
+publishers the node already pins. `vk driver uninstall` moves the version
 aside before deleting it, which Windows refuses while a file of it is open, and
-is refused while the daemon says that version is mounted.
+is refused while the daemon says that version is mounted; with no daemon on
+its endpoint it treats nothing as mounted and says so on stderr, so umount
+before stopping the daemon.
 
 **The fingerprint** (`hash_tree`, in `vk-capital`) is the SHA-256 over every
 regular file of the installed tree at any depth, in path order, each framed

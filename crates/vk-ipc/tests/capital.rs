@@ -873,12 +873,20 @@ async fn an_installed_tree_that_is_not_what_was_signed_is_refused_before_anythin
     let (root, _) = install_by_hand(&node.install_root, "fake", "1.0.0", &unpinned);
     let err = mount().await.unwrap_err();
     let why = &call_error(&err).message;
-    assert!(
-        why.contains(&format!(
-            "publisher {} is not pinned on this node; remedy: vk driver install pins it",
-            unpinned.key_id()
-        )),
-        "{err}"
+    // Where it looked, and the remedy for a pin made under another account
+    // (final review, Important 2): the daemon's own state dir.
+    let pins = node.d.path().join("capital").join("publishers");
+    assert_eq!(
+        why,
+        &format!(
+            "publisher {} is not pinned on this node: no pin in {}; remedy: vk driver install \
+             pins it, or vk driver install --state-dir {} when the install runs under another \
+             account than this daemon's (vk driver uninstall the version first: a version is \
+             never overwritten)",
+            unpinned.key_id(),
+            pins.display(),
+            node.d.path().display()
+        )
     );
 
     std::fs::remove_dir_all(&root).unwrap();
