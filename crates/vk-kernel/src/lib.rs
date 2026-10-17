@@ -1,5 +1,6 @@
 //! The real single-node kernel (spec §3): the stub's semantics over vk-store.
 pub mod arch;
+pub mod capital;
 pub mod drivers;
 pub mod ns;
 pub mod presence;
@@ -513,6 +514,34 @@ pub struct RealKernel {
     /// an inference outside a task leaves it `None` and the row names no
     /// task rather than the last one that happened to run.
     usage_step: Option<(String, usize)>,
+    /// Where installed drivers live (packaging spec §4.2): read once, when
+    /// the kernel is built, from `VK_DRIVER_INSTALL_ROOT` or `%ProgramFiles%`
+    /// ([`default_install_root`]). A tree that says `source: installed` must
+    /// be under it and a development tree must not be.
+    install_root: PathBuf,
+    /// The publisher key file a test named through
+    /// [`RealKernel::with_publisher_key_file`]; `None` in production, where
+    /// `VK_PUBLISHER_KEY_FILE` or the keyring decides at each call.
+    publisher_key_file: Option<PathBuf>,
+}
+
+/// `VK_DRIVER_INSTALL_ROOT` when set (the test seam, documented as such),
+/// else `%ProgramFiles%\Aubier\drivers` — `/opt/aubier/drivers` off Windows,
+/// so the kernel and its tests build everywhere.
+fn default_install_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("VK_DRIVER_INSTALL_ROOT").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if cfg!(windows) {
+        std::env::var_os("ProgramFiles")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+            .join("Aubier")
+            .join("drivers")
+    } else {
+        PathBuf::from("/opt/aubier/drivers")
+    }
 }
 
 /// One completed call on an arch: which arch, which step of which task, what
@@ -771,6 +800,8 @@ impl RealKernel {
             act_counter: 0,
             approval_challenges: BTreeMap::new(),
             usage_step: None,
+            install_root: default_install_root(),
+            publisher_key_file: None,
         };
         k.load()?;
         Ok(k)
@@ -2161,6 +2192,29 @@ impl RealKernel {
             .db
             .get_json("assertions", &Self::approval_key(approval))
             .map_err(store_failed)
+    }
+
+    /// Where installed drivers live: `VK_DRIVER_INSTALL_ROOT` if set, else
+    /// `%ProgramFiles%\Aubier\drivers`. Read once at boot, exposed in
+    /// `boot.info`.
+    pub fn install_root(&self) -> &Path {
+        &self.install_root
+    }
+
+    /// The test seam for the install root: this kernel's, whatever the
+    /// process environment says, so a test needs no process-wide variable.
+    #[doc(hidden)]
+    pub fn with_install_root(mut self, dir: impl Into<PathBuf>) -> RealKernel {
+        self.install_root = dir.into();
+        self
+    }
+
+    /// The test seam for the publisher key: a key file for this kernel,
+    /// ahead of `VK_PUBLISHER_KEY_FILE` and the keyring.
+    #[doc(hidden)]
+    pub fn with_publisher_key_file(mut self, file: impl Into<PathBuf>) -> RealKernel {
+        self.publisher_key_file = Some(file.into());
+        self
     }
 
     /// Enrol the node's own device key as `node:<node_id>`, trust class `full`.

@@ -24,9 +24,10 @@ use crate::tasks::{
 };
 use crate::{store_failed, RealKernel};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use vk_contracts::driver::{
-    DriverActed, DriverAction, DriverManifest, DriverMounted, DriverUnmounted,
+    DriverActed, DriverAction, DriverManifest, DriverMounted, DriverSource, DriverUnmounted,
+    ExecutionContext,
 };
 use vk_contracts::labels::Origin;
 use vk_contracts::principal::Principal;
@@ -77,6 +78,16 @@ pub struct DriverRow {
     /// one that has never acted. What the cadence refusal (§4.3, item 4)
     /// counts from.
     pub last_act_ms: u64,
+    /// The digest of the package an installed tree came from; `None` for a
+    /// development mount and on every row written before packaging.
+    #[serde(default)]
+    pub package_digest: Option<String>,
+    /// Where the daemon keeps the installed tree's fingerprint cache,
+    /// `<state_dir>/drivers/<name>/fingerprint.json` (packaging spec §4.3);
+    /// `None` for a development mount, which keeps R5's hash of the script's
+    /// directory instead.
+    #[serde(default)]
+    pub fingerprint_cache: Option<PathBuf>,
 }
 
 /// The three directories a driver may touch, all under
@@ -195,6 +206,35 @@ fn plain_name(name: &str) -> Option<&str> {
     crate::validate_artefact_kind(name).ok().map(|()| name)
 }
 
+/// `root` relative to `base` when `root` is `base` or below it. Both are
+/// resolved on disk when both exist, so a link, a junction, a `..`, a case or
+/// a short-name difference cannot carry a tree in or out; otherwise both are
+/// compared after the same lexical clean-up ([`lexical`]).
+fn within(root: &Path, base: &Path) -> Option<PathBuf> {
+    let (root, base) = match (std::fs::canonicalize(root), std::fs::canonicalize(base)) {
+        (Ok(root), Ok(base)) => (root, base),
+        _ => (lexical(root), lexical(base)),
+    };
+    root.strip_prefix(&base).ok().map(Path::to_path_buf)
+}
+
+/// `path` made absolute, with `.` dropped and `..` folded into its parent,
+/// without touching the disk.
+fn lexical(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut clean = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                clean.pop();
+            }
+            other => clean.push(other),
+        }
+    }
+    clean
+}
+
 /// Why a `driver.act` came back without an outcome: what the daemon hands
 /// [`RealKernel::driver_act_settle`] in place of one. Typed, so the settle
 /// decides what to degrade and what to remember from the variant, never from
@@ -212,6 +252,11 @@ pub enum DriverFailure {
     /// The act panicked in the daemon. Its host went with the unwinding,
     /// killed and reaped.
     Panicked,
+    /// The installed tree no longer hashes to the manifest's `files_sha256`:
+    /// something rewrote it after the install. Found by the daemon before a
+    /// spawn; the driver is degraded and never runs the rewritten code
+    /// (packaging spec §4.3).
+    Tampered,
 }
 
 impl From<HostError> for DriverFailure {
@@ -227,6 +272,7 @@ impl DriverFailure {
             DriverFailure::Host(e) => host_error_reason(e),
             DriverFailure::WouldNotStart(_) => "would not start".into(),
             DriverFailure::Panicked => "panicked".into(),
+            DriverFailure::Tampered => "tampered".into(),
         }
     }
 
@@ -238,6 +284,11 @@ impl DriverFailure {
             DriverFailure::Host(e) => e.to_string(),
             DriverFailure::WouldNotStart(why) => why.clone(),
             DriverFailure::Panicked => "the driver act panicked".into(),
+            DriverFailure::Tampered => {
+                "the installed tree no longer matches its fingerprint; reinstall the package, \
+                 then remount"
+                    .into()
+            }
         }
     }
 }
@@ -271,6 +322,48 @@ impl RealKernel {
         self.store.db.get_json(DRIVERS, name).map_err(store_failed)
     }
 
+    /// The rules of packaging spec §4.2, by context and by source, called by
+    /// [`RealKernel::mount_driver`] and [`RealKernel::driver_packed`]:
+    /// - `execution_context: service` is refused: that mode ships with
+    ///   `vk-agent`, and this daemon is interactive only;
+    /// - `source: installed` is verified by path, never trusted as declared:
+    ///   `root` must be under [`RealKernel::install_root`];
+    /// - a `development` root must not be: an installed tree mounts by
+    ///   `name@version`, so it is fingerprinted whole and never hashed as a
+    ///   development directory.
+    ///
+    /// The two paths are compared as [`within`] does. Each refusal is I1 and
+    /// names its remedy.
+    pub fn check_context(&self, manifest: &DriverManifest, root: &Path) -> Result<(), KernelError> {
+        if manifest.execution_context == ExecutionContext::Service {
+            return Err(KernelError::I1(
+                "the service mode ships with vk-agent; remedy: execution_context interactive"
+                    .into(),
+            ));
+        }
+        match (manifest.source, within(root, &self.install_root)) {
+            (DriverSource::Installed, None) => Err(KernelError::I1(format!(
+                "a manifest that says installed must live under {}; remedy: install the package \
+                 with vk driver install",
+                self.install_root.display()
+            ))),
+            (DriverSource::Development, Some(rel)) => {
+                // `<root>/<name>/<version>`: the version is the second step
+                // below the root, when the tree is that deep.
+                let version = rel
+                    .components()
+                    .nth(1)
+                    .and_then(|c| c.as_os_str().to_str())
+                    .unwrap_or("<version>");
+                Err(KernelError::I1(format!(
+                    "an installed tree mounts by name@version; remedy: vk mount driver {}@{version}",
+                    manifest.name
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Mount a driver: a human act (I1), as `vk mount anthropic` is.
     ///
     /// The manifest is validated, `governed` is set to what the host observed,
@@ -287,12 +380,24 @@ impl RealKernel {
     /// `profile_dir_hash` on the event is the hash of the profile directory's
     /// *path*, not of its contents (Ruling R11): a browser profile changes on
     /// every run and a populated one is hundreds of MB with locked files.
+    ///
+    /// Where the tree came from (packaging spec §4.2): the context rules of
+    /// [`RealKernel::check_context`] hold first — no `service` context, and
+    /// `source` verified by path in both directions. `package_digest` is
+    /// `Some` for an installed tree and only for one; it goes on the row and
+    /// on `driver.mounted` with the `source`, and an installed row names its
+    /// fingerprint cache, `<state_dir>/drivers/<name>/fingerprint.json`. The
+    /// repeat mount that is idempotent is the same driver from the same
+    /// package: another package of a `Ready` driver is refused like another
+    /// manifest, so a mount never answers with the row of a version it did
+    /// not mount.
     pub fn mount_driver(
         &mut self,
         ctx: &Ctx,
         mut manifest: DriverManifest,
         root: PathBuf,
         observed_governed: bool,
+        package_digest: Option<String>,
     ) -> Result<DriverRow, KernelError> {
         let by = match &ctx.principal {
             Principal::Human { device_id } => device_id.clone(),
@@ -305,6 +410,15 @@ impl RealKernel {
         manifest
             .validate()
             .map_err(|e| KernelError::Gate(e.to_string()))?;
+        self.check_context(&manifest, &root)?;
+        let source = manifest.source;
+        if (source == DriverSource::Installed) != package_digest.is_some() {
+            return Err(KernelError::Gate(
+                "a mount from an installed tree names its package digest, and only such a \
+                 mount does; remedy: mount an installed driver by name@version"
+                    .into(),
+            ));
+        }
         manifest.governed = observed_governed;
         let driver_id = manifest.driver_id();
         let name = manifest.name.clone();
@@ -317,6 +431,12 @@ impl RealKernel {
                 )));
             }
             if row.state == DriverState::Ready {
+                if row.package_digest != package_digest {
+                    return Err(KernelError::Gate(format!(
+                        "driver {name} is already mounted from another package; \
+                         run `vk driver umount {name}` first"
+                    )));
+                }
                 return Ok(row.clone());
             }
         }
@@ -325,6 +445,13 @@ impl RealKernel {
             vk_store::paths::private_dir(dir).map_err(store_failed)?;
         }
         let profile_dir_hash = hash_bytes(dirs.profile.to_string_lossy().as_bytes());
+        let fingerprint_cache = (source == DriverSource::Installed).then(|| {
+            self.store
+                .state_dir
+                .join("drivers")
+                .join(&name)
+                .join("fingerprint.json")
+        });
         let row = DriverRow {
             manifest,
             driver_id: driver_id.clone(),
@@ -332,6 +459,8 @@ impl RealKernel {
             mounted_ms: ctx.now_ms,
             state: DriverState::Ready,
             last_act_ms: existing.map(|r| r.last_act_ms).unwrap_or(0),
+            package_digest: package_digest.clone(),
+            fingerprint_cache,
         };
         // Ledger before the row, as everywhere else in this kernel.
         self.log(
@@ -344,8 +473,8 @@ impl RealKernel {
                 profile_dir_hash,
                 governed: observed_governed,
                 by,
-                package_digest: None,
-                source: vk_contracts::driver::DriverSource::Development,
+                package_digest,
+                source,
             },
         )?;
         self.store
@@ -1013,6 +1142,7 @@ mod tests {
         assert_eq!(spawn.reason(), "would not start");
         assert_eq!(spawn.detail(), leak, "the detail is kept, for the log");
         assert_eq!(DriverFailure::Panicked.reason(), "panicked");
+        assert_eq!(DriverFailure::Tampered.reason(), "tampered");
         for w in ["would not start", "panicked", "tampered"] {
             assert!(DRIVER_FAILURE_REASONS.contains(&w), "{w}");
         }

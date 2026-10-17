@@ -3963,6 +3963,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "vk-capital",
  "vk-contracts",
  "vk-driver",
  "vk-harness",

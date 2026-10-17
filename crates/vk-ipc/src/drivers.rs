@@ -561,7 +561,7 @@ pub(crate) fn mount(
         let mut k = lock(kernel)?;
         let existing = k.driver(&name).map_err(kerr)?;
         if existing.as_ref().is_some_and(|r| r.driver_id != driver_id) {
-            return Err(match k.mount_driver(&ctx, manifest, root, false) {
+            return Err(match k.mount_driver(&ctx, manifest, root, false, None) {
                 Err(e) => kerr(e),
                 Ok(_) => internal("a different manifest was mounted without its process"),
             });
@@ -578,12 +578,14 @@ pub(crate) fn mount(
         mounted_ms: ctx.now_ms,
         state: DriverState::Ready,
         last_act_ms: 0,
+        package_digest: None,
+        fingerprint_cache: None,
     });
     let had_host = pool.has_host(&name);
     let governed = pool
         .ensure(&row, &dirs)
         .map_err(|e| bad(&format!("driver {name} would not start: {e:#}")))?;
-    let mounted = lock(kernel)?.mount_driver(&ctx, manifest, root, governed);
+    let mounted = lock(kernel)?.mount_driver(&ctx, manifest, root, governed, None);
     let row = match mounted {
         Ok(row) => row,
         Err(e) => {
