@@ -11,6 +11,7 @@
 //! the interactive machine *is* the enrolled device; SP1b replaces the key
 //! file with a passkey.
 mod capital;
+mod install;
 mod man;
 mod render;
 mod until;
@@ -544,6 +545,20 @@ enum DriverCmd {
     /// does the work — a download on first use, pip, a whole tree hashed —
     /// and records `driver.packed`.
     Pack(capital::PackArgs),
+    /// Install a package `vk driver pack` wrote, under the install root
+    /// (`%ProgramFiles%\Aubier\drivers\<name>\<version>`): from an elevated
+    /// shell, offline, off the ledger, no daemon needed.
+    ///
+    /// Every digest of the package and its publisher's signature are
+    /// checked; a publisher this node has not pinned is shown — key id and
+    /// public key — and pinned only if you confirm it (`--yes` confirms,
+    /// for CI). The tree is built, held to the fingerprint the publisher
+    /// packed, made read-only to everyone but the administrators, and only
+    /// then put in place. `vk mount driver NAME@VERSION` mounts it.
+    Install(install::InstallArgs),
+    /// Remove an installed version, from an elevated shell. Refused while
+    /// the daemon reports it mounted: `vk driver umount NAME` first.
+    Uninstall(install::UninstallArgs),
 }
 
 #[derive(Subcommand)]
@@ -690,6 +705,14 @@ fn run(cli: &Cli) -> Result<()> {
         // The keyring is this account's, not the daemon's to reach into: the
         // shell writes it directly and no syscall is involved.
         Cmd::Secret { what } => secret(cli, what),
+        // An OS act by an administrator, off the ledger: the shell does it,
+        // and asks the daemon at most what is mounted.
+        Cmd::Driver {
+            what: DriverCmd::Install(args),
+        } => install::install(cli, args),
+        Cmd::Driver {
+            what: DriverCmd::Uninstall(args),
+        } => rt.block_on(install::uninstall(cli, args)),
         _ => rt.block_on(call(cli)),
     }
 }
@@ -800,7 +823,12 @@ async fn call(cli: &Cli) -> Result<()> {
     match &cli.cmd {
         // Dispatched before the client connects: one starts a daemon rather
         // than calling one, the other needs none at all.
-        Cmd::Boot(_) | Cmd::Man { .. } | Cmd::Secret { .. } => unreachable!("not a syscall"),
+        Cmd::Boot(_)
+        | Cmd::Man { .. }
+        | Cmd::Secret { .. }
+        | Cmd::Driver {
+            what: DriverCmd::Install(_) | DriverCmd::Uninstall(_),
+        } => unreachable!("not a syscall"),
         Cmd::Status => show(
             cli,
             c.call("boot.info", json!({}), None).await?,

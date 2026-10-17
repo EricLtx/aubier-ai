@@ -1213,6 +1213,49 @@ pub fn packed(v: &Value) -> String {
     ])
 }
 
+/// `vk driver install`: what was installed and where, the two digests the
+/// install held it to (the package the signature signs, the tree's
+/// fingerprint), the publisher and where its pin is — the daemon's state
+/// directory — and whether the tree was made read-only.
+pub fn installed(v: &Value) -> String {
+    let pinned = if v["pinned_now"] == true {
+        "pinned now"
+    } else {
+        "already pinned"
+    };
+    let acl = if v["read_only"] == true {
+        "read-only: administrators and SYSTEM full, users read and execute"
+    } else {
+        "the install root's own (not elevated)"
+    };
+    fields(&[
+        (
+            "installed",
+            format!("{}@{}", text(&v["name"]), text(&v["version"])),
+        ),
+        ("into", text(&v["target"])),
+        ("package", text(&v["package_digest"])),
+        ("files", text(&v["fingerprint"])),
+        (
+            "publisher",
+            format!("{} ({pinned})", text(&v["publisher_key_id"])),
+        ),
+        ("pins", text(&v["pins"])),
+        ("acl", acl.into()),
+    ])
+}
+
+/// `vk driver uninstall`: what was removed, and from where.
+pub fn uninstalled(v: &Value) -> String {
+    fields(&[
+        (
+            "uninstalled",
+            format!("{}@{}", text(&v["name"]), text(&v["version"])),
+        ),
+        ("from", text(&v["target"])),
+    ])
+}
+
 /// A `--dry-run` of `vk harness run`: the launch line and the `.mcp.json` it
 /// would write, the token already redacted by the daemon.
 pub fn harness_dry_run(v: &Value) -> String {
@@ -2100,6 +2143,45 @@ mod tests {
     /// `vk driver ls` (packaging Task 8): a mounted development driver, a
     /// mounted installed one with the version it runs, and one installed and
     /// not mounted, with every version there is of it.
+    /// `vk driver install` says what it installed, where, the two digests,
+    /// the publisher and where its pin is, and the ACL the tree got;
+    /// `vk driver uninstall` what it removed.
+    #[test]
+    fn vk_driver_install_and_uninstall_say_what_and_where() {
+        let report = json!({
+            "name": "maskai-1", "version": "1.0.0",
+            "target": r"C:\Program Files\Aubier\drivers\maskai-1\1.0.0",
+            "package_digest": "sha256:aa", "fingerprint": "sha256:bb",
+            "publisher_key_id": "sha256:cc", "pinned_now": true,
+            "pins": r"C:\Users\x\AppData\Local\VerticalAI\vk\data\capital\publishers",
+            "read_only": true,
+        });
+        assert_eq!(
+            installed(&report),
+            r"installed  maskai-1@1.0.0
+into       C:\Program Files\Aubier\drivers\maskai-1\1.0.0
+package    sha256:aa
+files      sha256:bb
+publisher  sha256:cc (pinned now)
+pins       C:\Users\x\AppData\Local\VerticalAI\vk\data\capital\publishers
+acl        read-only: administrators and SYSTEM full, users read and execute"
+        );
+        let mut again = report.clone();
+        again["pinned_now"] = json!(false);
+        again["read_only"] = json!(false);
+        let screen = installed(&again);
+        assert!(screen.contains("sha256:cc (already pinned)"), "{screen}");
+        assert!(
+            screen.ends_with("the install root's own (not elevated)"),
+            "{screen}"
+        );
+        assert_eq!(
+            uninstalled(&json!({"name": "maskai-1", "version": "1.0.0", "target": r"C:\d"})),
+            r"uninstalled  maskai-1@1.0.0
+from         C:\d"
+        );
+    }
+
     #[test]
     fn vk_driver_ls_says_where_each_driver_came_from() {
         let listed = json!([

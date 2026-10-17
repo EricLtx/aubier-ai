@@ -527,8 +527,9 @@ pub struct RealKernel {
 
 /// `VK_DRIVER_INSTALL_ROOT` when set (the test seam, documented as such),
 /// else `%ProgramFiles%\Aubier\drivers` — `/opt/aubier/drivers` off Windows,
-/// so the kernel and its tests build everywhere.
-fn default_install_root() -> PathBuf {
+/// so the kernel and its tests build everywhere. Public: `vk driver
+/// install` writes where the kernel will look.
+pub fn default_install_root() -> PathBuf {
     install_root_from(
         std::env::var_os("VK_DRIVER_INSTALL_ROOT"),
         std::env::var_os("ProgramFiles"),

@@ -27,6 +27,13 @@ use crate::error::{refuse, Result};
 
 /// The media type of the one blob a signature referrer carries.
 const MEDIA_SIGNATURE: &str = "application/vnd.aubier.signature.v1+json";
+/// The signature referrer's annotation that carries the publisher's public
+/// key, as the PEM `PublisherKey::public_pem` prints — the way cosign hangs
+/// the certificate on its signature manifest. An installer that has not
+/// pinned the key yet shows it to the administrator (TOFU, packaging spec
+/// D8); it is trusted for nothing until then, and only if its id is the
+/// signature's and the signature verifies under it.
+pub const ANN_PUBLISHER_KEY: &str = "org.aubier.publisher.public_key";
 /// The empty config blob both manifests point at (`OCI_EMPTY_TYPE`).
 const EMPTY: &[u8] = b"{}";
 const ALTERED: &str = "do not install this copy; fetch the package again from its publisher";
@@ -61,9 +68,16 @@ pub struct Opened {
     pub package: DriverPackage,
     /// The image manifest's digest: what the signature signs.
     pub package_digest: String,
+    /// The image manifest blob as read, whose SHA-256 is `package_digest`:
+    /// what an install keeps, verbatim, in `.package/manifest.json`.
+    pub package_bytes: Vec<u8>,
     /// Read and matched to `package_digest`; its Ed25519 signature is not
     /// verified here.
     pub signature: Signature,
+    /// The publisher's public key the signature referrer carries
+    /// ([`ANN_PUBLISHER_KEY`]), unparsed and untrusted; `None` for a layout
+    /// written before it did.
+    pub publisher_pem: Option<String>,
     pub layout: PathBuf,
 }
 
@@ -232,8 +246,14 @@ fn put_file(undo: &mut Undo, path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Appends the signature referrer: the signature blob, a second image manifest
-/// with `subject` = the driver manifest descriptor, and its `index.json` entry.
-pub fn write_signature(out: &Path, package_digest: &str, sig: &Signature) -> Result<()> {
+/// with `subject` = the driver manifest descriptor and the publisher's public
+/// key as its [`ANN_PUBLISHER_KEY`] annotation, and its `index.json` entry.
+pub fn write_signature(
+    out: &Path,
+    package_digest: &str,
+    sig: &Signature,
+    public_pem: &str,
+) -> Result<()> {
     let subject = blob_path(out, package_digest);
     if !well_formed(package_digest) || !subject.is_file() {
         return refuse(
@@ -274,6 +294,7 @@ pub fn write_signature(out: &Path, package_digest: &str, sig: &Signature) -> Res
             "digest": package_digest,
             "size": subject_size,
         },
+        "annotations": { ANN_PUBLISHER_KEY: public_pem },
     });
     let referrer = put_blob(
         out,
@@ -358,6 +379,9 @@ pub fn open(layout: &Path) -> Result<Opened> {
             ALTERED,
         );
     }
+    let publisher_pem = referrer["annotations"][ANN_PUBLISHER_KEY]
+        .as_str()
+        .map(str::to_string);
     let blob = match referrer["layers"].as_array().map(Vec::as_slice) {
         Some([blob]) => blob,
         _ => return refuse("signature manifest must carry one layer", ALTERED),
@@ -375,7 +399,9 @@ pub fn open(layout: &Path) -> Result<Opened> {
     Ok(Opened {
         package,
         package_digest,
+        package_bytes: bytes,
         signature,
+        publisher_pem,
         layout: layout.to_path_buf(),
     })
 }
@@ -557,6 +583,22 @@ mod tests {
             python_upstream_sha256: "2".repeat(64),
         }
     }
+    /// What the referrer carries in these tests: `open` reads it, never
+    /// parses it.
+    const PEM: &str =
+        "-----BEGIN AUBIER PUBLISHER KEY-----\nAAAA\n-----END AUBIER PUBLISHER KEY-----\n";
+
+    #[test]
+    fn the_signature_referrer_carries_the_publisher_key_and_open_returns_it() {
+        let t = tempfile::tempdir().unwrap();
+        let out = t.path().join("pkg");
+        let (_, digest) = write(&out, &layers(), &ann()).unwrap();
+        write_signature(&out, &digest, &sig(&digest), PEM).unwrap();
+        let o = open(&out).unwrap();
+        assert_eq!(o.publisher_pem.as_deref(), Some(PEM));
+        assert_eq!(digest_of(&o.package_bytes), o.package_digest, "verbatim");
+    }
+
     fn sig(d: &str) -> Signature {
         Signature {
             key_id: "sha256:".to_string() + &"1".repeat(64),
@@ -572,7 +614,7 @@ mod tests {
         let out = t.path().join("pkg");
         let (pkg, digest) = write(&out, &layers(), &ann()).unwrap();
         pkg.validate().unwrap();
-        write_signature(&out, &digest, &sig(&digest)).unwrap();
+        write_signature(&out, &digest, &sig(&digest), PEM).unwrap();
         assert!(out.join("oci-layout").exists());
         let o = open(&out).unwrap();
         assert_eq!(o.package_digest, digest);
@@ -585,7 +627,7 @@ mod tests {
             let t = tempfile::tempdir().unwrap();
             let out = t.path().join("pkg");
             let (pkg, digest) = write(&out, &layers(), &ann()).unwrap();
-            write_signature(&out, &digest, &sig(&digest)).unwrap();
+            write_signature(&out, &digest, &sig(&digest), PEM).unwrap();
             let d = &pkg.layer(component).unwrap().digest;
             let p = blob_path(&out, d);
             let mut bytes = std::fs::read(&p).unwrap();
@@ -600,7 +642,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let out = t.path().join("pkg");
         let (_, digest) = write(&out, &layers(), &ann()).unwrap();
-        write_signature(&out, &digest, &sig(&digest)).unwrap();
+        write_signature(&out, &digest, &sig(&digest), PEM).unwrap();
         let p = blob_path(&out, &digest);
         let mut text = std::fs::read_to_string(&p).unwrap();
         text = text.replace("\"1.0.0\"", "\"9.9.9\"");
@@ -619,6 +661,7 @@ mod tests {
             &out,
             &digest,
             &sig(&("sha256:".to_string() + &"f".repeat(64))),
+            PEM,
         )
         .unwrap();
         assert!(open(&out).unwrap_err().to_string().contains("signature"));
@@ -634,7 +677,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let out = t.path().join("pkg");
         let (pkg, digest) = write(&out, &layers(), &ann()).unwrap();
-        write_signature(&out, &digest, &sig(&digest)).unwrap();
+        write_signature(&out, &digest, &sig(&digest), PEM).unwrap();
         let o = open(&out).unwrap();
         // altered between open and read: the read refuses, it does not trust open
         std::fs::write(blob_path(&out, &pkg.layer("python").unwrap().digest), b"PX").unwrap();
@@ -647,7 +690,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let out = t.path().join("pkg");
         let (_, digest) = write(&out, &layers(), &ann()).unwrap();
-        write_signature(&out, &digest, &sig(&digest)).unwrap();
+        write_signature(&out, &digest, &sig(&digest), PEM).unwrap();
         let index = out.join("index.json");
         let text = std::fs::read_to_string(&index).unwrap();
         std::fs::write(&index, text.replace(&digest, "sha256:../../../oci-layout")).unwrap();
@@ -658,7 +701,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let out = t.path().join("pkg");
         let (_, digest) = write(&out, &layers(), &ann()).unwrap();
-        write_signature(&out, &digest, &sig(&digest)).unwrap();
+        write_signature(&out, &digest, &sig(&digest), PEM).unwrap();
         (t, out, digest)
     }
     /// A key a hostile publisher would plant: a newline, then a fake verdict.
@@ -737,7 +780,7 @@ mod tests {
     #[test]
     fn signing_a_layout_twice_is_refused_and_leaves_it_whole() {
         let (_t, out, digest) = signed();
-        let e = write_signature(&out, &digest, &sig(&digest))
+        let e = write_signature(&out, &digest, &sig(&digest), PEM)
             .unwrap_err()
             .to_string();
         assert!(e.contains("layout already carries a signature"), "{e}");

@@ -149,16 +149,9 @@ impl RealKernel {
     }
 }
 
-/// `MAJOR.MINOR.PATCH`, each a run of ASCII digits: the version rule of
-/// `vk mount driver <name>@<version>`, of `vk driver pack --version` and of
-/// a version directory under the install root.
-pub fn is_version(v: &str) -> bool {
-    let parts: Vec<&str> = v.split('.').collect();
-    parts.len() == 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-}
+/// `MAJOR.MINOR.PATCH`, the one version rule, kept where the installer
+/// uses it too.
+pub use vk_capital::is_version;
 
 /// A `vk-capital` refusal is already one line ending in its remedy, in the
 /// kernel's voice: a gate. Anything else is the store or the OS failing.

@@ -49,13 +49,14 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    ConvertStringSidToSidW, GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    ConvertStringSidToSidW, GetNamedSecurityInfoW, GetSecurityInfo, SetNamedSecurityInfoW,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows::Win32::Security::{
     AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorControl,
-    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED,
+    GetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
+    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED,
 };
 use windows::Win32::Storage::FileSystem::CreateDirectoryW;
 
@@ -63,6 +64,17 @@ use windows::Win32::Storage::FileSystem::CreateDirectoryW;
 pub const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 /// `BUILTIN\Administrators`.
 pub const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+/// `BUILTIN\Users`: every local account.
+pub const USERS_SID: &str = "S-1-5-32-545";
+/// What `0x1200a9` holds: `READ_CONTROL | SYNCHRONIZE | FILE_READ_DATA |
+/// FILE_READ_EA | FILE_EXECUTE | FILE_READ_ATTRIBUTES` — read and execute
+/// (list and traverse, on a directory), nothing that writes.
+pub const READ_AND_EXECUTE_MASK: u32 = 0x0012_00a9;
+/// The DACL of an installed driver's tree (packaging spec §4.2, Task 9):
+/// protected, so nothing of `%ProgramFiles%`'s own entries is merged in;
+/// the administrators and SYSTEM in full; the built-in users read and
+/// execute; every entry inherited by everything below.
+pub const READONLY_TREE_SDDL: &str = "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)";
 
 /// `ACCESS_ALLOWED_ACE_TYPE`.
 pub const ACE_ALLOW: u8 = 0;
@@ -143,6 +155,138 @@ pub fn create_protected_dir(dir: &Path, allowed: &[&str]) -> Result<()> {
     }
     audit_protected_dir(dir, allowed)
         .with_context(|| format!("the state directory {} was created wrong", dir.display()))
+}
+
+/// Give `dir` — an installed driver's tree, before it is renamed into
+/// place — [`READONLY_TREE_SDDL`]: created with it when it is not there,
+/// otherwise set on it, which the OS carries down to every file and
+/// directory already under it (`SetNamedSecurityInfoW` re-applies the
+/// inheritable entries to the whole subtree). Read back afterwards, by
+/// value: protected, and exactly those three accounts with those masks.
+pub fn create_readonly_tree_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        set_dacl(dir, READONLY_TREE_SDDL)?;
+    } else {
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        let wide_sddl = wide(READONLY_TREE_SDDL);
+        let wide_path = wide_os(dir);
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: both strings are NUL-terminated and outlive the calls; the
+        // descriptor the conversion allocates is freed once.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(wide_sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut psd,
+                None,
+            )
+            .context("the read-only tree descriptor is not valid")?;
+            let attrs = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd.0,
+                bInheritHandle: false.into(),
+            };
+            let made = CreateDirectoryW(PCWSTR(wide_path.as_ptr()), Some(&attrs));
+            LocalFree(Some(HLOCAL(psd.0)));
+            made.with_context(|| format!("create {} read-only", dir.display()))?;
+        }
+    }
+    let view = path_dacl(dir)?;
+    let mut held: Vec<(String, u32)> = view
+        .entries
+        .iter()
+        .map(|e| (e.sid.clone(), e.mask))
+        .collect();
+    held.sort();
+    let mut wanted = vec![
+        (ADMINISTRATORS_SID.to_string(), FILE_ALL_ACCESS_MASK),
+        (LOCAL_SYSTEM_SID.to_string(), FILE_ALL_ACCESS_MASK),
+        (USERS_SID.to_string(), READ_AND_EXECUTE_MASK),
+    ];
+    wanted.sort();
+    ensure!(
+        view.protected && held == wanted,
+        "{} did not take the read-only tree DACL: {view:?}",
+        dir.display()
+    );
+    Ok(())
+}
+
+/// Sets `sddl`'s DACL on the file or directory `path`, protected when the
+/// SDDL says `P`, and lets the OS carry its inheritable entries down to
+/// everything under it.
+fn set_dacl(path: &Path, sddl: &str) -> Result<()> {
+    let wide_sddl = wide(sddl);
+    let wide_path = wide_os(path);
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: both strings are NUL-terminated and outlive the calls; the ACL
+    // pointer points into `psd`, which is freed once, after the last use.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(wide_sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut psd,
+            None,
+        )
+        .with_context(|| format!("the descriptor {sddl:?} is not valid"))?;
+        let mut present = windows::core::BOOL::default();
+        let mut defaulted = windows::core::BOOL::default();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let read = GetSecurityDescriptorDacl(psd, &mut present, &mut dacl, &mut defaulted);
+        let protected = if sddl.starts_with("D:P") {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            Default::default()
+        };
+        let set = read.and_then(|()| {
+            SetNamedSecurityInfoW(
+                PCWSTR(wide_path.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | protected,
+                None,
+                None,
+                Some(dacl as *const ACL),
+                None,
+            )
+            .ok()
+        });
+        LocalFree(Some(HLOCAL(psd.0)));
+        set.with_context(|| format!("set the DACL of {}", path.display()))
+    }
+}
+
+/// Whether this process runs elevated: its token is the administrators'
+/// full one, not the filtered token UAC gives an administrator's ordinary
+/// shell. `vk driver install` sets [`READONLY_TREE_SDDL`] only then: a tree
+/// a non-administrator owns is theirs to rewrite whatever its DACL says.
+pub fn process_is_elevated() -> Result<bool> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // SAFETY: the token handle is closed on every path; the buffer is a
+    // `TOKEN_ELEVATION`, whose size is the length passed.
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .context("open this process's token")?;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let read = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        read.context("read whether this process's token is elevated")?;
+        Ok(elevation.TokenIsElevated != 0)
+    }
 }
 
 /// `D:P(A;OICI;FA;;;<sid>)…` — protected, so nothing is inherited from the
@@ -653,6 +797,76 @@ mod tests {
         let sid = current_process_sid().unwrap();
         crate::sid::ensure_string_sid(&sid).unwrap();
         assert_eq!(canonical_sid(&sid).unwrap(), sid, "already canonical");
+    }
+
+    /// The DACL an installed driver's tree is given (packaging Task 9):
+    /// protected, the administrators and SYSTEM in full, the built-in users
+    /// read and execute, every entry inheritable — and what was already in
+    /// the tree takes it too, so a driver's files are read-only to every
+    /// account that is not an administrator. A directory not there yet is
+    /// created with it.
+    #[test]
+    fn an_installed_tree_is_read_only_to_users_and_whole_to_the_administrators() {
+        let expected = set_of_entries([
+            (ADMINISTRATORS_SID, FILE_ALL_ACCESS_MASK),
+            (LOCAL_SYSTEM_SID, FILE_ALL_ACCESS_MASK),
+            (USERS_SID, READ_AND_EXECUTE_MASK),
+        ]);
+        let tree = temp_path("tree");
+        std::fs::create_dir_all(tree.join("python")).unwrap();
+        std::fs::write(tree.join("python").join("python.exe"), b"MZ").unwrap();
+        std::fs::write(tree.join("driver.py"), b"print(1)").unwrap();
+        create_readonly_tree_dir(&tree).unwrap();
+        let fresh = temp_path("fresh");
+        create_readonly_tree_dir(&fresh).unwrap();
+        for dir in [&tree, &fresh] {
+            let view = path_dacl(dir).unwrap();
+            assert!(view.protected, "{view:?}");
+            assert_eq!(entries_of(&view), expected, "{view:?}");
+            for e in &view.entries {
+                assert_eq!(e.kind, ACE_ALLOW, "{e:?}");
+                assert_eq!(
+                    e.flags & ACE_OBJECT_AND_CONTAINER_INHERIT,
+                    ACE_OBJECT_AND_CONTAINER_INHERIT,
+                    "inheritable: {e:?}"
+                );
+                assert_eq!(e.flags & ACE_INHERITED, 0, "set here: {e:?}");
+            }
+        }
+        for child in [
+            tree.join("driver.py"),
+            tree.join("python"),
+            tree.join("python").join("python.exe"),
+        ] {
+            let view = path_dacl(&child).unwrap();
+            assert_eq!(entries_of(&view), expected, "{child:?}: {view:?}");
+            assert!(
+                view.entries.iter().all(|e| e.flags & ACE_INHERITED != 0),
+                "{child:?} takes the tree's entries: {view:?}"
+            );
+        }
+        // Its owner may always rewrite a DACL: give the test its trees back.
+        let me = current_process_sid().unwrap();
+        for dir in [&tree, &fresh] {
+            set_dacl(dir, &format!("D:P(A;OICI;FA;;;{me})")).unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn whether_this_process_is_elevated_can_be_read() {
+        process_is_elevated().unwrap();
+    }
+
+    fn set_of_entries<'a>(it: impl IntoIterator<Item = (&'a str, u32)>) -> BTreeSet<(String, u32)> {
+        it.into_iter().map(|(s, m)| (s.to_string(), m)).collect()
+    }
+
+    fn entries_of(view: &DaclView) -> BTreeSet<(String, u32)> {
+        view.entries
+            .iter()
+            .map(|e| (e.sid.clone(), e.mask))
+            .collect()
     }
 
     fn create_with_sddl(dir: &Path, sddl: &str) {

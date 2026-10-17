@@ -215,7 +215,13 @@ pub(crate) fn pack(
         existed,
         keep: false,
     };
-    layout::write_signature(&out, &package_digest, &key.sign(&package_digest)).map_err(refused)?;
+    layout::write_signature(
+        &out,
+        &package_digest,
+        &key.sign(&package_digest),
+        &key.public_pem(),
+    )
+    .map_err(refused)?;
     // The act is recorded when it happens, not when it was asked for.
     let ctx = Ctx {
         now_ms: vk_kernel::now_ms(),

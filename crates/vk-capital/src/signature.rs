@@ -90,6 +90,14 @@ pub struct PinnedKey {
     pub verifying: VerifyingKey,
 }
 
+impl PinnedKey {
+    /// The key as the PEM `PublisherKey::public_pem` prints, rendered here
+    /// from the key's 32 bytes: never a third party's text.
+    pub fn pem(&self) -> String {
+        pem_of(&self.verifying)
+    }
+}
+
 pub fn key_id_of(verifying: &VerifyingKey) -> String {
     format!("sha256:{:x}", Sha256::digest(verifying.to_bytes()))
 }

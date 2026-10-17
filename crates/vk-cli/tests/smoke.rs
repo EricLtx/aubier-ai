@@ -2903,6 +2903,258 @@ fn vk_driver_pack_prints_what_it_packed() {
     assert_eq!(dmesg_kinds(&tail), ["driver.packed"], "{tail}");
 }
 
+/// `vk` as this shell runs it, with `env` on top — the install root a
+/// test hands it (`VK_DRIVER_INSTALL_ROOT`) — and `input` typed on stdin
+/// (none: stdin is closed, as under CI).
+fn vk_env(sh: &Shell, env: &[(&str, &std::path::Path)], args: &[&str], input: &str) -> Output {
+    let mut cmd = Command::new(vk_exe());
+    cmd.args(args)
+        .env("VK_ENDPOINT", &sh.endpoint)
+        .env("VK_NODE_KEY_FILE", &sh.node_key)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("run vk");
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin.write_all(input.as_bytes()).expect("type the answer");
+    }
+    child.wait_with_output().expect("vk")
+}
+
+/// `vk driver install` into a root this shell may not write — a read-only
+/// root, or one under a read-only directory — is refused with the one line
+/// an administrator who forgot to elevate needs, before the package is
+/// read, and writes nothing.
+#[test]
+fn vk_driver_install_refuses_without_elevation_message_when_the_root_is_read_only() {
+    if !cfg!(windows) {
+        eprintln!("the read-only root is a Windows DACL; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ro = dir.path().join("ro");
+    std::fs::create_dir_all(&ro).unwrap();
+    let icacls = |args: &[&str]| {
+        let ok = Command::new("icacls")
+            .arg(&ro)
+            .args(args)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "icacls {args:?}");
+    };
+    #[cfg(windows)]
+    let me = vk_store::win_acl::current_process_sid().unwrap();
+    #[cfg(not(windows))]
+    let me = String::new();
+    icacls(&["/inheritance:r", "/grant:r", &format!("*{me}:(OI)(CI)RX")]);
+    let sh = Shell {
+        endpoint: vk_ipc::transport::test_endpoint().0,
+        node_key: dir.path().join("node.key"),
+    };
+    let package = dir.path().join("dist");
+    for root in [ro.clone(), ro.join("installed")] {
+        let out = vk_env(
+            &sh,
+            &[("VK_DRIVER_INSTALL_ROOT", &root)],
+            &["driver", "install", &path_of(&package), "--yes"],
+            "",
+        );
+        let why = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{why}");
+        assert_eq!(
+            why.trim_end(),
+            format!(
+                "vk: vk driver install writes under {}: run it from an elevated shell",
+                path_of(&root)
+            )
+        );
+        assert!(out.stdout.is_empty());
+    }
+    let written: Vec<_> = std::fs::read_dir(&ro).unwrap().collect();
+    icacls(&["/reset"]);
+    assert!(written.is_empty(), "nothing written: {written:?}");
+}
+
+/// The whole chantier on two nodes, with the pinned CPython release
+/// (`VK_TEST_PYTHON_RELEASE`): node A packs `fake@0.1.0` with its own
+/// publisher key; `vk driver install` on node B shows that key and installs
+/// nothing when the administrator says no, then installs it with `--yes`,
+/// pinning the publisher in node B's state directory — where B's daemon
+/// looks when it mounts; a second install of the version is refused; B
+/// mounts `fake@0.1.0` from the installed tree, `vk driver ls` lists it;
+/// uninstall is refused while it is mounted and removes it once it is not.
+#[test]
+fn vk_driver_install_then_mount_by_name_end_to_end() {
+    let Some(archive) = std::env::var_os("VK_TEST_PYTHON_RELEASE") else {
+        eprintln!("VK_TEST_PYTHON_RELEASE is not set; skipping the install with the real release");
+        return;
+    };
+    let archive = archive.to_str().expect("a utf-8 path").to_string();
+    let a = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(a.path());
+    let (_packer, sa) = packaging_node(a.path(), &[("VK_TEST_PYTHON_RELEASE", &archive)]);
+    sa.ok(&["capital", "key", "init"]);
+    let shown = sa.json(&["capital", "key", "show", "--json"]);
+    let key_id = str_of(&shown, "key_id").to_string();
+    let src = a.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("fake_driver.py"), FAKE_DRIVER).unwrap();
+    let hash = vk_contracts::driver::hash_dir(&src).unwrap();
+    let manifest = src.join("manifest.json");
+    std::fs::write(
+        &manifest,
+        fake_manifest("fake", &hash, "development").to_string(),
+    )
+    .unwrap();
+    let dist = a.path().join("dist");
+    sa.ok(&[
+        "driver",
+        "pack",
+        "--manifest",
+        &path_of(&manifest),
+        "--version",
+        "0.1.0",
+        "--out",
+        &path_of(&dist),
+    ]);
+
+    let b = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(b.path());
+    let (_node, sb) = packaging_node(b.path(), &[]);
+    let root = b.path().join("installed");
+    let env = [("VK_DRIVER_INSTALL_ROOT", root.as_path())];
+    let install = |extra: &[&str], input: &str| {
+        let mut args = vec![
+            "driver",
+            "install",
+            dist.to_str().unwrap(),
+            "--state-dir",
+            b.path().to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        vk_env(&sb, &env, &args, input)
+    };
+    let pins = b.path().join("capital").join("publishers");
+
+    let no = install(&[], "n\n");
+    let asked = String::from_utf8_lossy(&no.stderr);
+    assert_eq!(no.status.code(), Some(1), "{asked}");
+    assert!(
+        asked.contains(&format!("publisher key {key_id}")),
+        "{asked}"
+    );
+    assert!(
+        asked.contains("-----BEGIN AUBIER PUBLISHER KEY-----"),
+        "{asked}"
+    );
+    assert!(
+        asked.contains("pin this publisher on this node? [y/N]"),
+        "{asked}"
+    );
+    assert!(asked.contains("refused by the administrator"), "{asked}");
+    assert!(
+        !root.join("fake").join("0.1.0").exists(),
+        "nothing installed"
+    );
+    assert!(!pins.exists(), "nothing pinned");
+
+    let yes = install(&["--yes"], "");
+    let printed = String::from_utf8_lossy(&yes.stdout).to_string();
+    assert!(
+        yes.status.success(),
+        "{}",
+        String::from_utf8_lossy(&yes.stderr)
+    );
+    let field = |label: &str| {
+        printed
+            .lines()
+            .find(|l| l.starts_with(label))
+            .map(|l| l[label.len()..].trim().to_string())
+            .unwrap_or_else(|| panic!("no {label} line in {printed}"))
+    };
+    let target = root.join("fake").join("0.1.0");
+    assert_eq!(field("installed"), "fake@0.1.0", "{printed}");
+    assert_eq!(field("into"), path_of(&target), "{printed}");
+    assert_eq!(
+        field("package"),
+        vk_capital::layout::open(&dist).unwrap().package_digest,
+        "{printed}"
+    );
+    assert_eq!(field("publisher"), format!("{key_id} (pinned now)"));
+    assert_eq!(
+        field("pins"),
+        path_of(&pins),
+        "the daemon's state directory"
+    );
+    assert!(target.join("python").join("python.exe").is_file());
+    assert!(target.join(".package").join("signature.json").is_file());
+
+    let again = install(&["--yes"], "");
+    let why = String::from_utf8_lossy(&again.stderr);
+    assert!(!again.status.success());
+    assert!(why.contains("fake@0.1.0 is already installed"), "{why}");
+
+    let mounted = sb.ok(&["mount", "driver", "fake@0.1.0"]);
+    let row: Vec<&str> = mounted
+        .lines()
+        .nth(1)
+        .expect("a row")
+        .split_whitespace()
+        .collect();
+    assert_eq!(row[0], "fake", "{mounted}");
+    assert_eq!(row[3..], ["installed", "0.1.0"], "{mounted}");
+    let listed = sb.ok(&["driver", "ls"]);
+    let row: Vec<&str> = listed
+        .lines()
+        .nth(1)
+        .expect("a row")
+        .split_whitespace()
+        .collect();
+    assert_eq!(row[..2], ["fake", "ready"], "{listed}");
+    assert_eq!(row[3..5], ["installed", "0.1.0"], "{listed}");
+
+    let uninstall = || vk_env(&sb, &env, &["driver", "uninstall", "fake@0.1.0"], "");
+    let refused = uninstall();
+    let why = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success());
+    assert_eq!(
+        why.trim_end(),
+        "vk: fake@0.1.0 is mounted; remedy: vk driver umount fake first"
+    );
+    assert!(target.is_dir(), "untouched");
+
+    sb.ok(&["driver", "umount", "fake"]);
+    let listed = sb.ok(&["driver", "ls"]);
+    let row: Vec<&str> = listed
+        .lines()
+        .nth(1)
+        .expect("a row")
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        row,
+        ["fake", "installed", "-", "installed", "0.1.0", "-", "-"],
+        "{listed}"
+    );
+    let gone = uninstall();
+    assert!(
+        gone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gone.stderr)
+    );
+    let printed = String::from_utf8_lossy(&gone.stdout);
+    assert!(printed.starts_with("uninstalled  fake@0.1.0"), "{printed}");
+    assert!(!target.exists());
+    assert_eq!(sb.ok(&["driver", "ls"]).lines().count(), 1, "header only");
+}
+
 fn path_of(p: &std::path::Path) -> String {
     p.to_str().expect("utf-8 path").to_string()
 }

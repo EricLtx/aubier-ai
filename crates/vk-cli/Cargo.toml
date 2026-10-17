@@ -17,6 +17,9 @@ vk-contracts = { path = "../vk-contracts" }
 vk-ipc = { path = "../vk-ipc", default-features = false }
 vk-kernel = { path = "../vk-kernel" }
 vk-store = { path = "../vk-store" }
+# `vk driver install|uninstall` (packaging Task 9) run in the shell, off the
+# ledger: the package is verified, materialised and pinned here.
+vk-capital = { path = "../vk-capital" }
 clap.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
@@ -42,6 +45,3 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-# The smoke tests lay out an installed driver tree by hand — its package
-# manifest and the publisher's signature — as `vk driver install` will.
-vk-capital = { path = "../vk-capital" }
