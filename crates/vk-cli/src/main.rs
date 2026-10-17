@@ -713,6 +713,18 @@ fn run(cli: &Cli) -> Result<()> {
         Cmd::Driver {
             what: DriverCmd::Uninstall(args),
         } => rt.block_on(install::uninstall(cli, args)),
+        // The pinned release, fetched with the pack's own code for CI: no
+        // daemon, nothing on the ledger.
+        Cmd::Capital {
+            what:
+                capital::CapitalCmd::Python {
+                    what: capital::PythonCmd::Fetch { cache, file },
+                },
+        } => {
+            let got = capital::python_fetch(cache, file)?;
+            println!("{}", plain_path(&got));
+            Ok(())
+        }
         _ => rt.block_on(call(cli)),
     }
 }
@@ -828,6 +840,9 @@ async fn call(cli: &Cli) -> Result<()> {
         | Cmd::Secret { .. }
         | Cmd::Driver {
             what: DriverCmd::Install(_) | DriverCmd::Uninstall(_),
+        }
+        | Cmd::Capital {
+            what: capital::CapitalCmd::Python { .. },
         } => unreachable!("not a syscall"),
         Cmd::Status => show(
             cli,
