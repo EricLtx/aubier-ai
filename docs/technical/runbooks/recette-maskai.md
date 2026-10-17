@@ -55,7 +55,7 @@ powershell -ExecutionPolicy Bypass -File drivers\maskai-recette\setup.ps1
 ```
 Attendu, en première ligne, `python de base : ` suivi du chemin du 1.1, puis en dernières lignes :
 ```
-files_sha256 : sha256:12a16356bdd00ac34a23a5fa577b0605e9f8e0b5b4a828bd965c39f58cb9c435
+files_sha256 : sha256:ea9b2eb4b50a12c03080ec92ef754189a8d76c64ce28385c1e2ec5c1d40e357f
 manifest.json : à jour
 manifest-fixture.json : à jour
 ```
@@ -321,8 +321,9 @@ Attendu : une ligne par cas joué, par exemple `N1-1     OK       disponibilite,
 | `sent_trigger`, `sent_popover`, `sent_text` | La pastille « Chiffré » du compositeur, son popover et son bloc de texte (`sent.json`). | pastille vue ; contenu à confirmer |
 | `stop_button` | Le bouton d'arrêt de la génération, cliqué à l'abandon. | un bouton vu sur la capture N1-3 ; aria-label à confirmer |
 | `send_button` | Le bouton d'envoi, utilisé seulement si Entrée n'a rien envoyé. | à confirmer |
-| `model_button`, `listbox`, `option` | Le bouton « Model: … » et sa liste (`choisir_modele`). | bouton relevé ; liste à confirmer |
-| `web_button`, `web_words` | Le bouton « Web search: … » et son `data-mode` (`recherche_web`). | bouton relevé ; cycle ou menu à confirmer |
+| `model_button`, `listbox`, `option` | Le bouton du compositeur qui ouvre la liste des modèles (`choisir_modele`) : par structure d'abord, `form button[aria-haspopup="listbox"]`, puis les libellés « Model: … » / « Modèle … » en secours. | structure vue le 17/10 ; libellés absents de l'interface française au premier essai de la recette 2 ; liste à confirmer |
+| `web_button`, `web_words` | Le bouton de recherche web (`recherche_web`) : par structure d'abord, `form button[data-mode]` (`auto`, `off`, `on`), puis les libellés « Web search: … » / « Recherche web … » en secours. | `data-mode` vu le 17/10 ; cycle ou menu à confirmer |
+| `maintenance` | La page de maintenance (« MAINTENANCE EN COURS / ON REVIENT TRÈS VITE ! »), lue sur le texte quand aucune zone de saisie n'est visible (§11). | vue au premier essai réel de la recette 2 |
 | `mask` | Les zones masquées des captures : la barre latérale et le bloc du compte. | `nav[aria-label="Main navigation"]` et `aside` vus ; `data-slot` à confirmer |
 | `sent_label` | Le panneau « SENT TO THE LLM » du 13/10, en secours du popover. | disparu |
 
@@ -478,6 +479,7 @@ Ce tableau décrit ce que fait le système **tel qu'il est construit**. Là où 
 | Délai d'action dépassé | Le driver abandonne à 3 × le budget du cas et journalise KO disponibilité. Le harnais passe au cas suivant. *La règle « trois de suite font échouer le pas » n'est pas construite.* | Si tout dépasse (MaskAI en panne) : `vk stop`, puis reprise plus tard. |
 | Driver mort ou muet | `vk_driver_act` est refusé par le noyau, et le driver est `degraded` (`driver.unmounted{reason}`). La raison est un mot fixe (`dead`, `timeout`, `protocol: malformed response`, `would not start`…) : le détail (chemin, empreinte, extrait de la réponse) n'est jamais au ledger, il est dans `$S\drivers\maskai-1\work\driver.log`, ligne `[daemon] act … failed`. Le harnais s'arrête. Le pas finit `done` s'il avait déjà laissé une preuve, sinon `failed: harness produced no artefact`, et la tâche échoue. | **Avant chaque niveau**, `vk driver ls`. S'il est `degraded`, lisez la fin de `driver.log`, puis remontez avec la commande du §6.1 : c'est le remède. Si la tâche a échoué : reprise (§12). |
 | Chrome affiche « Aw, Snap » (ou « Oh non ! »), ou le driver meurt `dead` sous une page lourde | Le plafond mémoire du Job (`program.max_memory_bytes`, 6 Gio) refuse les allocations de Chrome : faux KO disponibilité, ou driver dégradé. | Augmentez `max_memory_bytes` dans `manifest.json` (8589934592 pour 8 Gio), `vk driver umount maskai-1`, remontez (§6.1) : nouveau `driver_id`, `files_sha256` inchangé. Puis reprise (§12). |
+| Service en maintenance (la carte « MAINTENANCE EN COURS / ON REVIENT TRÈS VITE ! », sans zone de saisie) | Les actions qui ont besoin de l'application rechargent la page une fois, puis refusent `precondition` « service en maintenance », sans attendre la zone de saisie. `verdict_oracle` journalise alors le cas KO disponibilité, « service en maintenance (page de maintenance affichée) ». Le cas suivant n'est pas jugé d'office : il est essayé, et refusé à son tour. | **À la première ligne « service en maintenance », ne lancez pas le niveau suivant** : `vk stop` n'est pas nécessaire. Reprenez plus tard (§12). Les cas journalisés pendant la maintenance sont rejoués tels quels à la reprise. Pour les rejouer pour de bon, mettez leurs lignes de côté par une correction (`supersedes`) ou mettez le journal de côté. |
 | Navigation hors liste | L'action rend `host`. La page revient à l'entrée, le cas est KO sécurité, et l'hôte est au ledger (`hosts_seen`). | Un signal de sécurité. Si l'hôte est légitime : §6.3. |
 | STOP humain | `vk stop` tue l'arbre du harnais et l'action en vol. Le driver est dégradé, et le pas finit `failed`, ce qui fait échouer la tâche. | `vk resume <stop_id>`, remontez le driver (§6.1), puis reprise (§12). |
 | Démon tué (veille, fermeture de session) | Le journal est sur disque et le ledger est intact. Au redémarrage, le pas qui tournait est marqué `failed: interrupted`, et la tâche échoue. Le driver reste monté : il relance Chrome à sa première action, avec le même profil et la même session. | Relancez `vkd` (§3.2). Pour vérifier la session dans Chrome tout de suite, refaites `vk mount driver …` (§6.1), qui relance le processus. Puis reprise (§12). |

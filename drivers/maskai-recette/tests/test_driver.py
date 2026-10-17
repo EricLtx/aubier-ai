@@ -1492,5 +1492,90 @@ class Recette2OnFixture(FixtureBench):
         self.assertIn("passage a (v2-a) : OK ; texte envoyé identique", b["evidence"])
 
 
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class FieldFixesOnFixture(FixtureBench):
+    """The first live attempt of recette 2: MaskAI's maintenance page, and the French composer."""
+
+    def maintenance_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/new?maintenance=1"
+
+    def test_a_maintenance_page_is_a_precondition_refusal_and_a_ko_disponibilite_line(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.message_case(recette, "v2-maint-1", "Bonjour")
+        self.message_case(recette, "v2-maint-2", "Bonjour")
+        recette.entry = self.maintenance_url()  # the service went into maintenance
+        recette.browser.page().goto(recette.entry)
+        with self.assertRaises(drv.DriverRefusal):
+            self.act(A, "verdict_oracle", {"case": "v2-maint-1"})  # resumption probe: still to do
+        t0 = time.monotonic()
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "nouvelle_conversation")
+        self.assertLess(time.monotonic() - t0, 10, "no 15 s wait for a textarea that will not come")
+        self.assertEqual((refused.exception.reason, refused.exception.detail), ("precondition", "service en maintenance"))
+        res, _ = self.act(A, "verdict_oracle", {"case": "v2-maint-1"})
+        self.assertEqual((res["verdict"], res["replayed"]), ("KO", False))
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual((line["case"], line["evidence"]), ("v2-maint-1", "service en maintenance (page de maintenance affichée)"))
+        self.assertIn("disponibilite", line["nfr"])
+        # The next case is not judged on it: it is tried, and refused again on its own account.
+        with self.assertRaises(drv.DriverRefusal) as probe:
+            self.act(A, "verdict_oracle", {"case": "v2-maint-2"})
+        self.assertIn("aucune observation pour v2-maint-2", probe.exception.detail)
+        with self.assertRaises(drv.DriverRefusal):
+            self.act(A, "poser_question", {"case": "v2-maint-2"})
+        # Back in service: the guard reloads the stale maintenance page and the action goes through.
+        recette.entry = f"http://127.0.0.1:{self.port}/new"
+        self.act(A, "nouvelle_conversation")
+        res, _ = self.act(A, "poser_question", {"case": "v2-maint-2"})
+        self.assertIn("BONJOUR", res["answer"])
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "v2-maint-2"})[0]["verdict"], "OK")
+
+    def test_maintenance_words_in_an_answer_are_no_maintenance(self):
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "nouvelle_conversation")
+        res, _ = self.act(A, "envoyer_message", {"text": "Maintenance en cours, on revient très vite"})
+        self.assertIn("MAINTENANCE EN COURS", res["answer"])
+        self.act(A, "nouvelle_conversation")  # the composer is there: no maintenance
+
+    def test_the_harness_reads_refused_precondition_for_a_maintenance_page(self):
+        work = self.tmp()
+        env = dict(os.environ, VK_DRIVER_WORK_DIR=work, VK_DRIVER_PROFILE_DIR=self.tmp(),
+                   VK_DRIVER_HEADLESS="1", VK_DRIVER_CHANNEL="", VK_DRIVER_HOSTS="127.0.0.1",
+                   MASKAI_ENTRY_URL=self.maintenance_url())
+        with open(os.path.join(work, "driver.log"), "wb") as log:
+            p = subprocess.Popen([sys.executable, "-I", os.path.join(DRIVER_DIR, "driver.py")], env=env,
+                                 cwd=work, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
+            try:
+                self.assertIn("hello", json.loads(p.stdout.readline()))
+                p.stdin.write((json.dumps({"id": 1, "action": "nouvelle_conversation", "args": {},
+                                           "deadline_ms": 60000, "evidence_dir": self.tmp()}) + "\n").encode())
+                p.stdin.flush()
+                answer = json.loads(p.stdout.readline())
+            finally:
+                p.stdin.close()
+                p.wait(timeout=60)
+                p.stdout.close()
+        self.assertEqual((answer["id"], answer["ok"], answer["reason"]), (1, False, "precondition"))
+        self.assertEqual((answer["result"]["refused"], answer["result"]["detail"]),
+                         ("precondition", "service en maintenance"))
+
+    def test_the_composer_buttons_are_found_by_structure_whatever_their_labels(self):
+        drv, recette, A = self.make()
+        recette.open()
+        page = recette.browser.page()
+        page.evaluate("""() => { document.getElementById('model').setAttribute('aria-label', 'Choisir le modèle');
+                                document.getElementById('web').setAttribute('aria-label', 'Recherche sur le Web'); }""")
+        res, _ = self.act(A, "choisir_modele", {"model": "gemini"})
+        self.assertEqual(res["previous"], "Claude Haiku 5.5", "a label naming no model: the button's text")
+        self.assertTrue(drv.model_matches("gemini", res["model"]), res)
+        res, _ = self.act(A, "recherche_web", {"mode": "off"})
+        self.assertEqual((res["mode"], res["previous"]), ("off", "auto"))
+        self.assertEqual(drv.SELECTORS["model_button"][0], 'form button[aria-haspopup="listbox"]')
+        self.assertEqual(drv.SELECTORS["web_button"][0], 'form button[data-mode]')
+
+
 if __name__ == "__main__":
     unittest.main()

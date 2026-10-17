@@ -236,6 +236,7 @@ produit.
 | Identifiants fictifs | clé fausse par construction ; juger « en clair » à part de « mal typé » |
 | Même donnée collée ou jointe | deux chemins de masquage : tester les deux canaux |
 | Question qui ne fait pas recopier la donnée | la restitution n'est pas testée : faire recopier la valeur sensible |
+| Service en maintenance pendant un niveau (premier essai réel de cette recette) | à la première ligne « service en maintenance (page de maintenance affichée) », ne pas lancer le niveau suivant (pas besoin de `vk stop`) ; reprendre plus tard ; les cas journalisés KO pendant la maintenance se rejouent par une correction (runbook §11) |
 
 ## 8. Ce que le pilote v2 doit fournir
 

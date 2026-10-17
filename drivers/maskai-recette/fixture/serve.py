@@ -27,7 +27,9 @@ in flight; steers the attachment chip by file name (« fail », « slowidx »,
 
 Other paths: /busy (requests, then a popup after 3 s; /stats says when the popup
 was announced and when its request arrived), /redirect-unreachable (a 302 to an
-unreachable host).
+unreachable host). Any page asked with `maintenance=1` in its query is MaskAI's
+maintenance card instead (seen at the first live attempt of recette 2: no
+textarea, « MAINTENANCE EN COURS / ON REVIENT TRÈS VITE ! »).
 
 Usage: python -I serve.py [port]     (default 8765; 0 picks a free port)
 The first line on stdout is `listening <port>`.
@@ -52,6 +54,11 @@ setInterval(() => fetch('/ping?' + Math.random()), 200);
 setTimeout(async () => { await fetch('/popup-created'); window.open('/popup'); }, 3000);
 </script></body></html>"""
 STATS = {"created_ms": None, "popup_ms": None}
+# MaskAI's maintenance card, as the first live attempt of recette 2 met it on app.maskai.fr.
+MAINTENANCE_PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Mask AI</title></head>
+<body><main><h1>MAINTENANCE EN COURS</h1><p>ON REVIENT TRÈS VITE !</p>
+<p>Mask AI FR fait une petite pause pour s'améliorer. Une question ? contact@maskai.fr</p></main></body></html>
+""".encode("utf-8")
 
 
 def now_ms() -> int:
@@ -87,6 +94,8 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(200, json.dumps(STATS).encode(), "application/json")
         elif path == "/redirect-unreachable":
             self.reply(302, headers=[("Location", "http://unreachable.invalid/")])
+        elif "maintenance=1" in self.path.partition("?")[2]:
+            self.reply(200, MAINTENANCE_PAGE)
         else:
             with open(os.path.join(HERE, "index.html"), "rb") as f:
                 self.reply(200, f.read())

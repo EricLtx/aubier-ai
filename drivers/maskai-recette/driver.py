@@ -193,11 +193,18 @@ SELECTORS = {
     # Compositeur (v2) : le bouton « Model: <modèle> » qui ouvre une liste d'options, le bouton
     # « Web search: <mode> » et son data-mode (relevés le 17/10 par le fondateur). À confirmer : le
     # rôle de la liste (listbox ou menu), le mode web en cycle ou en menu, les mots des modes.
-    "model_button": ['button[aria-label^="Model:"]', 'button[aria-label^="Modèle"]'],
+    # Par structure d'abord (le 17/10 : le bouton du compositeur qui ouvre une liste,
+    # aria-haspopup="listbox") ; les libellés, localisés (au premier essai de la recette 2,
+    # l'interface française ne les avait pas), en secours.
+    "model_button": ['form button[aria-haspopup="listbox"]', 'button[aria-haspopup="listbox"]',
+                     'button[aria-label^="Model:"]', 'button[aria-label^="Modèle"]'],
     "model_prefix": r"^\s*(?:model|modèle)\s*:\s*",
     "listbox": '[role="listbox"]',
     "option": '[role="option"]',
-    "web_button": ['button[aria-label^="Web search:"]', 'button[aria-label^="Recherche web"]'],
+    # Par structure d'abord (le 17/10 : le bouton qui porte data-mode="auto|off|on"), les libellés
+    # en secours.
+    "web_button": ['form button[data-mode]', 'button[data-mode]',
+                   'button[aria-label^="Web search:"]', 'button[aria-label^="Recherche web"]'],
     "web_menu": '[role="menu"], [role="listbox"]',
     "web_menu_item": '[role="menuitemradio"], [role="menuitem"], [role="option"]',
     "web_words": {"off": r"\boff\b|désactiv|jamais|never", "auto": r"\bauto", "on": r"\bon\b|activ|toujours|always"},
@@ -207,6 +214,11 @@ SELECTORS = {
     # les data-slot sont à confirmer.
     "mask": ['nav[aria-label="Main navigation"]', 'aside', '[data-slot="sidebar"]',
              '[data-slot="sidebar-footer"]', '[data-slot="avatar"]'],
+    # Page de maintenance, vue au premier essai réel de la recette 2 : une carte « MAINTENANCE EN
+    # COURS / ON REVIENT TRÈS VITE ! / Mask AI FR fait une petite pause … » sur app.maskai.fr, sans
+    # zone de saisie. Motif sur le texte de la page replié (casse et accents), retenu seulement
+    # quand aucune zone de saisie n'est visible : les mêmes mots dans une réponse ne comptent pas.
+    "maintenance": r"maintenance en cours|on revient tr[èe]s vite|maintenance in progress",
     # Fenêtres modales (CSS).
     "modal": '[role="dialog"], [role="alertdialog"], [aria-modal="true"], .modal',
 }
@@ -243,6 +255,14 @@ DEFAULT_BUDGET_S = 60
 CLASS_BUDGET_S = {"load": 3, "message": 10, "model": 10, "web": 15, "long": 10, "list": 10,
                   "attach_question": 20, "concurrent": 15}
 PASTED_PII_BUDGET_S = 20
+# Une observation de maintenance ne juge un cas que si elle a au plus cet âge : une reprise plus
+# tard essaie le cas de nouveau.
+MAINTENANCE_FRESH_S = 600
+# Les actions qui ont besoin de l'application (la garde vérifie la page de maintenance avant
+# elles) ; une capture d'écran, la lecture du flux ou de la dernière réponse n'en ont pas besoin.
+NEEDS_APP = ("mesurer_chargement", "nouvelle_conversation", "joindre_document", "poser_question",
+             "envoyer_message", "lister_conversations", "charge_concurrente", "choisir_modele",
+             "recherche_web", "conversation_longue")
 # La couleur des zones masquées sur les captures.
 MASK_COLOR = "#FF00FF"
 # Fin de réponse (D6) : après la fin du flux, le corps de la nouvelle réponse immobile
@@ -497,6 +517,12 @@ OPTIONS_JS = "(a) => {" + _VISIBLE + """
     value: o.getAttribute('data-value') || o.getAttribute('value') || o.getAttribute('data-mode') || '' }));
 }"""
 
+# Le texte de la page et la présence d'une zone de saisie visible (page de maintenance).
+MAINTENANCE_JS = "(a) => {" + _VISIBLE + """
+  return { text: ((document.body && document.body.innerText) || '').slice(0, 20000),
+           textarea: [...document.querySelectorAll(a.textarea)].some(visible) };
+}"""
+
 LIST_OPEN_JS = "(a) => {" + _VISIBLE + " return [...document.querySelectorAll(a.list)].some(visible); }"
 
 TITLES_JS = "(a) => {" + _PICK + """
@@ -700,10 +726,15 @@ def choose_option(want: str, options: list) -> tuple[dict | None, list]:
 
 
 def model_of(control: dict | None) -> str | None:
-    """Le modèle affiché par le bouton du compositeur : son aria-label sans « Model: »."""
+    """Le modèle affiché par le bouton du compositeur : son aria-label sans « Model: » ; un libellé
+    sans ce préfixe (le bouton trouvé par sa structure, « Choisir le modèle ») ne nomme pas le
+    modèle : c'est alors le texte du bouton."""
     if not control:
         return None
-    return re.sub(SELECTORS["model_prefix"], "", control["label"], flags=re.I).strip() or control["text"] or None
+    label = control["label"] or ""
+    if re.match(SELECTORS["model_prefix"], label, flags=re.I):
+        return re.sub(SELECTORS["model_prefix"], "", label, flags=re.I).strip() or control["text"] or None
+    return control["text"] or label or None
 
 
 def web_mode_of(control: dict | None) -> str | None:
@@ -1317,6 +1348,10 @@ class Recette:
         self._mark = None  # where the action in hand began, in the browser's event sequence
         self._last_asked = None  # {"case", "mark"} of the last poser_question
         self._in_flight = False  # an abandon whose stop click did not end the generation
+        # The case a maintenance page is charged to: the one the action names, else the last case
+        # verdict_oracle said was still to do (nouvelle_conversation names none).
+        self._last_verdict_probe = None
+        self._action_case = None
         # The composer configuration last set by choisir_modele / recherche_web: nouvelle_conversation
         # sets it again when the interface lost it (PROCEDURE-2 §8.6).
         self.pinned = {}
@@ -1345,13 +1380,16 @@ class Recette:
             ev = Evidence(evidence_dir)
             self._case_in_hand = None
             self._mark = None
+            self._action_case = args.get("case") or self._last_verdict_probe
             try:
                 if browser:
-                    self._guard()  # delivers what happened between actions, before the mark
+                    self._guard(fn.__name__)  # delivers what happened between actions, before the mark
                     self._mark = self.browser.mark()
                 result = fn(args, ev)
                 if browser:
                     self._after()
+                    if fn.__name__ in NEEDS_APP and self._action_case:  # the app answered: no maintenance
+                        (self.observations.get(self._action_case) or {}).pop("maintenance", None)
                 if ev.dropped:
                     result["evidence_dropped"] = ev.dropped
                 return result, ev.items
@@ -1374,9 +1412,10 @@ class Recette:
         run.__name__ = fn.__name__
         return run
 
-    def _guard(self) -> None:
+    def _guard(self, action: str | None = None) -> None:
         """Avant toute action dans le navigateur : pas de dialogue en attente, pas de modale
-        inconnue ; une modale connue est fermée par son bouton."""
+        inconnue ; une modale connue est fermée par son bouton ; et, pour une action qui a besoin
+        de l'application, pas de page de maintenance (rechargée une fois avant de conclure)."""
         b = self.browser
         page = b.page()
         b.settle()  # all of the waiting period's events land before the action's mark
@@ -1404,6 +1443,52 @@ class Recette:
             b.own_modal = None  # closed since, by the page or by hand
         if modals["unknown"]:
             raise DriverRefusal("dialog", f"modale inconnue : {modals['unknown'][0]}")
+        if action in NEEDS_APP:
+            self._check_maintenance(page, reload=True)
+
+    def _check_maintenance(self, page, reload: bool = False) -> None:
+        """La page de maintenance de MaskAI (son texte, aucune zone de saisie visible) : refus
+        `precondition` « service en maintenance », et une observation pour le cas de l'action, que
+        verdict_oracle journalise KO disponibilité. `reload` : une page déjà ancienne est d'abord
+        rechargée (le service a pu revenir depuis)."""
+        b = self.browser
+
+        def maintenance() -> dict | None:
+            try:
+                got = b.call(MAINTENANCE_JS, {"textarea": SELECTORS["textarea"]}, page=page, timeout_ms=3000)
+            except PWTimeout:
+                if b.pending():
+                    raise
+                return None
+            if got["textarea"] or not evaluer.find(SELECTORS["maintenance"], got["text"]):
+                return None
+            return got
+
+        got = maintenance()
+        if got and reload:
+            self._goto(page, self.entry)
+            got = maintenance()
+        if not got:
+            return
+        seen = {"t": now_iso(), "epoch": time.time(), "url": short_url(page.url), "text": one_line(got["text"], 200)}
+        if self._action_case:
+            self.observations.setdefault(self._action_case, {})["maintenance"] = seen
+        log.warning("service in maintenance: %s", seen["text"])
+        raise DriverRefusal("precondition", "service en maintenance", extra={"maintenance": seen})
+
+    def _wait_for_composer(self, page, timeout_s: float = 15.0) -> None:
+        """La zone de saisie visible, au plus timeout_s ; une page de maintenance arrête l'attente
+        tout de suite (« service en maintenance »), au lieu de 15 s puis `internal`."""
+        deadline = time.monotonic() + timeout_s
+        loc = page.locator(SELECTORS["textarea"]).first
+        while True:
+            try:
+                loc.wait_for(state="visible", timeout=1000)
+                return
+            except PWTimeout:
+                self._check_maintenance(page)
+                if time.monotonic() >= deadline:
+                    raise
 
     @staticmethod
     def _dismiss(page, k: dict) -> None:
@@ -1559,6 +1644,7 @@ class Recette:
         turn = {"page": page, "n0": st["n"], "count0": st["count"], "posts0": len(b.posts),
                 "page_no": b.context.pages.index(page), "stop_before": st["stop"], "text": text, "pii": list(pii or [])}
         if not b.call(FILL_JS, {"sel": SELECTORS["textarea"], "text": text}, page=page):
+            self._check_maintenance(page)  # the app went into maintenance since the guard
             raise DriverRefusal("precondition", "pas de zone de saisie dans la page")
         page.bring_to_front()
         page.keyboard.type(" ")
@@ -1935,6 +2021,7 @@ class Recette:
             page.wait_for_load_state("networkidle", timeout=10_000)
         except PWTimeout:
             pass  # un flux tenu ouvert empêche le repos réseau : la mesure reste celle du load
+        self._check_maintenance(page)  # the load of a maintenance page is no measure of the app
         t = b.call(TIMING_JS)
         nav = t["nav"] or {}
         fcp = next((p["start"] for p in t["paint"] if p["name"] == "first-contentful-paint"), None)
@@ -1978,7 +2065,7 @@ class Recette:
                 continue
         if not clicked:
             self._goto(page, self.entry)
-        page.locator(SELECTORS["textarea"]).first.wait_for(state="visible", timeout=15_000)
+        self._wait_for_composer(page)
         b.call("() => {" + INTERCEPTOR_JS + " window.__ev = []; return true; }")
         self.conv = self._fresh_conversation()
         self.flux["ev"] = 0
@@ -2234,7 +2321,15 @@ class Recette:
         offlist = obs.get("offlist")
         nfr = case["nfr"]
         not_sent = obs.get("not_sent")
-        if (not asked and not dialog and not offlist
+        maint = (self.observations.get(cid) or {}).get("maintenance")
+        if maint and time.time() - maint.get("epoch", 0) > MAINTENANCE_FRESH_S:
+            maint = None  # an old maintenance never stands for a case tried again later
+        if maint and not dialog and not offlist:
+            # The app showed its maintenance page when this case was tried: KO disponibilité.
+            r = {"verdict": "KO", "notes": ["service en maintenance (page de maintenance affichée)"]}
+            nfr = nfr_union(nfr, ["disponibilite"])
+            obs = {k: v for k, v in obs.items() if k in ("verdict",)}  # judged on the maintenance alone
+        elif (not asked and not dialog and not offlist
                 and (not_sent or (attach and attach.get("state") not in ("ready", "attached")))):
             label = (not_sent or {}).get("label") or attach.get("label") or "sans puce"
             if not_sent:
@@ -2250,6 +2345,7 @@ class Recette:
             hint = {"load": "mesurer_chargement", "list": "lister_conversations",
                     "concurrent": "charge_concurrente", "long": "conversation_longue"}.get(case["kind"], "poser_question")
             hint = {"@model": "choisir_modele", "@web": "recherche_web"}.get(key, hint)
+            self._last_verdict_probe = cid  # still to do: a maintenance page next is this case's
             raise DriverRefusal("precondition", f"aucune observation pour {cid} : {hint} d'abord")
         elif asked:
             oracle = {"id": cid, "must": case["must"], "must_not": case["must_not"], "pii": case["pii"]}
