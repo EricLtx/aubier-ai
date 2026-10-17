@@ -44,7 +44,8 @@ Early-stage, under active development.
 | SP1a | Single-node kernel: tasks, scheduler, leases and approvals, STOP, encrypted storage, hash-chained ledger, local IPC, the `vk` shell | Done (`sp1a`) |
 | SP1b | Real model adapters (local and cloud), confined agent harness, passkey approvals, Windows service, signed builds | Done (`sp1b`) |
 | Pilot | First application driver under the driver contract (a browser behind typed business actions), task recipes, and a complete governed process run through the kernel: plan, confined execution, judgement, two signed approvals, release | Done (`pilot-driver`) |
-| Next | Driver packaging and deployment, quota and health tracking for the model adapters, the execution context for drivers on a desktop, then evidence-gated promotion, AI capital packaging and re-qualification, peer-to-peer nodes | Being specified |
+| Driver packaging | A driver cut as a signed package that carries its own CPython and libraries, installed once under `%ProgramFiles%` by an administrator and fingerprinted whole before every start (`tampered` on any change) | Built, under review (`driver-packaging`) |
+| Next | Quota and health tracking for the model adapters, the execution context for drivers on a desktop, then evidence-gated promotion, AI capital packaging and re-qualification, peer-to-peer nodes | Being specified |
 
 Feasibility of the next stages has been checked with throwaway prototypes before any product code is written.
 
