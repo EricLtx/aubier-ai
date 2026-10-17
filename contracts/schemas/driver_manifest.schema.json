@@ -13,6 +13,9 @@
     "clearance": {
       "$ref": "#/$defs/Clearance"
     },
+    "execution_context": {
+      "$ref": "#/$defs/ExecutionContext"
+    },
     "governed": {
       "description": "Read back from the host at mount, never trusted from the file.",
       "type": "boolean"
@@ -40,11 +43,28 @@
     "name": {
       "type": "string"
     },
+    "needs_input_desktop": {
+      "description": "The driver drives the UI by keyboard, mouse or UIA and needs the input\ndesktop unlocked. Recorded now, enforced when the agent arrives.",
+      "type": "boolean"
+    },
     "program": {
       "$ref": "#/$defs/DriverProgram"
+    },
+    "source": {
+      "$ref": "#/$defs/DriverSource"
     }
   },
   "additionalProperties": false,
+  "if": {
+    "properties": {
+      "execution_context": {
+        "const": "service"
+      }
+    },
+    "required": [
+      "execution_context"
+    ]
+  },
   "required": [
     "name",
     "kind",
@@ -56,6 +76,17 @@
     "clearance",
     "governed"
   ],
+  "then": {
+    "properties": {
+      "program": {
+        "properties": {
+          "headless": {
+            "const": true
+          }
+        }
+      }
+    }
+  },
   "$defs": {
     "Clearance": {
       "type": "object",
@@ -157,6 +188,22 @@
         "command",
         "files_sha256",
         "headless"
+      ]
+    },
+    "DriverSource": {
+      "description": "Where the tree the kernel mounts comes from. Verified by path, never\ntrusted as declared; not part of `driver_id`.",
+      "type": "string",
+      "enum": [
+        "development",
+        "installed"
+      ]
+    },
+    "ExecutionContext": {
+      "description": "Where the driver's process must live. In the manifest, so in `driver_id`.",
+      "type": "string",
+      "enum": [
+        "interactive",
+        "service"
       ]
     },
     "Scope": {

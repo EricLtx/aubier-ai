@@ -17,6 +17,37 @@ pub enum DriverKind {
     Browser,
 }
 
+/// Where the driver's process must live. In the manifest, so in `driver_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionContext {
+    #[default]
+    Interactive,
+    Service,
+}
+
+impl ExecutionContext {
+    pub fn is_default(&self) -> bool {
+        *self == ExecutionContext::Interactive
+    }
+}
+
+/// Where the tree the kernel mounts comes from. Verified by path, never
+/// trusted as declared; not part of `driver_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverSource {
+    #[default]
+    Development,
+    Installed,
+}
+
+impl DriverSource {
+    pub fn is_default(&self) -> bool {
+        *self == DriverSource::Development
+    }
+}
+
 /// The process the host spawns for this driver.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +101,17 @@ pub struct DriverAction {
 /// `to_registre` must fail loudly, not be dropped before `validate` can see it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+// `validate` refuses a headed service driver; the schema says it too, so a
+// manifest written by hand is refused before it reaches the kernel.
+#[schemars(extend(
+    "if" = {
+        "properties": { "execution_context": { "const": "service" } },
+        "required": ["execution_context"]
+    },
+    "then" = {
+        "properties": { "program": { "properties": { "headless": { "const": true } } } }
+    }
+))]
 pub struct DriverManifest {
     pub name: String,
     pub kind: DriverKind,
@@ -80,6 +122,14 @@ pub struct DriverManifest {
     pub min_interval_ms: u64,
     pub max_action_ms: u64,
     pub clearance: Clearance,
+    #[serde(default, skip_serializing_if = "ExecutionContext::is_default")]
+    pub execution_context: ExecutionContext,
+    /// The driver drives the UI by keyboard, mouse or UIA and needs the input
+    /// desktop unlocked. Recorded now, enforced when the agent arrives.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_input_desktop: bool,
+    #[serde(default, skip_serializing_if = "DriverSource::is_default")]
+    pub source: DriverSource,
     /// Read back from the host at mount, never trusted from the file.
     pub governed: bool,
 }
@@ -156,6 +206,7 @@ impl DriverManifest {
     pub fn driver_id(&self) -> String {
         let mut m = self.clone();
         m.governed = false;
+        m.source = DriverSource::Development;
         hash_canonical(&m)
     }
 
@@ -192,6 +243,11 @@ impl DriverManifest {
                      name a larger cap, or leave it out for the kind's default"
                 ));
             }
+        }
+        if self.execution_context == ExecutionContext::Service && !self.program.headless {
+            return invalid(
+                "execution_context service requires program.headless true: session 0 has no desktop",
+            );
         }
         if self.hosts.is_empty() {
             return invalid("hosts is empty: list the host names the driver may reach");
@@ -380,6 +436,55 @@ mod tests {
             "../../../contracts/examples/driver_manifest/valid/maskai.json"
         ))
         .unwrap()
+    }
+
+    const PILOT_ID: &str =
+        "sha256:174427596817f4843dbe1d6a0f618037430c0225b86becc7f2f206edbeccf142";
+
+    #[test]
+    fn the_pilot_manifest_keeps_its_id_with_the_new_fields_absent() {
+        let m = manifest();
+        assert_eq!(m.execution_context, ExecutionContext::Interactive);
+        assert!(!m.needs_input_desktop);
+        assert_eq!(m.source, DriverSource::Development);
+        assert_eq!(m.driver_id(), PILOT_ID);
+    }
+
+    #[test]
+    fn source_is_not_part_of_the_identity_but_execution_context_is() {
+        let mut m = manifest();
+        m.source = DriverSource::Installed;
+        assert_eq!(m.driver_id(), PILOT_ID, "installed or not, the same driver");
+        m.execution_context = ExecutionContext::Service;
+        m.program.headless = true;
+        assert_ne!(
+            m.driver_id(),
+            PILOT_ID,
+            "a driver moved to another context is another driver"
+        );
+    }
+
+    #[test]
+    fn a_service_driver_must_be_headless() {
+        let mut m = manifest();
+        m.execution_context = ExecutionContext::Service;
+        m.program.headless = false;
+        let e = m.validate().unwrap_err().to_string();
+        assert!(
+            e.contains("execution_context service requires program.headless true"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn unknown_words_are_refused_at_parse() {
+        let text = include_str!("../../../contracts/examples/driver_manifest/valid/maskai.json")
+            .replacen(
+                "\"kind\": \"browser\"",
+                "\"kind\": \"browser\", \"source\": \"packaged\"",
+                1,
+            );
+        assert!(serde_json::from_str::<DriverManifest>(&text).is_err());
     }
 
     #[test]

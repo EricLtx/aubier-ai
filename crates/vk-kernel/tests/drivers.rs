@@ -23,7 +23,7 @@ use std::time::Duration;
 use vk_contracts::arch::ArchManifest;
 use vk_contracts::driver::{
     DriverActed, DriverAction, DriverKind, DriverManifest, DriverMounted, DriverProgram,
-    DriverUnmounted,
+    DriverSource, DriverUnmounted, ExecutionContext,
 };
 use vk_contracts::hash_canonical;
 use vk_contracts::labels::{Clearance, DataClass, Label, Origin, Scope};
@@ -133,6 +133,9 @@ fn maskai_like() -> DriverManifest {
             third_party_allowed: true,
         },
         governed: false,
+        execution_context: ExecutionContext::Interactive,
+        needs_input_desktop: false,
+        source: DriverSource::Development,
     }
 }
 
