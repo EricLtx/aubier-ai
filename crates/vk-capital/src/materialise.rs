@@ -40,8 +40,10 @@
 //!    the install added are rewritten: the release's own (pip's, whose
 //!    `RECORD` names launchers and bytecode the release does not ship) stay
 //!    byte for byte as shipped.
-//! 5. **Every `__pycache__` directory is deleted**, the release's included
-//!    (bytecode is regenerated, and the fingerprint leaves it out anyway).
+//! 5. **Every `__pycache__` directory is deleted**, the release's included:
+//!    the fingerprint hashes bytecode (ruling R-T8b) and the installed tree
+//!    is run with `-B`, so an installed tree holds none and any `.pyc` that
+//!    appears in one later is a change to the tree.
 //!
 //! OS analogy: materialising is flashing the image to a blank partition and
 //! reading back its CRC; the rules strip what the flasher stamps with the

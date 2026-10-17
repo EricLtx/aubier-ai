@@ -13,16 +13,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Whether `rel` (relative to the tree root) is left out of the fingerprint:
-/// any `__pycache__` at any depth, a top-level `manifest*.json`, and the
-/// top-level `.package/` directory.
+/// a top-level `manifest*.json` and the top-level `.package/` directory,
+/// nothing else. Bytecode is hashed (ruling R-T8b): `materialise` deletes
+/// every `__pycache__` and the packed command runs with `-B`, so a `.pyc` in
+/// an installed tree was planted there, and Python would load it.
 fn excluded(rel: &Path) -> bool {
     let names: Vec<String> = rel
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    if names.iter().any(|n| n == "__pycache__") {
-        return true;
-    }
     if names.first().is_some_and(|n| n == ".package") {
         return true;
     }
@@ -73,9 +72,10 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<Vec<u8>, PathBuf>) -> std::i
 
 /// `hash_tree`: every regular file under `root` at any depth, path-sorted
 /// (`/`-joined relative paths, bytes compared), framed `path\0bytes\0` into
-/// SHA-256 — the framing of `vk_contracts::driver::hash_dir`. Excluded: any
-/// `__pycache__` directory, a top-level `manifest*.json`, the top-level
-/// `.package/` directory. Links are skipped, never followed.
+/// SHA-256 — the framing of `vk_contracts::driver::hash_dir`. Excluded: a
+/// top-level `manifest*.json` and the top-level `.package/` directory;
+/// `__pycache__` is hashed like any directory. Links are skipped, never
+/// followed.
 pub fn hash_tree(root: &Path) -> std::io::Result<String> {
     let mut files = BTreeMap::new();
     walk(root, root, &mut files)?;
@@ -203,16 +203,43 @@ mod tests {
         fs::write(dir.join(".package/signature.json"), b"{}").unwrap();
     }
     #[test]
-    fn the_fingerprint_ignores_pycache_manifests_and_the_package_dir() {
+    fn the_fingerprint_ignores_the_manifests_and_the_package_dir() {
         let a = tempfile::tempdir().unwrap();
         tree(a.path());
         let f1 = hash_tree(a.path()).unwrap();
-        fs::write(a.path().join("python/Lib/__pycache__/os.pyc"), b"changed").unwrap();
         fs::write(a.path().join("manifest.json"), b"{\"changed\":1}").unwrap();
         fs::write(a.path().join(".package/signature.json"), b"changed").unwrap();
         assert_eq!(hash_tree(a.path()).unwrap(), f1);
         fs::write(a.path().join("python/Lib/os.py"), b"changed").unwrap();
         assert_ne!(hash_tree(a.path()).unwrap(), f1);
+    }
+    /// Ruling R-T8b: an installed tree is fingerprinted whole, bytecode
+    /// included. `materialise` deletes every `__pycache__` and the packed
+    /// command runs with `-B`, so a `.pyc` in an installed tree is one that
+    /// somebody planted, and Python would run it: a change to one, or a new
+    /// one, is a change to the tree.
+    #[test]
+    fn bytecode_is_part_of_the_fingerprint() {
+        let a = tempfile::tempdir().unwrap();
+        tree(a.path());
+        let f1 = hash_tree(a.path()).unwrap();
+        fs::write(a.path().join("python/Lib/__pycache__/os.pyc"), b"changed").unwrap();
+        let f2 = hash_tree(a.path()).unwrap();
+        assert_ne!(f2, f1, "a changed .pyc changes the fingerprint");
+        fs::create_dir_all(a.path().join("__pycache__")).unwrap();
+        fs::write(
+            a.path().join("__pycache__/driver.cpython-313.pyc"),
+            b"planted",
+        )
+        .unwrap();
+        assert_ne!(hash_tree(a.path()).unwrap(), f2, "a planted .pyc does too");
+        let stats = stat_tree(a.path()).unwrap();
+        assert!(
+            stats
+                .iter()
+                .any(|e| e.path == "__pycache__/driver.cpython-313.pyc"),
+            "the stat set sees it, so a cache hit cannot hide it: {stats:?}"
+        );
     }
     #[test]
     fn the_same_tree_in_two_directories_has_one_fingerprint() {
