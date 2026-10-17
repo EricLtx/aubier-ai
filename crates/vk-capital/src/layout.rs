@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -149,6 +150,22 @@ pub fn write_signature(out: &Path, package_digest: &str, sig: &Signature) -> Res
             "sign the digest layout::write returned, into the layout it wrote",
         );
     }
+    const UNWRITTEN: &str = "write the layout with layout::write before signing it";
+    let path = out.join("index.json");
+    let mut index: Value = serde_json::from_slice(&fs::read(&path)?)
+        .or_else(|e| refuse(unparsed("index.json", &e), UNWRITTEN))?;
+    let Some(manifests) = index.get_mut("manifests").and_then(Value::as_array_mut) else {
+        return refuse("index.json has no manifests list", UNWRITTEN);
+    };
+    if manifests
+        .iter()
+        .any(|e| e["artifactType"] == SIGNATURE_ARTIFACT_TYPE)
+    {
+        return refuse(
+            "layout already carries a signature",
+            "pack again into an empty --out",
+        );
+    }
     let subject_size = fs::metadata(&subject)?.len();
     let config = put_blob(out, OCI_EMPTY_TYPE, EMPTY)?;
     let blob = put_blob(out, MEDIA_SIGNATURE, &serde_json::to_vec_pretty(sig)?)?;
@@ -169,14 +186,6 @@ pub fn write_signature(out: &Path, package_digest: &str, sig: &Signature) -> Res
         OCI_MANIFEST_TYPE,
         &serde_json::to_vec_pretty(&referrer)?,
     )?;
-    let path = out.join("index.json");
-    let mut index: Value = serde_json::from_slice(&fs::read(&path)?)?;
-    let Some(manifests) = index.get_mut("manifests").and_then(Value::as_array_mut) else {
-        return refuse(
-            "index.json has no manifests list",
-            "write the layout with layout::write before signing it",
-        );
-    };
     manifests.push(index_entry(&referrer, SIGNATURE_ARTIFACT_TYPE));
     fs::write(&path, serde_json::to_vec_pretty(&index)?)?;
     Ok(())
@@ -198,7 +207,7 @@ pub fn open(layout: &Path) -> Result<Opened> {
         Err(e) => return Err(e.into()),
     };
     let index: Value = serde_json::from_slice(&index)
-        .or_else(|e| refuse(format!("index.json does not parse: {e}"), NOT_A_PACKAGE))?;
+        .or_else(|e| refuse(unparsed("index.json", &e), NOT_A_PACKAGE))?;
     let entries = index["manifests"]
         .as_array()
         .map(Vec::as_slice)
@@ -225,7 +234,7 @@ pub fn open(layout: &Path) -> Result<Opened> {
     let (package_digest, size) = descriptor_of(driver, "image manifest")?;
     let bytes = read_blob(layout, &package_digest, size, "image manifest")?;
     let package: DriverPackage = serde_json::from_slice(&bytes)
-        .or_else(|e| refuse(format!("image manifest does not parse: {e}"), ALTERED))?;
+        .or_else(|e| refuse(unparsed("image manifest", &e), ALTERED))?;
     if let Err(e) = package.validate() {
         return refuse(format!("image manifest: {e}"), ALTERED);
     }
@@ -248,7 +257,7 @@ pub fn open(layout: &Path) -> Result<Opened> {
     let (digest, size) = descriptor_of(signature, "signature manifest")?;
     let referrer: Value =
         serde_json::from_slice(&read_blob(layout, &digest, size, "signature manifest")?)
-            .or_else(|e| refuse(format!("signature manifest does not parse: {e}"), ALTERED))?;
+            .or_else(|e| refuse(unparsed("signature manifest", &e), ALTERED))?;
     if referrer["subject"]["digest"] != package_digest.as_str() {
         return refuse(
             format!("signature manifest: its subject is not the image manifest {package_digest}"),
@@ -262,13 +271,10 @@ pub fn open(layout: &Path) -> Result<Opened> {
     let (digest, size) = descriptor_of(blob, "signature")?;
     let signature: Signature =
         serde_json::from_slice(&read_blob(layout, &digest, size, "signature")?)
-            .or_else(|e| refuse(format!("signature does not parse: {e}"), ALTERED))?;
+            .or_else(|e| refuse(unparsed("signature", &e), ALTERED))?;
     if signature.signed != package_digest {
         return refuse(
-            format!(
-                "signature names another digest ({:?}), not the package {package_digest}",
-                signature.signed
-            ),
+            format!("signature names another digest than the package {package_digest}"),
             ALTERED,
         );
     }
@@ -327,6 +333,17 @@ fn well_formed(digest: &str) -> bool {
     })
 }
 
+/// A refusal for JSON that does not parse: where, never what. serde's message
+/// can echo a key from the file verbatim, newlines included, and a refusal
+/// carries no third party's text.
+fn unparsed(what: &str, e: &serde_json::Error) -> String {
+    format!(
+        "{what} does not parse (line {}, column {})",
+        e.line(),
+        e.column()
+    )
+}
+
 /// The `digest` and `size` of a descriptor held as raw JSON.
 fn descriptor_of(v: &Value, what: &str) -> Result<(String, u64)> {
     match (v["digest"].as_str(), v["size"].as_u64()) {
@@ -339,32 +356,41 @@ fn descriptor_of(v: &Value, what: &str) -> Result<(String, u64)> {
 }
 
 /// The blob `digest` names, refused unless the digest is well formed (no name
-/// read from a file reaches the file system unchecked), the file has `size`
-/// bytes (checked before reading it) and its bytes hash to `digest`.
+/// read from a file reaches the file system unchecked), the blob is a regular
+/// file and not a link (a link could name a FIFO, whose read never returns, or
+/// a device, whose read never ends), it holds `size` bytes (read no further
+/// than one past) and they hash to `digest`.
 fn read_blob(layout: &Path, digest: &str, size: u64, what: &str) -> Result<Vec<u8>> {
     if !well_formed(digest) {
         return refuse(
-            format!("{what}: digest {digest:?} is not sha256:<64 hex>"),
+            format!("{what}: its digest is not sha256:<64 hex>"),
             ALTERED,
         );
     }
     let path = blob_path(layout, digest);
-    let len = match fs::metadata(&path) {
-        Ok(m) => m.len(),
+    let not_a_file = || refuse(format!("{what}: blob is not a regular file"), ALTERED);
+    match fs::symlink_metadata(&path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return not_a_file(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return refuse(format!("{what}: blob {digest} is missing"), ALTERED)
         }
         Err(e) => return Err(e.into()),
-    };
-    if len != size {
+    }
+    let file = fs::File::open(&path)?;
+    if !file.metadata()?.is_file() {
+        return not_a_file(); // replaced since the check above
+    }
+    let mut bytes = Vec::new();
+    file.take(size.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != size {
         return refuse(
             format!(
-                "{what}: size mismatch ({len} bytes, its descriptor says {size}), the package was altered"
+                "{what}: size mismatch (its descriptor says {size} bytes), the package was altered"
             ),
             ALTERED,
         );
     }
-    let bytes = fs::read(&path)?;
     if digest_of(&bytes) != digest {
         return refuse(
             format!("{what}: digest mismatch, the package was altered"),
@@ -494,14 +520,93 @@ mod tests {
         let e = open(&out).unwrap_err().to_string();
         assert!(e.contains("image manifest") && e.contains("64 hex"), "{e}");
     }
-    #[test]
-    fn a_second_signature_entry_is_refused() {
+    fn signed() -> (tempfile::TempDir, PathBuf, String) {
         let t = tempfile::tempdir().unwrap();
         let out = t.path().join("pkg");
         let (_, digest) = write(&out, &layers(), &ann()).unwrap();
         write_signature(&out, &digest, &sig(&digest)).unwrap();
-        write_signature(&out, &digest, &sig(&digest)).unwrap();
+        (t, out, digest)
+    }
+    /// A key a hostile publisher would plant: a newline, then a fake verdict.
+    const HOSTILE: &str = "x\nlayer files: OK; remedy: none";
+    fn with_hostile_key(json: &[u8]) -> Vec<u8> {
+        let mut v: Value = serde_json::from_slice(json).unwrap();
+        v[HOSTILE] = 0.into();
+        serde_json::to_vec(&v).unwrap()
+    }
+    /// Writes `bytes` as a blob and points the `index.json` entry naming `old` at it.
+    fn repoint_index(out: &Path, old: &str, bytes: &[u8]) {
+        std::fs::write(blob_path(out, &digest_of(bytes)), bytes).unwrap();
+        let path = out.join("index.json");
+        let mut index: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for e in index["manifests"].as_array_mut().unwrap() {
+            if e["digest"] == old {
+                e["digest"] = digest_of(bytes).into();
+                e["size"] = bytes.len().into();
+            }
+        }
+        std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+    }
+    fn assert_one_line_of_our_own(e: &str) {
+        assert_eq!(e.lines().count(), 1, "{e}");
+        assert!(
+            !e.contains("files: OK") && !e.contains("remedy: none"),
+            "{e}"
+        );
+    }
+    #[test]
+    fn an_unknown_key_in_the_image_manifest_does_not_reach_the_refusal() {
+        let (_t, out, digest) = signed();
+        let bytes = with_hostile_key(&std::fs::read(blob_path(&out, &digest)).unwrap());
+        repoint_index(&out, &digest, &bytes);
         let e = open(&out).unwrap_err().to_string();
-        assert!(e.contains("one driver manifest and one signature"), "{e}");
+        assert!(e.contains("image manifest"), "{e}");
+        assert_one_line_of_our_own(&e);
+    }
+    #[test]
+    fn an_unknown_key_in_the_signature_does_not_reach_the_refusal() {
+        let (_t, out, _) = signed();
+        let index: Value =
+            serde_json::from_slice(&std::fs::read(out.join("index.json")).unwrap()).unwrap();
+        let old = index["manifests"][1]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut referrer: Value =
+            serde_json::from_slice(&std::fs::read(blob_path(&out, &old)).unwrap()).unwrap();
+        let sig_digest = referrer["layers"][0]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let bytes = with_hostile_key(&std::fs::read(blob_path(&out, &sig_digest)).unwrap());
+        std::fs::write(blob_path(&out, &digest_of(&bytes)), &bytes).unwrap();
+        referrer["layers"][0]["digest"] = digest_of(&bytes).into();
+        referrer["layers"][0]["size"] = bytes.len().into();
+        repoint_index(&out, &old, &serde_json::to_vec(&referrer).unwrap());
+        let e = open(&out).unwrap_err().to_string();
+        assert!(e.contains("signature"), "{e}");
+        assert_one_line_of_our_own(&e);
+    }
+    #[test]
+    fn a_blob_longer_than_its_descriptor_or_not_a_file_is_refused_by_name() {
+        let (_t, out, _) = signed();
+        let package = open(&out).unwrap().package;
+        let files = blob_path(&out, &package.layer("files").unwrap().digest);
+        std::fs::write(&files, b"FILES and more").unwrap();
+        let e = open(&out).unwrap_err().to_string();
+        assert!(e.contains("layer files: size mismatch"), "{e}");
+        std::fs::remove_file(&files).unwrap();
+        std::fs::create_dir(&files).unwrap();
+        let e = open(&out).unwrap_err().to_string();
+        assert!(e.contains("layer files: blob is not a regular file"), "{e}");
+    }
+    #[test]
+    fn signing_a_layout_twice_is_refused_and_leaves_it_whole() {
+        let (_t, out, digest) = signed();
+        let e = write_signature(&out, &digest, &sig(&digest))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("layout already carries a signature"), "{e}");
+        open(&out).unwrap();
     }
 }
