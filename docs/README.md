@@ -11,6 +11,7 @@ in `CLAUDE.md`, so it is loaded at every start).
 |---|---|---|
 | `docs/technical/` | the **current** technical documentation: `technical-readme.md` (how the kernel and the node work), `specs/` (design specs of open or load-bearing chantiers), `plans/` (implementation plans of chantiers in progress), `runbooks/` (operator procedures) | yes |
 | `docs/technical/reviews/` | review records, SDD ledgers and rulings of chantiers in progress | **no** (git-ignored) |
+| `docs/technical/debriefs/` | post-run debriefs of a driver or a chantier: what the field revealed, measured signals, proposals for the next version (public, redacted) | yes |
 | `docs/functional/` | what the product does for its users: `use-cases/` (procedures, corpora, oracles, public reports), `demo/` (the demo brief, script and recorded runs) | yes |
 | `docs/functional/private/` | functional material that must not leave the node: recette reports naming exposed infrastructure or a test account, test documents | **no** |
 | `docs/strategy/` | framing and strategy: `business/` (business case), `decisions/` (founder decision notes that still bind), `research/` (literature notes) | **no** |
@@ -30,7 +31,7 @@ Outside `docs/`: `README.md` (the front page), `CLAUDE.md` (working rules), `01_
 
 ## Current documents (2026-10-17)
 
-- Technical: `technical/technical-readme.md`; specs `2026-09-22-verticalai-design.md` (the founding design), `2026-10-14-device-driver-contract-and-recette-pilot-design.md` (the driver contract, rulings R1–R28), `2026-10-16-driver-packaging-and-deployment-design.md`, `2026-10-17-driver-learning-office-design.md`; runbook `recette-maskai.md`.
+- Technical: `technical/technical-readme.md`; debrief `debriefs/2026-10-17-maskai-driver.md`; specs `2026-09-22-verticalai-design.md` (the founding design), `2026-10-14-device-driver-contract-and-recette-pilot-design.md` (the driver contract, rulings R1–R28), `2026-10-16-driver-packaging-and-deployment-design.md`, `2026-10-17-driver-learning-office-design.md`; runbook `recette-maskai.md`.
 - Functional: `use-cases/recettage-chat-ia/` (procedure, corpora v1/v2, oracles, the 2026-10-13 benchmark baseline, journal); `demo/` (brief, README, runs of 2026-09-25).
 - Strategy (private): business case; decision note of 2026-10-15 on the user-session agent; research notes on AI evolution and value.
 - Archive: plans SP0, SP1a, SP1b and the driver pilot; the SP1 gate checklist; review records and ledgers of SP1a, SP1b, claude-bin, liveness; the decision record of 2026-09-23.

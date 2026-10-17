@@ -1,0 +1,68 @@
+{
+ "url": "https://app.maskai.fr/new",
+ "nav": {
+  "name": "https://app.maskai.fr/new",
+  "entryType": "navigation",
+  "startTime": 0,
+  "duration": 105.40000000596046,
+  "navigationId": 893,
+  "initiatorType": "navigation",
+  "deliveryType": "",
+  "nextHopProtocol": "h2",
+  "renderBlockingStatus": "non-blocking",
+  "contentType": "text/html",
+  "contentEncoding": "gzip",
+  "workerStart": 0,
+  "workerRouterEvaluationStart": 0,
+  "workerCacheLookupStart": 0,
+  "workerMatchedSourceType": "",
+  "workerFinalSourceType": "",
+  "redirectStart": 0,
+  "redirectEnd": 0,
+  "fetchStart": 2.2000000029802322,
+  "domainLookupStart": 2.2000000029802322,
+  "domainLookupEnd": 2.2000000029802322,
+  "connectStart": 2.2000000029802322,
+  "secureConnectionStart": 2.2000000029802322,
+  "connectEnd": 2.2000000029802322,
+  "requestStart": 3.2999999970197678,
+  "responseStart": 53.900000005960464,
+  "firstInterimResponseStart": 0,
+  "finalResponseHeadersStart": 53.900000005960464,
+  "responseEnd": 74.90000000596046,
+  "transferSize": 13266,
+  "encodedBodySize": 12966,
+  "decodedBodySize": 47670,
+  "responseStatus": 200,
+  "serverTiming": [],
+  "unloadEventStart": 65.1000000089407,
+  "unloadEventEnd": 65.1000000089407,
+  "domInteractive": 95.70000000298023,
+  "domContentLoadedEventStart": 95.70000000298023,
+  "domContentLoadedEventEnd": 96.29999999701977,
+  "domComplete": 105.29999999701977,
+  "loadEventStart": 105.40000000596046,
+  "loadEventEnd": 105.40000000596046,
+  "type": "navigate",
+  "redirectCount": 0,
+  "activationStart": 0,
+  "criticalCHRestart": 0,
+  "notRestoredReasons": null,
+  "confidence": {
+   "randomizedTriggerRate": 0.4994798,
+   "value": "low"
+  }
+ },
+ "paint": [
+  {
+   "name": "first-paint",
+   "start": 112
+  },
+  {
+   "name": "first-contentful-paint",
+   "start": 264
+  }
+ ],
+ "resources": 49,
+ "resources_bytes": 29922
+}
