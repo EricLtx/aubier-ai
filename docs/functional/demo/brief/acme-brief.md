@@ -1,7 +1,7 @@
 # Client brief — Acme Fermentation Co.
 
 *A fictional brief. Acme Fermentation Co., its people and its numbers are
-invented; see `docs/demo/README.md`.*
+invented; see `docs/functional/demo/README.md`.*
 
 **Prepared for:** an independent brand and packaging designer
 **Prepared by:** Dana Okonjo, co-founder, Acme Fermentation Co.

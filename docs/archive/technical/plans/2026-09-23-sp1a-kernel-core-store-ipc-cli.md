@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust stable (MSVC on Windows), tokio, rusqlite (bundled SQLite), chacha20poly1305, keyring, clap 4, tracing, serde/serde_json, anyhow, directories, uuid. Existing crates: vk-contracts, vk-stub, vk-props.
 
-**Spec:** `docs/superpowers/specs/2026-09-22-verticalai-design.md` §3 (kernel), §3.9 (storage), §3.11 (syscalls), §5 (implementation), SP1 row of §6; SP1 design as approved in chat on 2026-09-23 (crates, transport, storage, `vk` shell, OS namespace). Companion plan: `2026-09-23-sp1b-arches-harness-passkeys-service-demo.md`.
+**Spec:** `docs/technical/specs/2026-09-22-verticalai-design.md` §3 (kernel), §3.9 (storage), §3.11 (syscalls), §5 (implementation), SP1 row of §6; SP1 design as approved in chat on 2026-09-23 (crates, transport, storage, `vk` shell, OS namespace). Companion plan: `2026-09-23-sp1b-arches-harness-passkeys-service-demo.md`.
 
 ## Execution tiering (requested by the founder)
 

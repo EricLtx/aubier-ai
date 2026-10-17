@@ -5,7 +5,7 @@ description: Recette fonctionnelle et benchmark d'un chat IA (web, piloté dans 
 
 # Recette d'un chat IA — procédure Aubier
 
-Lis d'abord `docs/use-cases/recettage-chat-ia/PROCEDURE.md` (les sept étapes, la grille
+Lis d'abord `docs/functional/use-cases/recettage-chat-ia/PROCEDURE.md` (les sept étapes, la grille
 N0–N9, le barème). Ce fichier ne contient que ce que l'agent doit savoir pour exécuter
 sans se tromper.
 
@@ -22,8 +22,8 @@ sans se tromper.
 
 | Besoin | Commande |
 |---|---|
-| Générer le corpus v1 (10 docs) | `powershell -File docs/use-cases/recettage-chat-ia/corpus/generer-corpus.ps1 -Out <dir>` |
-| Générer le corpus v2 (légers + volumineux) | `python -I docs/use-cases/recettage-chat-ia/corpus-v2/gen-corpus-v2.py <dir>` puis `powershell -File .../gen-corpus-v2.ps1 -Out <dir>` |
+| Générer le corpus v1 (10 docs) | `powershell -File docs/functional/use-cases/recettage-chat-ia/corpus/generer-corpus.ps1 -Out <dir>` |
+| Générer le corpus v2 (légers + volumineux) | `python -I docs/functional/use-cases/recettage-chat-ia/corpus-v2/gen-corpus-v2.py <dir>` puis `powershell -File .../gen-corpus-v2.ps1 -Out <dir>` |
 | Journaliser un test | `python -I scripts/recette/journal.py <run>.jsonl add --step exec --case <id> --verdict <OK\|PARTIEL\|KO> --timing <s> --nfr performance,securite --evidence "…"` |
 | Évaluer contre les oracles | `python -I scripts/recette/evaluer.py <oracles.json> <observations.json>` |
 | Agrégats pour le rapport | `python -I scripts/recette/journal.py <run>.jsonl stats` |

@@ -4,7 +4,7 @@ Version 2, 2026-10-13. Issue de deux exécutions réelles sur MaskAI (`app.maska
 12 et 13 octobre 2026. Cette procédure est faite pour être exécutée par un agent et apprise
 par Aubier : chaque étape a une entrée, une sortie, une preuve et, quand il le faut, un
 point de validation humaine. Les outils cités sont dans ce dépôt (`scripts/recette/`,
-`docs/use-cases/recettage-chat-ia/`). La compétence agent correspondante est
+`docs/functional/use-cases/recettage-chat-ia/`). La compétence agent correspondante est
 `.claude/skills/recettage-chat-ia/SKILL.md`.
 
 ## 1. Pourquoi ce cas d'usage démontre la valeur d'Aubier

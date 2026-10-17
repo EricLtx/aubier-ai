@@ -13,7 +13,7 @@ That is the whole demo. It takes about twelve minutes and asks nothing of you
 unless you run it with `-Approval passkey`, which is the variant where a person
 holds the key.
 
-The runs from 2026-09-25 are in `docs/demo/runs/2026-09-25/` — both orders, the
+The runs from 2026-09-25 are in `docs/functional/demo/runs/2026-09-25/` — both orders, the
 harness variant, the two proposals, the ledgers and the H1 verdict — so you can
 read what it does before you spend the twelve minutes.
 
@@ -23,7 +23,7 @@ read what it does before you spend the twelve minutes.
 |---|---|
 | **Gemma** | `gemma4:e4b`, 8B, in an Ollama container **this kernel starts**, on loopback, capped at 12 GiB and 6 CPUs. `governed: yes`. Nothing about the call leaves the machine. |
 | **Claude** | `claude-sonnet-5` to draft and `claude-opus-5` to judge, through the Claude Code installed on this machine, driven as a pure completion engine. `governed: no`, `locality: cloud`, `jurisdiction: US`. |
-| **The brief** | `docs/demo/brief/acme-brief.md` — a fictional client brief from a fictional four-person food business. It is the task's *goal*, verbatim. |
+| **The brief** | `docs/functional/demo/brief/acme-brief.md` — a fictional client brief from a fictional four-person food business. It is the task's *goal*, verbatim. |
 | **The task** | `[Plan(A), Draft(B), Judge(B), Approve, Release out]`. |
 | **The human** | `vk approve` signs a challenge **the kernel minted** for that task — never one the shell chose. That is invariant I1, and it is the only reason the artefact is allowed to leave. |
 | **The file** | `<export_root>/out/<hash12>.proposal`, owner-only, plaintext, outside the encrypted tier. |
@@ -199,7 +199,7 @@ Two things that run exposes, in case they surprise you:
 
 ## What is recorded, and where
 
-Under `docs/demo/runs/<date>/`, one set per run:
+Under `docs/functional/demo/runs/<date>/`, one set per run:
 
 | file | what it is |
 |---|---|

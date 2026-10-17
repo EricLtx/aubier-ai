@@ -1,4 +1,4 @@
-# Literature corpus — never pushed (see docs/superpowers/specs/*-design.md §8)
+# Literature corpus — never pushed (see docs/technical/specs/2026-09-22-verticalai-design.md §8)
 01_Architectural_Documentation/
 
 # OS / editor noise
@@ -24,16 +24,16 @@ target/
 # Subagent-driven-development scratch (ledgers, briefs, review packages)
 .superpowers/
 
-# Third-party and business material — never published
+# Third-party material — never published
 02_Consulting_Toolkit/
-docs/business/
-reports/
-research_notes/
 
-# Internal decision, review and status documents — kept private
-docs/decisions/
-docs/status/
-docs/superpowers/reviews/
+# Documentation kept private and local (see docs/README.md): strategy and framing,
+# review records, and the private parts of the functional documentation
+docs/strategy/
+docs/archive/strategy/
+docs/technical/reviews/
+docs/archive/technical/reviews/
+docs/**/private/
 
 # Python drivers: per-machine virtualenvs (a directory, or a junction made by setup.ps1) and bytecode
 drivers/**/.venv/

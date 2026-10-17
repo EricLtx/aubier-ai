@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust stable (MSVC toolchain on Windows), `serde`/`serde_json`, `schemars` 1.x (schema generation), `jsonschema` (example validation), `sha2` + `hex` (content addressing), `ed25519-dalek` 2.x + `rand` 0.8 (software stand-in for hardware human keys), `proptest`, `thiserror`. GitHub Actions for CI on windows/ubuntu/macos.
 
-**Spec:** `docs/superpowers/specs/2026-09-22-verticalai-design.md` — this plan implements §3 (kernel) at contract level, §4.1 object formats, §4.4 TUF roles, §5 spec-first + testing, and the SP0 row of §6.
+**Spec:** `docs/technical/specs/2026-09-22-verticalai-design.md` — this plan implements §3 (kernel) at contract level, §4.1 object formats, §4.4 TUF roles, §5 spec-first + testing, and the SP0 row of §6.
 
 ## Global Constraints
 
@@ -185,7 +185,7 @@ Expected: `test tests::hash_is_stable_and_prefixed ... ok`
 # VerticalAI
 
 Self-improving, peer-to-peer, local-first orchestration runtime for businesses.
-Design: `docs/superpowers/specs/2026-09-22-verticalai-design.md`.
+Design: `docs/technical/specs/2026-09-22-verticalai-design.md`.
 
 ## SP0 — contracts and kernel boundary
 

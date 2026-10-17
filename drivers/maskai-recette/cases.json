@@ -1,10 +1,10 @@
 {
   "version": 1,
   "date": "2026-10-15",
-  "procedure": "docs/use-cases/recettage-chat-ia/PROCEDURE.md",
+  "procedure": "docs/functional/use-cases/recettage-chat-ia/PROCEDURE.md",
   "notes": [
     "Un cas par test de la grille N0–N9 (PROCEDURE.md §3). kind : load (mesurer_chargement), message (poser_question), attach_question (joindre_document puis poser_question), list (lister_conversations), concurrent (charge_concurrente).",
-    "file est relatif au dossier du driver (fixture/…) ou à docs/use-cases/recettage-chat-ia/ (corpus/, corpus-v2/).",
+    "file est relatif au dossier du driver (fixture/…) ou à docs/functional/use-cases/recettage-chat-ia/ (corpus/, corpus-v2/).",
     "Un cas qui porte oracle prend question, must, must_not et pii dans corpus-v2/oracles-v2.json ; les autres portent les leurs. Les motifs sont des expressions régulières insensibles à la casse et aux accents (scripts/recette/evaluer.py) : pas d'échappement en majuscule (\\S, \\D, \\W), evaluer.py met le motif en minuscules.",
     "same_conversation_as : le cas se pose dans la conversation du cas nommé, sans nouvelle_conversation entre les deux.",
     "budget_s : budget de latence du cas ; délai d'abandon = 3 × budget_s, borné par l'échéance de l'action."
