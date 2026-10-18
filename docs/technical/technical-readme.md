@@ -684,6 +684,80 @@ the interpreter spawned from the protected tree) runs for the first time.
 What the kernel enforces and what it trusts is in
 [`contracts/tcb.md`](../../contracts/tcb.md), §Drivers.
 
+### Learned drivers: an Office driver written from the firm's own documents
+
+A driver for Word or PowerPoint is not written by hand. `vk driver learn` reads a
+folder of the firm's documents of one kind (contracts, quotes, decks), works out what
+they all have in common (the body font, the footer, the margins, the page numbering),
+and generates a driver whose one action brings any document to that house style. The
+firm's documents are the datasheet; the driver is the register map generated from it.
+Spec: [`docs/technical/specs/2026-10-17-driver-learning-office-design.md`](specs/2026-10-17-driver-learning-office-design.md);
+the operator's procedure is [`runbooks/learn-office-driver.md`](runbooks/learn-office-driver.md).
+
+The pipeline is `drivers/vkforge`, six stages, each a **governed one-shot process** the
+daemon spawns (`<python> -I <root>/vkforge/__main__.py <stage> ...`, in the vkforge root,
+under the platform's governor, killed with its tree at its deadline, stdout and stderr
+kept under `<state_dir>/forge/<name>/`). It is never protocol 1: a pipeline is not
+request and response. `vkd --vkforge-root <repository>\drivers` turns it on; without it
+`vk driver learn` and `vk driver qualify` refuse and say so. A stage that refuses speaks
+the kernel's voice in one line, `vkforge <stage>: ...; remedy: ...`, and that line is the
+refusal, verbatim.
+
+| Stage | Reads | Writes (under `--out`) |
+|---|---|---|
+| `inventory` | the application's type library (Office's COM registration), or a recorded catalogue under the test seam | `catalogue.json`: types, members, enums, the type library's hash |
+| `bind` | the ontology (`drivers/vkforge/ontology/office-document.json`) and the catalogue | `binding-<app>.json`: each verb bound or `unbound`, with its projection |
+| `mine` | the corpus, as zip files, formatting parts only | `invariants.json` (values with their support, no text of the documents) and `.vault.json` (the clear values a footer needs, `0600`) |
+| `plan` | invariants, binding, and the arch's answers if any | `plan.json` (the `DriverPlan`: one action, its steps, `pre`, `post`, `qualification` thresholds), `plan-excluded.json` |
+| `generate` | the plan, the binding, the vault | `driver/`: `driver.py`, `manifest.json` (`kind: com`), `vendor/` (the protocol and the COM adapter, vendored), `.venv` (a junction to the vkforge virtualenv) |
+| `qualify` | the driver, the corpus, the plan | `<state_dir>/drivers/<name>/work/qualify/qualification.json` |
+
+`learn` runs the first five. The kernel does only what a kernel does: a short lock phase
+for the human act `driver.learned` and its row in the `learned` table, and, when `--arch`
+names one, one model call per ambiguity (two values of a font near in support) whose
+answer is read by a strict rule: only a candidate the miner listed can be chosen, never
+applied in part. Without an arch every ambiguity is purged and listed, and a plan with
+none calls no model: zero tokens on the nominal path. The vault is deleted the moment
+`generate` returns, on every way out. One `learn` or `qualify` per driver name at a time:
+a second is refused with `... of <name> already in progress`.
+
+`vk driver plan show DIR` prints `plan.json` for review: each step, its pre- and
+postconditions, how each ambiguity was settled, and what the plan left out and why.
+`vk driver qualify --driver DIR\driver --corpus DIR` replays the driver on **copies** of
+the corpus, perturbs each copy first so that only a real repair counts, re-mines the
+result and checks every postcondition of the plan in code. The kernel records the replay
+as `driver.qualified` (the hash of `qualification.json`, passes, failures) on the
+`learned` row.
+
+**The mount gate.** `vk mount driver --manifest DIR\driver\manifest.json` is refused for
+a `kind: com` driver the kernel did not learn on this node, or whose last replay does not
+meet the plan's thresholds (`min_passes`, `min_rate`), or whose `qualification.json` no
+longer hashes to what the kernel stored. There is no override. Every other driver kind
+passes the gate untouched.
+
+**Seams, for development and CI only.**
+
+| Seam | Effect |
+|---|---|
+| `vkd --vkforge-root DIR` | the `drivers/` directory of a checkout; no default |
+| `VK_FORGE_PYTHON` | the interpreter; default `%LOCALAPPDATA%\vk\venvs\vkforge\Scripts\python.exe`, made by `drivers\vkforge\setup.ps1` |
+| `VK_FORGE_FIXTURES=1` | `inventory` reads the recorded catalogues (`drivers/vkforge/tests/fixtures/`) and `qualify` replays on the fake application instead of Office; `vkd` warns when it is set |
+| `<work>/fake.json` | written by `vkforge qualify --fake` into its own work directory, and nowhere else; it is what points the generated driver's adapter at the fake |
+
+**The deliberate fallback.** A verb the application's catalogue could not bind (for
+example `set_slide_layout` on Word) can be put to an arch:
+`vk driver learn --deliberate VERB --app A --out DIR --arch NAME`, with `DIR` an earlier
+learning's output. One `Draft` step, no harness, no application driving: the arch reads
+the verb's ontology entry and a slice of the catalogue (at most 20 kB) and answers with a
+projection rule `{"member": "Type.Member", "constants": "<Enum>" | null}`. The kernel
+writes `DIR\proposals\VERB.json` (the verb, the app, `proposed_by: arch:<id>`, the task,
+the `rule` if the answer carries one, else `null`, and the answer verbatim). Nothing is
+applied: not the ontology, not `driver.py`, not the ledger beyond the task's own rows.
+A human reads the proposal and versions a rule into `office-document.json`.
+
+What the kernel enforces and what it trusts is in
+[`contracts/tcb.md`](../../contracts/tcb.md), §Drivers.
+
 ### The human ceremony: passkeys and kernel-minted challenges
 
 Every human approval answers a **challenge the kernel minted** for the task:

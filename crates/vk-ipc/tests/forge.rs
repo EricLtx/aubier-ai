@@ -509,3 +509,74 @@ async fn learn_refuses_an_arch_that_cannot_plan_before_any_stage() {
     );
     node.shutdown().await;
 }
+
+#[tokio::test]
+async fn deliberate_writes_a_proposal_and_touches_nothing_else() {
+    if !forge_available() {
+        return;
+    }
+    let node = Node::start().await;
+    let arch = node
+        .call("arch.mount_mock", json!({"name": "mock"}))
+        .await
+        .unwrap()["arch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let corpus = ooxml_corpus(&node.dir().join("corpus"), 10, 0);
+    let out = node.dir().join("word-maison");
+    node.call_human("driver.learn", learn_params(&corpus, &out))
+        .await
+        .unwrap();
+    let ontology = repo_root().join("drivers/vkforge/ontology/office-document.json");
+    let hash_of = |p: &Path| hash_bytes(&std::fs::read(p).unwrap());
+    let (ontology_before, driver_before) =
+        (hash_of(&ontology), hash_of(&out.join("driver/driver.py")));
+    let ask = json!({"family": "office-document", "app": "word", "out": out, "deliberate": "set_slide_layout"});
+    let e = node
+        .call_human("driver.learn", ask.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        call_error(&e).message.contains("--deliberate needs --arch"),
+        "{e}"
+    );
+    let mut with_arch = ask;
+    with_arch["arch"] = json!(arch);
+    let r = node.call_human("driver.learn", with_arch).await.unwrap();
+    let proposal: Value = serde_json::from_slice(
+        &std::fs::read(out.join("proposals/set_slide_layout.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(proposal["proposed_by"], json!(format!("arch:{arch}")));
+    assert_eq!(
+        (proposal["verb"].as_str(), proposal["app"].as_str()),
+        (Some("set_slide_layout"), Some("word"))
+    );
+    assert_eq!(
+        proposal["rule"],
+        Value::Null,
+        "the mock's echo is no {{member, constants}} rule"
+    );
+    assert!(
+        proposal["answer"].as_str().unwrap().starts_with("draft: "),
+        "the Draft decision, verbatim (L-P29): {proposal}"
+    );
+    assert_eq!(r["proposal"], proposal);
+    assert_eq!(
+        hash_of(&ontology),
+        ontology_before,
+        "the ontology is a human's to edit"
+    );
+    assert_eq!(
+        hash_of(&out.join("driver/driver.py")),
+        driver_before,
+        "never code"
+    );
+    assert_eq!(
+        node.events("driver.learned").len(),
+        1,
+        "a proposal is not a learned driver"
+    );
+    node.shutdown().await;
+}

@@ -1222,6 +1222,32 @@ pub fn learned(v: &Value) -> String {
     .join("\n")
 }
 
+/// `vk driver learn --deliberate`: where the proposal was written, the rule the arch's answer
+/// carried if it carried one, and the reminder that nothing was applied.
+pub fn proposed(v: &Value) -> String {
+    let proposal = &v["proposal"];
+    let rule = match proposal["rule"].as_object() {
+        Some(rule) => format!(
+            "rule: {} / {}",
+            text(&rule["member"]),
+            rule["constants"].as_str().unwrap_or("null")
+        ),
+        None => "rule: none (read the answer in the file)".to_string(),
+    };
+    [
+        format!(
+            "proposal for {} on {} by {} -> {}",
+            text(&proposal["verb"]),
+            text(&proposal["app"]),
+            text(&proposal["proposed_by"]),
+            text(&v["path"])
+        ),
+        rule,
+        "nothing applied: a human versions a rule into the ontology".to_string(),
+    ]
+    .join("\n")
+}
+
 /// `vk driver qualify`: the replay's count, whether it ran on the fake
 /// application, and the record the mount gate holds the driver to.
 pub fn qualified(v: &Value) -> String {
@@ -1477,6 +1503,26 @@ mod tests {
         assert!(
             none.contains("unbound: none\nambiguities: none\nexcluded: none"),
             "{none}"
+        );
+
+        let ruled = proposed(
+            &json!({"path": r"C:\l\proposals\set_slide_layout.json", "proposal": {
+            "verb": "set_slide_layout", "app": "word", "proposed_by": "arch:sha256:9",
+            "rule": {"member": "Slide.Layout", "constants": "PpSlideLayout"}}}),
+        );
+        assert_eq!(
+            ruled,
+            "proposal for set_slide_layout on word by arch:sha256:9 -> C:\\l\\proposals\\set_slide_layout.json\n\
+             rule: Slide.Layout / PpSlideLayout\n\
+             nothing applied: a human versions a rule into the ontology"
+        );
+        let unruled = proposed(
+            &json!({"path": "p.json", "proposal": {"verb": "v", "app": "word",
+            "proposed_by": "arch:x", "rule": null}}),
+        );
+        assert!(
+            unruled.contains("\nrule: none (read the answer in the file)\n"),
+            "{unruled}"
         );
 
         let q = qualified(

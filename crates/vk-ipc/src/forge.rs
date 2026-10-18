@@ -246,13 +246,18 @@ pub fn run_stage(
 struct LearnParams {
     family: String,
     app: String,
-    corpus: PathBuf,
+    /// Required, but by `learn` and not by serde: the deliberate fallback names no corpus.
+    #[serde(default)]
+    corpus: Option<PathBuf>,
     out: PathBuf,
     #[serde(default)]
     threshold: Option<f64>,
     /// An arch id: the CLI resolves a name, as recipes do.
     #[serde(default)]
     arch: Option<String>,
+    /// A verb of the ontology, by presence: the fallback (ruling L-P3) in place of learning.
+    #[serde(default)]
+    deliberate: Option<String>,
 }
 
 /// The one family vkforge v1 knows, and its applications.
@@ -282,7 +287,8 @@ impl Drop for Vault {
     }
 }
 
-/// `driver.learn {family, app, corpus, out, threshold?, arch?}`, for a principal `dispatch` has
+/// `driver.learn {family, app, corpus, out, threshold?, arch?}` — or, with `deliberate`, `{family,
+/// app, out, arch, deliberate}` (see [`deliberate`]) — for a principal `dispatch` has
 /// already proved human (I1). Both take the `Ctx` their pre-lock arm built as the `driver.pack`
 /// arm does (L-P25): `learn`'s is human (`driver_learned`).
 ///
@@ -307,10 +313,12 @@ pub fn learn(
         out,
         threshold,
         arch,
+        deliberate: verb,
     } = serde_json::from_value(p).map_err(|e| {
         bad(&format!(
-            "driver.learn takes family, app, corpus, out, threshold and arch, nothing else ({e}); \
-             remedy: vk driver learn --family office-document --app word --corpus DIR --out DIR"
+            "driver.learn takes family, app, corpus, out, threshold, arch and deliberate, nothing \
+             else ({e}); remedy: vk driver learn --family office-document --app word --corpus DIR \
+             --out DIR"
         ))
     })?;
     if family != FAMILY {
@@ -323,6 +331,15 @@ pub fn learn(
             "app {app} is not known; remedy: --app word or --app powerpoint"
         )));
     }
+    if let Some(verb) = verb {
+        return deliberate(kernel, cfg, state_dir, ctx, &app, &out, arch, &verb);
+    }
+    let corpus = corpus.ok_or_else(|| {
+        bad(
+            "driver.learn needs a corpus; remedy: --corpus names a folder of the firm's documents \
+             of one kind",
+        )
+    })?;
     for (flag, path) in [("corpus", &corpus), ("out", &out)] {
         if !path.is_absolute() {
             return Err(bad(&format!(
@@ -591,6 +608,202 @@ pub fn learn(
         "ambiguities": plan.ambiguities,
         "excluded": excluded,
     }))
+}
+
+/// How much of the catalogue the fallback's evidence carries, and of the arch's answer the
+/// proposal keeps.
+const EVIDENCE_BYTES: usize = 20_000;
+const ANSWER_CHARS: usize = 2_000;
+
+/// `driver.learn` with `deliberate: VERB` (ruling L-P3, the fallback of spec §4.10): one `Draft`
+/// step of an arch proposing a projection rule for a verb the learned catalogue could not bind. It
+/// proposes and nothing else — no trace of the application, no code, nothing applied: the ontology
+/// is a human's to edit. The proposal is the file `<out>/proposals/<verb>.json`.
+///
+/// Refused before the model is called: no arch (`--deliberate needs --arch`), an `out` that is not
+/// absolute, not a learned driver's name or holds no `catalogue.json` of this app, a verb not in
+/// the ontology, an arch not mounted or that cannot `Generate` (the capability a `Draft` step
+/// infers with), a name another `learn` or `qualify` is working on (L-P55).
+///
+/// OS analogy: the engineer who cannot find a register in the datasheet writes a guess on a
+/// sticky note for the reviewer; the board is not reflashed with it.
+#[allow(clippy::too_many_arguments)]
+fn deliberate(
+    kernel: &Shared,
+    cfg: &ForgeConfig,
+    state_dir: &Path,
+    ctx: &Ctx,
+    app: &str,
+    out: &Path,
+    arch: Option<String>,
+    verb: &str,
+) -> Result<Value, RpcError> {
+    let arch = arch.ok_or_else(|| {
+        bad("--deliberate needs --arch: a proposal is drafted by an arch; remedy: --arch NAME")
+    })?;
+    if !out.is_absolute() {
+        return Err(bad(&format!(
+            "out {} is not absolute; remedy: name it by its absolute path",
+            out.display()
+        )));
+    }
+    let name = out
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| is_driver_name(n))
+        .ok_or_else(|| {
+            bad(&format!(
+                "out {}: its last component is a learned driver's name (1 to 32 characters of \
+                 a-z, 0-9 and -); remedy: --out names a learned driver's output",
+                out.display()
+            ))
+        })?
+        .to_string();
+    let catalogue_file = out.join("catalogue.json");
+    if !catalogue_file.is_file() {
+        return Err(bad(&format!(
+            "out {} holds no catalogue.json; remedy: --out names a learned driver's output",
+            out.display()
+        )));
+    }
+    let ontology_file = cfg
+        .root
+        .join("vkforge")
+        .join("ontology")
+        .join(format!("{FAMILY}.json"));
+    let ontology = read_json(&ontology_file, "deliberate", "the ontology")?;
+    let entry = ontology["verbs"]
+        .as_array()
+        .and_then(|verbs| verbs.iter().find(|v| v["verb"] == verb))
+        .ok_or_else(|| {
+            bad(&format!(
+                "verb {verb} is not in the ontology; remedy: --deliberate names a verb of \
+                 {FAMILY}, see {}",
+                ontology_file.display()
+            ))
+        })?;
+    let catalogue = read_json(&catalogue_file, "inventory", "catalogue.json")?;
+    if catalogue["app"] != app {
+        let held = catalogue["app"].as_str().unwrap_or("another application");
+        return Err(bad(&format!(
+            "out {} holds the catalogue of {held}, not of {app}; remedy: --app {held}",
+            out.display()
+        )));
+    }
+    // `infer` enforces no capability itself: this check is the gate. A `Draft` step infers with
+    // `Capability::Generate`.
+    let drafts = lock(kernel)?
+        .arches()
+        .into_iter()
+        .find(|(id, _)| *id == arch)
+        .map(|(_, m)| m.capabilities.contains(&Capability::Generate));
+    match drafts {
+        None => {
+            return Err(bad(&format!(
+                "arch {arch} is not mounted on this node; remedy: vk ls /arches lists the arches \
+                 this node has, by name and id"
+            )))
+        }
+        Some(false) => {
+            return Err(bad(&format!(
+                "arch {arch} cannot draft; remedy: an arch with the Generate capability"
+            )))
+        }
+        Some(true) => {}
+    }
+
+    // Held to the end of this function, as `learn` holds it (L-P55).
+    let _claim = Claim::take(state_dir, &name, "deliberate")?;
+    let goal = format!(
+        "propose a projection rule as JSON {{\"member\": \"Type.Member\", \"constants\": \
+         \"<Enum>\" | null}} for the verb {verb} on {app}"
+    );
+    let constraint = serde_json::to_string(entry)
+        .map_err(|e| internal(&format!("the ontology entry does not encode: {e}")))?;
+    let evidence = catalogue_slice(entry, &catalogue);
+    let now = Ctx {
+        now_ms: vk_kernel::now_ms(),
+        ..ctx.clone()
+    };
+    let (task, decision) = lock(kernel)?
+        .deliberate(&now, &arch, &goal, &constraint, &evidence)
+        .map_err(kerr)?;
+    let answer: String = decision.chars().take(ANSWER_CHARS).collect();
+    let proposal = json!({
+        "verb": verb,
+        "app": app,
+        "proposed_by": format!("arch:{arch}"),
+        "task": task,
+        "rule": rule_of(&answer),
+        "answer": answer,
+    });
+    let dir = out.join("proposals");
+    std::fs::create_dir_all(&dir).map_err(|e| io_failed("create the proposals directory", &e))?;
+    let path = dir.join(format!("{verb}.json"));
+    let mut bytes = serde_json::to_vec_pretty(&proposal)
+        .map_err(|e| internal(&format!("the proposal does not encode: {e}")))?;
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).map_err(|e| io_failed("write the proposal", &e))?;
+    Ok(json!({"proposal": proposal, "path": path.display().to_string()}))
+}
+
+/// What the arch reads of the catalogue: the members of the types the verb's projections name, for
+/// any application, that this catalogue has; else the catalogue's type names alone. At most
+/// [`EVIDENCE_BYTES`], cut on a character boundary.
+fn catalogue_slice(entry: &Value, catalogue: &Value) -> String {
+    let types = catalogue["types"]
+        .as_array()
+        .map_or(&[][..], |t| t.as_slice());
+    let heads: Vec<&str> = entry["projection"]
+        .as_object()
+        .into_iter()
+        .flat_map(|apps| apps.values())
+        .filter_map(|rule| rule["member"].as_str())
+        .filter_map(|member| member.split('.').next())
+        .collect();
+    let named: serde_json::Map<String, Value> = types
+        .iter()
+        .filter(|t| t["name"].as_str().is_some_and(|n| heads.contains(&n)))
+        .filter_map(|t| Some((t["name"].as_str()?.to_string(), t["members"].clone())))
+        .collect();
+    let slice = if named.is_empty() {
+        let names: Vec<&Value> = types.iter().map(|t| &t["name"]).collect();
+        json!({"types": names})
+    } else {
+        Value::Object(named)
+    };
+    let mut text = slice.to_string();
+    if text.len() > EVIDENCE_BYTES {
+        let mut cut = EVIDENCE_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    text
+}
+
+/// The rule an answer carries (ruling L-P29): the first JSON object in it with exactly the keys
+/// `member` (a string) and `constants` (a string or null), else `null`. The scan goes `{` by `{`,
+/// inside an object that is not the rule included.
+fn rule_of(answer: &str) -> Value {
+    let mut at = 0;
+    while let Some(offset) = answer[at..].find('{') {
+        let start = at + offset;
+        if let Some(Ok(Value::Object(o))) = serde_json::Deserializer::from_str(&answer[start..])
+            .into_iter::<Value>()
+            .next()
+        {
+            if o.len() == 2 && o.get("member").is_some_and(Value::is_string) {
+                if let Some(constants) = o.get("constants").filter(|c| c.is_string() || c.is_null())
+                {
+                    return json!({"member": o["member"], "constants": constants});
+                }
+            }
+        }
+        at = start + 1;
+    }
+    Value::Null
 }
 
 /// What `driver.qualify` takes, and nothing else.
@@ -915,6 +1128,50 @@ mod tests {
 
     /// A relative `--vkforge-root` is made absolute at start (review fix round 1), so the stage —
     /// run in the root — is handed a script path and a `--fixture` path that name the same files.
+    /// The rule of an answer is the first `{member, constants}` object in it (L-P29), else null.
+    #[test]
+    fn a_rule_is_the_first_object_with_exactly_member_and_constants() {
+        assert_eq!(
+            rule_of(r#"draft: use {"member": "Slide.Layout", "constants": "PpSlideLayout"} here"#),
+            json!({"member": "Slide.Layout", "constants": "PpSlideLayout"})
+        );
+        assert_eq!(
+            rule_of(r#"draft: {"member": "Slide.Layout", "constants": null}"#),
+            json!({"member": "Slide.Layout", "constants": null})
+        );
+        for none in [
+            r#"draft: {"member": "A.B", "constants": null, "why": "x"}"#,
+            r#"draft: {"member": "A.B"}"#,
+            r#"draft: {"member": 3, "constants": null}"#,
+            r#"draft: {"member": "Type.Member", "constants": "<Enum>" | null}"#,
+            "draft: no rule, a {brace",
+        ] {
+            assert_eq!(rule_of(none), Value::Null, "{none}");
+        }
+    }
+
+    /// The evidence is the members of the types the verb names when the catalogue has them, else
+    /// the type names alone, and never more than 20 kB.
+    #[test]
+    fn the_evidence_slice_names_members_or_types_and_is_bounded() {
+        let entry = json!({"projection": {"powerpoint": {"member": "Slide.Layout"},
+                                           "word": {"member": "Document.Save"}}});
+        let catalogue = json!({"types": [
+            {"name": "Document", "members": [{"name": "Save"}]},
+            {"name": "Range", "members": []}]});
+        assert_eq!(
+            catalogue_slice(&entry, &catalogue),
+            json!({"Document": [{"name": "Save"}]}).to_string()
+        );
+        let entry = json!({"projection": {"powerpoint": {"member": "Slide.Layout"}}});
+        assert_eq!(
+            catalogue_slice(&entry, &catalogue),
+            json!({"types": ["Document", "Range"]}).to_string()
+        );
+        let big = json!({"types": [{"name": "\u{e9}".repeat(30_000), "members": []}]});
+        assert!(catalogue_slice(&entry, &big).len() <= EVIDENCE_BYTES);
+    }
+
     #[test]
     fn a_relative_root_is_made_absolute_at_start() {
         let cfg = ForgeConfig::at("drivers".into());

@@ -45,6 +45,7 @@ Early-stage, under active development.
 | SP1b | Real model adapters (local and cloud), confined agent harness, passkey approvals, Windows service, signed builds | Done (`sp1b`) |
 | Pilot | First application driver under the driver contract (a browser behind typed business actions), task recipes, and a complete governed process run through the kernel: plan, confined execution, judgement, two signed approvals, release | Done (`pilot-driver`) |
 | Driver packaging | A driver cut as a signed package that carries its own CPython and libraries, installed once under `%ProgramFiles%` by an administrator and fingerprinted whole before every start (`tampered` on any change; stat cache: an unchanged size and mtime is not re-read) | Built, under review (`driver-packaging`) |
+| Driver learning | An Office driver (Word, then PowerPoint) learned from the firm's own documents: type-library catalogue, mined invariants, a reviewable plan, a generated driver replayed on copies and mounted only once qualified; zero tokens on the nominal path, a deliberate fallback that only proposes | Built, under review (`driver-learning`) |
 | Next | Quota and health tracking for the model adapters, the execution context for drivers on a desktop, then evidence-gated promotion, AI capital packaging and re-qualification, peer-to-peer nodes | Being specified |
 
 Feasibility of the next stages has been checked with throwaway prototypes before any product code is written.

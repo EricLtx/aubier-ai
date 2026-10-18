@@ -568,9 +568,10 @@ enum DriverCmd {
         family: String,
         #[arg(long)]
         app: String,
-        #[arg(long, value_name = "DIR")]
-        corpus: PathBuf,
-        /// A new directory; its name is the driver's (word-maison).
+        #[arg(long, value_name = "DIR", required_unless_present = "deliberate")]
+        corpus: Option<PathBuf>,
+        /// A new directory; its name is the driver's (word-maison). With
+        /// `--deliberate`, an earlier learning's output instead.
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
         #[arg(long, default_value_t = 0.8)]
@@ -579,6 +580,11 @@ enum DriverCmd {
         /// name or id; without it every ambiguity is purged, and no model is called.
         #[arg(long, value_name = "ARCH")]
         arch: Option<String>,
+        /// The fallback for a verb the application could not bind: the arch drafts a
+        /// projection rule for VERB into `--out/proposals/VERB.json`. It proposes and
+        /// applies nothing; a human versions a rule into the ontology. Needs `--arch`.
+        #[arg(long, value_name = "VERB", requires = "arch")]
+        deliberate: Option<String>,
     },
     /// Replay a learned driver on copies of its corpus; `driver.qualified`
     /// records the result, and a `com` driver mounts only when it meets its
@@ -1265,6 +1271,7 @@ async fn call(cli: &Cli) -> Result<()> {
                     out,
                     threshold,
                     arch,
+                    deliberate,
                 },
         } => {
             let arch = match arch {
@@ -1277,14 +1284,24 @@ async fn call(cli: &Cli) -> Result<()> {
             let mut params = json!({
                 "family": family,
                 "app": app,
-                "corpus": plain_path(&absolute(corpus)?),
                 "out": plain_path(&absolute(out)?),
                 "threshold": threshold,
             });
+            if let Some(corpus) = corpus {
+                params["corpus"] = json!(plain_path(&absolute(corpus)?));
+            }
             if let Some(arch) = arch {
                 params["arch"] = json!(arch);
             }
             let proof = presence(&c).await?;
+            if let Some(verb) = deliberate {
+                params["deliberate"] = json!(verb);
+                return show(
+                    cli,
+                    c.call("driver.learn", params, Some(proof)).await?,
+                    render::proposed,
+                );
+            }
             show(
                 cli,
                 c.call("driver.learn", params, Some(proof)).await?,

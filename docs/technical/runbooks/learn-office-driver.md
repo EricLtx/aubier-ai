@@ -1,0 +1,186 @@
+# Runbook — apprendre un driver Office (Word, PowerPoint) à partir des documents du cabinet
+
+Pour le fondateur, sur son nœud Windows, dans sa session interactive. Version du 2026-10-18.
+
+- Spec : `docs/technical/specs/2026-10-17-driver-learning-office-design.md`.
+- Section technique : `docs/technical/technical-readme.md`, « Learned drivers ».
+- Ce que le noyau garantit et ce qu'il croit sur parole : `contracts/tcb.md`, §Drivers.
+
+Chaque étape donne la commande, puis la ligne attendue (« Attendu »). Toutes les commandes se tapent dans PowerShell, à la racine du dépôt. Si la sortie ne ressemble pas à la ligne attendue, on s'arrête et on lit le §8.
+
+---
+
+## 0. La carte en une minute
+
+Apprendre un driver, c'est générer un pilote de périphérique à partir de la datasheet du périphérique et d'un lot de cartes échantillons. Ici le périphérique est Word (ou PowerPoint), la datasheet est sa bibliothèque de types COM, et les cartes échantillons sont les documents du cabinet.
+
+| Ici | En firmware |
+|---|---|
+| `vkforge` | La chaîne de production d'un firmware : six postes, chacun un banc séparé sous chien de garde, qui produit une image à partir de la datasheet et d'échantillons. |
+| `inventory` | Lire la datasheet : la bibliothèque de types de l'application (`catalogue.json`), la table des registres. |
+| `bind` | Associer la table des verbes de l'ontologie à ces registres (`binding-word.json`). Un verbe sans registre est `unbound`. |
+| `mine` | Mesurer les échantillons : quelles valeurs tous les documents partagent (`invariants.json`, sans aucun texte). C'est de la lecture de zip, Office n'est jamais ouvert. |
+| `plan` | Écrire la séquence d'initialisation : une action, ses étapes, ses pré- et postconditions (`plan.json`). |
+| `generate` | Compiler l'image : `driver/driver.py` et `manifest.json`. |
+| `qualify` | Le banc de test de l'image : le driver rejoué sur des copies du lot, chaque postcondition revérifiée dans le code. |
+| `learned` (table du noyau) | Le dossier de fabrication de l'image : les hashes de tout ce dont elle est issue. |
+| La porte du montage | La ROM de boot qui refuse une image sans rapport de test signé, ou dont le rapport n'est plus celui que l'usine a classé. |
+| `.vault.json` | La mémoire de travail du mineur (le texte clair d'un pied de page). Elle est effacée dès que `generate` rend la main. |
+
+---
+
+## 1. Prérequis, une fois par nœud
+
+**1.1 Office de bureau installé** (Word, et PowerPoint pour le §7). L'inventaire lit sa bibliothèque de types ; sans elle, `learn` s'arrête avec `remedy: install Microsoft 365 desktop`.
+
+**1.2 Un CPython 3.13 non empaqueté.** Le Python du Microsoft Store ne convient pas (R27 : ses enfants échappent au Job du noyau). Voir le §1.1 du runbook `recette-maskai.md` pour `uv python install 3.13`.
+
+**1.3 Le virtualenv de vkforge** (lxml, comtypes) :
+```powershell
+powershell -ExecutionPolicy Bypass -File drivers\vkforge\setup.ps1
+```
+Attendu, en dernière ligne : `VK_FORGE_PYTHON par défaut : C:\Users\<vous>\AppData\Local\vk\venvs\vkforge\Scripts\python.exe`. Avec un Python de python.org : ajouter `-Python <chemin>\python.exe`.
+
+Chaque driver généré reçoit sa propre jonction `.venv` vers ce virtualenv. Le déplacer ou le recréer ailleurs casse les drivers déjà appris.
+
+---
+
+## 2. Démarrer le démon avec vkforge
+
+Dans un terminal que l'on garde ouvert (le démon s'arrête avec lui, c'est voulu) :
+```powershell
+$env:PATH = "$env:CARGO_TARGET_DIR\debug;$env:PATH"
+vkd --auto-enroll-node --vkforge-root "$PWD\drivers"
+```
+Attendu, dans les traces :
+```
+vkforge: vk driver learn and vk driver qualify are served
+```
+Sans `--vkforge-root`, `vk driver learn` et `vk driver qualify` sont refusés : `vkforge is not configured on this daemon; remedy: start vkd with --vkforge-root <repository>\drivers`. La racine est une option du démon, jamais d'une requête : aucun client du tube ne peut nommer le code que le démon lance.
+
+**Ne jamais poser `VK_FORGE_FIXTURES=1` sur ce nœud.** C'est la prise de test de la CI (catalogues enregistrés, application factice à la place d'Office). Avec elle, une qualification contre le faux Word ouvre la porte du montage. Si elle est posée, `vkd` le dit en clair : `VK_FORGE_FIXTURES=1: vk driver learn reads the recorded catalogues and vk driver qualify replays on the fake application, not Office`. Dans ce cas on arrête le démon et on relance sans.
+
+Les actes humains (`learn`) demandent une clé d'appareil et un bail de vivacité, comme au §4 du runbook `recette-maskai.md`.
+
+---
+
+## 3. Apprendre : `vk driver learn`
+
+Le dossier du cabinet : au moins cinq documents `.docx` (ou `.pptx`, jamais les deux), d'un même genre, directement dans le dossier. Le dossier `--out` est nouveau et son nom devient celui du driver (1 à 32 caractères de `a-z`, `0-9`, `-`) ; il ne doit pas être dans le corpus.
+
+```powershell
+vk driver learn --family office-document --app word --corpus C:\cabinet\contrats --out C:\drivers-appris\word-maison
+```
+Options : `--threshold 0.8` (la part des documents qui doit porter une valeur pour qu'elle soit une règle ; par défaut 0,8) et `--arch NOM`. Sans `--arch`, aucun modèle n'est appelé : zéro token. Avec `--arch`, l'arch (qui doit pouvoir `Plan`) tranche entre les candidats d'une ambiguïté (deux polices de corps à 0,7 et 0,3 d'appui, par exemple), une question par ambiguïté, et son choix est écrit dans le plan avec `resolved_by: arch:<id>`.
+
+Attendu, cinq lignes (les valeurs de l'exemple varient avec le corpus et la version d'Office) :
+```
+learned word-maison  sha256:…
+plan sha256:… -> C:\drivers-appris\word-maison\plan.json (read it: vk driver plan show C:\drivers-appris\word-maison)
+unbound: set_slide_layout, set_placeholder_text, apply_theme
+ambiguities: none
+excluded: none
+```
+- `unbound` : les verbes de l'ontologie que cette application n'a pas (ici ceux de PowerPoint, sur Word). Ils sont exclus du plan ; le §6 les propose à un arch.
+- `ambiguities` : `<invariant> purged` (aucun arch) ou `<invariant> arch:<id>`.
+- `excluded` : ce que le plan a laissé de côté et pourquoi, par exemple `title_style (a custom style has no built-in anchor (v1))`.
+
+Le grand-livre reçoit `driver.learned` ; le fichier `.vault.json` n'existe plus.
+
+---
+
+## 4. Relire le plan : `vk driver plan show`
+
+On relit avant de qualifier, comme on relit une séquence d'initialisation avant de flasher :
+```powershell
+vk driver plan show C:\drivers-appris\word-maison
+```
+Attendu : l'action (`<nom> (reversible: no)`), ses étapes numérotées (`1. open(path="$arg.document")`, `2. set_font_run(...)`, …), `pre:`, `post:`, puis `ambiguities:` et `excluded:`. Une action `reversible: no` est normale : elle écrit dans le document.
+
+---
+
+## 5. Qualifier, puis monter
+
+**5.1 Qualifier.** Le driver est rejoué sur des copies du corpus d'apprentissage (le même dossier, inchangé). Chaque copie est d'abord dégradée, pour que seule une vraie réparation fasse passer la postcondition. Word est lancé par le driver lui-même.
+```powershell
+vk driver qualify --driver C:\drivers-appris\word-maison\driver --corpus C:\cabinet\contrats
+```
+Attendu :
+```
+qualified word-maison: 10/10 passes (0 failures), fake false -> C:\Users\<vous>\AppData\Local\vk\...\drivers\word-maison\work\qualify\qualification.json
+```
+`fake false` : le rejeu a eu lieu sur le vrai Office. `fake true` n'a de sens qu'en CI. Le noyau enregistre `driver.qualified` (le hash de `qualification.json`, les passes et les échecs). Un rejeu sous les seuils du plan est enregistré tout de même : c'est la porte du §5.2 qui le refuse.
+
+Pendant le rejeu, ne touchez pas à Word et n'ouvrez pas les documents du corpus. Le driver ferme les boîtes de dialogue sans jamais répondre (le §8 en dit les limites).
+
+**5.2 Monter** (acte humain, comme tout montage de driver) :
+```powershell
+vk mount driver --manifest C:\drivers-appris\word-maison\driver\manifest.json
+```
+Attendu, une ligne de tableau : `word-maison  sha256:…  yes  development` (le nom, l'id, `GOVERNED`, la source). C'est la porte : pour un driver `kind: com`, le noyau refuse le montage sans qualification valide.
+
+Un driver monté est un driver comme un autre : chaque `vk_driver_act` est un pas de tâche sous le harnais, supervisé, chaque acte approuvé. Seul le rejeu de `qualify` tourne hors harnais, comme enfant de son étage, dans le Job (c'est le seul écart de supervision, `contracts/tcb.md`).
+
+---
+
+## 6. Le repli : `vk driver learn --deliberate`
+
+Pour un verbe `unbound`, on peut demander à un arch de **proposer** une règle de projection (le membre de la bibliothèque de types qui le réaliserait). Il propose, il n'applique rien : pas de trace de l'application, pas de code, pas de modification de l'ontologie.
+```powershell
+vk driver learn --deliberate set_slide_layout --family office-document --app word --out C:\drivers-appris\word-maison --arch NOM
+```
+`--out` est la sortie d'un apprentissage précédent (il doit contenir `catalogue.json` de cette application) ; `--arch` est obligatoire, et l'arch doit pouvoir `Generate`. Le verbe doit exister dans l'ontologie.
+
+Attendu, trois lignes :
+```
+proposal for set_slide_layout on word by arch:sha256:… -> C:\drivers-appris\word-maison\proposals\set_slide_layout.json
+rule: Slide.Layout / PpSlideLayout
+nothing applied: a human versions a rule into the ontology
+```
+Si la réponse de l'arch ne contient pas d'objet `{"member": …, "constants": …}`, la deuxième ligne est `rule: none (read the answer in the file)` : on lit alors le champ `answer` du fichier. La décision est lue par un humain, qui versionne la règle dans `drivers/vkforge/ontology/office-document.json` si elle convient, puis réapprend (le hash de l'ontologie change, donc le driver aussi).
+
+---
+
+## 7. PowerPoint
+
+Mêmes étapes avec `--app powerpoint` et un dossier de présentations `.pptx`. Rien ne change dans vkforge, seulement le catalogue, la liaison et le corpus. Deux points propres à PowerPoint :
+
+- Le faux Word de la CI ne sait que le `.docx` : un driver PowerPoint se qualifie **contre le vrai PowerPoint, sur ce nœud**, jamais sur le faux.
+- Le corpus doit avoir été **produit par PowerPoint lui-même**. Les `.pptx` générés des fixtures de test ne sont pas acceptés pour les changements de police : la qualification les refuse.
+
+---
+
+## 8. Quand ça coince
+
+Toute étape qui refuse parle d'une ligne, `vkforge <étape>: <ce qui ne va pas>; remedy: <quoi faire>`, et cette ligne est le refus. Les journaux complets sont sous `%LOCALAPPDATA%\vk\...\forge\<nom>\` (état du démon).
+
+| Ligne | Cause | Remède |
+|---|---|---|
+| `corpus has N files; remedy: more documents of one kind` | moins de cinq documents `.docx`/`.pptx` | ajouter des documents du même genre |
+| `corpus mixes .docx and .pptx files; remedy: more documents of one kind` | les deux sortes dans un dossier | un dossier par sorte |
+| `no invariant reaches the threshold 0.8 over N files; remedy: more documents of one kind` | rien de commun assez constant | plus de documents, ou `--threshold` plus bas |
+| `out <dir> is not empty; remedy: a new directory` | `--out` déjà utilisé | un nouveau dossier (`learn` n'écrit jamais par-dessus) |
+| `out <dir> is inside the corpus; remedy: a new directory outside it` | `--out` dans le corpus | ailleurs |
+| `no invariant can be driven on word (excluded: …); remedy: read plan-excluded.json; vk driver learn --deliberate VERB proposes a binding` | tout est exclu (style personnalisé, verbe sans liaison) | lire `plan-excluded.json`, puis le §6 |
+| `arch <id> cannot plan; remedy: an arch with the Plan capability` | `--arch` ne sait pas planifier | une autre arch |
+| `arch <id> cannot draft; remedy: an arch with the Generate capability` | `--deliberate` : l'arch ne sait pas rédiger | une autre arch |
+| `--deliberate needs --arch: a proposal is drafted by an arch; remedy: --arch NAME` | pas d'arch | donner `--arch` |
+| `out <dir> holds no catalogue.json; remedy: --out names a learned driver's output` | `--deliberate` hors d'un apprentissage | le `--out` d'un `learn` |
+| `corpus changed since vkforge mine; remedy: qualify on the corpus the driver was learned from, or learn again` | le corpus a bougé depuis le `learn` | rejouer sur le même dossier, ou réapprendre |
+| `cannot perturb <id> for qualification` | une postcondition que la qualification ne sait pas dégrader | c'est un défaut de vkforge, pas du cabinet |
+| l'action rend `dialog` | une boîte de dialogue a retenu l'appel (connexion, écrasement) ; elle est fermée, jamais acceptée | traiter la cause (se connecter à Office, fermer les documents ouverts), puis requalifier |
+| `document opened read-only (locked elsewhere)` | une copie en lecture seule, ou un document tenu ouvert ailleurs | fermer le document ; une copie lecture seule reste lecture seule |
+| `office version changed; remedy: vk driver learn again` | Office a changé de version : la bibliothèque de types n'est plus celle du catalogue | réapprendre (jamais monter sur l'ancienne liaison) |
+| `driver <id> is not qualified; remedy: vk driver qualify --driver DIR --corpus DIR` | montage sans qualification enregistrée | §5.1 |
+| `driver <id> is not qualified: N passes of M, the plan asks P at rate R; remedy: …` | rejeu sous les seuils | lire `qualification.json`, corriger, requalifier |
+| `driver <id>: qualification.json changed since vk driver qualify; remedy: …` | le fichier de rapport a été modifié après le rejeu | requalifier |
+| `learn of <nom> already in progress; remedy: wait for it` (ou `qualify`, `deliberate`) | une seule demande à la fois par nom de driver | attendre sa fin |
+| `the plan changed since vk driver learn; remedy: learn again` | `plan.json` modifié à la main | réapprendre ; les fichiers d'un driver appris ne s'éditent pas |
+
+**Les cinq réserves de l'opérateur** (elles figurent aussi dans `contracts/tcb.md`) :
+
+1. **Le démon ne meurt pas entre `mine` et `generate`.** S'il meurt, `<out>\.vault.json` reste sur le disque avec le texte clair d'un pied de page. On le supprime à la main avant tout partage du dossier.
+2. **Un rejeu tué à son délai laisse Office ouvert.** Le driver qu'on tue n'exécute pas son `_quit` : l'instance Word qu'il avait lancée reste dans le gestionnaire de tâches. On la ferme à la main (sans enregistrer) avant de requalifier.
+3. **Les boîtes de dialogue de votre propre Word peuvent être annulées.** L'adaptateur ferme les fenêtres `#32770` de **tout** processus de l'exécutable de l'application, pas seulement de celui qu'il a lancé. Pendant un rejeu, on n'a donc pas de travail non enregistré dans Word.
+4. **L'appel de modèle d'une ambiguïté tient le verrou du noyau**, comme `task.step`. Un arch lent suspend les autres appels du démon pendant sa réponse.
+5. **Le noyau ne contrôle aucune capacité à l'`infer`** : seules les vérifications de `learn` (l'arch sait `Plan`) et de `--deliberate` (l'arch sait `Generate`) font barrière, avant tout étage.

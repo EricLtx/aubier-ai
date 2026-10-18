@@ -35,6 +35,9 @@ pub const ANSWER_RULE: &str = "Answer with one JSON object {\"invariant\": <the 
 /// The artefact kind of the ambiguity call's task: it attaches nothing, but every task names one.
 const ANSWER_KIND: &str = "answer";
 
+/// The artefact kind of the deliberate fallback's task: the draft, attached to it.
+const PROPOSAL_KIND: &str = "proposal";
+
 /// What every refusal of the gate asks for.
 const QUALIFY_REMEDY: &str = "vk driver qualify --driver DIR --corpus DIR";
 
@@ -281,6 +284,46 @@ impl RealKernel {
             .decisions
             .last()
             .and_then(|d| answer_choice(d.strip_prefix("plan: ").unwrap_or(d), ambiguity)))
+    }
+
+    /// The deliberate fallback's one model call (driver-learning plan Task 10, ruling L-P3): a task
+    /// over a fresh register — `goal`, `constraint` and `evidence` as the caller built them, label
+    /// scope `business` — with one `StepKind::Draft { arch_id }` step (`infer` with
+    /// `Capability::Generate`) run at once. Returns the task's id and the register's last decision
+    /// as `arch::raise` pushed it, `draft: ` prefix included (ruling L-P29). The step attaches that
+    /// text as a `proposal` artefact of the task, which is all the ledger learns; the caller turns
+    /// the answer into a file a human reads. No harness, no application, nothing applied.
+    pub fn deliberate(
+        &mut self,
+        ctx: &Ctx,
+        arch_id: &str,
+        goal: &str,
+        constraint: &str,
+        evidence: &str,
+    ) -> Result<(String, String), KernelError> {
+        let label = Label {
+            scope: Scope::Business,
+            ..Label::bottom()
+        };
+        let task = self.create_task(
+            ctx,
+            goal,
+            PROPOSAL_KIND,
+            label,
+            &[constraint.to_string()],
+            &[evidence.to_string()],
+            vec![StepKind::Draft {
+                arch_id: arch_id.into(),
+            }],
+        )?;
+        self.run_task_step(ctx, &task.id)?;
+        let reg = self.read_register(ctx, &task.register)?;
+        let answer = reg.decisions.last().cloned().ok_or_else(|| {
+            KernelError::Gate(format!(
+                "arch {arch_id} left no decision to read as a proposal"
+            ))
+        })?;
+        Ok((task.id, answer))
     }
 }
 
