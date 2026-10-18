@@ -60,7 +60,7 @@ Sans `--vkforge-root`, `vk driver learn` et `vk driver qualify` sont refusés : 
 
 **Ne jamais poser `VK_FORGE_FIXTURES=1` sur ce nœud.** C'est la prise de test de la CI (catalogues enregistrés, application factice à la place d'Office). Avec elle, une qualification contre le faux Word ouvre la porte du montage. Si elle est posée, `vkd` le dit en clair : `VK_FORGE_FIXTURES=1: vk driver learn reads the recorded catalogues and vk driver qualify replays on the fake application, not Office`. Dans ce cas on arrête le démon et on relance sans.
 
-Les actes humains (`learn`) demandent une clé d'appareil et un bail de vivacité, comme au §4 du runbook `recette-maskai.md`.
+Les actes humains (`learn`, `mount`, `umount`) demandent la clé d'appareil du nœud, inscrite par `--auto-enroll-node` (§4 du runbook `recette-maskai.md`) ; ils ne demandent pas de bail de vivacité.
 
 ---
 
