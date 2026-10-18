@@ -1640,9 +1640,15 @@ class Recette:
         before = self.browser.mark()
         try:
             page.goto(url, wait_until="load", timeout=60_000)
-        except PWError:
+        except PWError as e:
             if not check:
                 raise
+            if "ERR_ABORTED" in str(e):
+                # A script on the page sent the frame elsewhere while it was loading (18/10, CI's
+                # Chromium: the sign-in redirect fired during goto). Let it land, then read where.
+                page.wait_for_timeout(500)
+                if not self.browser.allowed(page.url):
+                    self._check_maintenance(page)  # refuses « non connecté » (off-list host)
             # A redirect followed to an unreachable host fails (and then commits an error
             # page, chrome-error://, which is no http URL): name the host from the failed
             # request; a failure of a listed host (the app itself down) is not a host refusal.

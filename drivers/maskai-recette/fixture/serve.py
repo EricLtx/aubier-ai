@@ -66,7 +66,7 @@ AUTH_ERROR_PAGE = b"""<!doctype html><html lang="fr"><head><meta charset="utf-8"
 # page, once loaded, sent the main frame to authentification.maskai.fr (off the host list) — the
 # driver had measured the login page's load as the app's. Here: localhost stands for that host.
 LOGIN_REDIRECT_PAGE = b"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>MaskAI</title></head>
-<body><p>Redirection...</p><script>setTimeout(function () { location.replace('http://localhost:PORT/login'); }, 50);</script>
+<body><p>Redirection...</p><script>window.addEventListener('load', function () { setTimeout(function () { location.replace('http://localhost:PORT/login'); }, 300); });</script>
 </body></html>
 """
 LOGIN_PAGE = b"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Connexion</title></head>
