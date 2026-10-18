@@ -1,0 +1,29 @@
+{
+  "family": "office-document",
+  "app": "word",
+  "ontology_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "catalogue_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "invariants_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+  "actions": [
+    {
+      "name": "appliquer_style_maison",
+      "reversible": false,
+      "steps": [
+        { "verb": "open", "args": { "path": "$arg.document" }, "target": "first" },
+        { "verb": "apply_paragraph_style", "args": { "selector": "first", "style": "Heading1" } },
+        { "verb": "set_font_run", "args": { "selector": "body", "font": { "name": "Garamond", "size": 11 } } },
+        { "verb": "set_footer", "args": { "text": "$secret.footer_text" } },
+        { "verb": "save", "args": {} },
+        { "verb": "export", "args": { "format": "pdf", "path": "$arg.pdf" } },
+        { "verb": "verify_paragraph_style", "args": { "selector": "first", "style": "Heading1" } },
+        { "verb": "verify_font_run", "args": { "selector": "body", "font": { "name": "Garamond", "size": 11 } } },
+        { "verb": "verify_footer", "args": { "text": "$secret.footer_text" } },
+        { "verb": "verify_pdf", "args": { "path": "$arg.pdf" } }
+      ],
+      "pre": ["document is .docx", "not open elsewhere"],
+      "post": ["title_style", "body_font", "footer_text", "pdf_exists"]
+    }
+  ],
+  "ambiguities": [],
+  "qualification": { "min_passes": 10, "min_rate": 1.0 }
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DriverQualified",
+  "description": "Ledger payload of `driver.qualified`: the kernel's record of a learned\ndriver's qualification replay, by counts and the hash of the record.",
+  "type": "object",
+  "properties": {
+    "driver_id": {
+      "type": "string"
+    },
+    "failures": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "passes": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "qualification_sha256": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "driver_id",
+    "passes",
+    "failures",
+    "qualification_sha256"
+  ]
+}

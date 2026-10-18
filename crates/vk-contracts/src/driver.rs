@@ -185,7 +185,7 @@ pub fn is_driver_name(s: &str) -> bool {
 }
 
 /// Does `s` read like a hash: `sha256:` and 64 lower-case hex digits?
-fn is_sha256(s: &str) -> bool {
+pub(crate) fn is_sha256(s: &str) -> bool {
     s.strip_prefix("sha256:").is_some_and(|h| {
         h.len() == 64
             && h.bytes()
@@ -494,6 +494,34 @@ pub struct DriverActed {
 pub struct DriverUnmounted {
     pub driver_id: String,
     pub reason: String,
+}
+
+/// Ledger payload of `driver.learned`: a human learned a driver from the
+/// firm's documents. It names every input by hash (the catalogue, the
+/// ontology, the corpus schema, the invariants, the approved plan) and the
+/// generated driver by its `driver_id`; no document text is on the ledger.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DriverLearned {
+    pub family: String,
+    pub app: String,
+    pub catalogue_sha256: String,
+    pub ontology_sha256: String,
+    pub corpus_schema_sha256: String,
+    pub invariants_sha256: String,
+    pub plan_sha256: String,
+    pub driver_id: String,
+    /// The node that recorded the act.
+    pub by: String,
+}
+
+/// Ledger payload of `driver.qualified`: the kernel's record of a learned
+/// driver's qualification replay, by counts and the hash of the record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DriverQualified {
+    pub driver_id: String,
+    pub passes: u32,
+    pub failures: u32,
+    pub qualification_sha256: String,
 }
 
 #[cfg(test)]
