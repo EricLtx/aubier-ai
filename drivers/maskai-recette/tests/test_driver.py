@@ -223,6 +223,23 @@ class ChipStateTest(unittest.TestCase):
 class GuardParseTest(unittest.TestCase):
     """The answer card's header as the 17/10 UI showed it (D5), from the published journal."""
 
+    def test_headers_seen_on_2026_10_18_name_the_model_without_a_provider_or_with_two_slashes(self):
+        """M3 on fourteen models (18/10): the Mistral and the older Claude entries sign « maskai
+        <model> » without a provider, deepseek signs with two slashes; each is the chosen model."""
+        drv = load_driver()
+        for header, model in (("Aucune donnée personnelle détectée L'Aiguilleur : PASS maskai claude-haiku-4-5", "claude-haiku-4-5"),
+                              ("Aucune donnée personnelle détectée L'Aiguilleur : PASS maskai mistral-large-4", "mistral-large-4"),
+                              ("Aucune donnée personnelle détectée L'Aiguilleur : PASS maskai tensorix/deepseek/deepseek-v4-pro-0813",
+                               "tensorix/deepseek/deepseek-v4-pro-0813"),
+                              ("Aucune donnée personnelle détectée L'Aiguilleur : PASS maskai google/eu.claude-haiku-5-5",
+                               "google/eu.claude-haiku-5-5")):
+            g = drv.parse_guard(header + " OK", "OK", True)
+            self.assertEqual(g["model"], model, header)
+        self.assertTrue(drv.model_matches("claude-haiku-4-5", "claude-haiku-4-5"))
+        self.assertTrue(drv.model_matches("deepseek v4 pro", "tensorix/deepseek/deepseek-v4-pro-0813"))
+        self.assertTrue(drv.model_matches("mistral-large-4", "mistral-large-4"))
+        self.assertFalse(drv.model_matches("mistral-large-3", "mistral-large-4"))
+
     def test_headers_seen_on_2026_10_17(self):
         drv = load_driver()
         body = "La capitale du Portugal est Lisbonne."

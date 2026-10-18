@@ -162,8 +162,13 @@ SELECTORS = {
     # PASS·Le Chirurgien : 2 PII détectées Détails maskai google/eu.claude-haiku-5-5 » ; le balisage
     # de ces blocs n'a pas été relevé, d'où des motifs sur le texte. « · en direct » suivait la
     # bannière d'une réponse coupée (N1-3) : marque de génération en cours, hypothèse.
-    "model_banner": r"\b[a-z][a-z0-9_-]*/[a-z0-9][a-z0-9._:-]*",
-    "brand_model": r"\bmaskai\s+([a-z][a-z0-9_-]*/[a-z0-9][a-z0-9._:-]*)",
+    # Le 18/10 (M3 sur quatorze modèles) : la bannière nomme le modèle sans fournisseur pour les
+    # Mistral et les anciens Claude (« maskai claude-haiku-4-5 », « maskai mistral-large-4 ») et
+    # avec deux barres pour deepseek (« maskai tensorix/deepseek/deepseek-v4-pro-0813 ») : le jeton
+    # entier après « maskai », barres comprises, est le modèle ; la forme à une barre du 17/10
+    # (« google/eu.claude-haiku-5-5 ») en est un cas.
+    "model_banner": r"\b[a-z][a-z0-9_-]*/[a-z0-9][a-z0-9._:/-]*",
+    "brand_model": r"\bmaskai\s+([a-z][a-z0-9][a-z0-9._:/-]*)",
     "brand": r"\bmaskai\s*$",
     "live_marker": r"en direct|\blive\b",
     "guard_pii": r"anonymis|<[A-Z][A-Z_]*_\d+>|\b[1-9]\d*\s*PII\b",
