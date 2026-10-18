@@ -400,3 +400,112 @@ async fn vk_forge_a_stage_past_its_deadline_is_killed_in_its_root() {
     assert!(node.events("driver.learned").is_empty());
     node.shutdown().await;
 }
+
+/// A stand-in vkforge whose every stage says it started, takes three seconds, then refuses in the
+/// kernel's voice (L-P15).
+const SLOW_REFUSAL: &str = r#"import sys, time
+from pathlib import Path
+Path(__file__).resolve().parents[1].joinpath("started.txt").write_text(sys.argv[1], encoding="utf-8")
+time.sleep(3)
+sys.stderr.write(f"vkforge {sys.argv[1]}: stand-in; remedy: none\n")
+sys.exit(2)
+"#;
+
+/// Ruling L-P55: two requests for one driver name are serialised. While a learning of
+/// `word-maison` runs on one connection, a second one on another connection — another `out`, the
+/// same last component — is refused at once with what holds the name; once the first is over (a
+/// refusal is a way out too), the name is free and the next learning runs its stage.
+#[tokio::test]
+async fn one_learn_per_driver_name_at_a_time() {
+    if !forge_available() {
+        return;
+    }
+    let roots = tempfile::tempdir().unwrap();
+    let root = roots.path().join("drivers");
+    std::fs::create_dir_all(root.join("vkforge")).unwrap();
+    std::fs::write(root.join("vkforge").join("__main__.py"), SLOW_REFUSAL).unwrap();
+    let node = Node::start_with_forge(ForgeConfig {
+        python: forge_python(),
+        ..ForgeConfig::at(root.clone())
+    })
+    .await;
+    let corpus = node.dir().join("corpus");
+    std::fs::create_dir_all(&corpus).unwrap();
+    let out = |dir: &str| node.dir().join(dir).join("word-maison");
+    let second = vk_ipc::client::Client::connect(&node.endpoint)
+        .await
+        .unwrap();
+    let (params, proof) = (learn_params(&corpus, &out("a")), node.proof().await);
+    let first = tokio::spawn(async move { second.call("driver.learn", params, Some(proof)).await });
+    let until = Instant::now() + Duration::from_secs(30);
+    while !root.join("started.txt").exists() {
+        assert!(
+            Instant::now() < until,
+            "the first learning never started its stage"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let m = learn_refusal(&node, learn_params(&corpus, &out("b"))).await;
+    assert_eq!(
+        m,
+        "learn of word-maison already in progress; remedy: wait for it"
+    );
+    let e = first.await.unwrap().unwrap_err();
+    assert_eq!(
+        call_error(&e).message,
+        "vkforge inventory: stand-in; remedy: none"
+    );
+    let m = learn_refusal(&node, learn_params(&corpus, &out("c"))).await;
+    assert_eq!(
+        m, "vkforge inventory: stand-in; remedy: none",
+        "the name is free again"
+    );
+    node.shutdown().await;
+}
+
+/// The one model call is a Plan step (L-P10): an arch that cannot plan, like one that is not
+/// mounted, is refused before any stage runs.
+#[tokio::test]
+async fn learn_refuses_an_arch_that_cannot_plan_before_any_stage() {
+    if !forge_available() {
+        return;
+    }
+    let node = Node::start().await;
+    let mock = node
+        .call("arch.mount_mock", json!({"name": "mock"}))
+        .await
+        .unwrap();
+    let shown = node
+        .call("arch.show", json!({"arch_id": mock["arch_id"]}))
+        .await
+        .unwrap();
+    let mut manifest = shown["manifest"].clone();
+    manifest["name"] = json!("drafter");
+    manifest["capabilities"] = json!(["generate"]);
+    // Another identity, hence another arch id: the id is the identity tuple's.
+    manifest["identity"]["weights_sha256"] = json!("sha256:mock-drafter");
+    let drafter = {
+        use vk_contracts::testing::KernelTestHooks;
+        node.k
+            .lock()
+            .unwrap()
+            .register_arch(serde_json::from_value(manifest).unwrap())
+    };
+    let corpus = node.dir().join("corpus");
+    std::fs::create_dir_all(&corpus).unwrap();
+    let mut params = learn_params(&corpus, &node.dir().join("word-maison"));
+    params["arch"] = json!(drafter);
+    let m = learn_refusal(&node, params.clone()).await;
+    assert_eq!(
+        m,
+        format!("arch {drafter} cannot plan; remedy: an arch with the Plan capability")
+    );
+    params["arch"] = json!(format!("sha256:{}", "0".repeat(64)));
+    let m = learn_refusal(&node, params).await;
+    assert!(m.contains("is not mounted on this node"), "{m}");
+    assert!(
+        !node.dir().join("forge").exists(),
+        "refused before any stage"
+    );
+    node.shutdown().await;
+}

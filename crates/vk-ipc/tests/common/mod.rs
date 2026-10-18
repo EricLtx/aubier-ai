@@ -114,6 +114,8 @@ pub struct Node {
     pub server: tokio::task::JoinHandle<anyhow::Result<()>>,
     pub c: Client,
     pub install_root: PathBuf,
+    /// Where the daemon serves: a test that needs a second connection dials it.
+    pub endpoint: vk_ipc::transport::Endpoint,
 }
 
 impl Node {
@@ -170,6 +172,7 @@ impl Node {
             server,
             c,
             install_root,
+            endpoint,
         }
     }
 

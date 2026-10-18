@@ -25,7 +25,9 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
+use vk_contracts::arch::Capability;
 use vk_contracts::driver::{is_driver_name, DriverLearned, DriverManifest, DriverQualified};
 use vk_contracts::hash_bytes;
 use vk_contracts::plan::{plan_sha256, DriverPlan};
@@ -51,7 +53,13 @@ impl ForgeConfig {
     /// `root` as `vkd --vkforge-root` gives it, with the interpreter and the seam read from the
     /// environment and `STAGE_DEADLINE`. Infallible (L-P26): a root without
     /// `vkforge/__main__.py` is refused by `run_stage`, at the first spawn.
+    ///
+    /// The root is made absolute here, against the daemon's working directory as it is at start
+    /// (review fix round 1): a stage runs with `current_dir = root`, so a relative script path or
+    /// `--fixture` path would otherwise be read a second time against the root itself
+    /// (`drivers\drivers\vkforge\__main__.py`), after the check had passed against the daemon's.
     pub fn at(root: PathBuf) -> ForgeConfig {
+        let root = std::path::absolute(&root).unwrap_or(root);
         let python = std::env::var_os("VK_FORGE_PYTHON")
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
@@ -281,7 +289,8 @@ impl Drop for Vault {
 /// Refused before any stage is spawned: an unknown family or app, a relative or missing
 /// corpus, a relative `out`, an `out` that holds anything or lies inside the corpus, an `out`
 /// whose last component is not a driver name (it becomes the driver's), a threshold outside
-/// `(0, 1]`, an arch this node has not mounted. Then the stages, each through [`run_stage`] with
+/// `(0, 1]`, an arch this node has not mounted or that cannot plan, a name another `learn` or
+/// `qualify` is working on (L-P55). Then the stages, each through [`run_stage`] with
 /// `cfg.stage_deadline`, their logs under `<state_dir>/forge/<name>/`; the one model call per
 /// ambiguity when `arch` is given; `driver.learned` and the `learned` row last.
 pub fn learn(
@@ -335,7 +344,7 @@ pub fn learn(
             out.display()
         )));
     }
-    if out.starts_with(&corpus) {
+    if inside_corpus(&out, &corpus) {
         return Err(bad(&format!(
             "out {} is inside the corpus; remedy: a new directory outside it",
             out.display()
@@ -361,15 +370,31 @@ pub fn learn(
         )));
     }
     if let Some(arch) = &arch {
-        let mounted = lock(kernel)?.arches().iter().any(|(id, _)| id == arch);
-        if !mounted {
-            return Err(bad(&format!(
-                "arch {arch} is not mounted on this node; remedy: vk ls /arches lists the arches \
-                 this node has, by name and id"
-            )));
+        // The one model call is a Plan step (L-P10): an arch that cannot plan is refused here,
+        // not after inventory, bind and mine have run.
+        let plans = lock(kernel)?
+            .arches()
+            .into_iter()
+            .find(|(id, _)| id == arch)
+            .map(|(_, m)| m.capabilities.contains(&Capability::Plan));
+        match plans {
+            None => {
+                return Err(bad(&format!(
+                    "arch {arch} is not mounted on this node; remedy: vk ls /arches lists the \
+                     arches this node has, by name and id"
+                )))
+            }
+            Some(false) => {
+                return Err(bad(&format!(
+                    "arch {arch} cannot plan; remedy: an arch with the Plan capability"
+                )))
+            }
+            Some(true) => {}
         }
     }
 
+    // One request per driver name at a time (L-P55), held to the end of this function.
+    let _claim = Claim::take(state_dir, &name, "learn")?;
     let logs = state_dir.join("forge").join(&name);
     if logs.exists() {
         // The daemon's own scratch: the logs of an earlier learning under this name.
@@ -488,8 +513,7 @@ pub fn learn(
             vault.0.display()
         ))
     })?;
-    let plan_bytes =
-        std::fs::read(&plan_file).map_err(|e| io_failed("read the plan vkforge wrote", &e))?;
+    let plan_bytes = read_output(&plan_file, "plan", "plan.json")?;
     let plan: DriverPlan = serde_json::from_slice(&plan_bytes).map_err(|e| {
         internal(&format!(
             "vkforge plan wrote a plan.json that does not parse: {e}"
@@ -581,7 +605,8 @@ struct QualifyParams {
 /// of the corpus, and `driver.qualified` records the replay (kernel-written: whatever principal
 /// the caller presented, L-P25). Refused before anything is spawned: relative paths, a directory
 /// that is not `<learn out>/driver` with `plan.json` and `invariants.json` beside it, a driver
-/// this node did not learn. The stage's work directory is the daemon's own scratch,
+/// this node did not learn, a name another `learn` or `qualify` is working on (L-P55). The
+/// stage's work directory is the daemon's own scratch,
 /// `<state_dir>/drivers/<name>/work/qualify`, emptied first; its logs go under
 /// `<state_dir>/forge/qualify-<name>/`; its deadline is a minute and 130 s per document.
 pub fn qualify(
@@ -632,6 +657,8 @@ pub fn qualify(
     if !is_driver_name(&name) {
         return Err(not_learned_dir());
     }
+    // One request per driver name at a time (L-P55), held to the end of this function.
+    let _claim = Claim::take(state_dir, &name, "qualify")?;
     let work_parent = state_dir.join("drivers").join(&name).join("work");
     let work = work_parent.join("qualify");
     vk_store::paths::private_dir(&work_parent)
@@ -659,7 +686,7 @@ pub fn qualify(
     let deadline = QUALIFY_BASE + QUALIFY_PER_DOCUMENT * documents;
     run_stage(cfg, "qualify", &args, &logs, deadline)?;
     let record = work.join("qualification.json");
-    let bytes = std::fs::read(&record).map_err(|e| io_failed("read qualification.json", &e))?;
+    let bytes = read_output(&record, "qualify", "qualification.json")?;
     let rec: Value = serde_json::from_slice(&bytes).map_err(|e| {
         internal(&format!(
             "vkforge qualify wrote a record that does not parse: {e}"
@@ -752,7 +779,13 @@ pub fn plan_show(p: Value) -> Result<Value, RpcError> {
             ))
         })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!([]),
-        Err(e) => return Err(io_failed("read plan-excluded.json", &e)),
+        Err(e) => {
+            return Err(bad(&format!(
+                "{} cannot be read ({}); remedy: learn the driver again",
+                excluded_file.display(),
+                e.kind()
+            )))
+        }
     };
     Ok(json!({
         "plan": plan,
@@ -768,13 +801,71 @@ fn arg(p: &Path) -> String {
 
 /// A JSON file a stage wrote, or the internal error naming the stage that should have.
 fn read_json(file: &Path, stage: &str, what: &str) -> Result<Value, RpcError> {
-    let bytes = std::fs::read(file)
-        .map_err(|e| internal(&format!("vkforge {stage} wrote no readable {what} ({e})")))?;
+    let bytes = read_output(file, stage, what)?;
     serde_json::from_slice(&bytes).map_err(|e| {
         internal(&format!(
             "vkforge {stage} wrote a {what} that does not parse ({e})"
         ))
     })
+}
+
+/// The bytes of a file a stage wrote, or the internal error naming the stage that should have:
+/// one failure class — a stage's output missing or unreadable — one code (review fix round 1).
+/// `io_failed` stays for the daemon's own directories.
+fn read_output(file: &Path, stage: &str, what: &str) -> Result<Vec<u8>, RpcError> {
+    std::fs::read(file)
+        .map_err(|e| internal(&format!("vkforge {stage} wrote no readable {what} ({e})")))
+}
+
+/// Does `out` — absent, or an empty directory — lie inside `corpus`? Decided on canonical paths
+/// (review fix round 1): case, `..` and junctions resolved as the file system resolves them, `out`
+/// standing for its nearest existing ancestor, so a spelling that differs only lexically is still
+/// refused before inventory and bind run. A corpus that cannot be resolved falls back to the
+/// lexical comparison.
+fn inside_corpus(out: &Path, corpus: &Path) -> bool {
+    let Ok(corpus) = std::fs::canonicalize(corpus) else {
+        return out.starts_with(corpus);
+    };
+    out.ancestors()
+        .find_map(|a| std::fs::canonicalize(a).ok())
+        .is_some_and(|a| a.starts_with(&corpus))
+}
+
+/// The driver names a vkforge request is working on, per state directory (ruling L-P55): two
+/// requests for one name would share `<state>/forge/<name>` or
+/// `<state>/drivers/<name>/work/qualify` and clear each other's files mid-run. One daemon serves one state directory (the
+/// store's lock), so the key is the daemon's; a test process running several daemons keeps them
+/// apart by their directories.
+static IN_FLIGHT: Mutex<BTreeMap<(PathBuf, String), &'static str>> = Mutex::new(BTreeMap::new());
+
+/// One request's hold on a driver name: taken before anything of that name is cleared or
+/// spawned, released on every way out — a refusal, an error, a panic.
+struct Claim {
+    key: (PathBuf, String),
+}
+
+impl Claim {
+    /// The name for `verb`, or the refusal naming what holds it.
+    fn take(state_dir: &Path, name: &str, verb: &'static str) -> Result<Claim, RpcError> {
+        let key = (state_dir.to_path_buf(), name.to_string());
+        let mut held = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(busy) = held.get(&key) {
+            return Err(bad(&format!(
+                "{busy} of {name} already in progress; remedy: wait for it"
+            )));
+        }
+        held.insert(key.clone(), verb);
+        Ok(Claim { key })
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        IN_FLIGHT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.key);
+    }
 }
 
 /// The documents of a corpus, as the miner counts them: the `.docx` and `.pptx` files directly
@@ -821,6 +912,71 @@ fn io_failed(what: &str, e: &std::io::Error) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A relative `--vkforge-root` is made absolute at start (review fix round 1), so the stage —
+    /// run in the root — is handed a script path and a `--fixture` path that name the same files.
+    #[test]
+    fn a_relative_root_is_made_absolute_at_start() {
+        let cfg = ForgeConfig::at("drivers".into());
+        assert!(cfg.root.is_absolute(), "{}", cfg.root.display());
+        assert_eq!(
+            cfg.root,
+            std::env::current_dir().unwrap().join("drivers"),
+            "against the daemon's working directory at start"
+        );
+    }
+
+    /// `out` inside the corpus is decided on canonical paths: a `..` spelling, and on Windows a
+    /// difference of case, is still inside; a sibling is not.
+    #[test]
+    fn out_inside_the_corpus_is_decided_on_canonical_paths() {
+        let t = tempfile::tempdir().unwrap();
+        let corpus = t.path().join("Corpus");
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::create_dir_all(t.path().join("other")).unwrap();
+        let dotted = t
+            .path()
+            .join("other")
+            .join("..")
+            .join("Corpus")
+            .join("word-maison");
+        assert!(!dotted.starts_with(&corpus), "lexically outside");
+        assert!(inside_corpus(&dotted, &corpus), "canonically inside");
+        assert!(inside_corpus(
+            &corpus.join("a").join("word-maison"),
+            &corpus
+        ));
+        assert!(!inside_corpus(&t.path().join("word-maison"), &corpus));
+        if cfg!(windows) {
+            let cased = t.path().join("CORPUS").join("word-maison");
+            assert!(
+                inside_corpus(&cased, &corpus),
+                "Windows names are case-blind"
+            );
+        }
+    }
+
+    /// One `learn` or `qualify` per driver name and state directory at a time (L-P55): a second
+    /// claim on the name is refused with what holds it, another name or another state directory
+    /// is not, and the name is free again once the claim is dropped.
+    #[test]
+    fn one_request_per_driver_name_at_a_time() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        let held = Claim::take(&a, "word-maison", "learn").unwrap();
+        let e = Claim::take(&a, "word-maison", "qualify")
+            .err()
+            .expect("the name is held");
+        assert_eq!(
+            e.message,
+            "learn of word-maison already in progress; remedy: wait for it"
+        );
+        let other_name = Claim::take(&a, "ppt-maison", "qualify").unwrap();
+        let other_node = Claim::take(&b, "word-maison", "qualify").unwrap();
+        drop(held);
+        Claim::take(&a, "word-maison", "qualify").expect("free once released");
+        drop((other_name, other_node));
+    }
 
     /// A root without `vkforge/__main__.py` is refused at the first spawn, before anything is
     /// written (L-P26): `ForgeConfig::at` checks nothing.

@@ -73,13 +73,15 @@ pub fn not_learned(driver_id: &str) -> KernelError {
 
 /// The answer rule (spec §6, "never applied in part"): at each `{` of `answer`, in order, one
 /// JSON value is parsed. An answer-shaped object — one with both an `invariant` and a `value` —
-/// is judged whole: it chooses its value when it names this ambiguity's invariant and the value
-/// is a candidate's, and is otherwise passed over whole, so a value inside an answer about
-/// another invariant, or inside an answer outside the candidates, is never taken for this one.
-/// Any other value chooses itself when it equals a candidate's value (an object compared as
-/// JSON: key order is not meaning), and otherwise the scan goes on at the next `{`, inside it
-/// included. Nothing else ever comes back: an arch can only pick among what the miner listed, and
-/// a string candidate only through the answer shape, never by being echoed.
+/// is judged whole: it chooses its value when it is exactly `{"invariant", "value"}` (no other
+/// key), names this ambiguity's invariant and its value is a candidate's, and is otherwise passed
+/// over whole, so a value inside an answer about another invariant, inside an answer outside the
+/// candidates, or inside an answer carrying more than the rule asks, is never taken for this one.
+/// Any other value chooses itself when it equals a candidate's value — compared as JSON: key
+/// order is not meaning, but a superset of a candidate is not that candidate, nor is `11.0` the
+/// candidate `11` — and otherwise the scan goes on at the next `{`, inside it included. Nothing
+/// else ever comes back: an arch can only pick among what the miner listed, and a string
+/// candidate only through the answer shape, never by being echoed.
 pub fn answer_choice(answer: &str, ambiguity: &Value) -> Option<Value> {
     let invariant = ambiguity.get("invariant")?.as_str()?;
     let candidates: Vec<&Value> = ambiguity
@@ -102,7 +104,10 @@ pub fn answer_choice(answer: &str, ambiguity: &Value) -> Option<Value> {
             .as_object()
             .filter(|o| o.contains_key("invariant") && o.contains_key("value"))
         {
-            if shaped["invariant"] == invariant && is_candidate(&shaped["value"]) {
+            if shaped.len() == 2
+                && shaped["invariant"] == invariant
+                && is_candidate(&shaped["value"])
+            {
                 return Some(shaped["value"].clone());
             }
             at = end;
@@ -308,5 +313,35 @@ mod tests {
         );
         // An ambiguity without candidates chooses nothing.
         assert_eq!(answer_choice("{}", &json!({"invariant": "x"})), None);
+    }
+
+    /// Nothing near a candidate passes for it (review fix round 1): an answer carrying more than
+    /// `{invariant, value}`, a value that is a superset of a candidate, and `11.0` for the
+    /// candidate `11` are all refused, alone or inside the answer shape.
+    #[test]
+    fn the_answer_rule_refuses_supersets_and_near_equal_values() {
+        let amb = json!({"invariant": "body_font", "candidates": [
+            {"value": {"name": "Garamond", "size": 11}, "support": 0.7},
+            {"value": {"name": "Calibri", "size": 12}, "support": 0.3}]});
+        let refused = [
+            // The answer shape with a key the rule does not ask for, judged whole: the
+            // candidate inside it is not taken either.
+            r#"{"invariant": "body_font", "value": {"name": "Garamond", "size": 11}, "extra": 1}"#,
+            r#"{"invariant": "body_font", "value": {"name": "Garamond", "size": 11, "bold": true}}"#,
+            r#"{"name": "Garamond", "size": 11, "bold": true}"#,
+            r#"{"invariant": "body_font", "value": {"name": "Garamond", "size": 11.0}}"#,
+            r#"{"name": "Garamond", "size": 11.0}"#,
+        ];
+        for answer in refused {
+            assert_eq!(answer_choice(answer, &amb), None, "{answer}");
+        }
+        // The exact shape still chooses.
+        assert_eq!(
+            answer_choice(
+                r#"{"value": {"size": 12, "name": "Calibri"}, "invariant": "body_font"}"#,
+                &amb
+            ),
+            Some(json!({"name": "Calibri", "size": 12}))
+        );
     }
 }

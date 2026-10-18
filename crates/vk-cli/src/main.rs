@@ -1268,10 +1268,10 @@ async fn call(cli: &Cli) -> Result<()> {
                 },
         } => {
             let arch = match arch {
-                Some(arch) => Some(resolve_arch(
-                    arch,
-                    &c.call("arch.ls", json!({}), None).await?,
-                )?),
+                Some(arch) => Some(
+                    resolve_arch(arch, &c.call("arch.ls", json!({}), None).await?)
+                        .map_err(|e| anyhow!("--arch {arch}: {e}"))?,
+                ),
                 None => None,
             };
             let mut params = json!({
@@ -1691,62 +1691,20 @@ fn names_an_arch(step: &RecipeStep) -> bool {
 /// pointing at `vk ls /arches`, where the names and ids are. An id is left as
 /// written: whether it is mounted is the kernel's to say when the step runs.
 fn resolve_arch_names(steps: &mut [RecipeStep], arches: &Value) -> Result<()> {
-    let rows = arches
-        .as_array()
-        .ok_or_else(|| anyhow!("arch.ls answered something other than a list: {arches}"))?;
     for (i, step) in steps.iter_mut().enumerate() {
         let Some((role, arch)) = step_arch(step) else {
             continue;
         };
-        if arch.starts_with("sha256:") {
-            continue;
-        }
-        let carrying: Vec<&Value> = rows
-            .iter()
-            .filter(|a| a["manifest"]["name"].as_str() == Some(arch.as_str()))
-            .collect();
-        match carrying.as_slice() {
-            [one] => {
-                *arch = one["arch_id"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("arch.ls listed `{arch}` without an id: {one}"))?
-                    .to_string();
-            }
-            [] => {
-                return Err(anyhow!(
-                    "step {} ({role}): no mounted arch is named `{arch}`; mount it, or write \
-                     its id instead (`vk ls /arches` lists the names and ids this node has)",
-                    i + 1
-                ))
-            }
-            many => {
-                let ids = many
-                    .iter()
-                    .map(|a| {
-                        format!(
-                            "{} ({})",
-                            a["arch_id"].as_str().unwrap_or("?"),
-                            a["state"].as_str().unwrap_or("?")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(anyhow!(
-                    "step {} ({role}): {} mounted arches are named `{arch}`: {ids}; unmount the \
-                     one you do not mean (`vk umount <ID>`) or write its id instead \
-                     (`vk ls /arches` lists them)",
-                    i + 1,
-                    many.len()
-                ));
-            }
-        }
+        *arch = resolve_arch(arch, arches).map_err(|e| anyhow!("step {} ({role}): {e}", i + 1))?;
     }
     Ok(())
 }
 
-/// `vk driver learn --arch` read as [`resolve_arch_names`] reads a recipe's
-/// arch: an id (`sha256:…`) is kept as it is, a name becomes the id of the
-/// one mounted arch carrying it, and none or several is refused.
+/// One arch named as a recipe step or `vk driver learn --arch` names it,
+/// against `arch.ls`: an id (`sha256:…`) is kept as it is, a name becomes the
+/// id of the one mounted arch carrying it, and none or several is refused —
+/// several with each one's id and state, so the person can tell which to
+/// unmount. The one place this matching is written.
 fn resolve_arch(arch: &str, arches: &Value) -> Result<String> {
     if arch.starts_with("sha256:") {
         return Ok(arch.to_string());
@@ -1764,18 +1722,27 @@ fn resolve_arch(arch: &str, arches: &Value) -> Result<String> {
             .map(str::to_owned)
             .ok_or_else(|| anyhow!("arch.ls listed `{arch}` without an id: {one}")),
         [] => Err(anyhow!(
-            "--arch {arch}: no mounted arch is named `{arch}`; mount it, or pass its id instead \
+            "no mounted arch is named `{arch}`; mount it, or write its id instead \
              (`vk ls /arches` lists the names and ids this node has)"
         )),
-        many => Err(anyhow!(
-            "--arch {arch}: {} mounted arches are named `{arch}`: {}; unmount the one you do not \
-             mean (`vk umount <ID>`) or pass its id instead (`vk ls /arches` lists them)",
-            many.len(),
-            many.iter()
-                .map(|a| a["arch_id"].as_str().unwrap_or("?"))
+        many => {
+            let ids = many
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{} ({})",
+                        a["arch_id"].as_str().unwrap_or("?"),
+                        a["state"].as_str().unwrap_or("?")
+                    )
+                })
                 .collect::<Vec<_>>()
-                .join(", ")
-        )),
+                .join(", ");
+            Err(anyhow!(
+                "{} mounted arches are named `{arch}`: {ids}; unmount the one you do not mean \
+                 (`vk umount <ID>`) or write its id instead (`vk ls /arches` lists them)",
+                many.len()
+            ))
+        }
     }
 }
 
@@ -2425,6 +2392,10 @@ mod recipe_tests {
         assert!(e.contains("no mounted arch is named `nobody`"), "{e}");
         let e = resolve_arch("twice", &listing()).unwrap_err().to_string();
         assert!(e.contains("2 mounted arches are named `twice`"), "{e}");
+        assert!(
+            e.contains("sha256:c01 (ready)") && e.contains("sha256:c02 (unavailable)"),
+            "the one function keeps each arch's state: {e}"
+        );
     }
 
     fn listing() -> serde_json::Value {
