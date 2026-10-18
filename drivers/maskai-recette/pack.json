@@ -1,0 +1,7 @@
+{
+  "vendor": [
+    "drivers/vkdriver",
+    "scripts/recette/evaluer.py",
+    "scripts/recette/journal.py"
+  ]
+}

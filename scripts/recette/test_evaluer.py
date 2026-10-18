@@ -1,10 +1,12 @@
 """Tests de l'évaluateur d'oracles : python -I -m unittest scripts/recette/test_evaluer.py"""
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from evaluer import evaluate_case, evaluate, SPAN_LEAK  # noqa: E402
+from evaluer import BROKEN_TOKEN, SPAN_LEAK, evaluate, evaluate_case, pii_in  # noqa: E402
 
 CASE = {
     "id": "T1", "size": "léger",
@@ -65,6 +67,55 @@ class EvaluerTests(unittest.TestCase):
 
     def test_span_regex_ignores_clean_tokens(self):
         self.assertIsNone(SPAN_LEAK.search("<PERSON_1>, <ADDRESS_1>. <DATE_2>"))
+
+    def test_a_well_formed_underscored_token_is_not_broken(self):
+        # The 17/10 header showed « <CREDIT_CARD_1> »: BROKEN_TOKEN read « CARD_1> » in it.
+        self.assertIsNone(BROKEN_TOKEN.search("Anonymisé → <PERSON_1> <CREDIT_CARD_1> <FR_NIR_2>"))
+        r = evaluate_case(CASE, {"answer": "2 820 € sous 15 jours", "sent": "carte <CREDIT_CARD_1>, <PERSON_1>"})
+        self.assertEqual((r["verdict"], r["span_issues"]), ("OK", []))
+        # and a token that lost its '<' is still caught, whole
+        self.assertEqual(BROKEN_TOKEN.search("carte CREDIT_CARD_1> ici").group(0), "CREDIT_CARD_1>")
+        self.assertEqual(BROKEN_TOKEN.search("12AB<PHONE_2>PERSON_1>").group(0), "PERSON_1>")
+
+    def sent_json(self, data) -> str:
+        d = tempfile.mkdtemp(prefix="evaluer-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        path = os.path.join(d, "sent.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        return path
+
+    def test_the_sent_text_of_sent_json_is_checked_and_a_leak_is_ko_securite(self):
+        path = self.sent_json({"source": "popover", "text": "Relance pour Marie Dupont, IBAN <IBAN_1>."})
+        r = evaluate_case(CASE, {"answer": "2 820 € sous 15 jours", "sent_json": path})
+        self.assertEqual((r["verdict"], r["leaks"], r["nfr"]), ("KO", ["Marie Dupont"], ["securite"]))
+        self.assertIn("KO sécurité : donnée identifiante en clair dans le texte envoyé", r["notes"])
+        path = self.sent_json({"source": "popover", "text": "Relance pour <PERSON_1>, IBAN <IBAN_1>."})
+        r = evaluate_case(CASE, {"answer": "2 820 € sous 15 jours", "sent_json": path})
+        self.assertEqual((r["verdict"], r["leaks"]), ("OK", []))
+        self.assertNotIn("nfr", r)
+
+    def test_a_sent_json_without_the_sent_text_leaves_the_leak_unverified(self):
+        for data in ({"source": None, "missing": "trigger"},
+                     {"source": None, "rejected": "le popover ne montre pas le texte de la question",
+                      "text": "Encrypted — no PII detected"}):
+            r = evaluate_case(CASE, {"answer": "2 820 € sous 15 jours", "sent_json": self.sent_json(data)})
+            self.assertEqual(r["verdict"], "OK")
+            self.assertTrue(any("non observé" in n for n in r["notes"]), r["notes"])
+        r = evaluate_case(CASE, {"answer": "2 820 € sous 15 jours", "sent_json": "absent/sent.json"})
+        self.assertTrue(any("non observé" in n for n in r["notes"]))
+
+    def test_an_inventory_value_is_matched_up_to_its_separators_only(self):
+        case = dict(CASE, pii=["FR55 3078 8009 0002 8479 1365 147", "M. Malzac"])
+        r = evaluate_case(case, {"answer": "2 820 € sous 15 jours",
+                                 "sent": "compte FR5530788009000284791365147 de M Malzac"})
+        self.assertEqual(r["leaks"], ["FR55 3078 8009 0002 8479 1365 147", "M. Malzac"])
+        # everything but blanks, '.' and '-' reads literally: no wildcard, no regex syntax
+        self.assertFalse(pii_in("12.5", "le code 1205"))
+        self.assertTrue(pii_in("12.5", "le code 12-5"))
+        self.assertFalse(pii_in("M. Malzac", "Mr Malzac"))
+        self.assertTrue(pii_in("+33 6 12 (34)", "appelez le +336-12 (34)"))
+        self.assertFalse(pii_in("a+b", "aab"))
 
 
 if __name__ == "__main__":

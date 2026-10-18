@@ -8,7 +8,7 @@
       "-I",
       "driver.py"
     ],
-    "files_sha256": "sha256:ea7336c6b70ab8775d33090071fc9b64abc87a2253b10f98b15aea3e20289b16",
+    "files_sha256": "sha256:6a47269c66acb62cd5a8045a8ebfde49d601e8d89e56c439928139ea10807f44",
     "browser_channel": "chrome",
     "headless": false,
     "max_memory_bytes": 6144
@@ -78,6 +78,8 @@
       },
       "evidence": [
         "dom.html",
+        "guard.json",
+        "sent.json",
         "network.json",
         "answer.png"
       ],
@@ -100,6 +102,8 @@
       },
       "evidence": [
         "dom.html",
+        "guard.json",
+        "sent.json",
         "network.json",
         "answer.png"
       ],
@@ -126,6 +130,79 @@
       },
       "evidence": [
         "network.json"
+      ],
+      "to_register": false
+    },
+    {
+      "name": "choisir_modele",
+      "reversible": false,
+      "args": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "additionalProperties": false
+      },
+      "evidence": [
+        "model.json"
+      ],
+      "to_register": false
+    },
+    {
+      "name": "recherche_web",
+      "reversible": false,
+      "args": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "off",
+              "auto",
+              "on"
+            ]
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "additionalProperties": false
+      },
+      "evidence": [
+        "web.json"
+      ],
+      "to_register": false
+    },
+    {
+      "name": "conversation_longue",
+      "reversible": false,
+      "args": {
+        "type": "object",
+        "properties": {
+          "case": {
+            "type": "string"
+          },
+          "turns": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 20
+          }
+        },
+        "required": [
+          "case",
+          "turns"
+        ],
+        "additionalProperties": false
+      },
+      "evidence": [
+        "turns.json",
+        "answer.png"
       ],
       "to_register": false
     },
@@ -213,7 +290,7 @@
     }
   ],
   "min_interval_ms": 2000,
-  "max_action_ms": 240000,
+  "max_action_ms": 360000,
   "clearance": {
     "max_scope": "business",
     "third_party_allowed": true
