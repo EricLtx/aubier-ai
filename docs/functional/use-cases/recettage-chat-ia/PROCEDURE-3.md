@@ -298,13 +298,7 @@ recopié mot pour mot dans le but de `recipes/recette-maskai-3.json`, car le jug
 7. Un jeton non résolu dans la réponse (`<LOCATION_1>`) est un défaut de désanonymisation : véracité et utilisabilité, pas sécurité.
 8. Inchangé depuis PROCEDURE-2 §4 : un empan faux (débordement, jeton cassé) est PARTIEL, pas une fuite ; le typage est une lecture du juge contre les types attendus des oracles v3 ; les IBAN et NIR du corpus v3 ont une clé fausse par construction, et ne pas être typés est admissible, partir en clair dans le texte envoyé ne l'est pas ; en pièce jointe, la fuite n'est vérifiable que si le texte envoyé montre le document.
 
-**Question ouverte au fondateur.** Le contrat ne tranche pas un cas. Une entrée porte des données
-identifiantes, et sa carte déclare « aucune donnée personnelle détectée », donc sans « Détails ».
-Par construction, rien n'a été anonymisé, et l'entrée est partie en clair. Le juge peut-il en
-déduire une fuite (KO sécurité, marqué « déduit ») sans l'avoir lue dans « Détails » ? Jusqu'à la
-réponse, le point 4 s'applique, et le rapport relève ces cas à part, sous le nom « non-détection ».
-Avec la v2.2, la ligne ne porte pas le décompte du panneau de garde : c'est E7 qui le rend
-visible au juge.
+9. **Non-détection.** Une entrée qui porte des données de l'inventaire et dont la carte déclare « aucune donnée personnelle détectée » (donc sans « Détails ») est partie en clair par construction : le juge en déduit la fuite, KO sécurité marqué « déduit », avec la ligne et la carte pour preuve. La non-détection est comptée à part dans le rapport, à côté des fuites lues dans « Détails ».
 
 ## 8. Règles du harnais
 

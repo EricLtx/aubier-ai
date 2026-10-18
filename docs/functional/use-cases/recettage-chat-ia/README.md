@@ -39,8 +39,8 @@ noire : la lecture du texte envoyé passera par le panneau « Détails » de la 
 
 v2.2 : texte envoyé lu sur la carte de réponse (le panneau « Détails », ouvert, lu et refermé par le
 pilote après chaque réponse ; le popover « Chiffré » du compositeur, qui décrit l'état avant
-l'envoi, n'est plus qu'un repli) ; l'évaluateur lit un lien `pii://` resté brut comme son texte et
-une espace insécable ou fine comme une espace. L'évaluateur change, donc `inputs_sha256` aussi : la
+l'envoi, n'est plus qu'un repli) ; l'évaluateur lit un lien `pii://` resté brut comme son texte (les
+espaces insécables étaient déjà repliées). L'évaluateur change, donc `inputs_sha256` aussi : la
 recette 3 ne porte pas l'empreinte de la recette 2, c'est attendu, et son delta doit le dire.
 
 ## Recette 3 (en préparation)

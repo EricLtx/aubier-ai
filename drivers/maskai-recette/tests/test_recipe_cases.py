@@ -20,7 +20,9 @@ CASE_ID = re.compile(r"(?<![\w-])(?:N\d-\d+[a-z]?|M\d-[A-Z]?\d+[a-z]?|V2-[LV]\d|
 RULES = re.compile(r"Règles\. .*?vk_write_decision\. ", re.S)
 LEVEL = re.compile(r"^Niveau ([NM]\d) ")
 # Each recipe and the grid it runs: every case of that grid, level by level, once.
-GRIDS = {"recette-maskai.json": "N", "recette-maskai-2.json": "M"}
+# Each recipe and the grid it runs: the letter and the highest level (recette 2 stops at M7,
+# recette 3 adds M8 and M9).
+GRIDS = {"recette-maskai.json": ("N", 9), "recette-maskai-2.json": ("M", 7), "recette-maskai-3.json": ("M", 9)}
 
 
 def load(*parts: str):
@@ -37,7 +39,7 @@ class RecipeCasesTest(unittest.TestCase):
         self.cases = {c["id"]: c for c in load(DRIVER, "cases.json")["cases"]}
         self.recipes = {
             name: load(REPO, "recipes", name)
-            for name in ("recette-maskai.json", "recette-maskai-2.json", "recette-fixture.json")
+            for name in ("recette-maskai.json", "recette-maskai-2.json", "recette-maskai-3.json", "recette-fixture.json")
         }
 
     def test_the_case_pattern_reads_whole_ids_only(self):
@@ -57,7 +59,7 @@ class RecipeCasesTest(unittest.TestCase):
                 found = RULES.findall(step["instruction"])
                 self.assertEqual(len(found), 1, f"{name} harness step {i + 1}: one rules block")
                 blocks.append((f"{name} harness step {i + 1}", found[0]))
-        self.assertEqual(len(blocks), 20)
+        self.assertEqual(len(blocks), 30)
         first = blocks[0][1]
         for where, block in blocks[1:]:
             self.assertEqual(block, first, f"{where} differs from {blocks[0][0]}")
@@ -87,17 +89,19 @@ class RecipeCasesTest(unittest.TestCase):
                 self.assertEqual(stray, [], f"{name} harness step {i + 1} ({level}) names other levels' cases")
 
     def test_each_recette_runs_every_case_of_its_grid_once_level_by_level(self):
-        """recette-maskai.json runs the N grid N0 to N9, recette-maskai-2.json the M grid M0 to M7."""
-        for name, grid_letter in GRIDS.items():
+        """recette-maskai.json runs the N grid N0 to N9, recette-maskai-2.json the M grid M0 to M7,
+        recette-maskai-3.json the M grid M0 to M9."""
+        for name, (grid_letter, top) in GRIDS.items():
             steps = harness_steps(self.recipes[name])
-            levels = sorted({c["level"] for c in self.cases.values() if c["level"].startswith(grid_letter)},
+            levels = sorted({c["level"] for c in self.cases.values()
+                             if c["level"].startswith(grid_letter) and int(c["level"][1:]) <= top},
                             key=lambda lv: int(lv[1:]))
             self.assertEqual([LEVEL.match(s["instruction"]).group(1) for s in steps], levels, name)
             named = set()
             for s in steps:
                 named.update(CASE_ID.findall(s["instruction"]))
             grid = {cid for cid, c in self.cases.items() if c["level"].startswith(grid_letter)
-                    and not cid.startswith("fixture-")}
+                    and int(c["level"][1:]) <= top and not cid.startswith("fixture-")}
             self.assertEqual(sorted(grid - named), [], f"{name}: cases of the grid no step runs")
         self.assertEqual({c["level"][0] for c in self.cases.values()}, {"N", "M"})
 
@@ -105,7 +109,7 @@ class RecipeCasesTest(unittest.TestCase):
         """The recette acts on maskai-1 and the dry run on maskai-fixture, the names
         their manifests mount under, and each instruction tells the harness so."""
         for name, manifest in (("recette-maskai.json", "manifest.json"), ("recette-maskai-2.json", "manifest.json"),
-                               ("recette-fixture.json", "manifest-fixture.json")):
+                               ("recette-maskai-3.json", "manifest.json"), ("recette-fixture.json", "manifest-fixture.json")):
             driver = load(DRIVER, manifest)["name"]
             for i, step in enumerate(harness_steps(self.recipes[name])):
                 self.assertEqual(step["drivers"], [driver], f"{name} harness step {i + 1}")
