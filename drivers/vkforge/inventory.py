@@ -26,7 +26,7 @@ _VT_PTR, _VT_SAFEARRAY, _VT_USERDEFINED = 26, 27, 29
 
 _TKIND_ENUM, _TKIND_INTERFACE, _TKIND_DISPATCH, _TKIND_COCLASS = 0, 3, 4, 5
 _INVOKE_KINDS = {1: "method", 2: "property_get", 4: "property_put"}   # INVOKE_FUNC, _PROPERTYGET, _PROPERTYPUT
-_IMPLTYPE_FSOURCE = 2                                                  # an event interface, not the object's own
+_IMPLTYPE_FDEFAULT, _IMPLTYPE_FSOURCE = 1, 2                           # IMPLTYPEFLAG_*: default; an event interface
 _MEMID_INHERITED = 0x60000000                                          # IUnknown / IDispatch plumbing
 
 
@@ -59,13 +59,19 @@ def typelib_path(guid: str) -> str:
                     versions.append(winreg.EnumKey(key, len(versions)))
             except OSError:                                 # the end of the enumeration
                 pass
-        for version in sorted(versions, key=_version_key, reverse=True):
+        parsable = []
+        for version in versions:
+            try:
+                parsable.append((_version_key(version), version))
+            except ValueError:                              # a subkey that is not `major.minor`: not a version
+                continue
+        for _, version in sorted(parsable, reverse=True):
             for bitness in ("win64", "win32"):
                 try:
                     return winreg.QueryValue(winreg.HKEY_CLASSES_ROOT, rf"TypeLib\{guid}\{version}\0\{bitness}")
                 except OSError:
                     continue
-    except (OSError, ValueError):
+    except OSError:
         pass
     raise _not_registered(guid)
 
@@ -107,18 +113,25 @@ def _members(info, count: int) -> list:
 
 
 def _default_interface(info, attr):
-    """The interface a coclass is used through: its first implemented interface that is not an event source."""
-    for i in range(attr.cImplTypes):
-        if not info.GetImplTypeFlags(i) & _IMPLTYPE_FSOURCE:
-            return info.GetRefTypeInfo(info.GetRefTypeOfImplType(i))
-    return None
+    """The interface a coclass is used through: the one flagged default and not an event source, else the first
+    implemented interface that is not an event source."""
+    candidates = [i for i in range(attr.cImplTypes) if not info.GetImplTypeFlags(i) & _IMPLTYPE_FSOURCE]
+    chosen = next((i for i in candidates if info.GetImplTypeFlags(i) & _IMPLTYPE_FDEFAULT),
+                  candidates[0] if candidates else None)
+    return None if chosen is None else info.GetRefTypeInfo(info.GetRefTypeOfImplType(chosen))
 
 
 def catalogue_from_typelib(app: str, path: str) -> dict:
     """The catalogue (spec §4.1) of the type library file at `path`; its hash is that file's bytes (L-P22)."""
     guid = _app(app)["typelib"]
-    from comtypes import typeinfo
-    tlib = typeinfo.LoadTypeLibEx(str(path))
+    try:
+        from comtypes import COMError, typeinfo
+    except ImportError as e:
+        raise Refusal(f"comtypes is not available ({e})", "install comtypes (drivers/vkforge/requirements.txt)")
+    try:
+        tlib = typeinfo.LoadTypeLibEx(str(path))
+    except (COMError, OSError) as e:
+        raise Refusal(f"type library {path} did not load ({e})", "repair Microsoft 365 desktop")
     lib = tlib.GetLibAttr()
     if str(lib.guid).upper() != guid.upper():
         raise Refusal(f"{path} is the type library {lib.guid}, not that of {app} {guid}",
@@ -152,7 +165,16 @@ def catalogue_from_typelib(app: str, path: str) -> dict:
 
 def catalogue_from_fixture(app: str, fixture: Path) -> dict:
     _app(app)                                               # before any file is read
-    cat = json.loads(Path(fixture).read_text(encoding="utf-8"))
+    remedy = f"record it with inventory --app {app} --out DIR on a node with Office"
+    fixture = Path(fixture)
+    if not fixture.is_file():
+        raise Refusal(f"fixture {fixture} not found", remedy)
+    try:
+        cat = json.loads(fixture.read_text(encoding="utf-8"))
+    except (OSError, ValueError):                           # unreadable, not UTF-8, not JSON
+        raise Refusal(f"fixture {fixture} is not a catalogue", remedy)
+    if not isinstance(cat, dict):
+        raise Refusal(f"fixture {fixture} is not a catalogue", remedy)
     if cat.get("app") != app:
         raise Refusal(f"{fixture} is the catalogue of {cat.get('app')}, not of {app}",
                       f"--app {cat.get('app')} or the fixture of {app}")
@@ -190,7 +212,13 @@ def run(ns: argparse.Namespace) -> int:
     else:
         cat = catalogue_from_typelib(ns.app, typelib_path(_app(ns.app)["typelib"]))
     if ns.only_types:
-        cat = restrict(cat, [n.strip() for n in ns.only_types.split(",") if n.strip()])
+        names = [n.strip() for n in ns.only_types.split(",") if n.strip()]
+        known = {t["name"] for t in cat["types"]}
+        unknown = sorted(set(names) - known)
+        if unknown:
+            raise Refusal(f"unknown types in --only-types: {', '.join(unknown)}",
+                          f"names from the catalogue of {ns.app} (types: {len(known)})")
+        cat = restrict(cat, names)
     path = write_catalogue(cat, ns.out)
     print(f"inventory: {len(cat['types'])} types, {len(cat['enums'])} enums -> {path}")
     return 0

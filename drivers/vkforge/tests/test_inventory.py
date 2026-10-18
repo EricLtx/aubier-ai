@@ -1,3 +1,4 @@
+import argparse
 import json
 import sys
 import tempfile
@@ -18,6 +19,14 @@ def reorder(x):
     if isinstance(x, list):
         return [reorder(v) for v in x]
     return x
+
+
+def entry_args(argv):
+    """The parsed namespace of `vkforge <argv>`, to call a stage's run() directly."""
+    p = argparse.ArgumentParser(prog="vkforge")
+    sub = p.add_subparsers(dest="stage", required=True)
+    inventory.add_arguments(sub.add_parser("inventory"))
+    return p.parse_args(argv)
 
 
 class InventoryTest(unittest.TestCase):
@@ -74,3 +83,39 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(code, 0)
         written = json.loads((out / "catalogue.json").read_text(encoding="utf-8"))
         self.assertEqual([t["name"] for t in written["types"]], ["Document", "Font"])
+
+    def test_a_missing_fixture_is_a_refusal_naming_the_remedy(self):
+        absent = FIXTURES / "absent.json"
+        with self.assertRaises(Refusal) as cm:
+            inventory.catalogue_from_fixture("word", absent)
+        self.assertEqual(str(cm.exception), f"fixture {absent} not found; "
+                         "remedy: record it with inventory --app word --out DIR on a node with Office")
+
+    def test_a_malformed_fixture_is_a_refusal_never_a_traceback(self):
+        d = Path(tempfile.mkdtemp())
+        for name, data in (("bad-json.json", b"{not json"), ("bad-utf8.json", b"\xff\xfe\x00"),
+                           ("array.json", b"[1, 2]")):
+            (d / name).write_bytes(data)
+            with self.assertRaises(Refusal, msg=name) as cm:
+                inventory.catalogue_from_fixture("word", d / name)
+            self.assertEqual(str(cm.exception), f"fixture {d / name} is not a catalogue; "
+                             "remedy: record it with inventory --app word --out DIR on a node with Office")
+
+    def test_a_fixture_of_another_app_is_refused(self):
+        path = Path(tempfile.mkdtemp()) / "c.json"
+        path.write_text(json.dumps({"app": "powerpoint", "types": [], "enums": {}}), encoding="utf-8")
+        with self.assertRaises(Refusal) as cm:
+            inventory.catalogue_from_fixture("word", path)
+        self.assertEqual(str(cm.exception), f"{path} is the catalogue of powerpoint, not of word; "
+                         "remedy: --app powerpoint or the fixture of word")
+
+    def test_an_unknown_only_types_name_is_refused_listing_the_unknown_names(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "c.json").write_text(json.dumps({"app": "word", "types": [{"name": "Document", "kind": "coclass",
+                                              "members": []}], "enums": {}}), encoding="utf-8")
+        with self.assertRaises(Refusal) as cm:
+            inventory.run(entry_args(["inventory", "--app", "word", "--out", str(d / "out"),
+                                      "--fixture", str(d / "c.json"), "--only-types", "Document,Fnot,Abc"]))
+        self.assertEqual(str(cm.exception), "unknown types in --only-types: Abc, Fnot; "
+                         "remedy: names from the catalogue of word (types: 1)")
+        self.assertFalse((d / "out").exists(), "nothing is written on a refusal")
