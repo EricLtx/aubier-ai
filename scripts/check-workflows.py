@@ -26,7 +26,7 @@ WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 # renamed, dropped, or gained is exactly the kind of mistake worth catching
 # in one place rather than by reading a diff carefully every time.
 EXPECTED_JOBS = {
-    "ci.yml": {"test", "arch-ollama", "driver-browser", "sign"},
+    "ci.yml": {"test", "arch-ollama", "driver-browser", "driver-install", "sign"},
     "release.yml": {"build"},
 }
 

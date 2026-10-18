@@ -197,14 +197,86 @@ Le `--timeout 600` donne dix minutes par appel au lieu de trois. Le rapport fina
 
 ## 6. Monter le driver et se connecter à MaskAI
 
+**6.0 Depuis un paquet installé** (facultatif : c'est le chemin du firmware signé, là où le §6.1 charge le code depuis le débogueur). Le driver y est livré en un paquet signé qui embarque son propre CPython et ses bibliothèques, installé une fois sous `C:\Program Files\Aubier\drivers\`, et le noyau en vérifie l'empreinte complète avant chaque démarrage. Le §6.1 reste la voie par défaut du jalon A.
+
+Prérequis, à lire avant la première commande :
+- **Le driver doit pouvoir démarrer hors du dépôt.** `driver.py` charge `evaluer.py` et `journal.py` depuis `scripts\recette\` à l'import. Installé sous `Program Files`, ce chemin n'existe pas, et le montage rend `would not start`. Il faut que le driver déclare ce qu'il emprunte au dépôt dans un `pack.json` à côté de son manifeste (`{"vendor": ["drivers/vkdriver", "scripts/recette/evaluer.py", "scripts/recette/journal.py"]}`) et qu'il cherche `vendor\` avant la disposition du dépôt. C'est la branche du driver v2 du pilote, pas celle du paquet. Les cas, les oracles et le corpus (`RECETTE_DIR`, sous `docs\`) sont encore lus hors de l'arbre : tant qu'ils ne sont pas vendorés eux aussi, le paquet de `maskai-recette` ne rend pas la recette, et le §6.1 reste la voie.
+- Un PowerShell **élevé** pour l'installation seulement. L'empaquetage et le montage se font dans le PowerShell ordinaire.
+- Du réseau pour l'empaquetage seulement : le premier pack télécharge CPython (environ 48 Mo, vérifié contre son SHA-256 avant d'être lu) puis les roues de `requirements.txt`. L'installation ne touche pas au réseau.
+
+1. **La clé de l'éditeur, une fois** (un acte humain, signé avec la clé de l'appareil du §4) :
+```powershell
+vk capital key init
+```
+Attendu :
+```
+publisher key  sha256:…
+pinned here    yes
+-----BEGIN AUBIER PUBLISHER KEY-----
+…
+-----END AUBIER PUBLISHER KEY-----
+```
+Cette clé signe des paquets, jamais une ligne du ledger ni un montage. Relancée, la commande montre la même clé. `vk capital key show` la réaffiche sans jamais en faire une.
+
+2. **Empaqueter**, démon lancé (§3), dans le PowerShell ordinaire, à la racine du dépôt :
+```powershell
+vk driver pack --manifest drivers\maskai-recette\manifest.json --version 1.0.0 --out dist\maskai-recette-1.0.0
+```
+Attendu, après quelques minutes la première fois :
+```
+packed     maskai-1@1.0.0
+into       <dépôt>\dist\maskai-recette-1.0.0
+package    sha256:…
+files      sha256:…
+driver_id  sha256:…
+```
+`--out` doit être absent ou vide. La version est `MAJOR.MINOR.PATCH` en chiffres. Le démon écrit `driver.packed` au ledger (un acte humain, comme le montage).
+
+3. **Installer**, dans un PowerShell **élevé**, à la racine du dépôt (aucun démon requis) :
+```powershell
+vk driver install dist\maskai-recette-1.0.0
+```
+Si le démon tourne avec `--state-dir X`, ajoutez `--state-dir X` : l'éditeur est épinglé dans le dossier d'état que lit le démon, et c'est le `pins` de la sortie qui dit où. **Si vous élevez avec un autre compte que celui qui fait tourner `vkd`** (l'UAC demande le mot de passe d'un autre administrateur), passez `--state-dir` = la ligne `state dir` de `vk status`, lancé dans le PowerShell ordinaire : sinon l'éditeur est épinglé dans le dossier d'état de l'autre compte, que le démon ne lit pas, et le montage du pas 4 est refusé (`is not pinned on this node: no pin in …`). La commande écrit d'abord sur stderr où elle épingle (`pinning publishers in the state dir …`), puis un avertissement (`warning: … is owned by …`) quand ce dossier appartient à un autre compte que celui du shell. Sur le nœud qui a fait le pack, la clé du pas 1 est déjà épinglée :
+```
+installed  maskai-1@1.0.0
+into       C:\Program Files\Aubier\drivers\maskai-1\1.0.0
+package    sha256:…
+files      sha256:…
+publisher  sha256:… (already pinned)
+pins       <dossier d'état>\capital\publishers
+acl        read-only: administrators and SYSTEM full, users read and execute
+```
+Sur un autre nœud, l'éditeur est inconnu : l'installation affiche son empreinte et sa clé publique, puis `pin this publisher on this node? [y/N]`. Comparez l'empreinte avec celle que l'éditeur vous a donnée par un autre canal avant de répondre `y` : toute autre réponse n'installe rien et n'épingle rien. C'est la confiance au premier usage, et c'est l'administrateur qui la donne.
+
+Refus attendus, une ligne chacun, avec leur remède : `run it from an elevated shell` (shell non élevé) ; `already installed` (une version n'est jamais écrasée : empaquetez une version suivante) ; un arbre dont le chemin le plus profond dépasse **240 caractères** (voir plus bas) ; une racine où un groupe large peut écrire.
+
+4. **Monter par nom et version** (un acte humain, signé) :
+```powershell
+vk mount driver maskai-1@1.0.0
+```
+Attendu :
+```
+DRIVER    ID          GOVERNED  SOURCE     VERSION
+maskai-1  sha256:…    yes       installed  1.0.0
+```
+Le noyau a, avant de lancer quoi que ce soit : vérifié la signature contre la clé épinglée, relu le manifeste installé contre celui que le paquet signe, et recalculé l'empreinte de tout l'arbre. Chrome s'ouvre ensuite sur **https://app.maskai.fr/new**. Le profil est sous le dossier d'état (`<dossier d'état>\drivers\maskai-1\profile`, le `state_dir` de `vk status`), pas dans l'arbre installé : il est **réutilisé** d'une version à l'autre, et la session MaskAI faite à la main au §6.1 n'est pas à refaire.
+
+Changer de version : `vk driver umount maskai-1`, puis `vk mount driver maskai-1@1.1.0`. Revenir en arrière : les mêmes deux commandes avec `1.0.0`. Retirer une version : `vk driver uninstall maskai-1@1.0.0`, dans un PowerShell élevé, refusé tant qu'elle est montée. **Démontez-la avant d'arrêter le démon** : sans démon sur le point d'accès du shell, la désinstallation ne peut pas demander ce qui est monté, n'en tient rien pour monté, et le dit sur stderr (`no daemon on <point d'accès>: nothing is treated as mounted`). Un démon arrêté avec une version montée garde ce montage au redémarrage, et son prochain acte échoue sur un arbre qui n'existe plus.
+
+5. **Les règles de l'arbre installé.**
+- **Ne lancez jamais le `python.exe` installé à la main sans `-B`.** L'arbre est lu seul, et `__pycache__` fait partie de l'empreinte : un `.pyc` écrit par un interpréteur lancé sans `-B`, dans un shell élevé, est un changement, et le driver est `tampered` au démarrage suivant. Le noyau lance `python\python.exe -E -s -B driver.py`. Pour essayer quelque chose à la main, faites-le sur une copie.
+- Si un driver devient `degraded` avec la raison `tampered` (`vk driver ls`, colonne WHY) : l'arbre n'est plus celui qui a été signé. Le remède est `vk driver umount maskai-1`, puis (élevé) `vk driver uninstall maskai-1@1.0.0` et `vk driver install dist\maskai-recette-1.0.0`, puis le montage. Un montage tenté sur un arbre qui ne correspond pas est refusé avec ce remède, sans rien lancer.
+- **Limite de 240 caractères.** Windows coupe à 260, et pip et la roue de Playwright (arbre `node` profond) échouent avant. L'installation refuse donc un arbre dont le chemin le plus profond, compté à son emplacement final, dépasse 240 : `C:\Program Files\Aubier\drivers\maskai-1\1.0.0\` en consomme une cinquantaine, avant les 105 du chemin le plus profond de l'interpréteur lui-même. La longueur du chemin le plus profond de Playwright reste à mesurer sur le nœud. Le remède est un nom ou une version plus courts, jamais une racine plus profonde.
+- Un manifeste signé ne se modifie pas : ajouter un hôte à `hosts` (§6.3) demande un nouveau pack et donc une nouvelle version.
+
 **6.1 Montage** (un acte humain, signé) :
 ```powershell
 vk mount driver --manifest drivers\maskai-recette\manifest.json
 ```
 Attendu :
 ```
-DRIVER    ID          GOVERNED
-maskai-1  sha256:…    yes
+DRIVER    ID          GOVERNED  SOURCE       VERSION
+maskai-1  sha256:…    yes       development  -
 ```
 
 Chrome s'ouvre sur **https://app.maskai.fr/new**, avec le profil dédié du driver (sous le dossier d'état, jamais votre profil personnel). **Connectez-vous à la main** avec le compte de test. Le noyau ne voit jamais le mot de passe (procédure §4).
@@ -213,7 +285,12 @@ Chrome s'ouvre sur **https://app.maskai.fr/new**, avec le profil dédié du driv
 ```powershell
 vk driver ls
 ```
-Attendu : `maskai-1  ready  yes  mesurer_chargement,…,exporter_journal  -`
+Attendu, sept colonnes (`NAME STATE GOVERNED SOURCE VERSION ACTIONS WHY`) :
+```
+NAME      STATE  GOVERNED  SOURCE       VERSION  ACTIONS                              WHY
+maskai-1  ready  yes       development  -        mesurer_chargement,…,exporter_journal  -
+```
+Monté depuis un paquet (§6.0), la ligne dit `installed` et `1.0.0` à la place de `development` et `-`. Un driver installé et non monté est listé aussi, à l'état `installed`, avec ses versions.
 
 `governed: yes` veut dire que le Job Object a confirmé le confinement du processus du driver : le plafond mémoire du manifeste (`program.max_memory_bytes`, 6 Gio), et l'arbre est tué avec le démon. Avec un Python du Store, Chrome est hors du Job (§1.2).
 

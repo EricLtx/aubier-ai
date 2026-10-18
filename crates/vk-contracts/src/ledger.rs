@@ -289,6 +289,10 @@ pub const ALLOWED_KINDS: &[&str] = &[
     "driver.mounted",
     "driver.acted",
     "driver.unmounted",
+    // A human packed a driver into a package (driver packaging chantier):
+    // the package's digest and the tree it holds. The payload is
+    // `package::DriverPacked`.
+    "driver.packed",
     "shred",
 ];
 
@@ -438,5 +442,11 @@ mod tests {
     fn liveness_renewed_is_an_allowed_kind() {
         assert!(is_allowed_kind("liveness.renewed"));
         assert!(!is_allowed_kind("liveness.renew"));
+    }
+
+    #[test]
+    fn driver_packed_is_an_allowed_kind() {
+        assert!(is_allowed_kind("driver.packed"));
+        assert!(!is_allowed_kind("driver.pack"));
     }
 }

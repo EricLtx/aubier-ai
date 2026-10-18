@@ -217,6 +217,81 @@ jobs:
         run: python -I -m unittest discover -s drivers/maskai-recette/tests -t .
       - name: The recette scripts
         run: python -I -m unittest discover -s scripts/recette -p "test_*.py"
+  driver-install:
+    # Driver packages on the one OS they are made for: the real pinned CPython
+    # release (downloaded with the pack's own SHA-256 check, cached by the
+    # table it is pinned in), the archive-gated tests `test` skips, and the
+    # install end to end. Pack a fixture driver with the daemon, install it
+    # under a temporary root standing in for %ProgramFiles%, mount it by
+    # name@version, run it from the installed tree, list it, refuse its
+    # uninstall while mounted, remove it; change a byte under the installed
+    # tree and see `tampered`.
+    #
+    # GitHub's Windows runner is an elevated administrator, so this is the
+    # first place `vk driver install` runs end to end elevated (the `test` job
+    # already runs its refusal paths there): the
+    # read-only tree (administrators and SYSTEM full, users read and
+    # execute), the root check, the interpreter spawned from that tree. A
+    # failure here is a finding about that path; do not loosen the test.
+    #
+    # No job-level VK_DRIVER_INSTALL_ROOT: every test daemon and every `vk
+    # driver install` the tests start sets its own (a temporary directory
+    # per test), so a job-level one would reach nothing and promise more
+    # than it does.
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      # The pinned release, as the file CI cached it under. The tests hash it
+      # against the SHA-256 in crates/vk-capital/src/python.rs, so a wrong
+      # file is refused, not used.
+      VK_TEST_PYTHON_RELEASE: ${{ github.workspace }}\pycache\release.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The tampered test and the fixture drivers run a plain `python` from
+      # PATH, as the driver-browser job does.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Same pin as the `test` job: a Windows-native Perl for the vendored
+      # OpenSSL that vk-web builds.
+      - name: A Windows-native Perl for the vendored OpenSSL
+        shell: pwsh
+        run: |
+          $perl = (Get-Command perl.exe -ErrorAction Stop).Source
+          $os = & $perl -e 'print $^O'
+          if ($os -ne 'MSWin32') {
+            Write-Output "::error title=perl::$perl reports '$os'; OpenSSL's Configure needs an MSWin32 Perl"
+            exit 1
+          }
+          "OPENSSL_SRC_PERL=$perl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "OPENSSL_SRC_PERL=$perl ($os)"
+      - name: Say whether this runner is elevated
+        shell: pwsh
+        run: |
+          $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $admin = ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Output "user $($id.Name), administrator role: $admin"
+      - name: The pinned CPython release (cached; keyed by the table that pins it)
+        uses: actions/cache@v4
+        with:
+          path: pycache
+          key: pbs-${{ hashFiles('crates/vk-capital/src/python.rs') }}
+      - name: Build
+        run: cargo build --locked -p vk-cli -p vkd -p vk-mcp
+      # Always run, cache hit or not: on a hit it hashes the cached file
+      # against the pinned SHA-256 and keeps it; on a miss it downloads it
+      # with the same code `vk driver pack` uses.
+      - name: Fetch the release, or check the cached one
+        run: cargo run --locked -p vk-cli -- capital python fetch --cache pycache --as release.tar.gz
+      - name: vk-capital with the real release
+        run: cargo test --locked -p vk-capital --test materialise -- --nocapture
+      - name: The daemon packs, mounts by name@version and refuses a tampered tree (needs PyPI)
+        run: cargo test --locked -p vk-ipc --test capital -- --nocapture
+      - name: End to end through the shell (pack, install, mount, act, list, uninstall)
+        run: cargo test --locked -p vk-cli --test smoke vk_driver_ -- --nocapture
   sign:
     # Signs the four release binaries for the SP1 gate (item 1: signed
     # binaries install without SmartScreen/Smart App Control prompts). Tries,

@@ -24,9 +24,10 @@ use crate::tasks::{
 };
 use crate::{store_failed, RealKernel};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use vk_contracts::driver::{
-    DriverActed, DriverAction, DriverManifest, DriverMounted, DriverUnmounted,
+    DriverActed, DriverAction, DriverManifest, DriverMounted, DriverSource, DriverUnmounted,
+    ExecutionContext,
 };
 use vk_contracts::labels::Origin;
 use vk_contracts::principal::Principal;
@@ -68,8 +69,8 @@ pub struct DriverRow {
     pub driver_id: String,
     /// The directory the manifest's relative `program.command` resolves
     /// against (Ruling R6). Per machine, so no part of the identity; kept here
-    /// for the daemon, which is the only thing that spawns. The kernel neither
-    /// resolves nor checks it.
+    /// for the daemon, which is the only thing that spawns. Kept [`resolved`]:
+    /// the path the context rules were checked on (packaging spec §4.2).
     pub root: PathBuf,
     pub mounted_ms: u64,
     pub state: DriverState,
@@ -77,6 +78,16 @@ pub struct DriverRow {
     /// one that has never acted. What the cadence refusal (§4.3, item 4)
     /// counts from.
     pub last_act_ms: u64,
+    /// The digest of the package an installed tree came from; `None` for a
+    /// development mount and on every row written before packaging.
+    #[serde(default)]
+    pub package_digest: Option<String>,
+    /// Where the daemon keeps the installed tree's fingerprint cache,
+    /// `<state_dir>/drivers/<name>/fingerprint.json` (packaging spec §4.3);
+    /// `None` for a development mount, which keeps R5's hash of the script's
+    /// directory instead.
+    #[serde(default)]
+    pub fingerprint_cache: Option<PathBuf>,
 }
 
 /// The three directories a driver may touch, all under
@@ -155,6 +166,7 @@ pub const DRIVER_FAILURE_REASONS: &[&str] = &[
     "evidence too large",
     "would not start",
     "panicked",
+    "tampered",
 ];
 
 /// The ledger's word for a host failure, from the variant and its fault
@@ -194,6 +206,163 @@ fn plain_name(name: &str) -> Option<&str> {
     crate::validate_artefact_kind(name).ok().map(|()| name)
 }
 
+/// `root` relative to `base` when `root` is `base` or below it, both
+/// [`resolved`] first, so a link, a junction, a `..`, a case or a short-name
+/// difference in the part of either that exists cannot carry a tree in or out.
+fn within(root: &Path, base: &Path) -> Option<PathBuf> {
+    resolved(root)
+        .strip_prefix(resolved(base))
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+/// `path` as the context rules compare it and a driver row keeps it: made
+/// absolute with `.` dropped and `..` folded ([`lexical`], as Windows folds
+/// them before it resolves anything), then every link in its existing part
+/// followed — the deepest existing ancestor canonicalised and the rest joined
+/// back (`vk_store::paths::canonical_form`) — and spelled without Windows'
+/// verbatim prefix, so it reads as a person would type it and a relative
+/// command with `/` still joins onto it. Nothing of it existing, the lexical
+/// form is all there is.
+pub fn resolved(path: &Path) -> PathBuf {
+    let clean = lexical(path);
+    match vk_store::paths::canonical_form(&clean) {
+        Some(real) => without_verbatim(real),
+        None => clean,
+    }
+}
+
+/// `\\?\C:\…` as `C:\…` and `\\?\UNC\host\share\…` as `\\host\share\…`;
+/// any other path as it is.
+fn without_verbatim(path: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        if let Some(s) = path.to_str() {
+            if let Some(share) = s.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{share}"));
+            }
+            if let Some(local) = s.strip_prefix(r"\\?\") {
+                if local.as_bytes().get(1) == Some(&b':') {
+                    return PathBuf::from(local);
+                }
+            }
+        }
+    }
+    path
+}
+
+/// Whether `rel`, a path under the install root, is exactly
+/// `<name>/<version>` with the version `MAJOR.MINOR.PATCH`.
+fn installed_at(rel: &Path, name: &str) -> bool {
+    let steps: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect::<Option<_>>()
+        .unwrap_or_default();
+    matches!(steps.as_slice(), [n, v]
+        if *n == name && v.to_str().is_some_and(crate::capital::is_version))
+}
+
+/// What an installed tree's `program.command` starts with: the interpreter
+/// its package carries, relative to the tree (`vk driver pack` writes it).
+pub const PACKED_INTERPRETER: &str = "python/python.exe";
+
+/// The interpreter flags an installed command may give before its script:
+/// CPython's options that take no argument and change nothing of *what*
+/// runs (`-B` no bytecode, `-E` no `PYTHON*`, `-s` no user site, `-I`, `-P`,
+/// `-S`, `-u`, `-O`, `-b`, `-d`, `-q`, `-R`, `-v`). Not `-c` and `-m`, which
+/// run something other than the script; not `-W` and `-X`, which take the
+/// next word; not `-i`, `-h`, `-V`, `-x` or a long option.
+const SCRIPT_FLAGS: &str = "BEsIPSuObdqRv";
+
+/// The command rule of [`RealKernel::check_context`] for `source: installed`
+/// (ruling R-F2): `command` is [`PACKED_INTERPRETER`], then one or more
+/// flags of [`SCRIPT_FLAGS`] (single or combined, `-sEB`) among which `B`,
+/// then a script — relative, plain names only, ending in `.py` — and
+/// whatever arguments follow it. With a `tree`, the interpreter and the
+/// script must be regular files under it (read without following a link).
+/// One I1 line, ending in the remedy: repack, since only `vk driver pack`
+/// writes such a command and a signed manifest cannot be edited.
+fn installed_command(command: &[String], tree: Option<&Path>) -> Result<(), KernelError> {
+    let refuse = |why: String| {
+        Err(KernelError::I1(format!(
+            "an installed driver runs the interpreter its package carries, and {why}; remedy: \
+             repack the driver with vk driver pack"
+        )))
+    };
+    if command.first().map(String::as_str) != Some(PACKED_INTERPRETER) {
+        return refuse(format!(
+            "its program.command does not start with {PACKED_INTERPRETER}"
+        ));
+    }
+    let rest = &command[1..];
+    let at = rest
+        .iter()
+        .position(|a| !a.starts_with('-'))
+        .unwrap_or(rest.len());
+    let flags = &rest[..at];
+    let known =
+        |flag: &String| flag.len() > 1 && flag[1..].chars().all(|c| SCRIPT_FLAGS.contains(c));
+    if !flags.iter().all(known) || !flags.iter().any(|f| f[1..].contains('B')) {
+        return refuse(format!(
+            "the flags before its script are not among -{SCRIPT_FLAGS} with -B"
+        ));
+    }
+    let script = match rest.get(at) {
+        Some(script) if script.ends_with(".py") && plain_relative(Path::new(script)) => script,
+        _ => {
+            return refuse(
+                "its program.command names no .py script under the tree after its flags".into(),
+            )
+        }
+    };
+    let Some(tree) = tree else {
+        return Ok(());
+    };
+    for (what, file) in [
+        (PACKED_INTERPRETER, tree.join("python").join("python.exe")),
+        (script.as_str(), tree.join(script)),
+    ] {
+        let regular = std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_file());
+        if !regular {
+            return refuse(format!(
+                "{what} is not a regular file under {}",
+                tree.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Relative and made of plain names only (`driver.py`, `sub/driver.py`,
+/// `./driver.py`), as the daemon's `under_root` reads a development
+/// command: no root, no drive, no `..`, and at least one name.
+fn plain_relative(path: &Path) -> bool {
+    path.components().any(|c| matches!(c, Component::Normal(_)))
+        && path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// `path` made absolute, with `.` dropped and `..` folded into its parent,
+/// without touching the disk.
+fn lexical(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut clean = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                clean.pop();
+            }
+            other => clean.push(other),
+        }
+    }
+    clean
+}
+
 /// Why a `driver.act` came back without an outcome: what the daemon hands
 /// [`RealKernel::driver_act_settle`] in place of one. Typed, so the settle
 /// decides what to degrade and what to remember from the variant, never from
@@ -211,6 +380,11 @@ pub enum DriverFailure {
     /// The act panicked in the daemon. Its host went with the unwinding,
     /// killed and reaped.
     Panicked,
+    /// The installed tree no longer hashes to the manifest's `files_sha256`:
+    /// something rewrote it after the install. Found by the daemon before a
+    /// spawn; the driver is degraded and never runs the rewritten code
+    /// (packaging spec §4.3).
+    Tampered,
 }
 
 impl From<HostError> for DriverFailure {
@@ -226,6 +400,7 @@ impl DriverFailure {
             DriverFailure::Host(e) => host_error_reason(e),
             DriverFailure::WouldNotStart(_) => "would not start".into(),
             DriverFailure::Panicked => "panicked".into(),
+            DriverFailure::Tampered => "tampered".into(),
         }
     }
 
@@ -237,11 +412,27 @@ impl DriverFailure {
             DriverFailure::Host(e) => e.to_string(),
             DriverFailure::WouldNotStart(why) => why.clone(),
             DriverFailure::Panicked => "the driver act panicked".into(),
+            DriverFailure::Tampered => {
+                "the installed tree no longer matches its fingerprint; remedy: reinstall the \
+                 package, then remount"
+                    .into()
+            }
         }
     }
 }
 
 impl RealKernel {
+    /// `<state_dir>/drivers/<name>/fingerprint.json`: where the daemon keeps
+    /// an installed driver's fingerprint cache (packaging spec §4.3), beside
+    /// its three directories.
+    pub fn driver_fingerprint_cache(&self, name: &str) -> PathBuf {
+        self.store
+            .state_dir
+            .join("drivers")
+            .join(name)
+            .join("fingerprint.json")
+    }
+
     /// `<state_dir>/drivers/<name>/{profile,work,evidence}`. A path, not a
     /// promise: the directories exist once the driver has been mounted.
     pub fn driver_dirs(&self, name: &str) -> DriverDirs {
@@ -270,6 +461,81 @@ impl RealKernel {
         self.store.db.get_json(DRIVERS, name).map_err(store_failed)
     }
 
+    /// The rules of packaging spec §4.2, by context and by source, called by
+    /// [`RealKernel::mount_driver`] and [`RealKernel::driver_packed`]:
+    /// - `execution_context: service` is refused: that mode ships with
+    ///   `vk-agent`, and this daemon is interactive only;
+    /// - `source: installed` is verified by path, never trusted as declared:
+    ///   `root` must be `<install_root>/<name>/<version>` exactly, the name
+    ///   the manifest's and the version `MAJOR.MINOR.PATCH`;
+    /// - a `development` root must not be: an installed tree mounts by
+    ///   `name@version`, so it is fingerprinted whole and never hashed as a
+    ///   development directory;
+    /// - `source: installed` runs the interpreter its package carries
+    ///   (ruling R-F2, [`installed_command`]): `program.command` is
+    ///   `python/python.exe`, flags that change nothing of what runs among
+    ///   which `-B`, then a `.py` script under the tree, and
+    ///   `root/python/python.exe` and the script are regular files. A command
+    ///   naming `python` would run whatever PATH finds while the ledger says
+    ///   `source: installed`, outside the fingerprint and the signature.
+    ///
+    /// The two paths are compared as [`within`] does. Each refusal is I1 and
+    /// names its remedy.
+    pub fn check_context(&self, manifest: &DriverManifest, root: &Path) -> Result<(), KernelError> {
+        self.check_context_with(manifest, root, Some(root))
+    }
+
+    /// [`RealKernel::check_context`] for a tree that is not at `root` yet:
+    /// the path rules hold on `root`, where it will be installed, and the
+    /// command rule looks for the interpreter and the script under `tree`,
+    /// where the files are now — the copy `driver.pack` materialised in its
+    /// stage, which [`RealKernel::driver_packed`] is handed. `None` before
+    /// that copy exists: everything but those two files is checked, which is
+    /// the daemon's early refusal before a pack downloads anything; the pack
+    /// is checked again, whole, at `driver_packed`.
+    pub fn check_context_with(
+        &self,
+        manifest: &DriverManifest,
+        root: &Path,
+        tree: Option<&Path>,
+    ) -> Result<(), KernelError> {
+        if manifest.execution_context == ExecutionContext::Service {
+            return Err(KernelError::I1(
+                "the service mode ships with vk-agent; remedy: execution_context interactive"
+                    .into(),
+            ));
+        }
+        match (manifest.source, within(root, &self.install_root)) {
+            (DriverSource::Installed, rel)
+                if !rel
+                    .as_deref()
+                    .is_some_and(|rel| installed_at(rel, &manifest.name)) =>
+            {
+                Err(KernelError::I1(format!(
+                    "a manifest that says installed must live under {}, at {}/<MAJOR.MINOR.PATCH>; \
+                     remedy: install the package with vk driver install",
+                    self.install_root.display(),
+                    manifest.name
+                )))
+            }
+            (DriverSource::Development, Some(rel)) => {
+                // `<root>/<name>/<version>`: the version is the second step
+                // below the root, when the tree is that deep.
+                let version = rel
+                    .components()
+                    .nth(1)
+                    .and_then(|c| c.as_os_str().to_str())
+                    .unwrap_or("<version>");
+                Err(KernelError::I1(format!(
+                    "an installed tree mounts by name@version; remedy: vk mount driver {}@{version}",
+                    manifest.name
+                )))
+            }
+            (DriverSource::Installed, _) => installed_command(&manifest.program.command, tree),
+            (DriverSource::Development, None) => Ok(()),
+        }
+    }
+
     /// Mount a driver: a human act (I1), as `vk mount anthropic` is.
     ///
     /// The manifest is validated, `governed` is set to what the host observed,
@@ -286,12 +552,24 @@ impl RealKernel {
     /// `profile_dir_hash` on the event is the hash of the profile directory's
     /// *path*, not of its contents (Ruling R11): a browser profile changes on
     /// every run and a populated one is hundreds of MB with locked files.
+    ///
+    /// Where the tree came from (packaging spec §4.2): the context rules of
+    /// [`RealKernel::check_context`] hold first — no `service` context, and
+    /// `source` verified by path in both directions. `package_digest` is
+    /// `Some` for an installed tree and only for one; it goes on the row and
+    /// on `driver.mounted` with the `source`, and an installed row names its
+    /// fingerprint cache, `<state_dir>/drivers/<name>/fingerprint.json`. The
+    /// repeat mount that is idempotent is the same driver from the same
+    /// package: another package of a `Ready` driver is refused like another
+    /// manifest, so a mount never answers with the row of a version it did
+    /// not mount.
     pub fn mount_driver(
         &mut self,
         ctx: &Ctx,
         mut manifest: DriverManifest,
         root: PathBuf,
         observed_governed: bool,
+        package_digest: Option<String>,
     ) -> Result<DriverRow, KernelError> {
         let by = match &ctx.principal {
             Principal::Human { device_id } => device_id.clone(),
@@ -301,9 +579,23 @@ impl RealKernel {
                 ))
             }
         };
-        manifest
-            .validate()
-            .map_err(|e| KernelError::Gate(e.to_string()))?;
+        manifest.validate().map_err(|e| {
+            KernelError::Gate(format!(
+                "{e}; remedy: correct the manifest, then mount it again"
+            ))
+        })?;
+        // The root the rules are checked on is the root the row keeps: a
+        // link retargeted after this call cannot move the tree it names.
+        let root = resolved(&root);
+        self.check_context(&manifest, &root)?;
+        let source = manifest.source;
+        if (source == DriverSource::Installed) != package_digest.is_some() {
+            return Err(KernelError::Gate(
+                "a mount from an installed tree names its package digest, and only such a \
+                 mount does; remedy: mount an installed driver by name@version"
+                    .into(),
+            ));
+        }
         manifest.governed = observed_governed;
         let driver_id = manifest.driver_id();
         let name = manifest.name.clone();
@@ -312,10 +604,16 @@ impl RealKernel {
             if row.driver_id != driver_id {
                 return Err(KernelError::Gate(format!(
                     "driver {name} is already mounted with a different manifest; \
-                     run `vk driver umount {name}` first"
+                     remedy: vk driver umount {name} first"
                 )));
             }
             if row.state == DriverState::Ready {
+                if row.package_digest != package_digest {
+                    return Err(KernelError::Gate(format!(
+                        "driver {name} is already mounted from another package; \
+                         remedy: vk driver umount {name}, then mount it again"
+                    )));
+                }
                 return Ok(row.clone());
             }
         }
@@ -324,6 +622,8 @@ impl RealKernel {
             vk_store::paths::private_dir(dir).map_err(store_failed)?;
         }
         let profile_dir_hash = hash_bytes(dirs.profile.to_string_lossy().as_bytes());
+        let fingerprint_cache =
+            (source == DriverSource::Installed).then(|| self.driver_fingerprint_cache(&name));
         let row = DriverRow {
             manifest,
             driver_id: driver_id.clone(),
@@ -331,6 +631,8 @@ impl RealKernel {
             mounted_ms: ctx.now_ms,
             state: DriverState::Ready,
             last_act_ms: existing.map(|r| r.last_act_ms).unwrap_or(0),
+            package_digest: package_digest.clone(),
+            fingerprint_cache,
         };
         // Ledger before the row, as everywhere else in this kernel.
         self.log(
@@ -343,6 +645,8 @@ impl RealKernel {
                 profile_dir_hash,
                 governed: observed_governed,
                 by,
+                package_digest,
+                source,
             },
         )?;
         self.store
@@ -1010,7 +1314,15 @@ mod tests {
         assert_eq!(spawn.reason(), "would not start");
         assert_eq!(spawn.detail(), leak, "the detail is kept, for the log");
         assert_eq!(DriverFailure::Panicked.reason(), "panicked");
-        for w in ["would not start", "panicked"] {
+        assert_eq!(DriverFailure::Tampered.reason(), "tampered");
+        assert!(
+            DriverFailure::Tampered
+                .detail()
+                .ends_with("; remedy: reinstall the package, then remount"),
+            "{}",
+            DriverFailure::Tampered.detail()
+        );
+        for w in ["would not start", "panicked", "tampered"] {
             assert!(DRIVER_FAILURE_REASONS.contains(&w), "{w}");
         }
     }

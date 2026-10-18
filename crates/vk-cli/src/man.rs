@@ -47,6 +47,14 @@ pub const SCHEMAS: &[(&str, &str)] = &[
         include_str!("../../../contracts/schemas/driver_mounted.schema.json"),
     ),
     (
+        "driver_package",
+        include_str!("../../../contracts/schemas/driver_package.schema.json"),
+    ),
+    (
+        "driver_packed",
+        include_str!("../../../contracts/schemas/driver_packed.schema.json"),
+    ),
+    (
         "driver_unmounted",
         include_str!("../../../contracts/schemas/driver_unmounted.schema.json"),
     ),

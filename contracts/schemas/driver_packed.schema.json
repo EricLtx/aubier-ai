@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DriverPacked",
+  "description": "Ledger payload of `driver.packed`: a human act, written by the node that\npacks. It names the package by digest and the tree it holds by\n`files_sha256`.",
+  "type": "object",
+  "properties": {
+    "by": {
+      "type": "string"
+    },
+    "driver_id": {
+      "type": "string"
+    },
+    "files_sha256": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "package_digest": {
+      "type": "string"
+    },
+    "publisher_key_id": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "driver_id",
+    "name",
+    "version",
+    "package_digest",
+    "files_sha256",
+    "publisher_key_id",
+    "by"
+  ]
+}

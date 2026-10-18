@@ -1,0 +1,9 @@
+{
+  "driver_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "maskai-fixture",
+  "version": "0.1.0",
+  "package_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "files_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "publisher_key_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "by": "node:phone-1"
+}

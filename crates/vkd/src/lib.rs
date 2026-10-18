@@ -620,6 +620,12 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         // Empty at start: a mounted driver's process is spawned again by the
         // first `driver.act` that needs it, from the row the kernel kept.
         drivers: vk_ipc::drivers::DriverPool::new(),
+        // The test seam of `driver.pack` (packaging Task 8): a copy of the
+        // pinned CPython release already on disk. Its SHA-256 is checked
+        // against the pinned one all the same.
+        python_archive: std::env::var_os("VK_TEST_PYTHON_RELEASE")
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from),
     };
     vk_ipc::server::serve_on(kernel, listener, config).await
 }

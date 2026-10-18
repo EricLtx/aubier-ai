@@ -1,0 +1,30 @@
+[package]
+name = "vk-capital"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The capital package: OCI layout, publisher signature, installed fingerprint (first component: drivers)"
+
+[dependencies]
+vk-contracts = { path = "../vk-contracts" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand = { workspace = true }
+base64 = { workspace = true }
+zeroize = "1"
+thiserror = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+walkdir = { workspace = true }
+reqwest = { workspace = true }
+keyring = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# The install tests read back the DACL an elevated install's tree is born
+# with, through the function `vk driver install` makes it with.
+[target.'cfg(windows)'.dev-dependencies]
+vk-store = { path = "../vk-store" }

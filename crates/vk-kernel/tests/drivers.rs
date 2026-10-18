@@ -23,7 +23,7 @@ use std::time::Duration;
 use vk_contracts::arch::ArchManifest;
 use vk_contracts::driver::{
     DriverActed, DriverAction, DriverKind, DriverManifest, DriverMounted, DriverProgram,
-    DriverUnmounted,
+    DriverSource, DriverUnmounted, ExecutionContext,
 };
 use vk_contracts::hash_canonical;
 use vk_contracts::labels::{Clearance, DataClass, Label, Origin, Scope};
@@ -133,6 +133,9 @@ fn maskai_like() -> DriverManifest {
             third_party_allowed: true,
         },
         governed: false,
+        execution_context: ExecutionContext::Interactive,
+        needs_input_desktop: false,
+        source: DriverSource::Development,
     }
 }
 
@@ -143,7 +146,7 @@ fn root() -> PathBuf {
 }
 
 fn mount(k: &mut RealKernel) -> DriverRow {
-    k.mount_driver(&human(1), maskai_like(), root(), true)
+    k.mount_driver(&human(1), maskai_like(), root(), true, None)
         .unwrap()
 }
 
@@ -315,7 +318,7 @@ fn mount_is_a_human_act_and_is_idempotent() {
 
     // I1: a machine principal cannot mount.
     let err = k
-        .mount_driver(&machine(1), maskai_like(), root(), true)
+        .mount_driver(&machine(1), maskai_like(), root(), true, None)
         .unwrap_err();
     assert!(matches!(err, KernelError::I1(_)), "{err}");
     assert!(k.drivers().unwrap().is_empty());
@@ -325,7 +328,9 @@ fn mount_is_a_human_act_and_is_idempotent() {
     let row = mount(&mut k);
     assert_eq!(row.driver_id, maskai_like().driver_id());
     assert_eq!(row.state, DriverState::Ready);
-    assert_eq!(row.root, root());
+    // Stored resolved (Task 8): absolute, the relative root kept as its tail.
+    assert!(row.root.is_absolute(), "{}", row.root.display());
+    assert!(row.root.ends_with(root()), "{}", row.root.display());
     assert_eq!(row.mounted_ms, 1);
     assert_eq!(row.last_act_ms, 0);
     assert!(
@@ -348,13 +353,15 @@ fn mount_is_a_human_act_and_is_idempotent() {
             profile_dir_hash: vk_contracts::hash_bytes(dirs.profile.to_string_lossy().as_bytes()),
             governed: true,
             by: "phone-1".into(),
+            package_digest: None,
+            source: vk_contracts::driver::DriverSource::Development,
         }),
         "the mounted event names the identity and who mounted it"
     );
 
     // The same driver again: the same row, no second event (Ruling 13).
     let again = k
-        .mount_driver(&human(2), maskai_like(), root(), true)
+        .mount_driver(&human(2), maskai_like(), root(), true, None)
         .unwrap();
     assert_eq!(again, row);
     assert_eq!(events_of(&k, "driver.mounted").len(), 1);
@@ -362,7 +369,9 @@ fn mount_is_a_human_act_and_is_idempotent() {
     // A different manifest under the same name is refused with the remedy.
     let mut other = maskai_like();
     other.hosts.push("other.example".into());
-    let err = k.mount_driver(&human(3), other, root(), true).unwrap_err();
+    let err = k
+        .mount_driver(&human(3), other, root(), true, None)
+        .unwrap_err();
     assert!(matches!(err, KernelError::Gate(_)), "{err}");
     assert!(err.to_string().contains("umount"), "{err}");
     assert_eq!(k.drivers().unwrap().len(), 1);
@@ -525,7 +534,7 @@ fn refusal_4_cadence() {
     let mut k = open(d.path());
     let mut m = maskai_like();
     m.min_interval_ms = 2000;
-    k.mount_driver(&human(1), m, root(), true).unwrap();
+    k.mount_driver(&human(1), m, root(), true, None).unwrap();
     let t = one_level(&mut k);
     let l = launch(&mut k, &t.id);
 
@@ -776,7 +785,7 @@ fn settle_on_host_timeout_degrades_the_driver() {
 
     // The remedy works: a remount of the same driver brings it back.
     let back = k
-        .mount_driver(&human(50), maskai_like(), root(), true)
+        .mount_driver(&human(50), maskai_like(), root(), true, None)
         .unwrap();
     assert_eq!(back.state, DriverState::Ready);
     assert_eq!(events_of(&k, "driver.mounted").len(), 2);
@@ -1303,7 +1312,7 @@ fn a_schema_that_does_not_compile_is_refused_at_mount_and_is_a_gate_at_begin() {
         "properties": { "case": { "type": "strnig" } }
     });
     let err = k
-        .mount_driver(&human(1), m.clone(), root(), true)
+        .mount_driver(&human(1), m.clone(), root(), true, None)
         .unwrap_err();
     assert!(matches!(err, KernelError::Gate(_)), "{err}");
     assert!(err.to_string().contains("does not compile"), "{err}");
@@ -1316,6 +1325,8 @@ fn a_schema_that_does_not_compile_is_refused_at_mount_and_is_a_gate_at_begin() {
         mounted_ms: 1,
         state: DriverState::Ready,
         last_act_ms: 0,
+        package_digest: None,
+        fingerprint_cache: None,
     };
     k.store().db.put_json("drivers", "maskai-1", &row).unwrap();
     let t = one_level(&mut k);
@@ -1705,12 +1716,12 @@ fn a_degraded_driver_can_be_remounted_after_umount() {
     fixed.program.files_sha256 = format!("sha256:{}", "1".repeat(64));
     assert_ne!(fixed.driver_id(), row.driver_id);
     let err = k
-        .mount_driver(&human(30), fixed.clone(), root(), true)
+        .mount_driver(&human(30), fixed.clone(), root(), true, None)
         .unwrap_err();
     assert!(matches!(err, KernelError::Gate(_)), "{err}");
     assert!(
         err.to_string()
-            .contains("run `vk driver umount maskai-1` first"),
+            .contains("; remedy: vk driver umount maskai-1 first"),
         "{err}"
     );
     assert_eq!(k.driver("maskai-1").unwrap().unwrap().state, degraded);
@@ -1736,7 +1747,7 @@ fn a_degraded_driver_can_be_remounted_after_umount() {
     );
 
     let back = k
-        .mount_driver(&human(40), fixed.clone(), root(), true)
+        .mount_driver(&human(40), fixed.clone(), root(), true, None)
         .unwrap();
     assert_eq!(back.state, DriverState::Ready);
     assert_eq!(back.driver_id, fixed.driver_id());

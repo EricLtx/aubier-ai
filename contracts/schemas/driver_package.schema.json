@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DriverPackage",
+  "description": "The OCI image manifest of a driver package: one layer per component.",
+  "type": "object",
+  "properties": {
+    "annotations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "artifactType": {
+      "description": "`application/vnd.aubier.driver.v1`.",
+      "type": "string"
+    },
+    "config": {
+      "description": "The empty descriptor: a driver package has no config.",
+      "$ref": "#/$defs/Descriptor"
+    },
+    "layers": {
+      "description": "The five components, in the order of [`COMPONENTS`].",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Descriptor"
+      }
+    },
+    "mediaType": {
+      "description": "`application/vnd.oci.image.manifest.v1+json`.",
+      "type": "string"
+    },
+    "schemaVersion": {
+      "description": "Always 2.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "mediaType",
+    "artifactType",
+    "config",
+    "layers",
+    "annotations"
+  ],
+  "$defs": {
+    "Descriptor": {
+      "description": "An OCI content descriptor: what a layer or the config is, by digest.",
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "digest": {
+          "type": "string"
+        },
+        "mediaType": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "mediaType",
+        "digest",
+        "size"
+      ]
+    }
+  }
+}

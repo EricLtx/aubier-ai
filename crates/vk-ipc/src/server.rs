@@ -85,6 +85,12 @@ pub struct ServerConfig {
     /// first `driver.act` that needs it. The kernel owns the table of what is
     /// mounted; this owns the processes.
     pub drivers: Arc<crate::drivers::DriverPool>,
+    /// The CPython release archive `driver.pack` uses instead of fetching one
+    /// (packaging Task 8): `VK_TEST_PYTHON_RELEASE` for `vkd`, set by tests and
+    /// CI to a copy already on disk. Only the file is moved: its SHA-256 is
+    /// still held to the pinned release's, so it can never be another
+    /// interpreter. `None` in every ordinary run.
+    pub python_archive: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -97,6 +103,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("anthropic_base_url", &self.anthropic_base_url)
             .field("api_arches", &self.api_arches)
             .field("claude_bin", &self.claude_bin)
+            .field("python_archive", &self.python_archive)
             .finish()
     }
 }
@@ -114,6 +121,7 @@ impl ServerConfig {
             api_arches: ApiArches::default(),
             claude_bin: PathBuf::from(DEFAULT_CLAUDE_BIN),
             drivers: crate::drivers::DriverPool::new(),
+            python_archive: None,
         }
     }
 }
@@ -728,6 +736,10 @@ fn takes_presence(method: &str) -> bool {
             // And so is ending the session it holds (Ruling R25): see the
             // refusal in the `driver.unmount` arm.
             | "driver.unmount"
+            // Making the key that signs this account's packages, and
+            // signing one, are human acts (packaging spec §4.4–4.5).
+            | "capital.key_init"
+            | "driver.pack"
             // Plaintext out of the encrypted store, to a terminal (R22).
             | "artefact.read"
     )
@@ -860,6 +872,26 @@ fn dispatch(
         }
         return crate::drivers::mount(kernel, &config.drivers, ctx, req.params);
     }
+    // **Packing a driver is a human act** (packaging spec §4.5, plan ruling
+    // P-4): it signs a package with this account's publisher key and puts
+    // `driver.packed` on the record. Verified here, before anything is read
+    // or downloaded; the pack then runs for minutes — a download, pip, a
+    // whole tree hashed — with the kernel lock taken only in short phases,
+    // on this connection's blocking thread, so every other syscall is served
+    // meanwhile.
+    if req.method == "driver.pack" {
+        let ctx = {
+            let k = lock(kernel)?;
+            ctx_for(&k, presence.take(), now)?
+        };
+        if !ctx.principal.is_human() {
+            return Err(invariant(
+                "I1: packing a driver signs it with this account's publisher key, which is a \
+                 human act; re-run it with a presence proof",
+            ));
+        }
+        return crate::capital::pack(kernel, config, ctx, req.params);
+    }
     // Mounting a Claude Code arch means running the binary to ask its version,
     // because the version is in the arch identity. That happens here, *before*
     // the kernel lock, so a binary that is slow — or missing, and about to be
@@ -969,6 +1001,10 @@ fn dispatch(
             // from.
             "policies_version": k.policies_version().map_err(kerr)?,
             "state_dir": k.store().state_dir.display().to_string(),
+            // Where installed drivers live (packaging spec §4.2): what a
+            // `source: installed` tree must be under, and where
+            // `vk driver install` writes.
+            "install_root": k.install_root().display().to_string(),
             // Where a `release` step's `to_dir` is resolved: the client names a
             // subpath and prints the resolved path, so "where did my artefact
             // go?" is answerable without the client guessing the layout.
@@ -1281,8 +1317,17 @@ fn dispatch(
             Ok(json!({ "ok": true, "arch_id": id }))
         }
         // The mounted drivers and one of them, as the `drivers` table holds
-        // them (pilot spec §4): manifest, identity, root, state.
-        "driver.ls" => k.drivers().map_err(kerr).and_then(to_value),
+        // them (pilot spec §4): manifest, identity, root, state. `driver.ls`
+        // adds, per row, its source, the version it was mounted from and the
+        // versions installed under its name, and lists what is installed and
+        // not mounted (packaging Task 8) — read from the install root with
+        // the kernel lock released.
+        "driver.ls" => {
+            let rows = k.drivers().map_err(kerr)?;
+            let install_root = k.install_root().to_path_buf();
+            drop(k);
+            crate::capital::listing(rows, &install_root)
+        }
         "driver.show" => {
             let name = p["name"].as_str().ok_or_else(|| bad("name"))?;
             k.driver(name)
@@ -1290,6 +1335,20 @@ fn dispatch(
                 .ok_or_else(|| not_found(&format!("driver {name}")))
                 .and_then(to_value)
         }
+        // The publisher key (packaging spec §4.5). Making it is a human act,
+        // refused to a machine principal by the kernel; showing it is not,
+        // and never makes one: an account with none is told how to make it.
+        "capital.key_init" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            k.publisher_key_init(&ctx).map_err(kerr).and_then(to_value)
+        }
+        "capital.key_show" => match k.publisher_key_show().map_err(kerr)? {
+            Some(key) => to_value(key),
+            None => Err(RpcError {
+                code: E_NOT_FOUND,
+                message: "no publisher key; remedy: vk capital key init".into(),
+            }),
+        },
         // **Unmounting a driver is a human act** (Ruling R25), symmetric with
         // mounting one: it ends a browser session this node controls, and it
         // kills an act in flight (R13). Refused to a machine principal here,

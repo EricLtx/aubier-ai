@@ -20,6 +20,10 @@ vk-harness = { path = "../vk-harness" }
 # came back. `vk-driver` depends on `vk-contracts` and `vk-harness`, never on
 # the kernel, so it stays a leaf like `vk-harness`.
 vk-driver = { path = "../vk-driver" }
+# The publisher key and its pins (packaging spec §4.5): `driver.pack` and
+# `vk capital key` are kernel acts. `vk-capital` depends on `vk-contracts`
+# only, never on the kernel, so it stays a leaf like the two above.
+vk-capital = { path = "../vk-capital" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

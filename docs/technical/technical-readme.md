@@ -371,7 +371,7 @@ The harness fence is the one SP1b built, unchanged.
 
 ```
 vk mount driver --manifest drivers/maskai-recette/manifest.json
-vk driver ls                       # NAME STATE GOVERNED ACTIONS WHY
+vk driver ls                       # NAME STATE GOVERNED SOURCE VERSION ACTIONS WHY
 vk driver show maskai-1            # identity, state, hosts, actions, root
 vk ls /drivers                     # the names; /drivers/NAME is `vk driver show`
 vk driver umount maskai-1          # signed; stop the process, whatever it is doing
@@ -419,12 +419,13 @@ under `WindowsApps`, refuses an existing `.venv` whose `pyvenv.cfg` names
 one, and without `-Python` takes the standalone CPython 3.13 that `uv`
 manages (pilot ruling R27).
 
-Three ledger kinds record a driver, each with its own schema:
+Four ledger kinds record a driver, each with its own schema:
 
 | kind | what it carries |
 |---|---|
-| `driver.mounted` | `driver_id`, `name`, `manifest_hash`, `profile_dir_hash`, `governed`, and `by`, the device key that signed the mount |
+| `driver.mounted` | `driver_id`, `name`, `manifest_hash`, `profile_dir_hash`, `governed`, and `by`, the device key that signed the mount; `package_digest` when the tree was installed from a package, and `source` (`development` or `installed`; rows written before packaging read as `development`) |
 | `driver.acted` | `task_id`, `step_index`, `driver_id`, `action`, `args_hash`, `result_hash`, `ok`, `reason` when it failed — a host or daemon failure's word from a closed vocabulary (`timeout`, `dead`, `protocol: malformed response`, `would not start`, …), a driver refusal's word from the protocol's five (`dialog`, `timeout`, `host`, `precondition`, `internal`; anything else is pinned to `internal`), or a kernel refusal composed of plain tokens and byte counts — `duration_ms`, `evidence` (the blob hashes), `evidence_bytes`, `hosts_seen` |
+| `driver.packed` | `driver_id`, `name`, `version`, `package_digest` (the OCI image manifest's digest), `files_sha256`, `publisher_key_id`, and `by`, the node that packed — a human act |
 | `driver.unmounted` | `driver_id` and the reason: the operator, what degraded it (a word of the same vocabulary), or `row unreadable at boot` |
 
 `driver.acted` carries hashes and sizes, never text (Ruling 28): what the
@@ -502,6 +503,176 @@ founder, in French, from the first boot to the release, is
 [`docs/technical/runbooks/recette-maskai.md`](runbooks/recette-maskai.md). The driver's
 tests run in CI (`driver-browser`) against a local fixture page in headless
 Chromium, with no network.
+
+### Driver packages: sign it, ship it, install it, check it before every start
+
+A development driver runs from a directory of the repository, under the
+interactive daemon only, with an interpreter and libraries nothing hashes
+(pilot ruling R15). A **driver package** is the same driver cut for a node
+that is not the developer's: one signed directory holding its files, its
+dependency lock, its wheels and its own CPython, that an administrator
+installs once under `%ProgramFiles%` and that the kernel then mounts by
+`name@version` with the whole installed tree fingerprinted before every
+spawn. It is to a development driver what a flashed, signed firmware image is
+to a binary loaded from the debugger: the bootloader checks the image against
+the key it trusts before it jumps, and checks the flash again at every reset.
+The design is
+[`specs/2026-10-16-driver-packaging-and-deployment-design.md`](specs/2026-10-16-driver-packaging-and-deployment-design.md).
+
+```
+vk capital key init                      # once: the publisher key; self-pinned on this node
+vk capital key show                      # its id and public half, to hand to other nodes
+vk driver pack --manifest drivers/maskai-recette/manifest.json --version 1.0.0 --out dist/maskai-recette-1.0.0
+vk driver install dist/maskai-recette-1.0.0      # elevated shell, offline, no daemon
+vk mount driver maskai-1@1.0.0           # signed, as any mount; from the installed tree
+vk driver ls                             # NAME STATE GOVERNED SOURCE VERSION ACTIONS WHY
+vk driver umount maskai-1
+vk driver uninstall maskai-1@1.0.0       # elevated; refused while it is mounted
+```
+
+**The package** is an OCI image layout (`oci-layout`, `index.json`,
+`blobs/sha256/…`; readable with `tar`). One image manifest, artifact type
+`application/vnd.aubier.driver.v1`, five layers, each by digest: `manifest`
+(the `DriverManifest`, `source: installed`, `files_sha256` = the installed
+fingerprint), `files` (the driver's directory and its `requirements.txt`),
+`lock` (every distribution with its wheel file name and SHA-256), `wheels`
+(the wheels, byte for byte) and `python` (one pinned python-build-standalone
+release, `install_only`, Windows x86_64, with its upstream SHA-256). The
+signature is a *referrer* — a second manifest whose `subject` is the image
+manifest — carrying `{key_id, algorithm: ed25519, signed, signature}` and, as
+the annotation `org.aubier.publisher.public_key`, the publisher's public key,
+so that an installer that has never met the publisher can show it. That key is
+untrusted text until its id is pinned (below). The package digest is the
+SHA-256 of the image manifest. A packed driver has its own `driver_id` (its
+`command` and `files_sha256` differ from the development manifest's); only
+`source` is excluded from the id (with `governed`, what the host observed),
+so the id does not depend on where the same packed manifest is mounted —
+which bytes ran is the package digest's to say.
+
+**`vk driver pack`** is a human act (signed with the node's device key; the
+daemon records `driver.packed` with the package digest). It is the only step
+of the whole chain that touches the network: it downloads the pinned CPython (to
+`<state_dir>/capital/python/`, or `--python-cache DIR`; the SHA-256 in the
+table in `crates/vk-capital/src/python.rs` is checked before a byte is read),
+resolves the wheels for that interpreter's tags with `pip download` (wheels
+only, no sdist), materialises the whole tree in a stage directory with a short
+path (`%LOCALAPPDATA%\vk\stage\<8 hex>`, because pip and the Playwright wheel
+fail under a deep one), fingerprints it, writes the fingerprint into the
+packed copy of the manifest, writes the layout and signs it with the publisher
+key. A stage is removed whether the pack succeeds or is refused.
+
+**`pack.json`** — a driver whose code lives partly outside its own directory
+(the `vkdriver` library, the evaluator and journal scripts of the recette)
+declares it in a `pack.json` beside its manifest:
+`{"vendor": ["drivers/vkdriver", "scripts/recette/evaluer.py"]}`. Paths are
+relative to the repository root (the nearest ancestor of the driver
+directory holding a `Cargo.toml`). A directory is copied into the files layer
+as `vendor/<its name>/`, a file as `vendor/<its parent's name>/<file>`, without
+`__pycache__`, `.venv`, `tests`, `fixture`, `test_*.py`, `*_test.py` and
+`*.pyc`. The pack refuses, before copying anything: an absolute path, `..`, a
+link resolving outside the repository, an absent path, two entries landing on
+one place, a place the driver's own files already hold, an unknown key. The
+driver looks in `DRIVER_DIR/vendor/` first and in the repository layout
+second, so one file serves both. With no `pack.json`, a `vkdriver/` beside the
+driver is copied as before. `pack.json` is part of the files layer, so it is
+part of the fingerprint.
+
+**The installed tree** is
+`<install root>/<name>/<version>/`: the files layer at its root, the
+interpreter in `python/` (wheels installed straight into its
+`Lib\site-packages` with `--no-index`, `--no-compile`; **no `venv` is created**,
+plan ruling P-1), the manifest layer verbatim as `manifest.json`, and
+`.package/` holding the image manifest blob (its SHA-256 is the package digest)
+and the signature. Console-script launchers pip writes under `python\Scripts\`
+embed the path of the interpreter and are deleted after the install (plan
+ruling P-2), as is every `__pycache__` the release shipped; the packed command
+is `python/python.exe -E -s -B <script> …` (ignore the environment, no user
+site, write no bytecode; not `-I`, which would drop the script's directory from
+`sys.path` and a driver with two modules could not import).
+
+**The install root** is `%ProgramFiles%\Aubier\drivers`, or the directory
+named by `VK_DRIVER_INSTALL_ROOT`; the kernel reads it once when it is built
+and `vk status` prints it (`install root`). The kernel refuses a manifest that
+says `source: installed` outside it, and a development tree inside it, and a
+root that is not exactly `<name>/<MAJOR.MINOR.PATCH>` below it, and an
+installed manifest whose command is not the interpreter its package carries
+(`python/python.exe`, flags with `-B`, a `.py` script under the tree, both
+regular files there; ruling R-F2), at pack and at mount. `vk driver
+install` writes under the same root, with no daemon, and writes nothing before
+its checks pass: every digest of the layout; the annotations against
+the manifest (a name and a version are path components); the signature, under
+the pinned key of its `key_id` or, if the id is not pinned, under the carried
+key once that key's id is shown to be the signature's — and then the
+administrator is asked (`publisher key sha256:…`, the PEM re-rendered from the
+key bytes, `pin this publisher on this node? [y/N]`; `--yes` answers for CI);
+the tree materialised into `<version>.part`, which an elevated install creates
+with its final ACL (administrators and SYSTEM full control, users read and
+execute, inheritance cut) *before* the interpreter runs inside it; the
+fingerprint against the manifest's; then a rename to `<version>` and, last,
+the pin. An elevated install refuses a root that Users, Authenticated Users,
+Everyone or INTERACTIVE may write, a root or a `<name>` that is a link, a
+version already installed (a version is never overwritten) and a tree whose
+deepest path exceeds 240 characters. A shell that cannot write the root is
+told so in one line (`run it from an elevated shell`). Installing from a
+shell that is not elevated into a root that user may write is the test seam:
+the tree gets that root's own ACL. The publisher is pinned into the state
+directory the daemon reads (`--state-dir`, else this user's, as `vk boot`
+resolves it): `<state_dir>/capital/publishers/<key_id>.pub`, with a sidecar
+recording who pinned it and when. The install names that directory on stderr
+before anything else and warns when another account owns it: an
+administrator who elevates with another account than the one running `vkd`
+passes `--state-dir` = the `state dir` line of that daemon's `vk status`, or
+the mount is refused (`is not pinned on this node: no pin in …`, which names
+the directory the daemon looked in). A name binds its publisher (ruling
+R-F1): while any version of `<name>` is installed, a package of that name
+signed by another key is refused before the prompt (`remedy: vk driver
+uninstall every version of <name> first`), and the prompt says how many
+publishers the node already pins. `vk driver uninstall` moves the version
+aside before deleting it, which Windows refuses while a file of it is open, and
+is refused while the daemon says that version is mounted; with no daemon on
+its endpoint it treats nothing as mounted and says so on stderr, so umount
+before stopping the daemon.
+
+**The fingerprint** (`hash_tree`, in `vk-capital`) is the SHA-256 over every
+regular file of the installed tree at any depth, in path order, each framed
+`path\0bytes\0`, links never followed. It leaves out the top-level
+`manifest*.json` and `.package/` and nothing else — `__pycache__` is hashed,
+because the tree is built without bytecode and runs with `-B`, so a `.pyc` that
+appears later is a change (ruling R-T8b). Packing and installing both
+materialise the layers and must reach the same digest; a node that reaches
+another refuses the install (`repack on a node with the same CPython release`).
+Before every spawn the kernel walks the tree and compares `(path, size,
+mtime_ns)` with `<state_dir>/drivers/<name>/fingerprint.json`; an unchanged set
+reuses the digest without a read, any difference rehashes the whole tree, and a
+digest that is not the manifest's degrades the driver (`driver.unmounted`
+with the reason `tampered`, remedy: reinstall, then remount). A cache that
+claims a mismatch is not believed on its own: the tree is hashed first. The cache
+is a speed-up, not a witness: it trusts the metadata, so a byte flipped with
+its size and mtime put back is not seen by it (the documented limit, and the
+reason the tree is also read-only to everyone but the administrators). A byte
+changed under a driver that is running is seen at its next spawn, not at its
+next act.
+
+**Test seams**, each documented where it is read and none a production knob:
+
+| Variable | Read by | What it does |
+|---|---|---|
+| `VK_DRIVER_INSTALL_ROOT` | the kernel, and `vk driver install` and `uninstall` | The install root, made absolute once. Every test daemon and test install sets its own, a directory of its own, so a machine that has real drivers installed under `%ProgramFiles%` does not change a result. |
+| `VK_PUBLISHER_KEY_FILE` | the kernel | The publisher key's secret in a file instead of the OS keyring, as `VK_NODE_KEY_FILE` does for the device key. |
+| `VK_TEST_PYTHON_RELEASE` | `vkd`, and the tests that gate on it | The path of an already downloaded CPython archive, in place of the download. Only the path moves: the SHA-256 is always the pinned one, so a wrong file is refused. The archive-gated tests skip, with one line on stderr, when it is not set. |
+
+**CI** has a Windows job, `driver-install`, for what no other job can run: it
+downloads the pinned release with `vk capital python fetch --cache DIR --as
+FILE` (a hidden verb that calls the pack's own `fetch`, hash check included;
+cached by the hash of `python.rs`), runs the real-release `vk-capital`
+materialise test, the daemon's pack, mount and `tampered` tests, and the
+`vk driver` smoke tests, among them the end-to-end `pack → install → mount →
+act → ls → uninstall`. GitHub's Windows runner is an administrator, so that job
+is where the elevated half of the install (the read-only ACL, the root check,
+the interpreter spawned from the protected tree) runs for the first time.
+
+What the kernel enforces and what it trusts is in
+[`contracts/tcb.md`](../../contracts/tcb.md), §Drivers.
 
 ### The human ceremony: passkeys and kernel-minted challenges
 
