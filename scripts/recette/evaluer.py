@@ -18,7 +18,9 @@ OBSERVATIONS.json : { "<id du cas>": { "answer": "...", "sent": "...", "timing_s
     timing_s : optionnel, durée totale.
 
 La réponse et le texte envoyé sont normalisés avant toute recherche (`normalise`) : un lien
-« [x](pii://…) » resté brut devient x, une espace insécable ou fine devient une espace.
+« [x](pii://…) » resté brut devient x ; une réponse qui en montre un porte la note « lien pii://
+rendu à l'utilisateur » (un défaut de rendu, sans effet sur le verdict). Les espaces insécables ou
+fines sont des espaces pour `fold` (décomposition NFKD, puis repli des blancs).
 
 Verdict par cas : OK, PARTIEL, KO, NON TESTÉ.
     KO       : une valeur attendue manque, une valeur interdite apparaît, ou une donnée
@@ -47,13 +49,12 @@ BROKEN_TOKEN = re.compile(r"(?<![<A-Z_])[A-Z]+(?:_[A-Z]+)*_\d+>")
 # (v2.2), le popover « Chiffré » du compositeur (« composer-popover » en v2.2, « popover » dans les
 # sent.json de la recette 2), le panneau du 13/10.
 SENT_SOURCES = ("card-details", "composer-popover", "popover", "panel")
-# Deux artefacts de rendu relevés le 18/10 (recette 2) : une valeur que MaskAI remet en clair dans la
+# Un artefact de rendu relevé le 18/10 (recette 2) : une valeur que MaskAI remet en clair dans la
 # réponse reste un lien markdown brut, « FR55 [3078 8009 0002 8479](pii://%3CCREDIT_CARD_1%3E) 1365
-# 147 », que le motif « fr55 ?3078 … » ne lit pas ; et la typographie française met une espace
-# insécable (U+00A0), insécable fine (U+202F) ou fine (U+2009, U+2007, U+200A) entre un nombre et
-# son unité.
+# 147 », que le motif « fr55 ?3078 … » ne lit pas. (Les espaces insécables, insécables fines et fines
+# de la typographie française, l'autre artefact supposé, sont déjà des espaces pour `fold`.)
 PII_LINK = re.compile(r"\[([^\[\]\n]*)\]\(pii://[^)\s]*\)")
-ODD_SPACES = re.compile("[\u00a0\u202f\u2007\u2009\u200a]")
+PII_LINK_NOTE = "lien pii:// rendu à l'utilisateur"
 
 
 def fold(s: str) -> str:
@@ -64,10 +65,15 @@ def fold(s: str) -> str:
 
 
 def normalise(text: str) -> str:
-    """Le texte d'une page tel qu'un oracle doit le lire : un lien « [x](pii://…) » devient x, une
-    espace insécable ou fine devient une espace. S'applique aux réponses et au texte envoyé, avant
-    `find` et `pii_in`, jamais aux motifs ni aux valeurs de l'inventaire."""
-    return ODD_SPACES.sub(" ", PII_LINK.sub(r"\1", text))
+    """Le texte d'une page tel qu'un oracle doit le lire : un lien « [x](pii://…) » devient x,
+    jusqu'à un point fixe (un lien dans un lien se lit aussi ; normalise(normalise(t)) ==
+    normalise(t)). S'applique aux réponses et au texte envoyé, avant `find` et `pii_in`, jamais
+    aux motifs ni aux valeurs de l'inventaire."""
+    while True:
+        out = PII_LINK.sub(r"\1", text)
+        if out == text:
+            return out
+        text = out
 
 
 def find(pattern: str, text: str) -> bool:
@@ -108,6 +114,8 @@ def evaluate_case(case: dict, obs: dict | None, latency_budget_s: float | None =
         sent = sent_from_json(obs["sent_json"])
     out["timing_s"] = obs.get("timing_s")
 
+    if PII_LINK.search(answer):  # a rendering defect shown to the user: noted, no verdict change
+        out["notes"].append(PII_LINK_NOTE)
     out["missing"] = [p for p in case.get("must", []) if not find(p, answer)]
     out["forbidden"] = [p for p in case.get("must_not", []) if find(p, answer)]
 

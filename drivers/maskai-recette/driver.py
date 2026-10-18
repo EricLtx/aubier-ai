@@ -64,15 +64,22 @@ Ce que la v2.2 ajoute (décision du fondateur du 18/10, recette 3 « de bout en 
 noire : le texte transmis au modèle est observé à chaque cas) :
 - le texte envoyé est lu, la réponse finie, dans le panneau « Détails » de la dernière carte de
   réponse : le driver clique le bouton de cette carte-là (jamais un rang parmi les boutons de la
-  page), lit le contenu ouvert quand il ne bouge plus, puis le referme d'un second clic
-  (`sent.json`, `source: "card-details"`). Le popover « Chiffré » du compositeur décrit l'état
-  AVANT l'envoi (« Aucune PII détectée — rien à anonymiser pour l'instant » le 18/10 : la
+  page, jamais le bouton de révélation des PII ni un bouton du corps de la réponse), lit le
+  contenu ouvert quand il ne bouge plus, et le referme d'un second clic s'il l'a bien ouvert
+  (`sent.json`, `source: "card-details"`). Le texte envoyé est le texte seul : le bloc de texte
+  du panneau, sinon son texte privé du libellé (`details_label`) ; c'est lui que portent
+  `sent_sha256` et la comparaison `replay_of`. La capture `answer.png` est prise avant le clic
+  (le clic fait défiler l'en-tête de la carte). Le popover « Chiffré » du compositeur décrit
+  l'état AVANT l'envoi (« Aucune PII détectée — rien à anonymiser pour l'instant » le 18/10 : la
   recette 2 n'a jamais vu le texte envoyé) ; il n'est plus qu'un repli, pour une carte sans
-  bouton « Détails » (`source: "composer-popover"`) ;
+  bouton « Détails » (`source: "composer-popover"`). Un panneau qui ne s'ouvre pas, qui ne montre
+  pas la question, ou qu'une erreur ou le délai de l'hôte empêche de lire reste
+  `source: "card-details"` avec `rejected`, sans repli ;
 - le bouton de révélation des PII de la carte n'est jamais pressé : son état au moment de la
   lecture est noté (`reveal_pressed`), jamais changé ;
-- l'évaluateur lit un lien « [x](pii://…) » resté brut comme x, et une espace insécable ou fine
-  comme une espace (`evaluer.normalise`) ; `inputs_sha256` change avec lui.
+- l'évaluateur lit un lien « [x](pii://…) » resté brut comme x (`evaluer.normalise`), et note
+  « lien pii:// rendu à l'utilisateur » quand la réponse en montre un ; `inputs_sha256` change
+  avec lui.
 
 Environnement (posé par l'hôte) : VK_DRIVER_PROFILE_DIR, VK_DRIVER_WORK_DIR,
 VK_DRIVER_HEADLESS, VK_DRIVER_CHANNEL, VK_DRIVER_HOSTS ; MASKAI_ENTRY_URL
@@ -213,11 +220,19 @@ SELECTORS = {
     # Sélecteurs Playwright, la structure d'abord, cherchés dans la carte : le préfixe « article »
     # retiré, `:has-text("…")` lu par le driver (details_triggers). À confirmer au premier passage
     # réel : le contenu ouvert, attendu en collapsible Radix (data-state="open") dans la même
-    # carte ; le driver en lit tout le texte et en garde le HTML (sent.json).
+    # carte ; le driver en lit le bloc de texte (`sent_text`), sinon tout le texte privé du libellé
+    # (`details_label`), et en garde le texte entier et le HTML (sent.json). Un candidat qui est le
+    # bouton de révélation des PII (`pii_reveal`) ou qui est dans le corps de la réponse
+    # (`answer_body`) n'est jamais retenu.
     "card_details_trigger": ['article button[data-slot="collapsible-trigger"][aria-label*="anonymis" i]',
                              'article button[data-slot="collapsible-trigger"]:has-text("Détails")',
                              'article button:has-text("Détails")'],
     "card_details_content": '[data-slot="collapsible-content"]',
+    # Le libellé en tête du panneau, retiré du texte envoyé (le banc : « Texte anonymisé envoyé au
+    # LLM : ») ; à défaut, une première ligne qui finit par « : » et que la question ne contient
+    # pas (details_text). Formulation réelle à relever au premier passage (sent.json `label`).
+    "details_label": (r"^\s*(?:texte\s+anonymis[ée]\s+envoy[ée]\s+au\s+(?:llm|mod[èe]le)"
+                      r"|anonymi[sz]ed\s+text\s+sent\s+to\s+the\s+(?:llm|model))\s*:?\s*"),
     # Le bouton qui révèle les PII dans la réponse, juste après « Détails » (18/10, même carte) :
     # <button type="button" aria-pressed="false" data-state="closed" data-slot="pii-reveal-toggle" …>.
     # Jamais pressé par le driver ; son état au moment de la lecture est noté (`reveal_pressed`).
@@ -229,6 +244,7 @@ SELECTORS = {
     # plus proche de la zone de saisie), jamais un bouton d'une carte de réponse.
     "sent_trigger": 'button[aria-haspopup="dialog"][data-slot="popover-trigger"]',
     "sent_popover": '[role="dialog"][data-slot="popover-content"]',
+    # Le bloc de texte du popover et, depuis la v2.2, du panneau « Détails » (CSS, dans l'ordre).
     "sent_text": ['[data-slot*="sent"]', 'pre', 'code', 'blockquote'],
     "popover_close": ('[data-slot="popover-close"], button[aria-label*="Fermer" i], '
                       'button[aria-label*="Close" i]'),
@@ -344,6 +360,9 @@ SENT_SETTLE_S = 3.0
 DETAILS_STABLE_S = 0.3
 DETAILS_OTHER_STABLE_S = 1.0
 DETAILS_CLOSE_S = 1.5
+# Le panneau n'est pas lu quand il reste moins de MARGIN_S + DETAILS_MIN_S avant l'échéance de
+# l'hôte : les preuves passent d'abord (`rejected: "délai de l'hôte"`).
+DETAILS_MIN_S = 3.0
 # Recherche web coupée : une étape web_search plus longue que cela est une recherche faite.
 WEB_OFF_MAX_MS = 1000
 WEB_MODES = ("off", "auto", "on")
@@ -521,8 +540,9 @@ _DETAILS_FIND = r"""
       const cards = all(document, s);
       if (!cards.length) continue;
       const card = cards[cards.length - 1];
-      for (const t of a.triggers) {
-        const el = all(card, t.css).find((e) => t.text === null || norm(e.textContent).includes(t.text));
+      for (const t of a.triggers) {  // never the PII reveal toggle, never a button of the answer's body
+        const el = all(card, t.css).find((e) => !e.closest(a.reveal) && !(a.body && e.closest(a.body))
+                                               && (t.text === null || norm(e.textContent).includes(t.text)));
         if (el) return { sel: s, count: cards.length, card, trigger: el, triggerSel: t.sel };
       }
       return { sel: s, count: cards.length, card, trigger: null, triggerSel: null };
@@ -552,8 +572,14 @@ DETAILS_JS = "(a) => {" + _VISIBLE + _DETAILS_FIND + r"""
     how = 'card';
   }
   out.open = !!c;
-  if (c) Object.assign(out, { how, controls: id, state: c.getAttribute('data-state'),
-                              text: (c.innerText || '').trim().slice(0, 20000), html: (c.outerHTML || '').slice(0, 20000) });
+  if (!c) return out;
+  let block = null, blockSel = null;
+  for (const s of a.text || []) {
+    const b = c.querySelector(s);
+    if (b && (b.innerText || '').trim()) { block = b.innerText.trim().slice(0, 20000); blockSel = s; break; }
+  }
+  Object.assign(out, { how, controls: id, state: c.getAttribute('data-state'), block, block_sel: blockSel,
+                       text: (c.innerText || '').trim().slice(0, 20000), html: (c.outerHTML || '').slice(0, 20000) });
   return out;
 }"""
 
@@ -957,6 +983,13 @@ def looks_like_sent(shown: str | None, question: str, pii=()) -> bool:
     return sum(w in seen for w in words) * 2 >= len(words)
 
 
+def details_open(seen: dict) -> bool:
+    """Le panneau « Détails » lu par DETAILS_JS est-il ouvert ? Son bouton le dit (aria-expanded) ;
+    sans aria-expanded, un contenu ouvert dans la carte (hors des rangs exclus) le dit."""
+    expanded = seen.get("expanded")
+    return expanded == "true" or (expanded not in ("true", "false") and bool(seen.get("open")))
+
+
 def details_triggers() -> list:
     """Les sélecteurs de `card_details_trigger` tels que le driver les cherche dans une carte : le
     préfixe « article » retiré (la carte est l'article), et `:has-text("…")` lu à part, comme
@@ -970,6 +1003,28 @@ def details_triggers() -> list:
             css = css[len("article "):].strip()
         out.append({"sel": sel, "css": css or "*", "text": text})
     return out
+
+
+def details_text(raw: str | None, block: str | None, question: str) -> tuple[str | None, str | None]:
+    """Le texte envoyé que montre le panneau « Détails », sans son libellé : le bloc de texte du
+    panneau (`sent_text`) s'il porte au moins la moitié du texte (un jeton en <code> n'est pas le
+    message), sinon le texte entier privé de son libellé : `details_label`, à défaut une première
+    ligne qui finit par « : » et que la question ne contient pas (« Voici un document : » ouvre des
+    questions du corpus v3 : jamais retiré). Rend (texte, libellé retiré ou None)."""
+    if not raw or not raw.strip():
+        return None, None
+    raw = raw.strip()
+    m = re.match(SELECTORS["details_label"], raw, flags=re.I)
+    if m is None:
+        m = re.match(r"([^\n]{1,120}?)\s*:[ \t]*\n", raw)
+        if m and evaluer.fold(m.group(1)).strip() in evaluer.fold(question or ""):
+            m = None
+    stripped = raw[m.end():].strip() if m else raw
+    block = (block or "").strip()
+    text = block if block and len(block) * 2 >= len(stripped) else stripped
+    at = raw.find(text)
+    label = raw[:at].strip() if at > 0 else (raw[:m.end()].strip() if m and text == stripped else None)
+    return text or None, label or None
 
 
 def chip_label(reading: dict | None) -> str:
@@ -1143,9 +1198,13 @@ class Evidence:
 
     def screenshot(self, page, name: str) -> None:
         """La partie visible de la page, barre latérale et bloc du compte masqués (SELECTORS["mask"])."""
-        masks = [page.locator(sel) for sel in SELECTORS["mask"]]
-        self.add(name, page.screenshot(full_page=False, type="png", timeout=10_000, mask=masks,
-                                       mask_color=MASK_COLOR))
+        self.add(name, screenshot_png(page))
+
+
+def screenshot_png(page) -> bytes:
+    """La partie visible de la page en PNG, barre latérale et bloc du compte masqués."""
+    masks = [page.locator(sel) for sel in SELECTORS["mask"]]
+    return page.screenshot(full_page=False, type="png", timeout=10_000, mask=masks, mask_color=MASK_COLOR)
 
 
 class Browser:
@@ -1497,6 +1556,9 @@ class Recette:
         self._mark = None  # where the action in hand began, in the browser's event sequence
         self._last_asked = None  # {"case", "mark"} of the last poser_question
         self._in_flight = False  # an abandon whose stop click did not end the generation
+        # answer.png taken by _collect before the « Détails » click (which scrolls the card header
+        # into view); the evidence uses it, once.
+        self._answer_shot = None
         # The case a maintenance page is charged to: the one the action names, else the last case
         # verdict_oracle said was still to do (nouvelle_conversation names none).
         self._last_verdict_probe = None
@@ -1529,6 +1591,7 @@ class Recette:
             ev = Evidence(evidence_dir)
             self._case_in_hand = None
             self._mark = None
+            self._answer_shot = None
             self._action_case = args.get("case") or self._last_verdict_probe
             try:
                 if browser:
@@ -1970,53 +2033,66 @@ class Recette:
         finie : son bouton « Détails », cherché dans cette carte seulement, cliqué ; le contenu
         ouvert lu quand il ne bouge plus (DETAILS_STABLE_S s'il porte la question,
         DETAILS_OTHER_STABLE_S sinon, au plus SENT_SETTLE_S) ; le même bouton recliqué pour le
-        refermer. Le contenu lu est celui que ce clic a ouvert : un autre panneau de la carte, déjà
-        ouvert avant, n'est jamais pris pour lui. Le bouton de révélation des PII n'est jamais
-        pressé : son état est noté (`reveal_pressed`). Un panneau déjà ouvert (aria-expanded à
-        true) est lu tel quel et laissé ouvert. Une carte sans bouton « Détails » rend
-        `missing: "trigger"` et `rejected` : le repli est à l'appelant."""
+        refermer s'il l'a bien ouvert. Le contenu lu est celui que ce clic a ouvert : un autre
+        panneau de la carte, déjà ouvert avant, n'est jamais pris pour lui. Le texte retenu est le
+        texte seul (details_text) ; le texte entier du panneau reste dans `content_text`. Le
+        bouton de révélation des PII n'est jamais pressé : son état est noté (`reveal_pressed`).
+        Un panneau déjà ouvert (aria-expanded à true) est lu tel quel et laissé ouvert.
+        Une carte sans bouton « Détails » (ou pas de carte nouvelle) rend `source: None`,
+        `missing` et `rejected` : le repli est à l'appelant. Tout autre échec (le panneau ne
+        s'ouvre pas, ne montre aucun texte, une erreur, le délai de l'hôte) reste
+        `source: "card-details"` avec `rejected` : pas de repli, la carte a son bouton. Un
+        dialogue pendant la lecture gèle la page : le panneau reste alors ouvert, le refus
+        `dialog` suit."""
         b = self.browser
-        info = {"source": None, "text": None, "trigger": None, "content": None, "closed": None, "seconds": None}
+        info = {"source": "card-details", "text": None, "trigger": None, "content": None, "closed": None,
+                "seconds": None}
+        if remaining_s() < MARGIN_S + DETAILS_MIN_S:  # the evidence first: the panel is not read
+            info.update(rejected="délai de l'hôte", seconds=0.0)
+            return info
         arg = {"assistant": SELECTORS["assistant_message"], "triggers": details_triggers(),
-               "reveal": SELECTORS["pii_reveal"], "content": SELECTORS["card_details_content"]}
+               "reveal": SELECTORS["pii_reveal"], "body": SELECTORS["answer_body"],
+               "content": SELECTORS["card_details_content"], "text": SELECTORS["sent_text"]}
         question, pii = turn.get("text", ""), turn.get("pii")
-        t0, opened = time.monotonic(), False
+        t0, clicked, content = time.monotonic(), False, None
         try:
             seen = b.call(DETAILS_JS, arg, page=page, timeout_ms=3000)
             if seen["count"] <= turn["count0"]:  # no card of this turn's on screen
-                info.update(missing="card", rejected="pas de carte de réponse")
+                info.update(source=None, missing="card", rejected="pas de carte de réponse")
                 return info
             info.update(card={"selector": seen["card"], "index": seen["index"]},
                         reveal_pressed={"true": True, "false": False}.get(seen["reveal"]))
             if seen["trigger"] is None:
-                info.update(missing="trigger", rejected="pas de bouton Détails sur la carte")
+                info.update(source=None, missing="trigger", rejected="pas de bouton Détails sur la carte")
                 return info
             info.update(trigger=seen["trigger"], trigger_label=seen.get("label"))
-            expanded = seen.get("expanded")
-            if expanded == "true" or (expanded not in ("true", "false") and seen.get("open")):
+            if details_open(seen):
                 info["already_open"] = True  # opened before the driver came: read as found, left as found
             else:
                 arg["exclude"] = seen.get("open_idx") or []  # open before the click: never its panel
                 self._click_details(page, arg)
-                opened = True
-            content, since, settled, t1 = None, None, False, time.monotonic()
+                clicked = True
+            since, settled, t1 = None, False, time.monotonic()
             while time.monotonic() - t1 < SENT_SETTLE_S:
                 got = b.call(DETAILS_JS, arg, page=page, timeout_ms=2000)
                 now = time.monotonic()
                 if got.get("text"):
                     if content is None or got["text"] != content["text"]:
                         content, since = got, now
-                    elif now - since >= (DETAILS_STABLE_S if looks_like_sent(got["text"], question, pii)
-                                         else DETAILS_OTHER_STABLE_S):
-                        settled = True
-                        break
+                    else:
+                        shown, _ = details_text(got["text"], got.get("block"), question)
+                        if now - since >= (DETAILS_STABLE_S if looks_like_sent(shown, question, pii)
+                                           else DETAILS_OTHER_STABLE_S):
+                            settled = True
+                            break
                 page.wait_for_timeout(100)
             if content:
-                info.update(source="card-details", text=content["text"],
+                text, label = details_text(content["text"], content.get("block"), question)
+                info.update(text=text, label=label, block=content.get("block_sel"),
                             content=(f"#{content['controls']}" if content["how"] == "aria-controls"
                                      else SELECTORS["card_details_content"]),
                             content_state=content["state"], content_settled=settled,
-                            content_html=content["html"])
+                            content_text=content["text"], content_html=content["html"])
             else:
                 info["missing"] = "content"
         except PWTimeout:
@@ -2026,7 +2102,7 @@ class Recette:
         except PWError as e:
             info["error"] = one_line(str(e), 200)
         finally:
-            if opened and not b.pending():
+            if clicked and not b.pending():
                 try:
                     info["closed"] = self._close_card_details(page, arg)
                 except PWError as e:
@@ -2034,6 +2110,13 @@ class Recette:
                 if info["closed"] is False:
                     log.warning("the « Détails » panel of the last answer card stays open")
             info["seconds"] = round(time.monotonic() - t0, 2)
+        if info["text"] is None and not info.get("rejected"):
+            if info.get("error"):
+                info["rejected"] = f"panneau « Détails » non lu ({info['error']})"
+            elif clicked and content is None and info["closed"] is None:
+                info["rejected"] = "le panneau ne s'est pas ouvert"
+            else:
+                info["rejected"] = "le panneau « Détails » ne montre aucun texte"
         return info
 
     def _click_details(self, page, arg: dict) -> None:
@@ -2047,16 +2130,18 @@ class Recette:
         finally:
             el.dispose()
 
-    def _close_card_details(self, page, arg: dict) -> bool:
-        """Refermer le panneau que le driver a ouvert : un second clic sur le même bouton, puis
-        aria-expanded revenu à false (sans aria-expanded : plus de contenu ouvert dans la carte),
-        au plus DETAILS_CLOSE_S."""
+    def _close_card_details(self, page, arg: dict) -> bool | None:
+        """Refermer le panneau que le clic du driver a ouvert, et lui seul : relu d'abord. Ouvert
+        (details_open), un second clic sur le même bouton, puis le panneau fermé au plus
+        DETAILS_CLOSE_S : True, ou False s'il reste ouvert. Pas ouvert (le premier clic n'a rien
+        ouvert) : rien n'est cliqué, None ; un clic à l'aveugle l'ouvrirait."""
         b = self.browser
+        if not details_open(b.call(DETAILS_JS, arg, page=page, timeout_ms=2000)):
+            return None
         self._click_details(page, arg)
         deadline = time.monotonic() + DETAILS_CLOSE_S
         while True:
-            got = b.call(DETAILS_JS, arg, page=page, timeout_ms=2000)
-            if got.get("expanded") == "false" or (got.get("expanded") is None and not got.get("open")):
+            if not details_open(b.call(DETAILS_JS, arg, page=page, timeout_ms=2000)):
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -2177,15 +2262,22 @@ class Recette:
         popover = dict(turn.get("sent_popover") or {"source": None})
         if popover.get("source") == "composer-popover" and not looks_like_sent(popover.get("text"), question, pii):
             popover.update(source=None, rejected="le popover ne montre pas le texte de la question")
-        card = self._read_card_details(page, turn) if turn.get("read_sent") and fresh else None
+        card = None
+        if turn.get("read_sent") and fresh:
+            if not b.pending():
+                try:  # answer.png now: the « Détails » click scrolls the card header into view
+                    self._answer_shot = screenshot_png(page)
+                except PWError as e:
+                    log.warning("answer screenshot before the « Détails » read failed: %s", one_line(str(e)))
+            card = self._read_card_details(page, turn)
         sent_to_model = None
-        if card is not None and card.get("trigger"):
-            # The card has its « Détails »: it alone says what left; the popover read before sending
-            # (the state before sending) is kept for the debrief.
+        if card is not None and card.get("missing") not in ("card", "trigger"):
+            # The card has its « Détails »: it alone says what left, never the fallback; the popover
+            # read before sending (the state before sending) is kept for the debrief.
             sent_info = {**card, "composer_popover": popover}
-            if sent_info["source"] == "card-details" and not looks_like_sent(card["text"], question, pii):
-                sent_info.update(source=None, rejected="le panneau « Détails » ne montre pas le texte de la question")
-            if sent_info["source"] == "card-details":
+            if not sent_info.get("rejected") and not looks_like_sent(card["text"], question, pii):
+                sent_info["rejected"] = "le panneau « Détails » ne montre pas le texte de la question"
+            if not sent_info.get("rejected"):
                 sent_to_model = sent_info["text"]
         else:
             # No « Détails » on the card: the composer popover, then the 13/10 panel (the fallback).
@@ -2305,7 +2397,15 @@ class Recette:
         ev.json("sent.json", {**(obs.get("sent_info") or {"source": None}),
                               "post_body": (obs.get("sent") or "")[:20_000] or None})
         ev.json("network.json", self.browser.capture(mark), cap=NETWORK_CAP)
-        ev.screenshot(page, "answer.png")
+        self._answer_png(ev, page)
+
+    def _answer_png(self, ev: Evidence, page) -> None:
+        """answer.png : la capture prise avant le clic sur « Détails » (_collect), sinon maintenant."""
+        shot, self._answer_shot = self._answer_shot, None
+        if shot:
+            ev.add("answer.png", shot)
+        else:
+            ev.screenshot(page, "answer.png")
 
     @staticmethod
     def _answer_result(obs: dict, label: str) -> dict:
@@ -3125,7 +3225,7 @@ class Recette:
         self.observations[cid] = {**obs, "html": None, "turns": turns, "composer": composer,
                                   "timing_s": slowest["total_s"], "slowest_turn": slowest["turn"]}
         ev.json("turns.json", {"case": cid, "asked_turns": n, "turns": turns, "slowest_turn": slowest["turn"]})
-        ev.screenshot(self.browser.page(), "answer.png")
+        self._answer_png(ev, self.browser.page())
         return {"case": cid, "turns": len(turns), "answer": obs.get("answer"),
                 "total_s": [t["total_s"] for t in turns],
                 "text": f"{cid} : {len(turns)} tours, le dernier en {obs.get('total_s')} s — "

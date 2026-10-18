@@ -286,6 +286,28 @@ class SentTextTest(unittest.TestCase):
                                             n91["question"], n91["pii"]))
         self.assertTrue(drv.looks_like_sent(masked, n91["question"], n91["pii"]))
 
+    def test_the_details_panel_gives_the_text_without_its_label(self):
+        """v2.2: the sent text is the panel's text only; its label never reaches the digest."""
+        drv = load_driver()
+        q = "Rédige une relance pour M. Hugo Bernard au sujet du loyer."
+        sent = "Rédige une relance pour <PERSON_1> au sujet du loyer."
+        label = "Texte anonymisé envoyé au LLM :"
+        self.assertEqual(drv.details_text(label + "\n\n" + sent, None, q), (sent, label))
+        self.assertEqual(drv.details_text(label + " " + sent, None, q), (sent, label))
+        self.assertEqual(drv.details_text("Anonymized text sent to the LLM\n" + sent, None, q),
+                         (sent, "Anonymized text sent to the LLM"))
+        # any first line ending with « : » that the question does not hold is a label
+        self.assertEqual(drv.details_text("Message transmis au modèle :\n" + sent, None, q),
+                         (sent, "Message transmis au modèle :"))
+        # never a line of the question itself (corpus v3 questions open with « Voici un document : »)
+        doc = "Voici un document :\n\nAGENCE RHÔNE GESTION"
+        self.assertEqual(drv.details_text(doc, None, doc), (doc, None))
+        # the panel's text block first; a token in <code> is not the message
+        self.assertEqual(drv.details_text(label + "\n" + sent, sent, q), (sent, label))
+        self.assertEqual(drv.details_text("Libellé : " + sent, "<PERSON_1>", q), ("Libellé : " + sent, None))
+        self.assertEqual(drv.details_text("  ", None, q), (None, None))
+        self.assertEqual(drv.sent_digest(drv.details_text(label + "\n" + sent, None, q)[0]), drv.sent_digest(sent))
+
 
 class KindChecksTest(unittest.TestCase):
     """What the cases model, web and long check beyond their oracle (no browser needed)."""
@@ -1258,6 +1280,7 @@ class CardDetailsOnFixture(FixtureBench):
 
     IBAN = "FR76 3000 6000 0112 3456 7890 189"
     LABEL = "Texte anonymisé envoyé au LLM :"
+    SENT = "Rédige une relance pour le virement sur l'IBAN <IBAN_1> avant vendredi."
     STATE_JS = """() => [...document.querySelectorAll('article')].map((a) => {
         const t = a.querySelector('[data-slot="collapsible-trigger"]'), c = a.querySelector('[data-slot="collapsible-content"]');
         return [t.getAttribute('aria-expanded'), c.dataset.state, c.hidden]; })"""
@@ -1281,13 +1304,15 @@ class CardDetailsOnFixture(FixtureBench):
         self.assertEqual((sent["content"], sent["content_state"]), (drv.SELECTORS["card_details_content"], "open"))
         self.assertEqual(sent["card"], {"selector": drv.SELECTORS["assistant_message"][0], "index": 0})
         self.assertIn('data-slot="collapsible-content"', sent["content_html"])
-        self.assertTrue(sent["text"].startswith(self.LABEL), sent["text"])
+        # the text only: the panel's text block, its label kept apart
+        self.assertEqual((sent["text"], sent["label"], sent["block"]), (self.SENT, self.LABEL, "pre"))
+        self.assertTrue(sent["content_text"].startswith(self.LABEL), sent["content_text"])
+        self.assertNotIn("rejected", sent)
         self.assertIn(self.IBAN, sent["post_body"], "the POST is the raw text, masked by the server")
         self.assertEqual(sent["composer_popover"]["source"], "composer-popover", "read before sending, kept, unused")
         # sent_to_model is the card's text: the token, never the IBAN
         self.assertEqual(res["sent_source"], "card-details")
-        self.assertIn("l'IBAN <IBAN_1> avant vendredi.", res["sent_to_model"])
-        self.assertNotIn("3000 6000", res["sent_to_model"])
+        self.assertEqual(res["sent_to_model"], self.SENT)
         # the answer and its header were read before the panel opened; the panel is closed again
         self.assertNotIn(self.LABEL, res["answer"])
         self.assertEqual(self.evidence_json(ev, "guard.json")["tokens"], ["<IBAN_1>"])
@@ -1298,12 +1323,14 @@ class CardDetailsOnFixture(FixtureBench):
         self.assertEqual((res["verdict"], res["leaks"]), ("OK", []))
         line = journal_lines(recette.work)[-1]
         self.assertNotIn("texte envoyé non observé", line["evidence"])
-        self.assertEqual(line["sent_sha256"], drv.sent_digest(sent["text"]))
+        self.assertEqual(line["sent_sha256"], drv.sent_digest(self.SENT), "the text's digest, never the label's")
         # The same question with LEAK: the « Détails » shows the IBAN in clear: KO sécurité.
         self.iban_case(recette, "v22-leak", " LEAK")
         self.act(A, "nouvelle_conversation")
         _, ev = self.act(A, "poser_question", {"case": "v22-leak"})
-        self.assertIn(self.IBAN, self.evidence_json(ev, "sent.json")["text"])
+        sent = self.evidence_json(ev, "sent.json")
+        self.assertEqual(sent["source"], "card-details", "read on the card, never the fallback (LEAK leaks both)")
+        self.assertEqual(sent["text"], f"Rédige une relance pour le virement sur l'IBAN {self.IBAN} avant vendredi. LEAK")
         res, _ = self.act(A, "verdict_oracle", {"case": "v22-leak"})
         self.assertEqual((res["verdict"], res["leaks"]), ("KO", [self.IBAN]))
         line = journal_lines(recette.work)[-1]
@@ -1324,8 +1351,7 @@ class CardDetailsOnFixture(FixtureBench):
               .observe(document.getElementById('messages'), { childList: true }); }""")
         res, ev = self.act(A, "envoyer_message", {"text": "Et pour le loyer de mars ?"})
         self.assertEqual(self.evidence_json(ev, "sent.json")["card"]["index"], 1)
-        self.assertEqual(res["sent_to_model"].splitlines()[-1], "Et pour le loyer de mars ?")
-        self.assertNotIn("Réflexion", res["sent_to_model"])
+        self.assertEqual(res["sent_to_model"], "Et pour le loyer de mars ?")
         self.assertEqual(page.evaluate("() => window.__first_clicks"), 0, "never the first card's")
         page.evaluate("() => document.querySelectorAll('.other').forEach((o) => o.remove())")
         self.assertEqual(page.evaluate(self.STATE_JS), [["false", "closed", True]] * 2)
@@ -1410,13 +1436,89 @@ class CardDetailsOnFixture(FixtureBench):
         self.act(A, "nouvelle_conversation")
         res, ev = self.act(A, "poser_question", {"case": "v22-status"})
         sent = self.evidence_json(ev, "sent.json")
-        self.assertIsNone(sent["source"])
+        self.assertEqual(sent["source"], "card-details", "read on the card; rejected says why it does not count")
         self.assertEqual(sent["rejected"], "le panneau « Détails » ne montre pas le texte de la question")
         self.assertIn("Aucune PII détectée", sent["text"], "kept as read, for the debrief")
         self.assertEqual((sent["closed"], sent["composer_popover"]["source"]), (True, "composer-popover"))
         self.assertNotIn("sent_to_model", res)
         self.act(A, "verdict_oracle", {"case": "v22-status"})
         self.assertIn("texte envoyé non observé", journal_lines(recette.work)[-1]["evidence"])
+
+    def test_the_text_fallbacks_never_click_the_reveal_toggle_or_a_button_of_the_answer(self):
+        """The `:has-text("Détails")` selectors: never the PII reveal toggle, even one carrying a
+        hidden « Afficher les détails » ahead of the trigger (`nostructure=1`); never a « Détails »
+        button inside the answer's body."""
+        drv, recette, A = self.make()
+        recette.entry = f"http://127.0.0.1:{self.port}/new?nostructure=1"
+        recette.open()
+        self.iban_case(recette, "v22-nostructure")
+        self.act(A, "nouvelle_conversation")
+        _, ev = self.act(A, "poser_question", {"case": "v22-nostructure"})
+        sent = self.evidence_json(ev, "sent.json")
+        self.assertEqual((sent["source"], sent["trigger"], sent["closed"], sent["text"]),
+                         ("card-details", drv.SELECTORS["card_details_trigger"][2], True, self.SENT), sent)
+        page = recette.browser.page()
+        self.assertEqual(page.evaluate("() => window.__reveal_clicks"), 0, "the reveal toggle was never pressed")
+        self.assertEqual(page.locator('article [data-slot="pii-reveal-toggle"]').get_attribute("aria-pressed"), "false")
+        recette.browser.close()
+        # A card without « Détails » whose answer holds a « Détails » button: never clicked.
+        drv, recette, A = self.make()
+        recette.entry = f"http://127.0.0.1:{self.port}/new?nodetails=1"
+        recette.open()
+        self.message_case(recette, "v22-body", "Bonjour BODY_DETAILS")
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "poser_question", {"case": "v22-body"})
+        self.assertIn("Détails", res["answer"])
+        sent = self.evidence_json(ev, "sent.json")
+        self.assertEqual((sent["card"]["missing"], sent["card"]["rejected"]), ("trigger", "pas de bouton Détails sur la carte"))
+        self.assertEqual(recette.browser.page().evaluate("() => window.__body_clicks || 0"), 0)
+
+    def test_the_aria_controls_branch_reads_the_panel_the_trigger_names(self):
+        """Radix's CollapsibleTrigger names its content (aria-controls, `controls=1`): read there."""
+        drv, recette, A = self.make()
+        recette.entry = f"http://127.0.0.1:{self.port}/new?controls=1"
+        recette.open()
+        self.iban_case(recette, "v22-controls")
+        self.act(A, "nouvelle_conversation")
+        _, ev = self.act(A, "poser_question", {"case": "v22-controls"})
+        sent = self.evidence_json(ev, "sent.json")
+        named = recette.browser.page().evaluate(
+            """() => document.querySelector('article [data-slot="collapsible-trigger"]').getAttribute('aria-controls')""")
+        self.assertTrue(named)
+        self.assertEqual((sent["source"], sent["content"], sent["closed"], sent["text"]),
+                         ("card-details", "#" + named, True, self.SENT))
+
+    def test_a_panel_that_does_not_open_is_left_as_it_was_and_the_host_deadline_is_respected(self):
+        """A trigger whose click opens nothing: no blind second click, `source` stays card-details
+        with `rejected`, no fallback to the popover. Under MARGIN_S + 3 s before the host's
+        deadline, the panel is not read at all."""
+        drv, recette, A = self.make()
+        recette.open()
+        self.iban_case(recette, "v22-dead")
+        self.act(A, "nouvelle_conversation")
+        page = recette.browser.page()
+        page.evaluate("""() => { window.__dead_clicks = 0;
+            new MutationObserver((records) => { for (const r of records) for (const n of r.addedNodes) {
+                if (n.tagName !== 'ARTICLE') continue;
+                const t = n.querySelector('[data-slot="collapsible-trigger"]');
+                t.onclick = null; t.addEventListener('click', () => { window.__dead_clicks += 1; }); } })
+              .observe(document.getElementById('messages'), { childList: true }); }""")
+        res, ev = self.act(A, "poser_question", {"case": "v22-dead"})
+        sent = self.evidence_json(ev, "sent.json")
+        self.assertEqual((sent["source"], sent["rejected"], sent["closed"], sent["text"]),
+                         ("card-details", "le panneau ne s'est pas ouvert", None, None), sent)
+        self.assertEqual(sent["composer_popover"]["source"], "composer-popover", "valid, yet no fallback")
+        self.assertNotIn("sent_to_model", res)
+        self.assertEqual(page.evaluate("() => window.__dead_clicks"), 1, "the open click only")
+        self.assertEqual(page.evaluate(self.STATE_JS), [["false", "closed", True]])
+        self.act(A, "verdict_oracle", {"case": "v22-dead"})
+        self.assertIn("texte envoyé non observé", journal_lines(recette.work)[-1]["evidence"])
+        # The host's deadline: fewer than MARGIN_S + 3 s left, the panel is not even probed.
+        drv.remaining_s = lambda: drv.MARGIN_S + 2
+        turn = {"count0": 0, "text": recette.cases["v22-dead"]["question"], "pii": [self.IBAN]}
+        info = recette._read_card_details(page, turn)
+        self.assertEqual((info["source"], info["rejected"], info["text"]), ("card-details", "délai de l'hôte", None))
+        self.assertEqual(page.evaluate("() => window.__dead_clicks"), 1, "no click")
 
 
 @unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
@@ -1512,8 +1614,8 @@ class NewActionsOnFixture(FixtureBench):
                           "Tour 3 : un synonyme de rapide", "Quel code au premier tour ?"])
         self.assertEqual(turns[2]["answer"], "TOUR 3 : UN SYNONYME DE RAPIDE — pièces jointes : aucune")
         self.assertTrue(all(t["display_stable"] and t["sent_source"] == "card-details" for t in turns), turns)
-        self.assertEqual([t["sent_to_model"].splitlines()[-1] for t in turns], [t["question"] for t in turns],
-                         "each turn read on its own card")
+        self.assertEqual([t["sent_to_model"] for t in turns], [t["question"] for t in turns],
+                         "each turn read on its own card, its text only")
         self.assertEqual(recette.browser.call("() => document.querySelectorAll('article').length"), 4,
                          "one conversation")
         res, _ = self.act(A, "verdict_oracle", {"case": "v2-long"})

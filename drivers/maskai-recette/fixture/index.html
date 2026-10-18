@@ -16,6 +16,8 @@
   article .head svg { width: 10px; height: 10px; }
   [data-slot="collapsible-content"] { font-size: 11px; background: #f8f8f8; border: 1px dashed #aaa; padding: 4px; margin: 4px 0; }
   [data-slot="collapsible-content"] pre { white-space: pre-wrap; margin: 2px 0; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+             clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
   #composer { border-top: 1px solid #ccc; padding: 8px; display: flex; gap: 6px; align-items: flex-end; flex-wrap: wrap; }
   #chips { width: 100%; display: flex; gap: 6px; }
   #chips > div { display: inline-flex; gap: 4px; padding: 2px 6px; border: 1px solid #999; border-radius: 10px; }
@@ -54,7 +56,11 @@
      content"]` in the card (Radix: always mounted, hidden and empty while closed) that
      shows the anonymised text the server computed (its `X-Sent-Anonymized` header).
      `?nodetails=1` draws the cards without the collapsible, `?revealed=1` draws the
-     reveal toggle pressed; both hold for the tab's life. -->
+     reveal toggle pressed, `?controls=1` gives the trigger Radix's default
+     `aria-controls` (the content's id), `?nostructure=1` draws the trigger without its
+     `data-slot` and `aria-label` and puts before it a reveal toggle that carries a
+     visually hidden « Afficher les détails » (the driver's text fallbacks must still
+     click the right button); all hold for the tab's life. -->
 <aside data-slot="sidebar">
   <nav aria-label="Main navigation">
     <a href="/new" data-slot="button" aria-label="Nouvelle conversation">Nouvelle conversation</a>
@@ -119,13 +125,15 @@ window.__dialog_answered = false;
 window.__survey_shown = 0;
 window.__survey_answered = false;
 window.__reveal_clicks = 0;
-// ?nodetails=1, ?revealed=1: kept in sessionStorage, the page pushes /conversation/<id> URLs
-// that drop the query.
-for (const k of ["nodetails", "revealed"]) {
+// ?nodetails=1, ?revealed=1, ?controls=1, ?nostructure=1: kept in sessionStorage, the page
+// pushes /conversation/<id> URLs that drop the query.
+for (const k of ["nodetails", "revealed", "controls", "nostructure"]) {
   if (new URLSearchParams(location.search).get(k) === "1") sessionStorage.setItem("bench-" + k, "1");
 }
 const NODETAILS = sessionStorage.getItem("bench-nodetails") === "1";
 const REVEALED = sessionStorage.getItem("bench-revealed") === "1";
+const CONTROLS = sessionStorage.getItem("bench-controls") === "1";
+const NOSTRUCTURE = sessionStorage.getItem("bench-nostructure") === "1";
 
 if (!localStorage.getItem("cookies-ok")) $("cookies").hidden = false;
 $("accept").onclick = () => { localStorage.setItem("cookies-ok", "1"); $("cookies").hidden = true; };
@@ -336,21 +344,27 @@ function addAnswer(tokens, model) {
     guard.innerHTML = "<span>Aucune donnée personnelle détectée</span><span>L'Aiguilleur : PASS</span>";
   }
   const parts = [guard];
+  const reveal = '<button type="button" aria-pressed="' + REVEALED + '" data-state="closed" '
+    + 'data-slot="pii-reveal-toggle" aria-label="Afficher les données personnelles">' + EYE
+    + (NOSTRUCTURE ? '<span class="sr-only">Afficher les détails</span>' : "") + "</button>";
+  if (NOSTRUCTURE) guard.insertAdjacentHTML("beforeend", reveal);  // before the trigger: a text match finds it first
   if (!NODETAILS) {
-    guard.insertAdjacentHTML("beforeend", '<button data-slot="collapsible-trigger" data-variant="ghost" data-size="xs" '
-      + 'type="button" aria-expanded="false" aria-label="Voir le texte anonymisé envoyé au LLM" data-state="closed">'
+    const id = "details-" + (++detailsCount);
+    guard.insertAdjacentHTML("beforeend", (NOSTRUCTURE ? '<button type="button" aria-expanded="false" data-state="closed">'
+      : '<button data-slot="collapsible-trigger" data-variant="ghost" data-size="xs" type="button" aria-expanded="false" '
+        + 'aria-label="Voir le texte anonymisé envoyé au LLM" data-state="closed">')
       + "<span>Détails</span>" + CHEVRON + "</button>");
     const content = document.createElement("div");
     content.dataset.slot = "collapsible-content";
     content.dataset.state = "closed";
-    content.id = "details-" + (++detailsCount);
+    content.id = id;
     content.hidden = true;
     parts.push(content);
-    const trigger = guard.querySelector('[data-slot="collapsible-trigger"]');
+    const trigger = [...guard.querySelectorAll("button")].find((b) => b.dataset.slot !== "pii-reveal-toggle");
+    if (CONTROLS) trigger.setAttribute("aria-controls", id);  // Radix's CollapsibleTrigger default
     trigger.onclick = () => toggleDetails(art, trigger, content);
   }
-  guard.insertAdjacentHTML("beforeend", '<button type="button" aria-pressed="' + REVEALED + '" data-state="closed" '
-    + 'data-slot="pii-reveal-toggle" aria-label="Afficher les données personnelles">' + EYE + "</button>");
+  if (!NOSTRUCTURE) guard.insertAdjacentHTML("beforeend", reveal);
   guard.querySelector('[data-slot="pii-reveal-toggle"]').onclick = () => { window.__reveal_clicks += 1; };
   const banner = document.createElement("div");
   banner.className = "head";

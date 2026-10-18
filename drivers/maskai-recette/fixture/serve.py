@@ -14,6 +14,9 @@ shows it in the answer card's « Détails » collapsible (pilot v2.2). Trigger
 words in the request body:
 
   SLOW            sleep 8 s before the first event (abandon deadline tests);
+  BODY_DETAILS    append a « Détails » button to the answer (in its body; the
+                  driver must never click it; it counts its clicks in
+                  window.__body_clicks);
   EXTERNAL_IMG    append <img src="http://example.invalid/x"> to the answer
                   (a third-party host, recorded and not blocked);
   TRIGGER_DIALOG  the page opens a confirm() at the end of the stream (dialog guard);
@@ -39,7 +42,9 @@ maintenance card instead (seen at the first live attempt of recette 2: no
 textarea, « MAINTENANCE EN COURS / ON REVIENT TRÈS VITE ! »). The page itself
 reads `nodetails=1` (answer cards without the « Détails » collapsible, the
 composer popover then being the driver's fallback) and `revealed=1` (the cards'
-PII reveal toggle drawn pressed).
+PII reveal toggle drawn pressed), `controls=1` (the « Détails » trigger with
+`aria-controls`) and `nostructure=1` (the trigger without `data-slot`, after a
+reveal toggle carrying a hidden « Afficher les détails »).
 
 Usage: python -I serve.py [port]     (default 8765; 0 picks a free port)
 The first line on stdout is `listening <port>`.
@@ -124,13 +129,16 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def reply(self, status: int, body: bytes = b"", ctype: str = "text/html; charset=utf-8", headers=()):
-        self.send_response(status)
-        for k, v in headers:
-            self.send_header(k, v)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            for k, v in headers:
+                self.send_header(k, v)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except GONE:
+            pass  # the tab went away mid-reply (the busy page's pings as it closes), as in do_POST
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -176,6 +184,9 @@ class Handler(BaseHTTPRequestHandler):
                   + " — pièces jointes : " + (", ".join(attachments) or "aucune"))
         if "EXTERNAL_IMG" in body:
             answer += ' <img src="http://example.invalid/x" alt="x">'
+        if "BODY_DETAILS" in body:
+            answer += (' <button type="button" onclick="window.__body_clicks = (window.__body_clicks || 0) + 1">'
+                       "Détails</button>")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
