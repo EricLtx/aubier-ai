@@ -685,3 +685,169 @@ async fn deliberate_refuses_before_the_model_is_called() {
     );
     node.shutdown().await;
 }
+
+/// A run directory from `drivers/vkforge/tests/debrief_fixtures.py`: "17-10" or "clean".
+fn debrief_run(dir: &Path, which: &str) -> PathBuf {
+    let script = repo_root().join("drivers/vkforge/tests/debrief_fixtures.py");
+    let ok = std::process::Command::new(forge_python())
+        .arg("-I")
+        .arg(&script)
+        .arg(dir)
+        .arg(which)
+        .status()
+        .expect("run the fixture builder")
+        .success();
+    assert!(ok, "debrief_fixtures.py {which}");
+    dir.to_path_buf()
+}
+
+#[tokio::test]
+async fn debrief_is_a_machine_act_that_writes_three_files_and_no_ledger_row() {
+    if !forge_available() {
+        return;
+    }
+    let node = Node::start().await;
+    let run = debrief_run(&node.dir().join("run"), "17-10");
+    let out = node.dir().join("debrief");
+    let before = node.last_event().seq;
+    let r = node
+        .call("driver.debrief", json!({"run": run, "out": out}))
+        .await
+        .unwrap(); // no presence proof
+    for f in ["debrief.json", "proposals.json", "debrief.md"] {
+        assert!(out.join(f).is_file(), "{f}");
+    }
+    assert_eq!(r["proposals"], json!(6));
+    assert_eq!(r["list"][0]["target"], json!("assistant_message"));
+    assert_eq!(
+        r["proposals_sha256"],
+        json!(hash_bytes(
+            &std::fs::read(out.join("proposals.json")).unwrap()
+        ))
+    );
+    assert_eq!(
+        r["debrief_sha256"],
+        json!(hash_bytes(
+            &std::fs::read(out.join("debrief.json")).unwrap()
+        ))
+    );
+    assert_eq!(
+        node.last_event().seq,
+        before,
+        "a debrief writes no ledger row (L-P5)"
+    );
+    // --until reaches the stage: at the end of t2, the selector is the one proposal (debrief §4).
+    let early = node.dir().join("debrief-t2");
+    let r = node
+        .call(
+            "driver.debrief",
+            json!({"run": run, "out": early, "until": "task-node-1-2"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["proposals"], json!(1), "{r}");
+    assert_eq!(r["list"][0]["kind"], json!("selector"));
+    // A stage refusal is relayed verbatim, in the kernel's voice (L-P15).
+    let e = node
+        .call(
+            "driver.debrief",
+            json!({"run": run, "out": node.dir().join("o3"), "until": "task-nope"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        call_error(&e)
+            .message
+            .starts_with("vkforge debrief: until: no task task-nope in the run; remedy: "),
+        "{e}"
+    );
+    assert_eq!(node.last_event().seq, before, "still no ledger row");
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn debrief_refuses_a_run_without_journal_and_a_used_out_before_spawning() {
+    if !forge_available() {
+        return;
+    }
+    let node = Node::start().await;
+    let empty = node.dir().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let e = node
+        .call(
+            "driver.debrief",
+            json!({"run": empty, "out": node.dir().join("o1")}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("no journal.jsonl") && e.contains("; remedy: "),
+        "{e}"
+    );
+    let run = debrief_run(&node.dir().join("clean"), "clean");
+    let used = node.dir().join("used");
+    std::fs::create_dir_all(&used).unwrap();
+    std::fs::write(used.join("x"), "x").unwrap();
+    let e = node
+        .call("driver.debrief", json!({"run": run, "out": used}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("is not empty"), "{e}");
+    let refused = [
+        (
+            json!({"run": "clean", "out": node.dir().join("o2")}),
+            "run clean is not absolute; remedy: ",
+        ),
+        (
+            json!({"run": run, "out": run.join("debrief")}),
+            "is inside the run directory; remedy: ",
+        ),
+        (
+            json!({"run": run, "out": used.join("x")}),
+            "is not a directory; remedy: ",
+        ),
+        (
+            json!({"run": run, "out": node.dir().join("o2"), "apply": true}),
+            "driver.debrief takes run, out and until, nothing else",
+        ),
+    ];
+    for (params, expected) in refused {
+        let e = node
+            .call("driver.debrief", params)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(expected), "{expected}: {e}");
+    }
+    let e = node
+        .call_human(
+            "driver.debrief",
+            json!({"run": run, "out": node.dir().join("o2")}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("does not take a presence proof"),
+        "a machine act, not in takes_presence: {e}"
+    );
+    assert!(
+        !node.dir().join("o1").exists(),
+        "nothing written on a refusal"
+    );
+    assert!(
+        !node.dir().join("o2").exists(),
+        "nothing written on a refusal"
+    );
+    assert!(
+        !run.join("debrief").exists(),
+        "the run directory is read, never written"
+    );
+    assert!(
+        !node.dir().join("forge").join("debrief").exists(),
+        "all refused before a process was spawned"
+    );
+    node.shutdown().await;
+}

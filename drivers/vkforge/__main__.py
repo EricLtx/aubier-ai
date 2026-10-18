@@ -11,14 +11,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent              # drivers/vkforge
 sys.path.insert(0, str(HERE.parent))                 # drivers/: vkforge and vkdriver from the repository
 
-from vkforge import generate, inventory, mine, ontology, plan, qualify  # noqa: E402
+from vkforge import debrief, generate, inventory, mine, ontology, plan, qualify  # noqa: E402
 from vkforge.errors import Refusal  # noqa: E402
 
 # The stage table, built here and nowhere else. A stage module defines add_arguments(parser) and
 # run(ns) -> int and does nothing at import: run as a script this file is `__main__`, so a stage
 # importing `vkforge.__main__` to register itself would fill a second copy of this table.
 STAGES = {"inventory": inventory, "bind": ontology, "mine": mine, "plan": plan, "generate": generate,
-          "qualify": qualify}
+          "qualify": qualify, "debrief": debrief}
 
 
 def main(argv=None) -> int:

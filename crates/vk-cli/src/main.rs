@@ -605,6 +605,22 @@ enum DriverCmd {
         #[command(subcommand)]
         what: PlanCmd,
     },
+    /// Debrief a governed run from its evidence: signals, proposals with the
+    /// lines that support them, and sections 1-3 of a debrief. Not a human
+    /// act: it reads files the node holds in clear and writes three files; it
+    /// applies nothing and writes no ledger row.
+    Debrief {
+        /// The run directory: journal.jsonl and tasks/<id>.json, optionally
+        /// journal-*.jsonl, driver.log, vkd-console.log, dmesg.json, cases.json.
+        #[arg(long, value_name = "DIR")]
+        run: PathBuf,
+        /// A new or empty directory for debrief.json, proposals.json, debrief.md.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// Debrief only the evidence up to the end of this task.
+        #[arg(long, value_name = "TASK")]
+        until: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1344,6 +1360,25 @@ async fn call(cli: &Cli) -> Result<()> {
             )
             .await?,
             render::plan_shown,
+        ),
+        // A machine act, no presence proof. The paths are made absolute here,
+        // where they mean what the person typed: the daemon's working
+        // directory is its own.
+        Cmd::Driver {
+            what: DriverCmd::Debrief { run, out, until },
+        } => show(
+            cli,
+            c.call(
+                "driver.debrief",
+                json!({
+                    "run": plain_path(&absolute(run)?),
+                    "out": plain_path(&absolute(out)?),
+                    "until": until,
+                }),
+                None,
+            )
+            .await?,
+            render::debriefed,
         ),
         Cmd::Task { what } => task(cli, &c, what).await,
         Cmd::Harness { what } => harness(cli, &c, what).await,

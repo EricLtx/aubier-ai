@@ -1,5 +1,5 @@
-//! vkforge under the daemon (driver-learning spec §4.10, plan Task 9): `driver.learn`,
-//! `driver.qualify` and `driver.plan_show`.
+//! vkforge under the daemon (driver-learning spec §4.10, plan Tasks 9 and 11): `driver.learn`,
+//! `driver.qualify`, `driver.plan_show` and `driver.debrief`.
 //!
 //! Learning a driver is six stages of `drivers/vkforge` — inventory, bind, mine, plan, generate,
 //! qualify — each a **governed one-shot process** (ruling L-P2): `<python> -I
@@ -8,6 +8,9 @@
 //! stderr kept under the state directory. Never protocol 1: a pipeline is not request/response.
 //! A stage that refuses speaks the kernel's voice — one line, `vkforge <stage>: …; remedy: …`
 //! (ruling L-P15) — and that line is the refusal, verbatim.
+//!
+//! The seventh stage, `debrief`, reads a governed run's evidence after the fact and proposes
+//! what to change; it is a machine act that applies nothing and writes no ledger row (L-P5).
 //!
 //! None of it runs under the kernel lock (ruling L-P17): the arms are dispatched before the
 //! general lock, as `driver.pack` is, and a stage runs for seconds to minutes on the connection's
@@ -1012,6 +1015,108 @@ pub fn plan_show(p: Value) -> Result<Value, RpcError> {
     }))
 }
 
+/// How long a debrief may run: it reads a run's files, a few megabytes.
+pub const DEBRIEF_DEADLINE: Duration = Duration::from_secs(120);
+
+/// What `driver.debrief` takes, and nothing else.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DebriefParams {
+    run: PathBuf,
+    out: PathBuf,
+    #[serde(default)]
+    until: Option<String>,
+}
+
+/// `driver.debrief {run, out, until?}` (founder decision 2026-10-17): vkforge's `debrief` stage
+/// on a run directory the operator assembled, under the same governor as `learn`'s stages, its
+/// logs under `<state_dir>/forge/debrief/`. A machine act: no presence proof and no ledger row
+/// (ruling L-P5) — the answer carries the hashes of `debrief.json` and `proposals.json`, so
+/// whoever applies a proposal can name the evidence that motivated it. Nothing is applied.
+///
+/// Refused before spawning, in the kernel's voice, what the stage would refuse: a relative path
+/// (the stage runs in the vkforge root, not in the daemon's working directory), a run without
+/// `journal.jsonl`, an `out` that is a file, is not empty or lies inside the run directory; and
+/// a debrief while another one runs.
+pub fn debrief(cfg: &ForgeConfig, state_dir: &Path, p: Value) -> Result<Value, RpcError> {
+    let DebriefParams { run, out, until } = serde_json::from_value(p).map_err(|e| {
+        bad(&format!(
+            "driver.debrief takes run, out and until, nothing else ({e}); remedy: vk driver \
+             debrief --run DIR --out DIR"
+        ))
+    })?;
+    for (flag, path) in [("run", &run), ("out", &out)] {
+        if !path.is_absolute() {
+            return Err(bad(&format!(
+                "{flag} {} is not absolute; remedy: name it by its absolute path",
+                path.display()
+            )));
+        }
+    }
+    if !run.join("journal.jsonl").is_file() {
+        return Err(bad(&format!(
+            "no journal.jsonl under {}; remedy: copy the driver's journal (its work directory) \
+             into the run directory",
+            run.display()
+        )));
+    }
+    if out.exists() && !out.is_dir() {
+        return Err(bad(&format!(
+            "out {} is not a directory; remedy: a new directory: a debrief never overwrites one",
+            out.display()
+        )));
+    }
+    if !empty_or_absent(&out) {
+        return Err(bad(&format!(
+            "out {} is not empty; remedy: a new directory: a debrief never overwrites one",
+            out.display()
+        )));
+    }
+    // The containment `learn` checks for its corpus, on canonical paths.
+    if inside_corpus(&out, &run) {
+        return Err(bad(&format!(
+            "out {} is inside the run directory; remedy: a new directory outside it: the run \
+             directory is read, never written",
+            out.display()
+        )));
+    }
+    // One debrief at a time (L-P55's lock, under the name of its log directory): two would
+    // write the same stage logs, and a `learn` of a driver named `debrief` would clear them.
+    let _claim = Claim::take(state_dir, "debrief", "debrief")?;
+    let mut args = vec!["--run".into(), arg(&run), "--out".into(), arg(&out)];
+    if let Some(task) = until {
+        // One argument, so a value that starts with `-` is still the value.
+        args.push(format!("--until={task}"));
+    }
+    let logs = state_dir.join("forge").join("debrief");
+    run_stage(cfg, "debrief", &args, &logs, DEBRIEF_DEADLINE)?;
+    let signals = read_output(&out.join("debrief.json"), "debrief", "debrief.json")?;
+    let proposals = read_output(&out.join("proposals.json"), "debrief", "proposals.json")?;
+    let list: Vec<Value> = serde_json::from_slice(&proposals).map_err(|e| {
+        internal(&format!(
+            "vkforge debrief wrote a proposals.json that does not parse ({e})"
+        ))
+    })?;
+    let list: Vec<Value> = list
+        .iter()
+        .map(|p| {
+            json!({
+                "kind": p["kind"],
+                "target": p["target"],
+                "confidence": p["confidence"],
+                "proposal": p["proposal"],
+            })
+        })
+        .collect();
+    Ok(json!({
+        "out": arg(&out),
+        "proposals": list.len(),
+        "list": list,
+        "debrief_sha256": hash_bytes(&signals),
+        "proposals_sha256": hash_bytes(&proposals),
+    }))
+}
+
 /// A path as a stage argument. The paths came in as JSON strings, so they are UTF-8.
 fn arg(p: &Path) -> String {
     p.to_string_lossy().into_owned()
@@ -1238,6 +1343,32 @@ mod tests {
         drop(held);
         Claim::take(&a, "word-maison", "qualify").expect("free once released");
         drop((other_name, other_node));
+    }
+
+    /// One debrief at a time per state directory, and not while a driver named `debrief` is being
+    /// learned: both would use `<state>/forge/debrief`. Refused before the stage is spawned.
+    #[test]
+    fn a_debrief_waits_for_the_one_in_progress() {
+        let t = tempfile::tempdir().unwrap();
+        let (state, run) = (t.path().join("state"), t.path().join("run"));
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("journal.jsonl"), "").unwrap();
+        let cfg = ForgeConfig::at(t.path().join("nowhere"));
+        let params = json!({"run": run, "out": t.path().join("out")});
+        let held = Claim::take(&state, "debrief", "learn").unwrap();
+        let e = debrief(&cfg, &state, params.clone()).unwrap_err();
+        assert_eq!(
+            e.message,
+            "learn of debrief already in progress; remedy: wait for it"
+        );
+        assert!(!state.join("forge").exists(), "refused before a spawn");
+        drop(held);
+        let e = debrief(&cfg, &state, params).unwrap_err();
+        assert!(
+            e.message.starts_with("vkforge root not found"),
+            "{}",
+            e.message
+        );
     }
 
     /// A root without `vkforge/__main__.py` is refused at the first spawn, before anything is

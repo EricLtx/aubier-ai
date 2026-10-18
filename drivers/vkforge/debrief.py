@@ -1,0 +1,505 @@
+"""vkforge debrief --run DIR --out DIR [--until TASK] — the post-launch retro-learning loop.
+
+Founder decision 2026-10-17; requirements: docs/technical/debriefs/2026-10-17-maskai-driver.md §4.
+Reads what the node holds in clear after a governed run of a driver and writes debrief.json (the
+signals), proposals.json (what to change, each with its evidence lines) and debrief.md (sections
+1-3 of a debrief). Deterministic, stdlib only, no model, no socket. Nothing is applied here: the
+operator applies a proposal; for a learned driver the deliberate run proposes the rule (spec §5.3).
+
+Run directory (fixed names; only journal.jsonl and tasks/ are required):
+  journal.jsonl          the run's journal (the driver's work directory)
+  journal-*.jsonl        journals set aside during the run (a first try, kept)
+  driver.log             the driver's stderr, as the host appends it
+  vkd-console.log        the daemon's console: harness notes `harness log task=… harness=…`
+  tasks/<task_id>.json   `vk task show <task_id> --json`, one per task of the run
+  dmesg.json             `vk dmesg -n N --json` covering the run (`kind`, `wall_ms` are read)
+  cases.json             the driver's cases (`level`, `kind`, `budget_s` per case are read)
+  manifest.json          the driver's manifest (`kind: com` marks a learned driver)
+"""
+import argparse
+import json
+import math
+import re
+import statistics
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from .errors import Refusal
+
+KINDS = ("selector", "modal", "budget", "oracle", "recipe")
+REASONS = ("timeout", "dialog", "precondition", "host", "internal")
+EVIDENCE_CAP = 8
+CLIP = 240
+# What stays human, per kind (debrief 2026-10-17 §4): the debrief proposes, never writes.
+HUMAN = {
+    "selector": "l'opérateur corrige SELECTORS dans driver.py : nouveau driver_id, remontage signé",
+    "modal": "l'opérateur qualifie la modale (bénigne ou sécurité) puis l'ajoute à KNOWN_MODALS : "
+             "nouveau driver_id, remontage signé",
+    "budget": "l'opérateur change budget_s dans cases.json : nouvelle inputs_sha256, déclarée dans le delta du rapport",
+    "oracle": "l'opérateur change l'oracle ou l'évaluation : nouvelle inputs_sha256 ; un verdict publié ne se "
+              "corrige que par une ligne supersedes écrite par un humain",
+    "recipe": "l'opérateur change la consigne de la recette (recipes/*.json), relue et committée",
+}
+# A learned driver's code is never edited by hand (spec §3.3): its selector and modal fixes go
+# through the deliberate run, which proposes a projection rule a human reviews (spec §5.3).
+HUMAN_LEARNED = ("driver appris : son code ne s'édite pas ; vk driver learn --deliberate VERBE propose la règle, "
+                 "relue par un humain (spec §5.3)")
+
+ABANDON = re.compile(r"abandon à (\d+(?:[.,]\d+)?) s \(3 × budget (\d+(?:[.,]\d+)?) s\)")
+OVER = re.compile(r"latence (\d+(?:[.,]\d+)?) s > budget (\d+(?:[.,]\d+)?) s")
+EMPTY = re.compile(r"réponse vide")
+ANSWER = re.compile(r"réponse : «(.*)", re.S)
+HEADER = re.compile(r"\bmaskai\s+[a-z][a-z0-9_-]*/[a-z0-9][a-z0-9._:-]*|aucune donn[ée]e personnelle d[ée]tect[ée]e"
+                    r"|anonymis[ée]\s*→|l'aiguilleur", re.I)
+LIVE = re.compile(r"·\s*en direct|affichage encore en mouvement")
+UNSENT = "texte envoyé non observé"
+UNSEEN_DOC = re.compile(r"je n['\u2019]ai pas acc[èe]s|aucun (?:document|fichier)|ne (?:vois|retrouve) aucun", re.I)
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+NOTE = re.compile(r"^(\S+)\s.*?harness log task=(\S+) harness=(.*)$")
+REFUSAL = re.compile(r"refus\w*\s*\((%s)\)" % "|".join(REASONS))
+MODAL = re.compile(r"modale inconnue\s*:\s*(.+?)(?:\s+[—–]\s+|\s*;|\s*$)")
+LOGLINE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ ([A-Z]+) (\S+) (.*)$")
+MAINT = re.compile(r"service in maintenance|service en maintenance", re.I)
+DISMISSED = re.compile(r"known modal (\S+) dismissed")
+LEVEL = re.compile(r"^\s*Niveau (N\d+)")
+NO_ARTEFACT = "harness produced no artefact"
+
+
+def _ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+def _num(s: str) -> float:
+    return float(s.replace(",", "."))
+
+
+def _clip(s: str) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= CLIP else s[: CLIP - 1] + "…"
+
+
+def _status(s) -> str:
+    return s if isinstance(s, str) else "; ".join(f"{k}: {v}" for k, v in s.items())
+
+
+def _stats(values: list) -> dict:
+    v = sorted(values)
+    return {"n": len(v), "median": statistics.median(v), "p90": v[max(0, math.ceil(0.9 * len(v)) - 1)], "max": v[-1]}
+
+
+def _answer(e: dict):
+    m = ANSWER.search(e.get("evidence") or "")
+    return m.group(1) if m else None
+
+
+def _json(at: str, text: str):
+    """A JSON document or journal line of the run directory, or the refusal naming where it breaks
+    (L-P15: one line, never a traceback): a journal line cut mid-write, a dump that is not JSON."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise Refusal(f"{at} is not JSON ({e})", "the run directory holds copies: copy that file again, "
+                      "or drop a line cut mid-write from the copy") from None
+
+
+class Run:
+    """The run directory, loaded: every line keeps its place (`at`), its time and its task."""
+
+    def __init__(self, root: Path, until=None):
+        if not (root / "journal.jsonl").is_file():
+            raise Refusal(f"no journal.jsonl under {root}",
+                          "copy the driver's journal (its work directory) into the run directory")
+        dumps = sorted((root / "tasks").glob("*.json")) if (root / "tasks").is_dir() else []
+        if not dumps:
+            raise Refusal(f"no task dump under {root / 'tasks'}",
+                          "vk task show TASK --json > tasks/TASK.json for each task of the run")
+        self.root, self.text = root, {}
+        tasks = []
+        for p in dumps:
+            t = _json(f"tasks/{p.name}", p.read_text(encoding="utf-8-sig"))
+            ends = [x for s in t["steps"] for x in (s.get("started_ms"), s.get("ended_ms")) if x]
+            tasks.append(dict(t, _file=f"tasks/{p.name}", _end=max(ends + [t["created_ms"]])))
+        self.tasks = sorted(tasks, key=lambda t: t["created_ms"])
+        self.limit = None
+        if until is not None:
+            hit = [t for t in self.tasks if t["id"] == until]
+            if not hit:
+                raise Refusal(f"until: no task {until} in the run", "name a task of the run's tasks/ directory")
+            self.limit = hit[0]["_end"]
+            self.tasks = [t for t in self.tasks if t["created_ms"] <= self.limit]
+        cases = root / "cases.json"
+        self.cases = _json("cases.json", cases.read_text(encoding="utf-8-sig"))["cases"] if cases.is_file() else {}
+        manifest = root / "manifest.json"
+        self.learned = manifest.is_file() and _json("manifest.json", manifest.read_text(encoding="utf-8-sig")).get(
+            "kind") == "com"
+        self.journal = self._journal("journal.jsonl", effective=True)
+        self.set_aside = [e for p in sorted(root.glob("journal-*.jsonl")) for e in self._journal(p.name, effective=False)]
+        first = (self.journal or self.set_aside or [None])[0]
+        # driver.log carries the node's local time without an offset: the journal's offset names it
+        self.tz = timezone(first["_t0"].utcoffset() if first else timedelta(0))
+        self.notes = self._notes(root / "vkd-console.log")
+        self.log = self._driver_log(root / "driver.log")
+        dmesg = root / "dmesg.json"
+        rows = _json("dmesg.json", dmesg.read_text(encoding="utf-8-sig")) if dmesg.is_file() else None
+        self.ledger = None if rows is None else [r for r in rows if self._keep(r["wall_ms"])]
+
+    def _keep(self, ms: int) -> bool:
+        return self.limit is None or ms <= self.limit
+
+    def _task(self, lo: int, hi: int):
+        hit = [t["id"] for t in self.tasks if t["created_ms"] <= hi and t["_end"] >= lo]
+        return hit[-1] if hit else None
+
+    def _journal(self, name: str, effective: bool) -> list:
+        raw = (x for x in (self.root / name).read_text(encoding="utf-8-sig").splitlines() if x.strip())
+        events = [_json(f"{name}:{n}", x) for n, x in enumerate(raw, 1)]
+        stamped = [(e, datetime.fromisoformat(e["ts"])) for e in events]
+        # journal.py's corrections: `supersedes` is the index of the line replaced; with --until, a
+        # correction written after the limit has not happened yet
+        dropped = {e["supersedes"] for e, t0 in stamped
+                   if effective and e.get("supersedes") is not None and self._keep(_ms(t0))}
+        out = []
+        for i, (e, t0) in enumerate(stamped):
+            lo = _ms(t0)
+            hi = lo + (59_999 if len(e["ts"]) <= 22 else 999)  # "…T15:31+02:00" is a minute wide
+            if i in dropped or not self._keep(lo):
+                continue
+            at = f"{name}:{i + 1}"
+            self.text[at] = json.dumps(e, ensure_ascii=False)
+            out.append(dict(e, _at=at, _t0=t0, _lo=lo, _task=self._task(lo, hi)))
+        return out
+
+    def _notes(self, path: Path):
+        if not path.is_file():
+            return None
+        out = []
+        for n, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+            m = NOTE.match(ANSI.sub("", raw))
+            if m and self._keep(ms := _ms(datetime.fromisoformat(m.group(1)))):
+                self.text[f"{path.name}:{n}"] = m.group(3)
+                out.append({"at": f"{path.name}:{n}", "ms": ms, "task": m.group(2), "text": m.group(3)})
+        return out
+
+    def _driver_log(self, path: Path):
+        if not path.is_file():
+            return None
+        out = []
+        for n, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+            m = LOGLINE.match(raw)
+            if m and self._keep(ms := _ms(datetime.fromisoformat(m.group(1)).replace(tzinfo=self.tz))):
+                self.text[f"{path.name}:{n}"] = f"{m.group(2)} {m.group(4)}"
+                out.append({"at": f"{path.name}:{n}", "ms": ms, "task": self._task(ms, ms), "text": m.group(4)})
+        return out
+
+    def evidence(self, items: list) -> list:
+        return [{"at": x["at"], "task": x["task"], "text": _clip(self.text[x["at"]])} for x in items]
+
+
+def signals(run: Run) -> dict:
+    def level_of(cid):
+        m = re.match(r"(N\d+)-", cid)
+        return run.cases.get(cid, {}).get("level") or (m.group(1) if m else "?")
+
+    notes = run.notes or []
+    refusal_notes = [(n, m.group(1)) for n in notes for m in [REFUSAL.search(n["text"])] if m]
+    lines = run.journal + run.set_aside
+    cases = []
+    # the run's verdicts, corrections applied: a `correction` line replaces the line it supersedes
+    for e in (x for x in run.journal if x.get("step") in ("exec", "correction")):
+        ev, cid = e.get("evidence") or "", e["case"]
+        ab, over = ABANDON.search(ev), OVER.search(ev)
+        budget = _num((ab or over).group(2)) if (ab or over) else run.cases.get(cid, {}).get("budget_s")
+        reasons = (["timeout"] if ab else []) + [
+            r for n, r in refusal_notes if r != "timeout" and re.search(rf"\b{re.escape(cid)}\b", n["text"])]
+        cases.append({"case": cid, "level": level_of(cid), "verdict": e["verdict"], "timing_s": e.get("timing_s"),
+                      "budget_s": budget, "aborted": bool(ab), "over_budget": bool(ab or over), "reasons": reasons,
+                      "at": e["_at"], "task": e["_task"]})
+
+    def acts_in(lo, hi):
+        if run.ledger is None:
+            return None
+        return sum(1 for r in run.ledger if r["kind"] == "driver.acted" and lo <= r["wall_ms"] <= hi)
+
+    levels, tasks = {}, []
+    for t in run.tasks:  # one pass per harness step whose instruction names its level
+        usage = t.get("usage") or []
+
+        def cost(i=None):
+            return round(sum(u.get("cost_list_usd") or 0 for u in usage if i is None or u.get("step_index") == i), 3)
+
+        harness = 0.0
+        for i, s in enumerate(t["steps"]):
+            m = LEVEL.match(s["kind"].get("instruction") or "") if s["kind"].get("kind") == "harness" else None
+            if not m or not s.get("started_ms"):
+                continue
+            harness += cost(i)
+            lo, hi = s["started_ms"], s.get("ended_ms") or s["started_ms"]
+            p = {"task": t["id"], "step": i, "level": m.group(1), "status": _status(s["status"]),
+                 "duration_s": round((hi - lo) / 1000), "acts": acts_in(lo, hi), "cost_usd": cost(i),
+                 "new_lines": sum(1 for e in lines if e["_task"] == t["id"] and level_of(e["case"]) == m.group(1)),
+                 "at": f"{t['_file']}#steps[{i}]", "_w": (lo, hi)}
+            run.text[p["at"]] = f"{p['level']} : {p['status']} ({p['acts']} actes)"
+            levels.setdefault(m.group(1), []).append(p)
+        tasks.append({"id": t["id"], "status": t["status"], "window": [t["created_ms"], t["_end"]],
+                      "levels": [lv for lv in sorted(levels) if any(p["task"] == t["id"] for p in levels[lv])],
+                      "acts": acts_in(t["created_ms"], t["_end"]), "harness_usd": round(harness, 3), "cost_usd": cost()})
+    passes = [p for ps in levels.values() for p in ps]
+    replays = [p for p in passes if p["status"] == "done" and p["new_lines"] == 0]
+    console_from = notes[0]["ms"] if notes else None
+    no_artefact = [{"task": p["task"], "level": p["level"], "step": p["step"], "acts": p["acts"], "at": p["at"],
+                    "refusals_noted": None if console_from is None or console_from > p["_w"][0] else sum(
+                        1 for n, _ in refusal_notes if n["task"] == p["task"] and p["_w"][0] <= n["ms"] <= p["_w"][1])}
+                   for p in passes if NO_ARTEFACT in p["status"]]
+    modals = {}
+    for i, n in enumerate(notes):  # after_abort: the task's previous other note was an abandon
+        m = MODAL.search(n["text"])
+        if m:
+            before = [x for x in notes[:i] if x["task"] == n["task"] and not MODAL.search(x["text"])]
+            e = modals.setdefault(m.group(1), {"text": m.group(1), "count": 0, "after_abort": 0, "lines": []})
+            e["count"] += 1
+            e["after_abort"] += bool(before and "abandon" in before[-1]["text"])
+            e["lines"].append({"at": n["at"], "task": n["task"]})
+    dismissed = {}
+    for x in run.log or []:
+        if m := DISMISSED.search(x["text"]):
+            dismissed[m.group(1)] = dismissed.get(m.group(1), 0) + 1
+    maintenance = ([{"at": x["at"], "task": x["task"]} for x in run.log or [] if MAINT.search(x["text"])]
+                   + [{"at": n["at"], "task": n["task"]} for n in notes if MAINT.search(n["text"])]
+                   + [{"at": e["_at"], "task": e["_task"]} for e in lines if MAINT.search(e.get("evidence") or "")])
+    answered = [(e, a) for e in run.journal for a in [_answer(e)] if a is not None]
+    pipelines = [e["pipeline_ms"] for e in run.journal if e.get("pipeline_ms")]
+    nodes = sorted({k for p in pipelines for k in p})
+    classes = {}
+    for c in cases:
+        if isinstance(c["timing_s"], (int, float)):
+            classes.setdefault((run.cases.get(c["case"], {}).get("kind", "?"), c["budget_s"] or 0), []).append(c)
+    hashes = {"lines_without_ui_profile": sum(1 for e in lines if "ui_profile_sha256" not in e), "changes": []}
+    for field in ("inputs_sha256", "ui_profile_sha256"):
+        seen, prev = [], None
+        for e in sorted(lines, key=lambda e: (e["_lo"], e["_at"])):
+            v = e.get(field)
+            if v and v not in [x["value"] for x in seen]:
+                seen.append({"value": v, "from": e["_at"]})
+            if v and prev and v != prev:
+                hashes["changes"].append({"field": field, "at": e["_at"], "from": prev, "to": v})
+            prev = v or prev
+        hashes[field] = seen
+    header = [(e, a) for e, a in answered if HEADER.search(a)]
+    aborted = sorted(c["case"] for c in cases if c["aborted"])
+    concurrent = [{"case": c["case"], "at": c["at"], "pairs": pairs} for c in cases
+                  if run.cases.get(c["case"], {}).get("kind") == "concurrent"
+                  for pairs in [[x for x in aborted if re.search(rf"\b{re.escape(x)}\b", run.text[c["at"]])]] if pairs]
+    composer = {}
+    for e in run.journal:
+        if e.get("config"):
+            key = (e["config"].get("model"), e["config"].get("web"))
+            composer[key] = composer.get(key, 0) + 1
+    return {
+        "run": {"tasks": [t["id"] for t in run.tasks], "until_ms": run.limit, "learned_driver": run.learned,
+                "inputs": sorted(p.relative_to(run.root).as_posix() for p in run.root.rglob("*") if p.is_file()),
+                "console_from_ms": console_from},
+        "tasks": tasks,
+        "acts_total": None if run.ledger is None else sum(1 for r in run.ledger if r["kind"] == "driver.acted"),
+        "relaunches": [{"after": a["id"], "next": b["id"]} for a, b in zip(run.tasks, run.tasks[1:]) if a["status"] != "done"],
+        "cases": cases,
+        "levels": {k: [{x: v for x, v in p.items() if x != "_w"} for p in ps] for k, ps in sorted(levels.items())},
+        "refusals": {r: sum(c["aborted"] for c in cases) if r == "timeout" else sum(1 for _, x in refusal_notes if x == r)
+                     for r in REASONS},
+        "selector_suspects": [{"case": e["case"], "at": e["_at"], "task": e["_task"], "call_llm_ms": e["pipeline_ms"]["call_llm"]}
+                              for e in lines if EMPTY.search(e.get("evidence") or "")
+                              and (e.get("pipeline_ms") or {}).get("call_llm", 0) > 0],
+        "empty_without_llm": [{"case": e["case"], "at": e["_at"], "task": e["_task"]} for e in lines
+                              if EMPTY.search(e.get("evidence") or "") and not (e.get("pipeline_ms") or {}).get("call_llm")],
+        "modal_refusals": list(modals.values()),
+        "known_modals_dismissed": dismissed,
+        "maintenance": maintenance,
+        "cut_suspects": [{"case": e["case"], "at": e["_at"]} for e, a in answered if LIVE.search(a)],
+        "attachment_unseen": [{"case": e["case"], "at": e["_at"]} for e, a in answered
+                              if run.cases.get(e["case"], {}).get("kind") == "attach_question" and UNSEEN_DOC.search(a)],
+        "header_in_answer": {"lines": len(header), "of": len(answered),
+                             "at": [{"at": e["_at"], "task": e["_task"]} for e, _ in header]},
+        "sent_unobserved": {"lines": sum(1 for e, _ in answered if UNSENT in e["evidence"]), "of": len(answered)},
+        "replays": {"passes": len(replays), "acts": sum(p["acts"] or 0 for p in replays),
+                    "cost_usd": round(sum(p["cost_usd"] for p in replays), 3)},
+        "levels_without_artefact": no_artefact,
+        "concurrent_on_failing": concurrent,
+        "composer": [{"model": m, "web": w, "lines": n} for (m, w), n in sorted(composer.items(), key=str)],
+        "hashes": hashes,
+        "constant_nodes": {k: vs[0] for k in nodes for vs in [[p[k] for p in pipelines if k in p]]
+                           if len(vs) >= 5 and len(set(vs)) == 1},
+        "pipeline": {k: _stats([p[k] for p in pipelines if k in p]) for k in nodes},
+        "latency_classes": [{"kind": k, "budget_s": b, **_stats([c["timing_s"] for c in cs]),
+                             "over_budget": sum(c["over_budget"] for c in cs), "aborted": sum(c["aborted"] for c in cs)}
+                            for (k, b), cs in sorted(classes.items())],
+    }
+
+
+def propose(run: Run, s: dict) -> list:
+    out, order = [], {t: i for i, t in enumerate(s["run"]["tasks"])}
+
+    def add(kind, target, items, proposal, confidence):
+        out.append({"kind": kind, "target": target, "evidence": run.evidence(items[:EVIDENCE_CAP]),
+                    "evidence_total": len(items), "proposal": proposal, "confidence": confidence,
+                    "tasks": sorted({x["task"] for x in items if x["task"]}, key=order.get), "proposed_by": "debrief",
+                    "human": HUMAN_LEARNED if run.learned and kind in ("selector", "modal") else HUMAN[kind]})
+
+    sus = s["selector_suspects"]  # D1: an empty answer although the stream carried call_llm
+    if sus:
+        add("selector", "assistant_message", sus,
+            f"{', '.join(x['case'] for x in sus)} : réponse vide alors que le flux a porté call_llm "
+            f"({', '.join(str(x['call_llm_ms']) for x in sus)} ms) : le sélecteur de la réponse ne vise plus la carte ; "
+            "la relever sur dom.html ou la capture, corriger le sélecteur, sonder l'interface avant N0",
+            "high" if len(sus) >= 2 else "medium")
+    for m in s["modal_refusals"]:  # D2: a modal the driver does not know blocks every act
+        add("modal", m["text"], m["lines"],
+            f"KNOWN_MODALS += « {m['text']} » : sélecteur structurel relevé sur modal.html ou la capture, fermeture "
+            "par la croix, jamais par « Envoyer »" + (f" ; {m['after_abort']}/{m['count']} refus suivent un abandon : "
+                                                     "cliquer sur arrêt avant de rendre la main" if m["after_abort"] else ""),
+            "high" if m["count"] >= 2 else "medium")
+    by_level = {}
+    for c in s["cases"]:
+        by_level.setdefault(c["level"], []).append(c)
+    for level, cs in sorted(by_level.items()):  # D8: a level whose cases end by abandon
+        ab = [c for c in cs if c["aborted"]]
+        if len(ab) >= 2 and 2 * len(ab) >= len(cs):
+            profiled = all("question partie" in run.text[c["at"]] and "flux ouvert" in run.text[c["at"]] for c in ab)
+            add("budget", level, ab,
+                f"{level} : {len(ab)}/{len(cs)} cas abandonnés à 3 × le budget (budgets "
+                f"{', '.join(f'{b:g}' for b in sorted({c['budget_s'] for c in ab}))} s) ; "
+                + ("la question est partie et le flux a démarré : relever le budget de la classe au temps du produit"
+                   if profiled else "sans profil d'abandon la faute produit n'est pas démontrée : instrumenter "
+                                    "l'abandon (question partie, flux ouvert, dernier nœud) avant de juger, ou relever le budget"),
+                "high" if profiled else "medium")
+    h = s["header_in_answer"]  # D5: the judged text carries the header (model banner, guard panel)
+    if h["of"] >= 3 and 2 * h["lines"] >= h["of"]:
+        add("oracle", "answer_scope", h["at"],
+            f"la réponse jugée contient l'en-tête (bannière du modèle, panneau de garde) sur {h['lines']}/{h['of']} "
+            "lignes : un must qui nomme un modèle ou un mot de garde peut passer sur l'en-tête seul ; évaluer le "
+            "corps seul, rejuger les cas dont un must nomme un modèle", "medium")
+    if s["maintenance"]:
+        add("recipe", "maintenance", s["maintenance"],
+            f"la page de maintenance est apparue {len(s['maintenance'])} fois : la consigne suspend le niveau sur le "
+            "refus « service en maintenance », sans juger, et le reprend quand le service revient ; les cas jugés "
+            "pendant la fenêtre se rejouent", "high")
+    na = s["levels_without_artefact"]  # D11: a harness ended a level without an artefact
+    if na:
+        add("recipe", "level_without_artefact", na,
+            f"{len(na)} niveau(x) fini(s) sans artefact ({', '.join(x['task'] + ' ' + x['level'] for x in na)}) : "
+            "la consigne termine un niveau par une note de refus (raison, dernier refus) quand tous ses actes sont "
+            "refusés ; côté driver, une capture d'écran hors du garde-modale", "high" if len(na) >= 2 else "medium")
+    return sorted(out, key=lambda p: (KINDS.index(p["kind"]), p["target"]))
+
+
+def _hm(ms: int, tz) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz).strftime("%H:%M")
+
+
+def _usd(x) -> str:
+    return "—" if x is None else f"{x:.3f}".replace(".", ",")
+
+
+def _n(x) -> str:
+    return f"{x:g}".replace(".", ",")
+
+
+def render(run: Run, s: dict, proposals: list) -> str:
+    """Sections 1-3 of a debrief, in the register of docs/technical/debriefs/; 4 and 5 are human."""
+    tz = run.tz
+    drivers = sorted({d for t in run.tasks for st in t["steps"] for d in st["kind"].get("drivers", [])})
+    day = datetime.fromtimestamp(run.tasks[0]["created_ms"] / 1000, tz).date().isoformat()
+    ref = {(p["kind"], p["target"]): f"{p['kind']} `{p['target']}` ({p['confidence']})" for p in proposals}
+    out = [f"# Debrief automatique — {', '.join(drivers) or 'driver'} ({day})", "",
+           "Produit par `vkforge debrief` sur " + ", ".join(f"`{x}`" for x in s["run"]["inputs"]) + ". **[V]** lu sur "
+           "pièce, **[I]** déduit. Heures locales, coûts USD des tables `vk task show`. Les sections 4 et 5 (cahier des "
+           "charges, propositions retenues) restent humaines : `proposals.json` en est l'entrée.", "",
+           "## 1. Chronologie du run", "",
+           "| Tâche | Fenêtre | Niveaux | Statut | Actes | Harnais | Total |", "|---|---|---|---|---|---|---|"]
+    for t in s["tasks"]:
+        out.append(f"| {t['id']} | {_hm(t['window'][0], tz)}–{_hm(t['window'][1], tz)} | {', '.join(t['levels']) or '—'} "
+                   f"| {t['status']} | {'—' if t['acts'] is None else t['acts']} | {_usd(t['harness_usd'])} | {_usd(t['cost_usd'])} |")
+    out += ["", "| Niveau | Tâche | Statut | Durée | Actes | Coût | Lignes |", "|---|---|---|---|---|---|---|"]
+    out += [f"| {lv} | {p['task']} | {p['status']} | {p['duration_s']} s | {'—' if p['acts'] is None else p['acts']} | "
+            f"{_usd(p['cost_usd'])} | {p['new_lines']} |" for lv, ps in s["levels"].items() for p in ps]
+    r = s["replays"]
+    out += ["", f"Rejeux sans ligne nouvelle : {r['passes']} passes, {r['acts']} actes, {_usd(r['cost_usd'])} USD [V]. "
+                f"Relances après un arrêt : {len(s['relaunches'])} [V].", "",
+            "## 2. Défauts révélés par le terrain", "",
+            "| Signal | Constat | Preuve | Proposition |", "|---|---|---|---|"]
+
+    def row(signal, seen, items, key=None):
+        at = ", ".join(x["at"] for x in items[:4]) + (" …" if len(items) > 4 else "")
+        out.append(f"| {signal} | {seen} | {at or '—'} | {ref.get(key, '—')} |")
+
+    sus = s["selector_suspects"]
+    row("réponse vide, call_llm présent", (", ".join(x["case"] for x in sus) + " [V]") if sus else "aucune", sus,
+        ("selector", "assistant_message"))
+    for m in s["modal_refusals"]:
+        row("modale inconnue", f"« {m['text']} » × {m['count']}, {m['after_abort']} après un abandon [V]", m["lines"],
+            ("modal", m["text"]))
+    for p in (p for p in proposals if p["kind"] == "budget"):
+        row("abandons", f"{p['target']} : {p['evidence_total']} abandons [V]", p["evidence"], ("budget", p["target"]))
+    h = s["header_in_answer"]
+    row("en-tête dans la réponse jugée", f"{h['lines']}/{h['of']} [V]", h["at"], ("oracle", "answer_scope"))
+    row("page de maintenance", f"{len(s['maintenance'])} [V]", s["maintenance"], ("recipe", "maintenance"))
+    row("niveau fini sans artefact", f"{len(s['levels_without_artefact'])} [V]", s["levels_without_artefact"],
+        ("recipe", "level_without_artefact"))
+    row("réponse vide sans call_llm (produit)", ", ".join(x["case"] for x in s["empty_without_llm"]) or "aucune",
+        s["empty_without_llm"])
+    row("texte envoyé non observé", f"{s['sent_unobserved']['lines']}/{s['sent_unobserved']['of']} [V]", [])
+    row("réponse coupée (marque de génération)", f"{len(s['cut_suspects'])} [I]", s["cut_suspects"])
+    row("pièce jointe non vue du modèle", f"{len(s['attachment_unseen'])} [I]", s["attachment_unseen"])
+    row("charge concurrente sur des cas déjà KO seuls", ", ".join(f"{x['case']} ({' + '.join(x['pairs'])})"
+                                                                 for x in s["concurrent_on_failing"]) or "aucune",
+        s["concurrent_on_failing"])
+    row("configuration du compositeur", "; ".join(f"{c['model']} / web {c['web']} × {c['lines']}" for c in s["composer"])
+        or "non relevée sur les lignes", [])
+    hs = s["hashes"]
+    row("empreintes", f"inputs_sha256 : {len(hs['inputs_sha256'])} valeur(s), {len(hs['changes'])} changement(s) ; "
+                      f"ui_profile_sha256 absente sur {hs['lines_without_ui_profile']} lignes [V]", [])
+    row("nœuds constants", (", ".join(f"{k} {v}" for k, v in s["constant_nodes"].items()) + " [V]")
+        if s["constant_nodes"] else "aucun", [])
+    out += ["", "## 3. Mesures utiles au prochain pilote", "",
+            "| Nœud (ms) | n | Médiane | p90 | Max |", "|---|---|---|---|---|"]
+    out += [f"| `{k}` | {v['n']} | {_n(v['median'])} | {_n(v['p90'])} | {_n(v['max'])} |" for k, v in s["pipeline"].items()]
+    out += ["", "| Classe | Budget | n | Médiane | p90 | Max | Hors budget | Abandons |", "|---|---|---|---|---|---|---|---|"]
+    out += [f"| {c['kind']} | {_n(c['budget_s'])} s | {c['n']} | {_n(c['median'])} s | {_n(c['p90'])} s | {_n(c['max'])} s | "
+            f"{c['over_budget']}/{c['n']} | {c['aborted']} |" for c in s["latency_classes"]]
+    out += ["", "Refus par raison (timeout lu au journal, les autres aux notes du harnais ; le ledger les hache) : "
+            + ", ".join(f"`{k}` {v}" for k, v in s["refusals"].items()) + " [V].", ""]
+    return "\n".join(out)
+
+
+def debrief(root: Path, until=None) -> tuple:
+    run = Run(root, until)
+    s = signals(run)
+    proposals = propose(run, s)
+    return s, proposals, render(run, s, proposals)
+
+
+def write(s: dict, proposals: list, md: str, out: Path) -> None:
+    if out.exists() and not out.is_dir():
+        raise Refusal(f"out {out} is not a directory", "a new directory: a debrief never overwrites one")
+    if out.exists() and any(out.iterdir()):
+        raise Refusal(f"out {out} is not empty", "a new directory: a debrief never overwrites one")
+    out.mkdir(parents=True, exist_ok=True)
+    for name, value in (("debrief.json", s), ("proposals.json", proposals)):
+        (out / name).write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=1) + "\n",
+                                encoding="utf-8", newline="\n")
+    (out / "debrief.md").write_text(md, encoding="utf-8", newline="\n")
+
+
+def add_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--run", required=True, help="the run directory (layout in the module docstring)")
+    p.add_argument("--out", required=True, help="a new or empty directory")
+    p.add_argument("--until", help="debrief only the evidence up to the end of this task")
+
+
+def run(ns: argparse.Namespace) -> int:
+    root, out = Path(ns.run), Path(ns.out)
+    if out.resolve().is_relative_to(root.resolve()):
+        raise Refusal(f"out {out} is inside the run directory",
+                      "a new directory outside it: the run directory is read, never written")
+    s, proposals, md = debrief(root, ns.until)
+    write(s, proposals, md, out)
+    print(f"debrief: {len(proposals)} proposals -> {ns.out}")
+    return 0

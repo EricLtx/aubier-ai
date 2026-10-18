@@ -17,7 +17,7 @@ from vkforge import __main__ as entry  # noqa: E402  (tests/__init__.py put driv
 from vkforge import canon  # noqa: E402
 from vkforge.errors import Refusal  # noqa: E402
 
-STAGE_NAMES = ["bind", "generate", "inventory", "mine", "plan", "qualify"]
+STAGE_NAMES = ["bind", "debrief", "generate", "inventory", "mine", "plan", "qualify"]
 
 
 class PackageTest(unittest.TestCase):

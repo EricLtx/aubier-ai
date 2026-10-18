@@ -1324,6 +1324,31 @@ pub fn plan_shown(v: &Value) -> String {
     lines.join("\n")
 }
 
+/// `vk driver debrief`: one line per proposal (kind, target, confidence, what
+/// to change), then the files, and that nothing was applied.
+pub fn debriefed(v: &Value) -> String {
+    let mut lines = vec![format!(
+        "debrief: {} proposals -> {}",
+        v["proposals"],
+        text(&v["out"])
+    )];
+    for p in array(v, "list") {
+        lines.push(format!(
+            "  {:<8} {:<24} {:<6}  {}",
+            text(&p["kind"]),
+            text(&p["target"]),
+            text(&p["confidence"]),
+            text(&p["proposal"])
+        ));
+    }
+    lines.push(
+        "files: debrief.md, debrief.json, proposals.json; nothing applied: each proposal is the \
+         operator's to apply"
+            .into(),
+    );
+    lines.join("\n")
+}
+
 /// `vk driver umount`: what was taken away, named back.
 pub fn unmounted_driver(v: &Value) -> String {
     format!("unmounted driver {}", text(&v["name"]))
@@ -1549,6 +1574,30 @@ mod tests {
              ambiguities:\n\
              \x20 body_font  arch:sha256:9  {\"name\":\"Garamond\",\"size\":11}\n\
              excluded: none"
+        );
+    }
+
+    /// `vk driver debrief`: the count and where the files went, one line per
+    /// proposal, and the reminder that nothing was applied — with none, the
+    /// reminder still.
+    #[test]
+    fn the_debrief_renders_one_line_per_proposal_and_applies_nothing() {
+        let v = json!({"out": "C:\\d\\out", "proposals": 2, "list": [
+            {"kind": "selector", "target": "assistant_message", "confidence": "high", "proposal": "N1-1 : réponse vide"},
+            {"kind": "budget", "target": "N4", "confidence": "medium", "proposal": "N4 : 5/5 cas abandonnés"}]});
+        assert_eq!(
+            debriefed(&v),
+            "debrief: 2 proposals -> C:\\d\\out\n\
+             \x20 selector assistant_message        high    N1-1 : réponse vide\n\
+             \x20 budget   N4                       medium  N4 : 5/5 cas abandonnés\n\
+             files: debrief.md, debrief.json, proposals.json; nothing applied: each proposal is \
+             the operator's to apply"
+        );
+        let none = debriefed(&json!({"out": "o", "proposals": 0, "list": []}));
+        assert!(
+            none.starts_with("debrief: 0 proposals -> o\nfiles: ")
+                && none.contains("nothing applied"),
+            "{none}"
         );
     }
 

@@ -35,6 +35,7 @@ Une séance complète se déroule ainsi :
 2. On soumet la recette, puis on lance un pas de plan et dix exécutions du harnais (N0 à N9).
 3. On lance le juge, puis on signe. On lance la rédaction, puis on signe. On publie.
 4. On copie le résultat dans le dépôt, après l'avoir expurgé.
+5. Après le tir, on lance le debrief (§16) : il lit les journaux et la console, il propose, il n'applique rien.
 
 ---
 
@@ -675,3 +676,30 @@ Pour finir : Ctrl+C sur ce `vkd`, et fermez la fenêtre de `serve.py`. Puis `Rem
 - [ ] Le garde-dialogue s'est déclenché au moins une fois en test : `test_dialog_guard_reports_and_never_answers`, déjà vert.
 - [ ] La CI est verte.
 - [ ] Le fondateur a reçu, en registre embarqué, ce que montre le ledger et ce que la recette a trouvé.
+
+---
+
+## 16. Après le tir : le debrief automatique
+
+Le debrief lit ce que le nœud garde en clair après un tir (journaux, `driver.log`, console du démon, tables des tâches) et propose quoi changer, chaque proposition avec les lignes qui la fondent. Il ne change rien : c'est le post-mortem d'un crash dump, pas un correctif. Ce qui suit reste à vous : sélecteurs et modales (nouveau `driver_id`, remontage signé), budgets et oracles (nouvelle `inputs_sha256`, déclarée dans le delta), consigne de la recette, corrections `supersedes`, signatures.
+
+Pour garder la console, lancez le démon du §3.2 ainsi, dans son terminal dédié :
+```powershell
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$S = "$env:LOCALAPPDATA\VerticalAI\vk\data"
+vkd --auto-enroll-node --harness-timeout-secs 2700 | ForEach-Object { $_; Add-Content -Path "$S\vkd-console.log" -Value $_ -Encoding UTF8 }
+```
+La première ligne compte : Windows PowerShell 5.1 lit la sortie de `vkd` dans la page de codes de la console (850 sur un poste français), et sans elle « refusée », « — » ou « × » arrivent abîmés dans le fichier ; le debrief ne lit plus alors ni les refus ni les modales. `Add-Content -Encoding UTF8` écrit de l'UTF-8. `$S` est ici le répertoire d'état par défaut, écrit en dur parce que le démon ne répond pas encore à `vk status` ; c'est celui que `vk status --json` donnera ensuite.
+
+Après le tir, assemblez le dossier et lancez le debrief. `$T` liste les tâches du tir (`vk ps`), ici celles du 17/10 ; un journal mis de côté au §8 se copie aussi, renommé `journal-<suffixe>.jsonl` :
+```powershell
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$S = (vk status --json | ConvertFrom-Json).state_dir
+$T = "task-node-1-2", "task-node-1-7", "task-node-1-16", "task-node-1-25", "task-node-1-39"
+$R = "$S\debrief\run"; New-Item -ItemType Directory -Force "$R\tasks" | Out-Null
+Copy-Item "$S\drivers\maskai-1\work\journal.jsonl", "$S\drivers\maskai-1\work\driver.log", "$S\vkd-console.log", drivers\maskai-recette\cases.json $R
+foreach ($t in $T) { vk task show $t --json | Out-File -Encoding utf8 "$R\tasks\$t.json" }
+vk dmesg -n 5000 --json | Out-File -Encoding utf8 "$R\dmesg.json"
+vk driver debrief --run $R --out "$S\debrief\out"
+```
+Attendu : `debrief: N proposals -> …`, une ligne par proposition (genre, cible, confiance, quoi changer), puis `nothing applied`. Lisez `debrief.md` (sections 1 à 3) ; les sections 4 et 5 sont les vôtres. Aucune ligne n'est ajoutée au ledger. `--until TASK` rejoue le debrief tel qu'il aurait été à la fin de cette tâche. Le dossier `--out` doit être neuf (ou vide) et hors du dossier du tir : le debrief n'écrase rien et n'écrit jamais dans ce qu'il lit.

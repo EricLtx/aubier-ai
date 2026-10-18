@@ -95,7 +95,8 @@ pub struct ServerConfig {
     /// Task 9): `vkd --vkforge-root`, the `drivers/` directory of a checkout.
     /// Daemon configuration, never a request field — a client that could name
     /// it would choose the code the daemon runs. `None` on a daemon started
-    /// without one: `driver.learn` and `driver.qualify` then refuse.
+    /// without one: `driver.learn`, `driver.qualify` and `driver.debrief`
+    /// then refuse.
     pub forge: Option<crate::forge::ForgeConfig>,
 }
 
@@ -955,6 +956,14 @@ fn dispatch(
     }
     if req.method == "driver.plan_show" {
         return crate::forge::plan_show(req.params);
+    }
+    // A machine act: it reads evidence the node holds in clear and writes
+    // three files. No presence proof (not in `takes_presence`), no ledger row
+    // (ruling L-P5); before the general lock, like the other vkforge methods
+    // (L-P17).
+    if req.method == "driver.debrief" {
+        let (cfg, state_dir) = forge_context(kernel, config)?;
+        return crate::forge::debrief(cfg, &state_dir, req.params);
     }
     // Mounting a Claude Code arch means running the binary to ask its version,
     // because the version is in the arch identity. That happens here, *before*

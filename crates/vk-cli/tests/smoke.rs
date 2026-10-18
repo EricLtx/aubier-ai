@@ -2843,6 +2843,52 @@ fn vk_forge_plan_show_prints_the_actions_and_the_ambiguities() {
     assert!(shown.contains("excluded: none"), "{shown}");
 }
 
+#[test]
+fn vk_forge_debrief_prints_the_proposals_and_writes_no_ledger_row() {
+    if !forge_available() {
+        return;
+    }
+    let (dir, _daemon, sh) = forge_node();
+    let run = dir.path().join("run");
+    let script = repo_drivers().join("vkforge/tests/debrief_fixtures.py");
+    assert!(Command::new(forge_python())
+        .arg("-I")
+        .arg(&script)
+        .arg(&run)
+        .arg("17-10")
+        .status()
+        .unwrap()
+        .success());
+    let out = dir.path().join("debrief");
+    let head = sh.json(&["dmesg", "-n", "1", "--json"])[0]["seq"].clone();
+    let printed = sh.ok(&[
+        "driver",
+        "debrief",
+        "--run",
+        run.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    for needle in [
+        "6 proposals",
+        "assistant_message",
+        "Votre avis",
+        "N4",
+        "answer_scope",
+        "level_without_artefact",
+        "maintenance",
+        "nothing applied",
+    ] {
+        assert!(printed.contains(needle), "{needle} missing:\n{printed}");
+    }
+    assert!(out.join("debrief.md").is_file());
+    assert_eq!(
+        sh.json(&["dmesg", "-n", "1", "--json"])[0]["seq"],
+        head,
+        "a debrief writes no ledger row"
+    );
+}
+
 /// A `vkd` over `dir` — its install root at `<dir>/installed` and its
 /// publisher key in `<dir>/publisher.key`, as [`vkd_cmd`] sets them — with
 /// `extra_env` and no CPython release unless it names one, and the shell
