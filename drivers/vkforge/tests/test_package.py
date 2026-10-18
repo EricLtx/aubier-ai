@@ -97,24 +97,56 @@ class PackageTest(unittest.TestCase):
         self.assertEqual(canon.sha256(obj), "sha256:" + hashlib.sha256(data).hexdigest())
 
     def test_the_package_opens_no_socket(self):
-        """No module of the package imports a network module, in any form: `import a, socket`,
-        `from socket import x`, `from urllib import request`, `__import__("ssl")`."""
-        banned = {"socket", "ssl", "urllib", "http", "requests", "ftplib", "smtplib"}
+        """No module of the package imports a network module (NETWORK_MODULES, the list the TCB
+        names), in any form: `import a, socket`, `from socket import x`, `from urllib import request`,
+        `__import__("ssl")`, `importlib.import_module("httpx")`; and no dynamic import names a module
+        the walk cannot read (final review M-4)."""
         for p in (ROOT / "vkforge").rglob("*.py"):
             if "tests" in p.parts:
                 continue
-            found = []
-            for node in ast.walk(ast.parse(p.read_text(encoding="utf-8"), str(p))):
-                if isinstance(node, ast.Import):
-                    found += [a.name for a in node.names]
-                elif isinstance(node, ast.ImportFrom):
-                    found.append(node.module or "")
-                elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                      and node.func.id == "__import__" and node.args
-                      and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
-                    found.append(node.args[0].value)
+            found, dynamic = _imports(ast.parse(p.read_text(encoding="utf-8"), str(p)))
+            self.assertEqual(dynamic, [], f"{p}: a dynamic import whose module is not a constant")
             for name in found:
-                self.assertNotIn(name.split(".")[0], banned, f"{p}: imports {name}")
+                self.assertNotIn(name.split(".")[0], NETWORK_MODULES, f"{p}: imports {name}")
+
+    def test_the_import_walk_sees_every_form(self):
+        source = ("import os, socket\nfrom urllib import request\nfrom xmlrpc.client import ServerProxy\n"
+                  "__import__('ssl')\nimport importlib\nimportlib.import_module('httpx')\n"
+                  "from importlib import import_module\nimport_module('imaplib')\nimport_module(name)\n")
+        found, dynamic = _imports(ast.parse(source))
+        self.assertEqual(sorted(n.split(".")[0] for n in found if n.split(".")[0] in NETWORK_MODULES),
+                         ["httpx", "imaplib", "socket", "ssl", "urllib", "xmlrpc"])
+        self.assertEqual(dynamic, [9], "import_module(name) is refused: its module cannot be read")
+
+
+# The network modules the package never imports (contracts/tcb.md, "A stage is a governed one-shot
+# process"): the standard library's and the common third-party clients.
+NETWORK_MODULES = frozenset({"socket", "ssl", "socketserver", "urllib", "http", "ftplib", "smtplib", "imaplib",
+                             "poplib", "xmlrpc", "requests", "httpx", "urllib3", "aiohttp"})
+
+
+def _imports(tree: ast.AST) -> tuple[list, list]:
+    """(the module names `tree` imports, the line numbers of dynamic imports whose module is not a
+    string constant): `import`, `from … import`, `__import__(…)`, `importlib.import_module(…)` and
+    `import_module(…)`."""
+    found, dynamic = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            found.append(node.module or "")
+        elif isinstance(node, ast.Call):
+            f = node.func
+            called = (f.id if isinstance(f, ast.Name) else
+                      f.attr if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                      and f.value.id == "importlib" else None)
+            if called not in ("__import__", "import_module"):
+                continue
+            if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                found.append(node.args[0].value)
+            else:
+                dynamic.append(node.lineno)
+    return found, dynamic
 
 
 if __name__ == "__main__":

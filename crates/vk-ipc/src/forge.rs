@@ -46,6 +46,9 @@ pub struct ForgeConfig {
     pub python: PathBuf,
     /// `VK_FORGE_FIXTURES=1`, a test seam like `VK_TEST_PYTHON_RELEASE`: the recorded catalogues
     /// (`inventory --fixture`) and the fake application (`qualify --fake`). `vkd` warns when it is set.
+    /// The server hands it to the kernel when it starts (`RealKernel::set_forge_fixtures`): a
+    /// daemon without it refuses at mount a driver whose last replay ran on the fake (final review
+    /// I-1).
     pub fixtures: bool,
     /// The deadline of each `learn` stage: `STAGE_DEADLINE` from `at`; a test sets it shorter
     /// (L-P30). `qualify` and `debrief` keep their own.
@@ -268,9 +271,12 @@ const FAMILY: &str = "office-document";
 const APPS: [&str; 2] = ["word", "powerpoint"];
 const DEFAULT_THRESHOLD: f64 = 0.8;
 
-/// `OUT/.vault.json`, the clear text the miner set aside for the generator: deleted on every
-/// way out of `learn` once `mine` may have written it — a refusal, an error, a panic — and,
-/// strictly, after `generate`.
+/// `<state_dir>/forge/<name>/.vault.json`, the clear text the miner set aside for the generator
+/// (`mine --vault`, final review I-2): under the daemon's private forge directory and the state
+/// directory's ACL, never in the operator's `--out`. Deleted on every way out of `learn` once
+/// `mine` may have written it — a refusal, an error, a panic — and, strictly, after `generate`;
+/// a daemon that dies in between leaves it there until the next `learn` of the name clears the
+/// directory.
 struct Vault(PathBuf);
 
 impl Vault {
@@ -300,8 +306,9 @@ impl Drop for Vault {
 /// whose last component is not a driver name (it becomes the driver's), a threshold outside
 /// `(0, 1]`, an arch this node has not mounted or that cannot plan, a name another `learn` or
 /// `qualify` is working on (L-P55). Then the stages, each through [`run_stage`] with
-/// `cfg.stage_deadline`, their logs under `<state_dir>/forge/<name>/`; the one model call per
-/// ambiguity when `arch` is given; `driver.learned` and the `learned` row last.
+/// `cfg.stage_deadline`, their logs — and, from `mine` to `generate`, the [`Vault`] — under
+/// `<state_dir>/forge/<name>/`; the one model call per ambiguity when `arch` is given;
+/// `driver.learned` and the `learned` row last.
 pub fn learn(
     kernel: &Shared,
     cfg: &ForgeConfig,
@@ -456,7 +463,9 @@ pub fn learn(
         ],
     )?;
     // 3. The invariants of the corpus. From here the vault may exist, and goes on every way out.
-    let vault = Vault(out.join(".vault.json"));
+    // It is written under the daemon's forge directory, which `run_stage` made private before
+    // the stage started (I-2): the operator's `--out` never holds a clear string.
+    let vault = Vault(logs.join(".vault.json"));
     stage(
         "mine",
         vec![
@@ -464,6 +473,8 @@ pub fn learn(
             arg(&corpus),
             "--out".into(),
             arg(&out),
+            "--vault".into(),
+            arg(&vault.0),
             "--threshold".into(),
             threshold.to_string(),
         ],
@@ -925,6 +936,10 @@ pub fn qualify(
             .ok_or_else(|| internal(&format!("vkforge qualify wrote no {field} count")))
     };
     let (passes, failures) = (count("passes")?, count("failures")?);
+    // The gate reads it (final review I-1): a replay on the fake opens no gate on a clean daemon.
+    let fake = rec["fake"]
+        .as_bool()
+        .ok_or_else(|| internal("vkforge qualify wrote no fake flag"))?;
     let now = Ctx {
         now_ms: vk_kernel::now_ms(),
         ..ctx.clone()
@@ -939,6 +954,7 @@ pub fn qualify(
                 qualification_sha256: hash_bytes(&bytes),
             },
             &record,
+            fake,
         )
         .map_err(kerr)?;
     Ok(json!({
@@ -947,7 +963,7 @@ pub fn qualify(
         "passes": passes,
         "failures": failures,
         "rate": rec["rate"],
-        "fake": rec["fake"],
+        "fake": fake,
         "record": record.display().to_string(),
     }))
 }

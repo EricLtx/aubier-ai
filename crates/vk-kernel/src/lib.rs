@@ -524,6 +524,12 @@ pub struct RealKernel {
     /// [`RealKernel::with_publisher_key_file`]; `None` in production, where
     /// `VK_PUBLISHER_KEY_FILE` or the keyring decides at each call.
     publisher_key_file: Option<PathBuf>,
+    /// Whether this daemon runs vkforge under its fixtures seam
+    /// (`VK_FORGE_FIXTURES=1`): set once by the server from its own
+    /// configuration ([`RealKernel::set_forge_fixtures`]). Off, the
+    /// qualification gate refuses a replay made on the fake application
+    /// (final review I-1). In memory only: the daemon's, for as long as it runs.
+    forge_fixtures: bool,
 }
 
 /// `VK_DRIVER_INSTALL_ROOT` when set (the test seam, documented as such),
@@ -819,6 +825,7 @@ impl RealKernel {
             usage_step: None,
             install_root: default_install_root(),
             publisher_key_file: None,
+            forge_fixtures: false,
         };
         k.load()?;
         Ok(k)

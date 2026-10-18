@@ -235,7 +235,7 @@ fn driver_learned_is_a_human_act_and_qualified_needs_a_learned_driver() {
         qualification_sha256: hash_bytes(b"{}\n"),
     };
     let e = k
-        .driver_qualified(&machine(2), q, &record)
+        .driver_qualified(&machine(2), q, &record, false)
         .unwrap_err()
         .to_string();
     assert!(
@@ -295,7 +295,8 @@ fn driver_qualified_then_the_com_gate_reads_the_record() {
         failures: 0,
         qualification_sha256: write("{\"passes\": 10}\n"),
     };
-    k.driver_qualified(&machine(2), q.clone(), &record).unwrap();
+    k.driver_qualified(&machine(2), q.clone(), &record, false)
+        .unwrap();
     assert_eq!(events_of(&k, "driver.qualified").len(), 1);
     k.check_qualified(&m).unwrap();
     write("{\"passes\": 3}\n");
@@ -311,8 +312,78 @@ fn driver_qualified_then_the_com_gate_reads_the_record() {
         qualification_sha256: write("{\"passes\": 9}\n"),
         ..q
     };
-    k.driver_qualified(&machine(3), nine, &record).unwrap();
+    k.driver_qualified(&machine(3), nine, &record, false)
+        .unwrap();
     let e = k.check_qualified(&m).unwrap_err().to_string();
     assert!(e.contains("9 passes of 10"), "{e}");
     k.check_qualified(&browser()).unwrap();
+}
+
+/// Final review I-1: a replay on the fake application is recorded (`fake` on the row), and the
+/// gate refuses it on a daemon that does not run the fake itself — whatever its counts — and
+/// takes it on one that does (CI). The seam is the daemon's, set at start, off by default.
+#[test]
+fn a_replay_on_the_fake_application_opens_the_gate_only_under_the_fixtures_seam() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    assert!(!k.forge_fixtures(), "off until the daemon says otherwise");
+    let m = word_com();
+    let id = m.driver_id();
+    k.driver_learned(&human(1), learned(&id), "word-maison", d.path(), TEN)
+        .unwrap();
+    let record = d.path().join("qualification.json");
+    let text = "{\"fake\": true, \"passes\": 10}\n";
+    std::fs::write(&record, text).unwrap();
+    let q = DriverQualified {
+        driver_id: id.clone(),
+        passes: 10,
+        failures: 0,
+        qualification_sha256: hash_bytes(text.as_bytes()),
+    };
+    k.driver_qualified(&machine(2), q.clone(), &record, true)
+        .unwrap();
+    let row = k.learned(&id).unwrap().expect("the learned row");
+    assert!(row.qualified.expect("the replay is on the row").fake);
+    match k.check_qualified(&m).unwrap_err() {
+        KernelError::Gate(why) => assert_eq!(
+            why,
+            format!(
+                "driver {id} was qualified on the fake application; remedy: vk driver qualify \
+                 on the real one"
+            )
+        ),
+        other => panic!("{other}"),
+    }
+    k.set_forge_fixtures(true);
+    k.check_qualified(&m).unwrap();
+    // The same counts on the real application open it on a clean daemon.
+    k.set_forge_fixtures(false);
+    k.driver_qualified(&machine(3), q, &record, false).unwrap();
+    k.check_qualified(&m).unwrap();
+}
+
+/// Final review I-3: the plan of a six-document corpus asks six passes (`min(10, n)`), and six of
+/// six open the gate.
+#[test]
+fn a_six_document_plan_is_qualified_by_six_passes() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let m = word_com();
+    let id = m.driver_id();
+    let six = Qualification {
+        min_passes: 6,
+        min_rate: 1.0,
+    };
+    k.driver_learned(&human(1), learned(&id), "word-maison", d.path(), six)
+        .unwrap();
+    let record = d.path().join("qualification.json");
+    std::fs::write(&record, b"{}\n").unwrap();
+    let q = DriverQualified {
+        driver_id: id.clone(),
+        passes: 6,
+        failures: 0,
+        qualification_sha256: hash_bytes(b"{}\n"),
+    };
+    k.driver_qualified(&machine(2), q, &record, false).unwrap();
+    k.check_qualified(&m).unwrap();
 }

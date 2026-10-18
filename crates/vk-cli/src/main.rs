@@ -102,8 +102,9 @@ enum Cmd {
         #[command(subcommand)]
         what: ArchCmd,
     },
-    /// The drivers this node has mounted: the browsers a harness step may act
-    /// through (`vk mount driver` mounts one).
+    /// The drivers a harness step may act through: written ones that drive a
+    /// browser, and learned ones that drive Word or PowerPoint (`vk driver
+    /// learn` learns one, `vk mount driver` mounts either).
     Driver {
         #[command(subcommand)]
         what: DriverCmd,

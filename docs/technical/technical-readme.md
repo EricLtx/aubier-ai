@@ -707,8 +707,8 @@ and that line is the refusal, verbatim.
 |---|---|---|
 | `inventory` | the application's type library (Office's COM registration), or a recorded catalogue under the test seam | `catalogue.json`: types, members, enums, the type library's hash |
 | `bind` | the ontology (`drivers/vkforge/ontology/office-document.json`) and the catalogue | `binding-<app>.json`: each verb bound or `unbound`, with its projection |
-| `mine` | the corpus, as zip files, formatting parts only | `invariants.json` (values with their support, no text of the documents) and `.vault.json` (the clear values a footer needs, `0600`) |
-| `plan` | invariants, binding, and the arch's answers if any | `plan.json` (the `DriverPlan`: one action, its steps, `pre`, `post`, `qualification` thresholds), `plan-excluded.json` |
+| `mine` | the corpus, as zip files, formatting parts only | `invariants.json` (values with their support, no text of the documents); the clear values a footer needs go to the vault, `<state_dir>/forge/<name>/.vault.json` (`mine --vault`), under the daemon's private forge directory and the state directory's ACL, never under `--out` |
+| `plan` | invariants, binding, and the arch's answers if any | `plan.json` (the `DriverPlan`: one action, its steps, `pre`, `post`, `qualification` thresholds: `min_passes` ten, or the number of documents mined when fewer, `min_rate` 1), `plan-excluded.json` |
 | `generate` | the plan, the binding, the vault | `driver/`: `driver.py`, `manifest.json` (`kind: com`), `vendor/` (the protocol and the COM adapter, vendored), `.venv` (a junction to the vkforge virtualenv) |
 | `qualify` | the driver, the corpus, the plan | `<state_dir>/drivers/<name>/work/qualify/qualification.json` |
 
@@ -722,7 +722,8 @@ none calls no model: zero tokens on the nominal path. The vault is deleted the m
 a second is refused with `... of <name> already in progress`.
 
 `vk driver plan show DIR` prints `plan.json` for review: each step, its pre- and
-postconditions, how each ambiguity was settled, and what the plan left out and why.
+postconditions, the qualification thresholds the gate will hold the replay to, how each
+ambiguity was settled, and what the plan left out and why.
 `vk driver qualify --driver DIR\driver --corpus DIR` replays the driver on **copies** of
 the corpus, perturbs each copy first so that only a real repair counts, re-mines the
 result and checks every postcondition of the plan in code. The kernel records the replay
@@ -732,8 +733,12 @@ as `driver.qualified` (the hash of `qualification.json`, passes, failures) on th
 **The mount gate.** `vk mount driver --manifest DIR\driver\manifest.json` is refused for
 a `kind: com` driver the kernel did not learn on this node, or whose last replay does not
 meet the plan's thresholds (`min_passes`, `min_rate`), or whose `qualification.json` no
-longer hashes to what the kernel stored. There is no override. Every other driver kind
-passes the gate untouched.
+longer hashes to what the kernel stored, or whose last replay ran on the fake application
+while this daemon runs without `VK_FORGE_FIXTURES=1` (`... was qualified on the fake
+application; remedy: vk driver qualify on the real one`). There is no override. Every
+other driver kind passes the gate untouched. `vk driver pack` refuses a learned driver in
+this version (`a learned driver is not packaged in this version; remedy: mount it from
+its learn directory`): it is mounted from its learn directory.
 
 **Seams, for development and CI only.**
 
@@ -741,7 +746,7 @@ passes the gate untouched.
 |---|---|
 | `vkd --vkforge-root DIR` | the `drivers/` directory of a checkout; no default |
 | `VK_FORGE_PYTHON` | the interpreter; default `%LOCALAPPDATA%\vk\venvs\vkforge\Scripts\python.exe`, made by `drivers\vkforge\setup.ps1` |
-| `VK_FORGE_FIXTURES=1` | `inventory` reads the recorded catalogues (`drivers/vkforge/tests/fixtures/`) and `qualify` replays on the fake application instead of Office; `vkd` warns when it is set |
+| `VK_FORGE_FIXTURES=1` | `inventory` reads the recorded catalogues (`drivers/vkforge/tests/fixtures/`) and `qualify` replays on the fake application instead of Office; `vkd` warns when it is set; the replay is recorded `fake: true`, and only a daemon under this seam mounts a driver so qualified |
 | `<work>/fake.json` | written by `vkforge qualify --fake` into its own work directory, and nowhere else; it is what points the generated driver's adapter at the fake |
 
 **The deliberate fallback.** A verb the application's catalogue could not bind (for

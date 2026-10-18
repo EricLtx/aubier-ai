@@ -447,6 +447,14 @@ pub async fn serve_on(
     mut listener: transport::os::Listener,
     config: ServerConfig,
 ) -> Result<()> {
+    // The kernel's half of the vkforge fixtures seam (final review I-1): this
+    // daemon's configuration, handed over once, before the first request. A
+    // daemon without vkforge, or without the seam, refuses at mount a learned
+    // driver whose last replay ran on the fake application.
+    kernel
+        .lock()
+        .map_err(|_| anyhow::anyhow!("kernel lock poisoned"))?
+        .set_forge_fixtures(config.forge.as_ref().is_some_and(|f| f.fixtures));
     let challenges = Arc::new(Mutex::new(Challenges::default()));
     // The endpoint the harness's `vk-mcp` must dial back on and the daemon's
     // harness settings, threaded to every connection for `harness.run`.

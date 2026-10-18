@@ -21,7 +21,7 @@ refusal line naming the file and the field (L-P15). The append-only files are bo
 from the first task's creation to the last task's end plus a minute, harness notes of the run's
 tasks only. The evidence of proposals.json never carries an answer, a sent text or a document's
 content (ruling L-P57): a journal line is cut before them, a driver.log line keeps the driver's
-own words; a harness note, the operator's own vk_log line, is kept as it is.
+own words; a harness note, a vk_log line the arch wrote during the run, is kept as it is.
 """
 import argparse
 import contextlib
@@ -408,7 +408,7 @@ class Run:
                 at = f"{name}:{n}"
                 ms = _ms(_when(m.group(1), at, "time"))
                 if self._in_run(ms):
-                    self.text[at] = self.shown[at] = m.group(3)  # the operator's own vk_log lines (L-P57)
+                    self.text[at] = self.shown[at] = m.group(3)  # the arch's vk_log lines, kept whole (L-P57)
                     out.append({"at": at, "ms": ms, "task": m.group(2), "text": m.group(3)})
         return out
 

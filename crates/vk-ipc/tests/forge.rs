@@ -25,6 +25,39 @@ fn manifest_of(driver: &Path) -> DriverManifest {
     serde_json::from_slice(&std::fs::read(driver.join("manifest.json")).unwrap()).unwrap()
 }
 
+/// Watches, from a thread of its own while a request runs, whether any of `outside` (paths under
+/// the operator's `--out`) or `private` (the daemon's forge directory) ever exists (final review
+/// I-2). The vault lives from `mine` to the end of `generate` — two stage processes at least — so a
+/// poll every 2 ms sees it.
+struct VaultWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<(bool, bool)>,
+}
+
+impl VaultWatch {
+    fn start(outside: Vec<PathBuf>, private: PathBuf) -> VaultWatch {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let (mut seen_outside, mut seen_private) = (false, false);
+            while !flag.load(Ordering::SeqCst) {
+                seen_outside |= outside.iter().any(|p| p.exists());
+                seen_private |= private.exists();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            (seen_outside, seen_private)
+        });
+        VaultWatch { stop, thread }
+    }
+
+    /// (seen under `--out`, seen in the private directory).
+    fn stop(self) -> (bool, bool) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.thread.join().unwrap()
+    }
+}
+
 async fn learn_refusal(node: &Node, params: Value) -> String {
     let e = node.call_human("driver.learn", params).await.unwrap_err();
     call_error(&e).message.clone()
@@ -38,10 +71,36 @@ async fn learn_runs_the_five_stages_and_writes_driver_learned() {
     let node = Node::start().await;
     let corpus = ooxml_corpus(&node.dir().join("corpus"), 10, 0);
     let out = node.dir().join("word-maison");
+    let private_vault = node
+        .dir()
+        .join("forge")
+        .join("word-maison")
+        .join(".vault.json");
+    let watch = VaultWatch::start(
+        vec![
+            out.join(".vault.json"),
+            out.join("driver").join(".vault.json"),
+        ],
+        private_vault.clone(),
+    );
     let r = node
         .call_human("driver.learn", learn_params(&corpus, &out))
         .await
         .unwrap();
+    let (in_out, in_forge) = watch.stop();
+    assert!(
+        !in_out,
+        "no vault under --out at any time: the clear strings live in the daemon's forge directory \
+         (final review I-2)"
+    );
+    assert!(
+        in_forge,
+        "the vault was written under <state>/forge/word-maison/ between mine and generate"
+    );
+    assert!(
+        !private_vault.exists(),
+        "the vault is deleted after generation"
+    );
     for f in [
         "catalogue.json",
         "binding-word.json",
@@ -210,6 +269,28 @@ async fn qualify_writes_driver_qualified_and_the_mount_gate_opens() {
             qualification_sha256: hash_bytes(&bytes),
         })
     );
+    // Final review I-1: the replay ran on the fake (`fake: true`), so a daemon that does not run
+    // the fake itself refuses it, whatever its counts — the kernel's flag is the one the server
+    // set from its configuration when it started.
+    assert!(
+        node.k.lock().unwrap().forge_fixtures(),
+        "serve_on handed the seam over"
+    );
+    node.k.lock().unwrap().set_forge_fixtures(false);
+    let e = node
+        .call_human("driver.mount", mount.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        call_error(&e).message.contains(&format!(
+            "driver {} was qualified on the fake application; remedy: vk driver qualify on the \
+             real one",
+            manifest.driver_id()
+        )),
+        "{e}"
+    );
+    assert!(node.events("driver.mounted").is_empty());
+    node.k.lock().unwrap().set_forge_fixtures(true);
     // The gate opens; the kind is read from the row's manifest: driver.mounted carries none (L-P11).
     node.call_human("driver.mount", mount.clone())
         .await
@@ -236,6 +317,69 @@ async fn qualify_writes_driver_qualified_and_the_mount_gate_opens() {
             .contains("qualification.json changed since vk driver qualify"),
         "{e}"
     );
+    node.shutdown().await;
+}
+
+/// Final review I-1: the daemon hands its fixtures seam to the kernel when it starts serving —
+/// on with `ForgeConfig.fixtures`, off without it (and off on a daemon with no vkforge, the
+/// kernel's default, `tests/learn.rs`).
+#[tokio::test]
+async fn the_daemon_hands_its_fixtures_seam_to_the_kernel() {
+    let seam = |fixtures: bool| ForgeConfig {
+        fixtures,
+        ..ForgeConfig::at(repo_root().join("drivers"))
+    };
+    for fixtures in [true, false] {
+        let node = Node::start_with_forge(seam(fixtures)).await;
+        // One answered request: the server's prologue has run.
+        node.call("driver.ls", json!({})).await.unwrap();
+        assert_eq!(node.k.lock().unwrap().forge_fixtures(), fixtures);
+        node.shutdown().await;
+    }
+}
+
+/// Final review I-3: a corpus of six documents learns, its plan asks six passes (`min(10, n)`),
+/// the replay makes six of six, and the mount gate opens — a corpus of five to nine is no longer
+/// a driver that can never mount.
+#[tokio::test]
+async fn a_six_document_corpus_learns_qualifies_six_of_six_and_mounts() {
+    if !forge_available() {
+        return;
+    }
+    let node = Node::start().await;
+    let corpus = ooxml_corpus(&node.dir().join("corpus"), 6, 0);
+    let out = node.dir().join("word-six");
+    node.call_human("driver.learn", learn_params(&corpus, &out))
+        .await
+        .unwrap();
+    let (plan, _) = read_plan(&out);
+    assert_eq!(
+        (plan.qualification.min_passes, plan.qualification.min_rate),
+        (6, 1.0)
+    );
+    let driver = out.join("driver");
+    let q = node
+        .call(
+            "driver.qualify",
+            json!({"driver": driver, "corpus": corpus}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (q["passes"].as_u64(), q["failures"].as_u64()),
+        (Some(6), Some(0))
+    );
+    let manifest = manifest_of(&driver);
+    node.call_human(
+        "driver.mount",
+        json!({"manifest": manifest, "root": driver}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(node.last_event().kind, "driver.mounted");
+    node.call_human("driver.unmount", json!({"name": "word-six"}))
+        .await
+        .unwrap();
     node.shutdown().await;
 }
 

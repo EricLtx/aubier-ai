@@ -55,16 +55,18 @@ class MineTest(unittest.TestCase):
         for i in range(6):
             ooxml_fixtures.docx(d / f"c{i}.docx", footer="Pied " + secrets[0], personal=" ".join(secrets))
         out = Path(tempfile.mkdtemp())
+        private = Path(tempfile.mkdtemp()) / "forge" / "word-maison" / ".vault.json"   # the daemon's (I-2)
         inv, vault = mine.mine_corpus(d)
-        mine.write_invariants(inv, vault, out)
+        self.assertEqual(mine.write_invariants(inv, vault, out, private), private)
+        self.assertEqual([p.name for p in out.iterdir()], ["invariants.json"], "no clear string in --out")
         blob = (out / "invariants.json").read_bytes()
         for s in secrets:
             self.assertNotIn(s.encode("utf-8"), blob)
         self.assertEqual(blob, canon.dumps(inv))
-        self.assertEqual(json.loads((out / ".vault.json").read_text(encoding="utf-8")),
+        self.assertEqual(json.loads(private.read_text(encoding="utf-8")),
                          {mine.redact("Pied Jean Dupont"): "Pied Jean Dupont"})
         if os.name == "posix":
-            self.assertEqual((out / ".vault.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual(private.stat().st_mode & 0o777, 0o600)
 
     def test_a_mixed_folder_skips_what_is_not_ooxml_and_never_opens_office(self):
         d = Path(tempfile.mkdtemp())
@@ -156,6 +158,22 @@ class MineTest(unittest.TestCase):
             self.assertEqual(entry.main(["mine", "--corpus", str(d), "--out", str(out)]), 0)
         self.assertEqual(sorted(p.name for p in out.iterdir()), [".vault.json", "invariants.json"])
         self.assertEqual(printed.getvalue(), f"mine: 3 invariants, 0 ambiguities over 5 files (0 skipped) -> {out / 'invariants.json'}\n")
+
+    def test_the_cli_writes_the_vault_where_vault_names_it_and_nothing_clear_in_out(self):
+        """The daemon's form (final review I-2): `--vault` under its private forge directory."""
+        d = self.corpus(5, footer=FOOTER)
+        out = Path(tempfile.mkdtemp()) / "out"
+        vault = Path(tempfile.mkdtemp()) / "forge" / "word-maison" / ".vault.json"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(entry.main(["mine", "--corpus", str(d), "--out", str(out), "--vault", str(vault)]), 0)
+        self.assertEqual(sorted(p.name for p in out.iterdir()), ["invariants.json"])
+        self.assertEqual(json.loads(vault.read_text(encoding="utf-8")), {mine.redact(FOOTER): FOOTER})
+        self.assertNotIn(FOOTER.encode("utf-8"), (out / "invariants.json").read_bytes())
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(entry.main(["mine", "--corpus", str(d), "--out", str(Path(tempfile.mkdtemp()) / "o"),
+                                         "--vault", str(d / "v" / ".vault.json")]), 2)
+        self.assertIn("is inside the corpus; remedy: write elsewhere", err.getvalue())
 
     def test_the_fixture_script_builds_the_rust_tests_corpus(self):
         d = ooxml_fixtures.corpus(Path(tempfile.mkdtemp()) / "corpus", 7, 3)

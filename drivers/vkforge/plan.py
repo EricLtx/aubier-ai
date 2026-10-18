@@ -44,7 +44,18 @@ EXPORT = ("export_format", lambda v: [step("export", format=v["format"], path="$
 EMITTED_VERBS = frozenset({"open", "apply_paragraph_style", "set_font_run", "set_header", "set_footer", "save", "export",
                            "verify_paragraph_style", "verify_font_run", "verify_header", "verify_footer", "verify_pdf"})
 ACTION = {"word": "appliquer_style_maison", "powerpoint": "appliquer_style_presentation"}
-QUALIFICATION = {"min_passes": 10, "min_rate": 1.0}
+QUALIFICATION = {"min_passes": 10, "min_rate": 1.0}   # min_passes is a ceiling: see qualification()
+
+
+def qualification(invariants: dict) -> dict:
+    """The plan's thresholds (final review I-3): `min_passes` is ten, or the number of files the
+    miner mined when the corpus holds fewer — the replay has one pass per mined document, so a
+    corpus of five to nine could never reach ten — and `min_rate` is unchanged."""
+    corpus = invariants.get("corpus")
+    files = corpus.get("files") if isinstance(corpus, dict) else None
+    if isinstance(files, bool) or not isinstance(files, int) or files < 1:
+        raise Refusal("invariants.json names no corpus.files count", "run vkforge mine again")
+    return {"min_passes": min(QUALIFICATION["min_passes"], files), "min_rate": QUALIFICATION["min_rate"]}
 
 _DRIVEN = ("bound", "partial")
 _ONTOLOGY_REMEDY = "fix its projection in drivers/vkforge/ontology/office-document.json"
@@ -152,7 +163,7 @@ def build(invariants: dict, binding: dict, ontology: dict, resolve=None) -> tupl
             "invariants_sha256": canon.sha256(invariants),
             "actions": [action],
             "ambiguities": ambiguities,
-            "qualification": dict(QUALIFICATION)}
+            "qualification": qualification(invariants)}
     validate(plan)
     return plan, excluded
 

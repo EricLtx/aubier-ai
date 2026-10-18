@@ -41,6 +41,20 @@ const PROPOSAL_KIND: &str = "proposal";
 /// What every refusal of the gate asks for.
 const QUALIFY_REMEDY: &str = "vk driver qualify --driver DIR --corpus DIR";
 
+impl RealKernel {
+    /// Whether this daemon runs vkforge under its test seam (`VK_FORGE_FIXTURES=1`, final review
+    /// I-1): the daemon's configuration, set once when it starts serving, never a request's. Off,
+    /// the gate refuses a driver whose last replay ran on the fake application. `false` until set.
+    pub fn set_forge_fixtures(&mut self, on: bool) {
+        self.forge_fixtures = on;
+    }
+
+    /// See [`RealKernel::set_forge_fixtures`].
+    pub fn forge_fixtures(&self) -> bool {
+        self.forge_fixtures
+    }
+}
+
 /// One learned driver, as `driver.learned` recorded it and `driver.qualified` completed it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LearnedRow {
@@ -57,13 +71,19 @@ pub struct LearnedRow {
 }
 
 /// What `driver.qualified` recorded of a replay: where its record is, the hash of that file's
-/// bytes when the kernel read them, and the counts.
+/// bytes when the kernel read them, the counts, and whether the replay ran on the fake
+/// application (the record's `fake`, final review I-1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QualifiedRecord {
     pub record: PathBuf,
     pub qualification_sha256: String,
     pub passes: u32,
     pub failures: u32,
+    /// `qualification.json`'s `fake`: the replay ran on the fake application, not Office. A row
+    /// written before the field existed reads `false`: the only such rows were replayed on the
+    /// real Office (the Task 12 run); every fixture run lived in a test's own state directory.
+    #[serde(default)]
+    pub fake: bool,
 }
 
 /// The refusal for a driver this node never learned: what `driver.qualify` says before anything
@@ -163,13 +183,15 @@ impl RealKernel {
 
     /// Kernel-written: refused for a `driver_id` with no `learned` row ("driver <id> was not
     /// learned on this node; remedy: vk driver learn"); logs `driver.qualified`, then records
-    /// `record`'s path, `qualification_sha256`, passes and failures on the row. A replay under the
-    /// thresholds is recorded all the same (spec §6): the gate is what refuses it.
+    /// `record`'s path, `qualification_sha256`, passes, failures and `fake` (the record's own flag:
+    /// the replay ran on the fake application) on the row. A replay under the thresholds, or on
+    /// the fake, is recorded all the same (spec §6): the gate is what refuses it.
     pub fn driver_qualified(
         &mut self,
         ctx: &Ctx,
         q: DriverQualified,
         record: &Path,
+        fake: bool,
     ) -> Result<(), KernelError> {
         let mut row = self
             .learned(&q.driver_id)?
@@ -180,6 +202,7 @@ impl RealKernel {
             qualification_sha256: q.qualification_sha256,
             passes: q.passes,
             failures: q.failures,
+            fake,
         });
         self.store
             .db
@@ -196,9 +219,12 @@ impl RealKernel {
     }
 
     /// The gate (ruling L-P4): `Ok` for every kind but `com`; for `com`, a `learned` row with a
-    /// record whose file still hashes to `qualification_sha256` and whose passes meet the plan's
-    /// thresholds (`passes ≥ min_passes`, `passes / (passes + failures) ≥ min_rate`), else
-    /// [`KernelError::Gate`] naming the remedy. There is no override (ruling L-P16).
+    /// record whose file still hashes to `qualification_sha256`, made on the real application
+    /// unless this daemon runs under the fixtures seam (final review I-1: "driver <id> was
+    /// qualified on the fake application; remedy: vk driver qualify on the real one"), and whose
+    /// passes meet the plan's thresholds (`passes ≥ min_passes`, `passes / (passes + failures) ≥
+    /// min_rate`), else [`KernelError::Gate`] naming the remedy. There is no override (ruling
+    /// L-P16).
     pub fn check_qualified(&self, manifest: &DriverManifest) -> Result<(), KernelError> {
         if manifest.kind != DriverKind::Com {
             return Ok(());
@@ -231,6 +257,14 @@ impl RealKernel {
                     e.kind()
                 )))
             }
+        }
+        // A replay on the fake application proves nothing about Office: it opens the gate only
+        // on a daemon that runs the fake itself (CI), never on one started clean.
+        if q.fake && !self.forge_fixtures {
+            return Err(KernelError::Gate(format!(
+                "driver {id} was qualified on the fake application; remedy: vk driver qualify on \
+                 the real one"
+            )));
         }
         let runs = u64::from(q.passes) + u64::from(q.failures);
         let Qualification {

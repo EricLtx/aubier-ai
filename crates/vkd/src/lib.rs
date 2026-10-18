@@ -623,7 +623,8 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         if f.fixtures {
             tracing::warn!(
                 "VK_FORGE_FIXTURES=1: vk driver learn reads the recorded catalogues and vk driver \
-                 qualify replays on the fake application, not Office — a test seam, never a node's"
+                 qualify replays on the fake application, not Office — a test seam, never a \
+                 node's; a driver qualified on the fake mounts only on a daemon under this seam"
             );
         }
     }

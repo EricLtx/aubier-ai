@@ -149,7 +149,24 @@ class PlanTest(unittest.TestCase):
         a = p["actions"][0]
         self.assertEqual((p["app"], a["name"], a["post"]), ("powerpoint", "appliquer_style_presentation", ["title_font"]))
         self.assertEqual(a["pre"], ["document is .pptx", "not open elsewhere"])
+        self.assertEqual(p["qualification"], {"min_passes": 6, "min_rate": 1.0}, "six decks, six passes (I-3)")
         plan.validate(p)
+
+    def test_min_passes_follows_the_corpus_up_to_ten(self):
+        """Final review I-3: one replay pass per mined document, so a corpus of five to nine asks
+        that many passes, never ten it could not reach; ten and more ask ten; min_rate is unchanged."""
+        for files, wanted in ((5, 5), (6, 6), (9, 9), (10, 10), (40, 10)):
+            inv = house_invariants()
+            inv["corpus"]["files"] = files
+            p, _ = plan.build(inv, self.binding, self.ont)
+            self.assertEqual(p["qualification"], {"min_passes": wanted, "min_rate": 1.0}, files)
+            plan.validate(p)
+        for broken in (None, 0, "6", True):
+            inv = house_invariants()
+            inv["corpus"]["files"] = broken
+            with self.assertRaises(Refusal) as cm:
+                plan.build(inv, self.binding, self.ont)
+            self.assertEqual(str(cm.exception), "invariants.json names no corpus.files count; remedy: run vkforge mine again")
 
     def test_a_plan_is_held_to_the_contract_rules(self):
         def refuse(edit, needle):

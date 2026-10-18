@@ -2841,6 +2841,10 @@ fn vk_forge_plan_show_prints_the_actions_and_the_ambiguities() {
         "{shown}"
     );
     assert!(shown.contains("excluded: none"), "{shown}");
+    assert!(
+        shown.contains("qualification: min_passes 10, min_rate 1.0"),
+        "the thresholds the gate holds a replay to:\n{shown}"
+    );
 }
 
 #[test]

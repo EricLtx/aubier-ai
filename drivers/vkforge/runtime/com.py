@@ -12,7 +12,7 @@ from pathlib import Path
 
 from vkdriver.protocol import DriverRefusal
 
-CALL_DEADLINE_S = 30.0   # one COM call (L-P33); a qualification pass has 120 s (qualify.PASS_DEADLINE_S)
+CALL_DEADLINE_S = 30.0   # one COM call (L-P33); a qualification pass has 90 s (qualify.PASS_DEADLINE_S)
 CLEANUP_DEADLINE_S = 5.0  # the close that ends an action, and the end of the session: often after a timeout
 DIALOG_CLASS = "#32770"  # the Win32 dialog box class: a sign-in, an overwrite, a repair prompt
 WM_CLOSE = 0x0010

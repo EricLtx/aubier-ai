@@ -1264,8 +1264,9 @@ pub fn qualified(v: &Value) -> String {
 
 /// `vk driver plan show`: each action, its numbered steps — an ontology verb
 /// and its arguments, each value as compact JSON — its pre- and
-/// post-conditions and its note; then the ambiguities and how each was
-/// settled, with the chosen value; then the invariants left out and why.
+/// post-conditions and its note; then the qualification thresholds the mount
+/// gate holds a replay to; then the ambiguities and how each was settled,
+/// with the chosen value; then the invariants left out and why.
 pub fn plan_shown(v: &Value) -> String {
     let plan = &v["plan"];
     let mut lines = Vec::new();
@@ -1299,6 +1300,11 @@ pub fn plan_shown(v: &Value) -> String {
             lines.push(format!("  note: {note}"));
         }
     }
+    let q = &plan["qualification"];
+    lines.push(format!(
+        "qualification: min_passes {}, min_rate {}",
+        q["min_passes"], q["min_rate"]
+    ));
     let ambiguities = array(plan, "ambiguities");
     if ambiguities.is_empty() {
         lines.push("ambiguities: none".into());
@@ -1560,7 +1566,8 @@ mod tests {
             "steps": [{"verb": "open", "args": {"path": "$arg.document"}},
                       {"verb": "set_font_run", "args": {"selector": "body", "font": {"name": "Garamond", "size": 11}}}],
             "pre": ["document is .docx"], "post": ["body_font", "pdf_exists"], "note": "partial: x"}],
-            "ambiguities": [{"invariant": "body_font", "resolved_by": "arch:sha256:9", "value": {"name": "Garamond", "size": 11}}]},
+            "ambiguities": [{"invariant": "body_font", "resolved_by": "arch:sha256:9", "value": {"name": "Garamond", "size": 11}}],
+            "qualification": {"min_passes": 6, "min_rate": 1.0}},
             "plan_sha256": "sha256:2", "excluded": []});
         let shown = plan_shown(&plan);
         assert_eq!(
@@ -1571,6 +1578,7 @@ mod tests {
              \x20 pre: document is .docx\n\
              \x20 post: body_font, pdf_exists\n\
              \x20 note: partial: x\n\
+             qualification: min_passes 6, min_rate 1.0\n\
              ambiguities:\n\
              \x20 body_font  arch:sha256:9  {\"name\":\"Garamond\",\"size\":11}\n\
              excluded: none"

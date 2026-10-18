@@ -122,6 +122,17 @@ class QualifyTest(unittest.TestCase):
         self.assertEqual(json.loads((self.work / "qualification.json").read_text(encoding="utf-8")), rec)
         self.assertEqual(mine.content_sha256(self.corpus), self.inv["corpus"]["content_sha256"], "the originals are never touched")
 
+    def test_a_six_document_corpus_learns_qualifies_six_of_six_and_meets_its_plan(self):
+        """Final review I-3: six documents learn, the plan asks six passes (min(10, n)), the replay
+        makes six of six, and the gate's arithmetic (`passes >= min_passes`, rate) holds."""
+        corpus = ooxml_fixtures.corpus(Path(tempfile.mkdtemp()) / "corpus", 6)
+        driver, p, inv = learned(corpus)
+        self.assertEqual((inv["corpus"]["files"], p["qualification"]), (6, {"min_passes": 6, "min_rate": 1.0}))
+        rec = qualify.qualify(driver, corpus, p, inv, self.work, fake=True)
+        self.assertEqual((rec["passes"], rec["failures"], rec["rate"]), (6, 0, 1.0))
+        q = p["qualification"]
+        self.assertTrue(rec["passes"] >= q["min_passes"] and rec["passes"] / len(rec["runs"]) >= q["min_rate"])
+
     def test_a_read_only_copy_is_a_failed_pass_not_a_hang(self):
         # Review Focus 4: the user's Word holds c3.docx; its copy keeps the read-only attribute.
         locked = self.corpus / "c3.docx"

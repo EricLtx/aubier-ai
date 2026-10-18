@@ -1,6 +1,6 @@
 # Runbook — apprendre un driver Office (Word, PowerPoint) à partir des documents du cabinet
 
-Pour le fondateur, sur son nœud Windows, dans sa session interactive. Version du 2026-10-18.
+Pour le fondateur, sur son nœud Windows, dans sa session interactive. Version du 2026-10-19.
 
 - Spec : `docs/technical/specs/2026-10-17-driver-learning-office-design.md`.
 - Section technique : `docs/technical/technical-readme.md`, « Learned drivers ».
@@ -25,7 +25,7 @@ Apprendre un driver, c'est générer un pilote de périphérique à partir de la
 | `qualify` | Le banc de test de l'image : le driver rejoué sur des copies du lot, chaque postcondition revérifiée dans le code. |
 | `learned` (table du noyau) | Le dossier de fabrication de l'image : les hashes de tout ce dont elle est issue. |
 | La porte du montage | La ROM de boot qui refuse une image sans rapport de test signé, ou dont le rapport n'est plus celui que l'usine a classé. |
-| `.vault.json` | La mémoire de travail du mineur (le texte clair d'un pied de page). Elle est effacée dès que `generate` rend la main. |
+| `.vault.json` | La mémoire de travail du mineur (le texte clair d'un pied de page), en RAM protégée : sous le répertoire privé du démon (`<état>\forge\<nom>\`), jamais dans le dossier `--out`. Elle est effacée dès que `generate` rend la main. |
 
 ---
 
@@ -58,7 +58,7 @@ vkforge: vk driver learn and vk driver qualify are served
 ```
 Sans `--vkforge-root`, `vk driver learn` et `vk driver qualify` sont refusés : `vkforge is not configured on this daemon; remedy: start vkd with --vkforge-root <repository>\drivers`. La racine est une option du démon, jamais d'une requête : aucun client du tube ne peut nommer le code que le démon lance.
 
-**Ne jamais poser `VK_FORGE_FIXTURES=1` sur ce nœud.** C'est la prise de test de la CI (catalogues enregistrés, application factice à la place d'Office). Avec elle, une qualification contre le faux Word ouvre la porte du montage. Si elle est posée, `vkd` le dit en clair : `VK_FORGE_FIXTURES=1: vk driver learn reads the recorded catalogues and vk driver qualify replays on the fake application, not Office`. Dans ce cas on arrête le démon et on relance sans.
+**Ne jamais poser `VK_FORGE_FIXTURES=1` sur ce nœud.** C'est la prise de test de la CI (catalogues enregistrés, application factice à la place d'Office). Une qualification faite sous elle est marquée `fake true` : un démon relancé sans la prise refuse de monter ce driver (`was qualified on the fake application; remedy: vk driver qualify on the real one`), et il faut le requalifier sur le vrai Office. Si elle est posée, `vkd` le dit en clair : `VK_FORGE_FIXTURES=1: vk driver learn reads the recorded catalogues and vk driver qualify replays on the fake application, not Office`. Dans ce cas on arrête le démon et on relance sans.
 
 Les actes humains (`learn`, `mount`, `umount`) demandent la clé d'appareil du nœud, inscrite par `--auto-enroll-node` (§4 du runbook `recette-maskai.md`) ; ils ne demandent pas de bail de vivacité.
 
@@ -85,7 +85,9 @@ excluded: none
 - `ambiguities` : `<invariant> purged` (aucun arch) ou `<invariant> arch:<id>`.
 - `excluded` : ce que le plan a laissé de côté et pourquoi, par exemple `title_style (a custom style has no built-in anchor (v1))`.
 
-Le grand-livre reçoit `driver.learned` ; le fichier `.vault.json` n'existe plus.
+Le grand-livre reçoit `driver.learned` ; le fichier `.vault.json` n'existe plus (il n'a jamais été dans `--out`).
+
+Avec moins de dix documents, le plan demande autant de passes de qualification que de documents (`min_passes` = le nombre de documents, au plus dix) : un corpus de six documents se qualifie à 6/6.
 
 ---
 
@@ -95,13 +97,13 @@ On relit avant de qualifier, comme on relit une séquence d'initialisation avant
 ```powershell
 vk driver plan show C:\drivers-appris\word-maison
 ```
-Attendu : l'action (`<nom> (reversible: no)`), ses étapes numérotées (`1. open(path="$arg.document")`, `2. set_font_run(...)`, …), `pre:`, `post:`, puis `ambiguities:` et `excluded:`. Une action `reversible: no` est normale : elle écrit dans le document.
+Attendu : l'action (`<nom> (reversible: no)`), ses étapes numérotées (`1. open(path="$arg.document")`, `2. set_font_run(...)`, …), `pre:`, `post:`, puis les seuils que la porte du montage exigera (`qualification: min_passes 10, min_rate 1.0`), `ambiguities:` et `excluded:`. Une action `reversible: no` est normale : elle écrit dans le document.
 
 ---
 
 ## 5. Qualifier, puis monter
 
-**5.1 Qualifier.** Le driver est rejoué sur des copies du corpus d'apprentissage (le même dossier, inchangé). Chaque copie est d'abord dégradée, pour que seule une vraie réparation fasse passer la postcondition. Word est lancé par le driver lui-même.
+**5.1 Qualifier.** Le driver est rejoué sur des copies du corpus d'apprentissage (le même dossier, inchangé). Chaque copie est d'abord dégradée, pour que seule une vraie réparation fasse passer la postcondition. Le driver lance Word lui-même, ou s'attache à l'instance Word que vous avez déjà ouverte (d'où la réserve 3 du §8).
 ```powershell
 vk driver qualify --driver C:\drivers-appris\word-maison\driver --corpus C:\cabinet\contrats
 ```
@@ -118,6 +120,8 @@ Pendant le rejeu, ne touchez pas à Word et n'ouvrez pas les documents du corpus
 vk mount driver --manifest C:\drivers-appris\word-maison\driver\manifest.json
 ```
 Attendu, une ligne de tableau : `word-maison  sha256:…  yes  development` (le nom, l'id, `GOVERNED`, la source). C'est la porte : pour un driver `kind: com`, le noyau refuse le montage sans qualification valide.
+
+On monte depuis le dossier du `learn`, jamais depuis un paquet : `vk driver pack` refuse un driver appris dans cette version (`a learned driver is not packaged in this version; remedy: mount it from its learn directory`) ; l'étape de pack optionnelle du rapport de la Task 12 est caduque.
 
 Un driver monté est un driver comme un autre : chaque `vk_driver_act` est un pas de tâche sous le harnais, supervisé, chaque acte approuvé. Seul le rejeu de `qualify` tourne hors harnais, comme enfant de son étage, dans le Job (c'est le seul écart de supervision, `contracts/tcb.md`).
 
@@ -146,7 +150,7 @@ Si la réponse de l'arch ne contient pas d'objet `{"member": …, "constants": �
 Mêmes étapes avec `--app powerpoint` et un dossier de présentations `.pptx`. Rien ne change dans vkforge, seulement le catalogue, la liaison et le corpus. Deux points propres à PowerPoint :
 
 - Le faux Word de la CI ne sait que le `.docx` : un driver PowerPoint se qualifie **contre le vrai PowerPoint, sur ce nœud**, jamais sur le faux.
-- Le corpus doit avoir été **produit par PowerPoint lui-même**. Les `.pptx` générés des fixtures de test ne sont pas acceptés pour les changements de police : la qualification les refuse.
+- Le corpus doit avoir été **produit par PowerPoint lui-même**. Les `.pptx` générés des fixtures de test ne sont pas acceptés pour les changements de police : sur eux, les passes de qualification échouent (`postcondition`).
 
 ---
 
@@ -174,12 +178,14 @@ Toute étape qui refuse parle d'une ligne, `vkforge <étape>: <ce qui ne va pas>
 | `driver <id> is not qualified; remedy: vk driver qualify --driver DIR --corpus DIR` | montage sans qualification enregistrée | §5.1 |
 | `driver <id> is not qualified: N passes of M, the plan asks P at rate R; remedy: …` | rejeu sous les seuils | lire `qualification.json`, corriger, requalifier |
 | `driver <id>: qualification.json changed since vk driver qualify; remedy: …` | le fichier de rapport a été modifié après le rejeu | requalifier |
+| `driver <id> was qualified on the fake application; remedy: vk driver qualify on the real one` | le dernier rejeu a eu lieu sur le faux Word (`VK_FORGE_FIXTURES=1`), et ce démon tourne sans la prise | requalifier sur le vrai Office (§5.1), démon sans la prise |
+| `a learned driver is not packaged in this version; remedy: mount it from its learn directory` | `vk driver pack` sur un driver appris | monter depuis le dossier du `learn` (§5.2) |
 | `learn of <nom> already in progress; remedy: wait for it` (ou `qualify`, `deliberate`) | une seule demande à la fois par nom de driver | attendre sa fin |
 | `the plan changed since vk driver learn; remedy: learn again` | `plan.json` modifié à la main | réapprendre ; les fichiers d'un driver appris ne s'éditent pas |
 
 **Les cinq réserves de l'opérateur** (elles figurent aussi dans `contracts/tcb.md`) :
 
-1. **Le démon ne meurt pas entre `mine` et `generate`.** S'il meurt, `<out>\.vault.json` reste sur le disque avec le texte clair d'un pied de page. On le supprime à la main avant tout partage du dossier.
+1. **Le démon ne meurt pas entre `mine` et `generate`.** S'il meurt, `<état>\forge\<nom>\.vault.json` reste sur le disque avec le texte clair d'un pied de page, sous l'ACL privée du répertoire d'état (jamais dans `--out`). Le prochain `learn` du même nom vide ce répertoire ; sinon on le supprime à la main.
 2. **Un rejeu tué à son délai laisse Office ouvert.** Le driver qu'on tue n'exécute pas son `_quit` : l'instance Word qu'il avait lancée reste dans le gestionnaire de tâches. On la ferme à la main (sans enregistrer) avant de requalifier.
 3. **Les boîtes de dialogue de votre propre Word peuvent être annulées.** L'adaptateur ferme les fenêtres `#32770` de **tout** processus de l'exécutable de l'application, pas seulement de celui qu'il a lancé. Pendant un rejeu, on n'a donc pas de travail non enregistré dans Word.
 4. **L'appel de modèle d'une ambiguïté tient le verrou du noyau**, comme `task.step`. Un arch lent suspend les autres appels du démon pendant sa réponse.

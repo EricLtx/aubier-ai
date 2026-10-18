@@ -2,9 +2,11 @@
 
 The miner is deterministic and reads structure only: styles, fonts, footers and headers, page
 setup, as OOXML declares them. It never opens Office and never reads the body text of a document.
-What it does read of the text — a footer, a header, a custom style id — is free text that can carry
-a name or an address: it leaves `invariants.json` as a `<redacted:sha256:…>` token and its clear
-value goes to the `.vault.json` sidecar (0o600), which stays on the node.
+What it does read of the text — a footer, a header, a custom style's name — is free text that can
+carry a name or an address: it leaves `invariants.json` as a `<redacted:sha256:…>` token and its
+clear value goes to the vault (`--vault FILE`, by default `<out>/.vault.json`), which stays on the
+node. The daemon names a vault under its own private forge directory, never under `--out`
+(final review I-2): on Windows a mode is no ACL, so the directory's ACL is the protection.
 
 A value is an invariant when the share of mined files carrying it (its support) reaches the
 threshold; below it, two values or more are an ambiguity listed with their candidates, and a lone
@@ -325,22 +327,29 @@ def mine_corpus(corpus: Path, threshold: float = 0.8) -> tuple[dict, dict]:
     return inv, {t: vault[t] for t in sorted(used) if t in vault}
 
 
-def write_invariants(inv: dict, vault: dict, out: Path) -> None:
+def write_invariants(inv: dict, vault: dict, out: Path, vault_path: Path | None = None) -> Path:
+    """invariants.json into `out`; the vault at `vault_path` (default `<out>/.vault.json`), its
+    directory made if need be. Returns the vault's path."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     canon.write(inv, out / "invariants.json")
-    sidecar = out / ".vault.json"
+    sidecar = Path(vault_path) if vault_path is not None else out / ".vault.json"
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
     sidecar.touch()
     try:
         os.chmod(sidecar, 0o600)                        # before the clear text is written; best effort on Windows
     except OSError:
         pass
     canon.write(vault, sidecar)
+    return sidecar
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--corpus", required=True, type=Path, help="folder of .docx or .pptx files of one kind")
-    parser.add_argument("--out", required=True, type=Path, help="directory that receives invariants.json and .vault.json")
+    parser.add_argument("--out", required=True, type=Path, help="directory that receives invariants.json")
+    parser.add_argument("--vault", type=Path,
+                        help="file that receives the clear values (default <out>/.vault.json; the daemon names "
+                             "one under its private forge directory)")
     parser.add_argument("--threshold", type=float, default=0.8, help="support an invariant needs (default 0.8)")
 
 
@@ -350,8 +359,10 @@ def run(ns: argparse.Namespace) -> int:
     corpus, out = Path(ns.corpus).resolve(), Path(ns.out).resolve()
     if out == corpus or corpus in out.parents:
         raise Refusal(f"out {ns.out} is inside the corpus", "write elsewhere")
+    if ns.vault is not None and corpus in Path(ns.vault).resolve().parents:
+        raise Refusal(f"vault {ns.vault} is inside the corpus", "write elsewhere")
     inv, vault = mine_corpus(ns.corpus, ns.threshold)
-    write_invariants(inv, vault, ns.out)
+    write_invariants(inv, vault, ns.out, ns.vault)
     print(f"mine: {len(inv['invariants'])} invariants, {len(inv['ambiguities'])} ambiguities over "
           f"{inv['corpus']['files']} files ({inv['corpus']['skipped']} skipped) -> {Path(ns.out) / 'invariants.json'}")
     return 0
