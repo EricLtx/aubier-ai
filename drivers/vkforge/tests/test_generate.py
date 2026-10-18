@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vkdriver.hash_dir import hash_dir, list_files
 from vkdriver.protocol import DriverRefusal
@@ -37,6 +38,50 @@ def fake_venv() -> Path:
     (venv / "Scripts").mkdir()
     (venv / "Scripts" / "python.exe").write_bytes(b"MZ")
     return venv
+
+
+# A stand-in vkforge root whose FakeApplication records the end of the session in a file: the driver's
+# own wiring (L-P46) seen from outside its process, with no Office.
+RECORDING_FAKE = '''from pathlib import Path
+
+
+class FakeApplication:
+    def __init__(self, binding, config):
+        self.marker = Path(config["quit_marker"])
+
+    def probe(self):
+        pass
+
+    def open(self, path):
+        return path
+
+    def call(self, verb, doc, **args):
+        if verb == "export":
+            Path(args["path"]).write_bytes(b"%PDF-1.4 recording")
+        return True
+
+    def close(self, doc):
+        pass
+
+    def quit(self):
+        with open(self.marker, "a", encoding="utf-8") as f:
+            f.write("quit\\n")
+'''
+
+
+def recording_root() -> Path:
+    root = Path(tempfile.mkdtemp())
+    (root / "vkforge" / "runtime").mkdir(parents=True)
+    (root / "vkforge" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "vkforge" / "runtime" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "vkforge" / "runtime" / "fake.py").write_text(RECORDING_FAKE, encoding="utf-8")
+    return root
+
+
+def winword_pids() -> set:
+    listing = subprocess.run(["tasklist", "/FO", "CSV", "/NH", "/FI", "IMAGENAME eq WINWORD.EXE"],
+                             capture_output=True, text=True, errors="replace").stdout
+    return {line.split('","')[1] for line in listing.splitlines() if line.startswith('"WINWORD.EXE"')}
 
 
 class Session:
@@ -240,3 +285,42 @@ class GenerateTest(unittest.TestCase):
         self.assertTrue((out / "driver.py").is_file() and (out / ".venv").exists())
         files_sha256 = json.loads((out / "manifest.json").read_text(encoding="utf-8"))["program"]["files_sha256"]
         self.assertEqual(printed.getvalue(), f"generate: word-maison {files_sha256} -> {out}\n")
+
+    def test_the_driver_quits_its_application_once_when_serve_returns(self):
+        # L-P46: stdin's end returns serve, the driver quits the application it used, once (atexit is
+        # the backstop); a session that never touched the application quits nothing.
+        driver, root = self.gen(), recording_root()
+        doc = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "c.docx")
+        used, idle = root / "used.log", root / "idle.log"
+        s = Session(driver, fake=True, fake_extra={"vkforge_root": str(root), "quit_marker": str(used)})
+        ans = s.act("appliquer_style_maison", {"document": str(doc), "pdf": str(doc.with_suffix(".pdf"))})
+        s.close()
+        self.assertTrue(ans["ok"], ans)
+        self.assertEqual(used.read_text(encoding="utf-8"), "quit\n")
+        Session(driver, fake=True, fake_extra={"vkforge_root": str(root), "quit_marker": str(idle)}).close()
+        self.assertFalse(idle.exists())
+
+    @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("word"), "Word not installed")
+    def test_no_word_the_driver_started_outlives_its_run(self):
+        # L-P46 on the real Word: the instance the driver started (none when the user's was running) is
+        # gone once the driver has ended.
+        before = winword_pids()
+        doc = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "c.docx", title_style="Normal", body_font=("Calibri", 12))
+        s = Session(self.gen(), fake=False, extra_env={"VK_DRIVER_APPLICATIONS": "WINWORD.EXE"})
+        ans = s.act("appliquer_style_maison", {"document": str(doc), "pdf": str(doc.with_suffix(".pdf"))})
+        s.close()
+        self.assertTrue(ans["ok"], ans)
+        deadline = time.monotonic() + 30
+        while winword_pids() - before and time.monotonic() < deadline:
+            time.sleep(0.5)
+        self.assertEqual(winword_pids() - before, set(), "a Word this run started is still running")
+
+    def test_a_failed_generation_leaves_no_out(self):
+        parent, venv = Path(tempfile.mkdtemp()), fake_venv()
+        out = parent / "word-maison"
+        with mock.patch.object(generate, "hash_dir", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                generate.generate(self.plan, self.binding, self.invariants, self.vault, out, name="word-maison",
+                                  venv=venv)
+        self.assertEqual(list(parent.iterdir()), [], "no out, no partial directory")
+        self.assertTrue((venv / "Scripts" / "python.exe").is_file(), "the venv the link named is untouched")

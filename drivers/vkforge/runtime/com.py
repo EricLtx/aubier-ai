@@ -3,6 +3,7 @@ generated driver as vendor/vkforge_runtime/com.py (L-P19): the stdlib, vkdriver.
 and on Windows only, comtypes. It names no application (L-P31): what differs between Word and
 PowerPoint at this level is binding["application"], the ontology's applications block for the app."""
 import ctypes
+import gc
 import hashlib
 import os
 import sys
@@ -12,6 +13,7 @@ from pathlib import Path
 from vkdriver.protocol import DriverRefusal
 
 CALL_DEADLINE_S = 30.0   # one COM call (L-P33); a qualification pass has 120 s (qualify.PASS_DEADLINE_S)
+CLEANUP_DEADLINE_S = 5.0  # the close that ends an action, and the end of the session: often after a timeout
 DIALOG_CLASS = "#32770"  # the Win32 dialog box class: a sign-in, an overwrite, a repair prompt
 WM_CLOSE = 0x0010
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -114,26 +116,62 @@ def guarded(fn, what: str, deadline_s: float = CALL_DEADLINE_S, find_dialogs=Non
     return box.get("value")
 
 
-def live_typelib_sha256(guid: str) -> str:
-    """The type library file the registry names for `guid` today — HKCR\\TypeLib\\{guid}, its highest
-    version (hexadecimal major.minor), 0\\win64 then 0\\win32, the path inventory read — hashed as the
-    catalogue's `typelib_sha256` is (L-P22)."""
-    if sys.platform == "win32":
-        import winreg
+def _com_errors() -> tuple:
+    """What a failed COM call raises: OSError and, once Application has loaded comtypes, COMError."""
+    com = sys.modules.get("comtypes")
+    return (OSError,) if com is None else (OSError, com.COMError)
 
-        try:
-            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"TypeLib\{guid}") as key:
-                versions = [winreg.EnumKey(key, i) for i in range(winreg.QueryInfoKey(key)[0])]
-            version = max(versions, key=lambda v: tuple(int(p, 16) for p in v.split(".")))
-            for arch in ("win64", "win32"):
+
+def _version_key(name: str):
+    major, _, minor = name.partition(".")
+    return int(major, 16), int(minor or "0", 16)          # registry versions are hexadecimal `major.minor`
+
+
+def _not_registered(guid: str) -> DriverRefusal:
+    return DriverRefusal("precondition", f"type library {guid} is not registered; remedy: install Microsoft 365 desktop")
+
+
+def typelib_path(guid: str) -> str:
+    """inventory.typelib_path, line for line (this module is vendored and cannot import it), so the
+    probe hashes the very file inventory hashed (L-P22): HKCR\\TypeLib\\{guid}, its parsable versions
+    highest first (hexadecimal `major.minor`, any other subkey skipped), 0\\win64 then 0\\win32."""
+    if sys.platform != "win32":
+        raise _not_registered(guid)
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"TypeLib\{guid}") as key:
+            versions = []
+            try:
+                while True:
+                    versions.append(winreg.EnumKey(key, len(versions)))
+            except OSError:                                 # the end of the enumeration
+                pass
+        parsable = []
+        for version in versions:
+            try:
+                parsable.append((_version_key(version), version))
+            except ValueError:                              # a subkey that is not `major.minor`: not a version
+                continue
+        for _, version in sorted(parsable, reverse=True):
+            for bitness in ("win64", "win32"):
                 try:
-                    path = winreg.QueryValue(winreg.HKEY_CLASSES_ROOT, rf"TypeLib\{guid}\{version}\0\{arch}")
-                    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                    return winreg.QueryValue(winreg.HKEY_CLASSES_ROOT, rf"TypeLib\{guid}\{version}\0\{bitness}")
                 except OSError:
                     continue
-        except (OSError, ValueError):
-            pass
-    raise DriverRefusal("precondition", f"type library {guid} is not registered; remedy: install Microsoft 365 desktop")
+    except OSError:
+        pass
+    raise _not_registered(guid)
+
+
+def live_typelib_sha256(guid: str) -> str:
+    """The type library file the registry names for `guid` today (typelib_path), hashed as the
+    catalogue's `typelib_sha256` is (L-P22)."""
+    path = typelib_path(guid)
+    try:
+        return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        raise DriverRefusal("precondition", f"type library file of {guid} cannot be read; "
+                                            "remedy: repair Microsoft 365 desktop") from None
 
 
 def probe(binding: dict) -> None:
@@ -144,11 +182,26 @@ def probe(binding: dict) -> None:
 
 
 class Application:
-    """The application binding["application"] names, the user's own instance (spike verdict 3)."""
+    """The application binding["application"] names, the user's own instance (spike verdict 3). Attached
+    to that instance, the adapter changes only its DisplayAlerts, read first and put back by quit()
+    (L-P47); an instance the adapter started itself, quit() ends (L-P46). `connect` returns
+    (application, started); the default is the running instance, else a new one."""
 
-    def __init__(self, binding: dict):
+    def __init__(self, binding: dict, connect=None):
         self.binding, self.spec = binding, binding["application"]
         self.verbs = {v["verb"]: v for v in binding["verbs"]}
+        self.deadline_s, self.cleanup_deadline_s = CALL_DEADLINE_S, CLEANUP_DEADLINE_S
+        self.app, self.started, self.alerts_before = None, False, None
+        progid = self.spec["progid"]
+        try:
+            self.app, self.started = (connect or self._connect)()
+            if not self.started:      # the user's instance: its own setting, put back at the end (L-P47)
+                self.alerts_before = guarded(lambda: self.app.DisplayAlerts, "DisplayAlerts")
+            guarded(lambda: setattr(self.app, "DisplayAlerts", self.spec["alerts_off"]), "DisplayAlerts")
+        except _com_errors() as e:
+            raise DriverRefusal("precondition", f"{progid} cannot be started: {e}") from e
+
+    def _connect(self) -> tuple:
         progid = self.spec["progid"]
         if sys.platform != "win32":
             raise DriverRefusal("precondition", f"{progid} cannot be started: not Windows")
@@ -163,36 +216,76 @@ class Application:
             except (OSError, comtypes.COMError):
                 return comtypes.client.CreateObject(progid), True
 
-        try:
-            self.app, self.started = guarded(start, f"start {progid}")
-            guarded(lambda: setattr(self.app, "DisplayAlerts", self.spec["alerts_off"]), "DisplayAlerts")
-        except (OSError, comtypes.COMError) as e:
-            raise DriverRefusal("precondition", f"{progid} cannot be started: {e}") from e
+        return guarded(start, f"start {progid}")
+
+    def _documents(self):
+        return getattr(self.app, self.spec["collection"])
 
     def probe(self) -> None:
         probe(self.binding)
 
     def open(self, path: str):
-        # The plan's "not open elsewhere" in this very instance: Open hands back a document the user
-        # already has open, unsaved edits included. Refused, and that document is not closed: it is theirs.
-        open_before = guarded(lambda: {d.FullName for d in _items(getattr(self.app, self.spec["collection"]))}, "open")
-        doc = guarded(lambda: getattr(self.app, self.spec["collection"]).Open(path, **self.spec["open"]), "open")
-        if guarded(lambda: doc.FullName, "open") in open_before:
+        """The document, opened. A failure while opening (no such file, a damaged one, the application's
+        refusal) is `precondition`, as the fake's; a failure inside a verb is `internal` in both. The
+        plan's "not open elsewhere" holds in this very instance too: there Open hands back a document the
+        user already has open, unsaved edits included; refused, and that document is not closed."""
+        try:
+            open_before = guarded(lambda: {d.FullName for d in _items(self._documents())}, "open", self.deadline_s)
+            doc = guarded(lambda: self._documents().Open(path, **self.spec["open"]), "open", self.deadline_s)
+            already = guarded(lambda: doc.FullName, "open", self.deadline_s) in open_before
+            read_only = not already and guarded(lambda: bool(doc.ReadOnly), "open", self.deadline_s)
+        except _com_errors() as e:
+            raise DriverRefusal("precondition", f"document cannot be opened: {e}") from e
+        if already:
             raise DriverRefusal("precondition", "document already open in the application (the user's window)")
-        if guarded(lambda: bool(doc.ReadOnly), "open"):
+        if read_only:
             self.close(doc)
             raise DriverRefusal("precondition", "document opened read-only (locked elsewhere)")
         return doc
 
     def call(self, verb: str, doc, **args):
-        return guarded(lambda: VERBS[verb](self, doc, **args), verb)
+        try:
+            return guarded(lambda: VERBS[verb](self, doc, **args), verb, self.deadline_s)
+        except _com_errors() as e:
+            raise DriverRefusal("internal", f"{verb}: {e}") from e
 
     def close(self, doc) -> None:
-        guarded(lambda: doc.Close(**self.spec["close"]), "close")
+        """Closed without saving, under the short cleanup deadline; its own refusal is written to stderr,
+        never raised: the action's first refusal is the one the host gets (after a timeout, the close
+        meets the same wedged application)."""
+        try:
+            guarded(lambda: doc.Close(**self.spec["close"]), "close", self.cleanup_deadline_s)
+        except (DriverRefusal, *_com_errors()) as e:
+            sys.stderr.write(f"close: {e}\n")
 
     def quit(self) -> None:
-        if self.started:
-            guarded(lambda: self.app.Quit(), "quit")
+        """The end of the session (L-P46, L-P47), once. Attached to the user's instance: its DisplayAlerts
+        put back, nothing else. Started by this adapter: the references this process dropped are
+        collected, then Quit, unless a document is still open in the instance (one the user opened there,
+        or one a failed close left): nothing is closed then, the instance is left running, stderr says
+        so. Every reference to the application is released at the end. A failure is written to stderr,
+        never raised: this runs when serve returns and at exit."""
+        if self.app is None:
+            return
+        try:
+            if not self.started:
+                if self.alerts_before is not None:
+                    guarded(lambda: setattr(self.app, "DisplayAlerts", self.alerts_before), "DisplayAlerts",
+                            self.cleanup_deadline_s)
+            else:
+                guarded(gc.collect, "quit", self.cleanup_deadline_s)
+                if guarded(lambda: self._documents().Count, "quit", self.cleanup_deadline_s):
+                    sys.stderr.write(f"quit: {self.spec['progid']} still holds documents; left running\n")
+                else:
+                    guarded(lambda: self.app.Quit(), "quit", self.deadline_s)
+        except (DriverRefusal, *_com_errors()) as e:
+            sys.stderr.write(f"quit: {e}\n")
+        finally:
+            held, self.app = [self.app], None
+            try:      # the last reference dropped in the apartment it was made in
+                guarded(lambda: (held.clear(), gc.collect()), "release", self.cleanup_deadline_s)
+            except DriverRefusal as e:
+                sys.stderr.write(f"quit: {e}\n")
 
 
 # --- the verbs (L-P40) -------------------------------------------------------------------------------
@@ -205,6 +298,7 @@ class Application:
 _DRIVEN = ("bound", "partial")
 _COLLECTIONS = {"Section": "Sections", "Slide": "Slides"}   # heads that are every item of a document collection
 _MASTER = "SlideMaster"                                      # the `Master` head: the deck's slide master
+_SELECTED = ("Paragraph", "Shape")                           # heads a selector picks
 _PLACEHOLDER = {"title": "Title", "body": "Body"}            # a Shape selector: the placeholder type it names
 _PRIMARY = "Primary"                                         # the header or footer of a section's body pages
 
@@ -232,16 +326,18 @@ def _items(collection) -> list:
 
 
 def _constant(entry: dict, value) -> int:
-    """The constant the binding carries for `value`: the name its enum's common prefix and `value` make,
-    case aside (wdStyle + Heading1, wdExportFormat + pdf). A built-in style is reached by its constant,
-    never by a localised name (L-P42)."""
-    for enum in (entry.get("constants") or {}).values():
-        prefix = os.path.commonprefix(sorted(enum)) if len(enum) > 1 else ""
-        wanted = (prefix + str(value)).lower()
-        for name, number in sorted(enum.items()):
-            if name.lower() == wanted:
-                return number
-    raise DriverRefusal("precondition", f"{entry['verb']}: {value} is not a constant the binding carries")
+    """The constant the binding carries for `value`: the member of the verb's enum whose lower-case name
+    ends with `value`'s, the least qualified when several do (wdStyleTitle, not wdStyleBookTitle or
+    wdStyleSubtitle; ppPlaceholderBody, not ppPlaceholderVerticalBody). A built-in style is reached by
+    its constant, never by a localised name (L-P42). None, or two equally qualified: `internal`."""
+    enums = entry.get("constants") or {}
+    if isinstance(value, str) and value:
+        wanted = value.lower()
+        for enum in sorted(enums):
+            found = sorted((len(name), name) for name in enums[enum] if name.lower().endswith(wanted))
+            if len(found) == 1 or (len(found) > 1 and found[0][0] < found[1][0]):
+                return enums[enum][found[0][1]]
+    raise DriverRefusal("internal", f"no unique constant for {value} in {', '.join(sorted(enums)) or 'no enum'}")
 
 
 def _paragraphs(app, doc, selector: str) -> list:
@@ -270,8 +366,6 @@ def _placeholders(app, doc, selector: str) -> list:
     """A Shape selector resolves over the master's placeholders (L-P40: title_font is mined from the
     master): the shapes whose placeholder type, read through the apply_paragraph_style chain, is the
     binding's constant for the selector."""
-    import comtypes
-
     if selector not in _PLACEHOLDER:
         raise DriverRefusal("precondition", f"selector {selector} names no placeholder of the master")
     entry = _entry(app, "apply_paragraph_style")
@@ -281,21 +375,21 @@ def _placeholders(app, doc, selector: str) -> list:
     for shape in _items(getattr(doc, _MASTER).Shapes):
         try:
             kind = _walk(shape, names)
-        except comtypes.COMError:           # not a placeholder
+        except _com_errors():               # not a placeholder
             continue
         if kind == wanted:
             found.append(shape)
     return found
 
 
-def _heads(app, doc, head: str, selector=None) -> list:
+def _heads(app, doc, verb: str, head: str, selector=None) -> list:
     """The objects `head` names in the opened document (L-P40)."""
     if head == _chain(_entry(app, "save"))[0]:   # the document's own type: the type `open` returns
         return [doc]
-    if head == "Paragraph":
-        return _paragraphs(app, doc, selector)
-    if head == "Shape":
-        return _placeholders(app, doc, selector)
+    if head in _SELECTED:
+        if not isinstance(selector, str):
+            raise DriverRefusal("precondition", f"verb {verb} needs a selector")
+        return (_paragraphs if head == "Paragraph" else _placeholders)(app, doc, selector)
     if head in _COLLECTIONS:
         return _items(getattr(doc, _COLLECTIONS[head]))
     if head == "Master":
@@ -306,7 +400,7 @@ def _heads(app, doc, head: str, selector=None) -> list:
 def _ends(app, doc, verb: str, selector=None) -> list:
     """The objects at the end of `verb`'s chain, one per head."""
     head, names = _chain(_entry(app, verb))
-    return [_walk(target, names) for target in _heads(app, doc, head, selector)]
+    return [_walk(target, names) for target in _heads(app, doc, verb, head, selector)]
 
 
 def _bands(app, doc, verb: str) -> list:
@@ -330,7 +424,7 @@ def apply_paragraph_style(app, doc, selector: str, style: str) -> None:
     entry = _entry(app, "apply_paragraph_style")
     head, names = _chain(entry)
     value = _constant(entry, style)
-    for target in _heads(app, doc, head, selector):
+    for target in _heads(app, doc, "apply_paragraph_style", head, selector):
         setattr(_walk(target, names[:-1]), names[-1], value)
 
 

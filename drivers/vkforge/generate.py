@@ -13,7 +13,9 @@ import json
 import keyword
 import os
 import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from vkdriver import protocol as vkdriver_protocol
@@ -32,9 +34,9 @@ _NAME = re.compile(r"[a-z0-9-]{1,32}")
 _ARG, _SECRET = "$arg.", "$secret."
 # Names driver.py defines at module level, and the parameters of Application.call: an action or an
 # argument of the same name would break the code the generator writes.
-_DRIVER_NAMES = frozenset({"hashlib", "json", "os", "sys", "Path", "DRIVER_DIR", "VENDOR_DIR", "VKDRIVER_DIR",
-                           "DriverRefusal", "serve", "Application", "NAME", "VERSION", "BINDING", "SECRETS",
-                           "ACTIONS", "app", "_app", "_sha", "_first_dir"})
+_DRIVER_NAMES = frozenset({"atexit", "hashlib", "json", "os", "sys", "Path", "DRIVER_DIR", "VENDOR_DIR",
+                           "VKDRIVER_DIR", "DriverRefusal", "serve", "Application", "NAME", "VERSION", "BINDING",
+                           "SECRETS", "ACTIONS", "app", "_app", "_quit", "_sha", "_first_dir"})
 _CALL_PARAMETERS = frozenset({"self", "verb", "doc"})
 
 _HEAD = '''"""@NAME@: driver learned by vkforge, no timestamp.
@@ -44,6 +46,7 @@ catalogue_sha256  @CATALOGUE@
 invariants_sha256 @INVARIANTS@
 plan_sha256       @PLAN@
 """
+import atexit
 import hashlib
 import json
 import os
@@ -96,6 +99,15 @@ def app():
     return _app
 
 
+def _quit():
+    """The end of the session (L-P46), once, whether serve returned or the interpreter is exiting: the
+    adapter quits the instance it started and gives the user's own its DisplayAlerts back (L-P47)."""
+    global _app
+    if _app is not None:
+        ending, _app = _app, None
+        ending.quit()
+
+
 def _sha(path) -> str:
     return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
 '''
@@ -115,7 +127,9 @@ _ACTION_TAIL = '''    finally:
 _FOOT = '''
 
 if __name__ == "__main__":
+    atexit.register(_quit)
     serve(NAME, VERSION, ACTIONS)
+    _quit()
 '''
 
 
@@ -267,11 +281,25 @@ def generate(plan: dict, binding: dict, invariants: dict, vault: dict, out: Path
     if venv is not None and not (Path(venv) / "Scripts" / "python.exe").is_file():
         raise Refusal(f"no virtualenv at {venv}", r"powershell -ExecutionPolicy Bypass -File drivers\vkforge\setup.ps1")
     driver = render_driver(plan, binding, name)
-    out.mkdir(parents=True, exist_ok=True)
-    _write(out / "driver.py", driver.encode("utf-8"))
-    _write(out / "binding.json", canon.dumps(binding))
+    # Built in a sibling directory and moved into place last: a failed write leaves no partial `out`
+    # (which the next run would refuse as not empty). hash_dir hashes relative paths: the same there.
+    out.parent.mkdir(parents=True, exist_ok=True)
+    build = Path(tempfile.mkdtemp(prefix=f".{out.name}.", suffix=".partial", dir=out.parent))
+    try:
+        _build(build, plan, binding, name, driver, secrets, venv)
+        if out.exists():
+            out.rmdir()                                     # empty: _check refused anything else
+        os.replace(build, out)
+    except BaseException:
+        _discard(build)
+        raise
+
+
+def _build(build: Path, plan: dict, binding: dict, name: str, driver: str, secrets: dict, venv) -> None:
+    _write(build / "driver.py", driver.encode("utf-8"))
+    _write(build / "binding.json", canon.dumps(binding))
     if secrets:
-        path = out / "secrets.json"
+        path = build / "secrets.json"
         path.touch()
         try:
             os.chmod(path, 0o600)                           # before the clear text is written; best effort on Windows
@@ -281,12 +309,22 @@ def generate(plan: dict, binding: dict, invariants: dict, vault: dict, out: Path
     vkdriver_dir = Path(vkdriver_protocol.__file__).resolve().parent
     for source in sorted(vkdriver_dir.glob("*.py")):
         if not source.name.startswith("test_"):
-            _write(out / "vendor" / "vkdriver" / source.name, source.read_bytes())
+            _write(build / "vendor" / "vkdriver" / source.name, source.read_bytes())
     for source in ("__init__.py", "com.py"):                # never fake.py (L-P19)
-        _write(out / "vendor" / "vkforge_runtime" / source, (RUNTIME / source).read_bytes())
+        _write(build / "vendor" / "vkforge_runtime" / source, (RUNTIME / source).read_bytes())
     if venv is not None:
-        _link(Path(venv), out / ".venv")
-    canon.write(_manifest(plan, name, hash_dir(str(out))), out / "manifest.json")
+        _link(Path(venv), build / ".venv")
+    canon.write(_manifest(plan, name, hash_dir(str(build))), build / "manifest.json")
+
+
+def _discard(build: Path) -> None:
+    """A failed generation's directory removed, its .venv link first and alone: never what it points to."""
+    link = build / ".venv"
+    if getattr(os.path, "isjunction", lambda p: False)(link):
+        os.rmdir(link)
+    elif link.is_symlink():
+        link.unlink()
+    shutil.rmtree(build, ignore_errors=True)
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:

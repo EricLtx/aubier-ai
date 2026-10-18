@@ -3,7 +3,8 @@ vendored: a generated driver reaches it only when `vkforge qualify --fake` (or a
 in its work directory. Word .docx only (L-P31). Its verbs are com.VERBS' keys: they edit the
 package's parts in memory, `save` writes them with ooxml.write_parts, and every check re-reads the
 saved file through the miner, the reading the qualification makes. Its dialog box (fake.json's
-"dialog_on") is closed by com.guarded, the guard the real driver runs (L-P33)."""
+"dialog_on") is closed by com.guarded, the guard the real driver runs (L-P33). Its refusals are the
+adapter's: a failure while opening is `precondition`, a failure inside a verb `internal`."""
 import os
 import posixpath
 import threading
@@ -47,8 +48,8 @@ class _Document:
             try:
                 with ooxml.open_package(self.path) as zf:
                     root = ooxml.part(zf, name)
-            except Refusal as e:
-                raise DriverRefusal("precondition", str(e)) from e
+            except (Refusal, OSError) as e:                 # inside a verb: the adapter's COMError
+                raise DriverRefusal("internal", str(e)) from e
             if root is None:
                 return None
             self.parts[name] = root
@@ -133,8 +134,14 @@ def _child(parent, local: str, order: tuple = ()):
     return element
 
 
-def _paragraphs(doc: _Document, selector: str) -> list:
+def _need_selector(selector, verb: str) -> None:
+    if not isinstance(selector, str):
+        raise DriverRefusal("precondition", f"verb {verb} needs a selector")
+
+
+def _paragraphs(doc: _Document, selector: str, verb: str) -> list:
     """The paragraphs a selector names, in the miner's reading of document.xml (every w:p, in order)."""
+    _need_selector(selector, verb)
     root = doc.part(_DOCUMENT)
     paragraphs = [] if root is None else list(root.iter(q("w", "p")))
     count = len(paragraphs)
@@ -239,8 +246,11 @@ def _write_band(doc: _Document, kind: str, text: str) -> None:
             name = target[1:] if target.startswith("/") else posixpath.normpath(posixpath.join("word", target))
             doc.put(name, root)
             return
-    with ooxml.open_package(doc.path) as zf:
-        taken = set(zf.namelist()) | set(doc.parts)
+    try:
+        with ooxml.open_package(doc.path) as zf:
+            taken = set(zf.namelist()) | set(doc.parts)
+    except (Refusal, OSError) as e:
+        raise DriverRefusal("internal", str(e)) from e
     n = 1
     while f"word/{kind}{n}.xml" in taken:
         n += 1
@@ -259,15 +269,15 @@ def _observed(doc: _Document) -> list:
     """The saved file, read back by the miner: what the qualification will see."""
     try:
         return mine.mine_file(doc.path)["obs"]
-    except Refusal as e:
-        raise DriverRefusal("precondition", str(e)) from e
+    except (Refusal, OSError) as e:
+        raise DriverRefusal("internal", str(e)) from e
 
 
 # --- the verbs: com.VERBS' keys, over the parts --------------------------------------------------------
 
 def apply_paragraph_style(app, doc, selector: str, style: str) -> None:
     com._constant(com._entry(app, "apply_paragraph_style"), style)   # the adapter's refusal for a style it lacks
-    targets = _paragraphs(doc, selector)
+    targets = _paragraphs(doc, selector, "apply_paragraph_style")
     sid = _style_id(doc, style)
     for p in targets:
         _child(_child(p, "pPr"), "pStyle").set(q("w", "val"), sid)
@@ -276,6 +286,7 @@ def apply_paragraph_style(app, doc, selector: str, style: str) -> None:
 
 def verify_paragraph_style(app, doc, selector: str, style: str) -> bool:
     com._constant(com._entry(app, "verify_paragraph_style"), style)
+    _need_selector(selector, "verify_paragraph_style")
     obs = _observed(doc)
     wheres = _STYLE_WHERE.get(selector, ())
     return bool(wheres) and all({"kind": "paragraph_style", "where": w, "value": {"builtin": style}} in obs
@@ -288,7 +299,7 @@ def set_font_run(app, doc, selector: str, font: dict) -> None:
     half_points = str(int(size)) if float(size).is_integer() else None
     if half_points is None:
         raise DriverRefusal("precondition", f"font size {font['size']} is not a whole number of half-points")
-    for p in _paragraphs(doc, selector):
+    for p in _paragraphs(doc, selector, "set_font_run"):
         for run in p.iter(q("w", "r")):
             rpr = _child(run, "rPr")
             fonts = _child(rpr, "rFonts", _RPR_ORDER)
@@ -302,6 +313,7 @@ def set_font_run(app, doc, selector: str, font: dict) -> None:
 
 def verify_font_run(app, doc, selector: str, font: dict) -> bool:
     com._entry(app, "verify_font_run")
+    _need_selector(selector, "verify_font_run")
     return any(o["kind"] == "font_run" and o["where"] == selector and o["value"]["name"] == font["name"]
                and float(o["value"]["size"]) == float(font["size"]) for o in _observed(doc))
 
@@ -331,9 +343,9 @@ def save(app, doc) -> None:
     try:
         ooxml.write_parts(doc.path, {name: _xml(doc.parts[name]) for name in sorted(doc.dirty)})
     except Refusal as e:
-        raise DriverRefusal("precondition", str(e)) from e
-    except OSError as e:
-        raise DriverRefusal("precondition", f"the document cannot be written: {e.strerror}") from e
+        raise DriverRefusal("internal", f"save: {e}") from e
+    except OSError as e:                                    # the adapter's COMError for the same condition
+        raise DriverRefusal("internal", f"save: the document cannot be written: {e.strerror}") from e
     doc.dirty.clear()
 
 
@@ -341,7 +353,10 @@ def export(app, doc, format: str, path: str) -> None:
     com._constant(com._entry(app, "export"), format)
     if format.lower() != "pdf":
         raise DriverRefusal("precondition", f"the fake application exports pdf only, not {format}")
-    Path(path).write_bytes(FAKE_PDF)
+    try:
+        Path(path).write_bytes(FAKE_PDF)
+    except OSError as e:
+        raise DriverRefusal("internal", f"export: {e.strerror}") from e
 
 
 def verify_pdf(app, doc, path: str) -> bool:
