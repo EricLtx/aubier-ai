@@ -10,7 +10,7 @@
 
 **Spec:** `docs/technical/specs/2026-10-17-driver-learning-office-design.md` (decisions L1–L8, contracts §4, flows §5, failure modes §6, tests §7, exit §8, TCB §11). The driver contract of `docs/technical/specs/2026-10-14-device-driver-contract-and-recette-pilot-design.md` (rulings R5, R6, R18, R25, R28) stays binding.
 
-**Revision 2026-10-18.** Revised on the pre-flight scan (`.superpowers/sdd/2026-10-17-driver-learning-office/preflight-scan.md`, 69 rows) and the controller's rulings L-P7 … L-P21 (SDD ledger `progress.md`). Every interface below is written identically in the task that produces it and in every task that consumes it; line ranges are those of master `bcffc16`.
+**Revision 2026-10-18.** Revised on the pre-flight scan (`.superpowers/sdd/2026-10-17-driver-learning-office/preflight-scan.md`, 69 rows) and the controller's rulings L-P7 … L-P34 (SDD ledger `progress.md`). Fixed again on the rescan of plan `887b877` (`.superpowers/sdd/2026-10-17-driver-learning-office/preflight-rescan.md`, 175 rows, 18 not consistent), by rulings L-P22 (amended) and L-P25 … L-P34. Every interface below is written identically in the task that produces it and in every task that consumes it; line ranges are those of master `bcffc16`.
 
 ## Global Constraints
 
@@ -26,7 +26,7 @@
 - **The stage table** `STAGES` is built in `__main__.py` by explicit imports (`{"inventory": inventory, "bind": ontology, "mine": mine, "plan": plan, "generate": generate, "qualify": qualify}`, plus `"debrief": debrief` from Task 11); a stage module defines `add_arguments(parser) -> None` and `run(ns) -> int` and does nothing at import — a stage that registered itself through `from .__main__ import STAGES` would fill a second copy of `__main__` (the running script is `__main__`, not `vkforge.__main__`) and `main` would see an empty table.
 - **L-P14 (stubs first):** Task 0 creates every stage module (`inventory.py`, `ontology.py`, `mine.py`, `plan.py`, `generate.py`, `qualify.py`) as a stub — `add_arguments` adds nothing, `run` raises `Refusal("not implemented", "wait for Task N")`; Tasks 3–8 **modify** them, never create them.
 - **L-P15 (refusal voice):** a refusal is one line, `vkforge <stage>: <what>; remedy: <remedy>`, everywhere: `main` writes exactly that to stderr and exits 2, and the kernel's refusal of a failed stage is that last stderr line, verbatim (R28). The generated driver's own refusal reasons are the protocol's five words.
-- **L-P2 (how `learn` runs):** the spec's "run as a driver of the kernel" is a governed one-shot process: `vk-ipc` spawns `<python> -I <root>/vkforge/__main__.py <stage> …` under `vk_harness::confine::for_this_platform(1 << 30, None)` with a deadline, `current_dir = <root>`, `<root>` being the `drivers/` directory the daemon was started with (`vkd --vkforge-root`), never through protocol 1 (a pipeline is not request/response). The Job governor does not block the network; the package opens no socket, which a test pins (no `socket`/`urllib`/`http`/`requests` import).
+- **L-P2 (how `learn` runs):** the spec's "run as a driver of the kernel" is a governed one-shot process: `vk-ipc` spawns `<python> -I <root>/vkforge/__main__.py <stage> …` under `vk_harness::confine::for_this_platform(1 << 30, None)` with a deadline, `current_dir = <root>`, `<root>` being the `drivers/` directory the daemon was started with (`vkd --vkforge-root`), never through protocol 1 (a pipeline is not request/response). The Job governor does not block the network; the package opens no socket, which a test pins (no `socket`/`urllib`/`http`/`requests` import). The working directory, the deadline and the kill of the whole tree are pinned by Task 9's `vk_forge_a_stage_past_its_deadline_is_killed_in_its_root` (L-P30).
 - **L-P12 (interpreters):** `ForgeConfig.python` is `VK_FORGE_PYTHON` when set, else the vkforge virtualenv `%LOCALAPPDATA%\vk\venvs\vkforge\Scripts\python.exe` that `drivers/vkforge/setup.ps1` makes (Task 9). A generated driver's development command is `[".venv/Scripts/python.exe", "-I", "driver.py"]`, `.venv` being a junction to that same virtualenv, made by the generator (`--venv`, default the virtualenv on Windows) and outside the fingerprint as every `.venv` is (`hash_dir`); the packed command is the packaging chantier's (`python/python.exe -E -s -B …`).
 - **L-P17 (lock):** `driver.learn`, `driver.qualify`, `driver.plan_show` (Task 9) and `driver.debrief` (Task 11) are dispatched **before** the general kernel lock, as `driver.pack` is (`crates/vk-ipc/src/server.rs` 882–895): `dispatch` already runs on tokio's blocking pool (`spawn_blocking`, `server.rs` 575), so the stages run there and the kernel lock is taken only in short phases. Task 9 moves the test `Node` helper of `crates/vk-ipc/tests/capital.rs` (226–413) into `crates/vk-ipc/tests/common/mod.rs`, shared by `capital.rs` and `forge.rs`.
 
@@ -43,8 +43,8 @@
 
 **Plan rulings**
 
-- **L-P1 (fake application):** the generated driver's COM calls go through one adapter, `drivers/vkforge/runtime/com.py` (`Application(progid, binding)`: `open`, `call`, `close`, `quit`). `FakeApplication(binding)` in `drivers/vkforge/runtime/fake.py` implements the same verb table on the OOXML of the file directly (with `ooxml.write_parts`, the miner's writer twin), so `qualify` runs against the fake in CI and against the real Word on the node, through the same driver bytes.
-- **L-P19 (how the fake is reached):** the adapter is vendored into every generated driver (`vendor/vkforge_runtime/com.py`); the fake stays in the repository and is injected only by `vkforge qualify --fake`, which writes `<work>/fake.json` (`{"vkforge_root": "<drivers/>"}`) into the work directory it runs the driver in; the generated driver loads the fake when, and only when, that file is in its work directory (`VK_DRIVER_WORK_DIR`). Never an environment variable: `VKFORGE_FAKE` does not exist. A mount's work directory is the kernel's private `<state_dir>/drivers/<name>/work`, which nothing writes a `fake.json` into.
+- **L-P1 (fake application):** the generated driver's COM calls go through one adapter, `drivers/vkforge/runtime/com.py` (`Application(binding)`: `probe`, `open`, `call`, `close`, `quit`). `FakeApplication(binding, config)` in `drivers/vkforge/runtime/fake.py` implements the same verb table on the OOXML of the file directly (with `ooxml.write_parts`, the miner's writer twin), so `qualify` runs against the fake in CI and against the real Word on the node, through the same driver bytes.
+- **L-P19 (how the fake is reached):** the adapter is vendored into every generated driver (`vendor/vkforge_runtime/com.py`); the fake stays in the repository and is injected only by `vkforge qualify --fake`, which writes `<work>/fake.json` (`{"vkforge_root": "<drivers/>"}`; Task 7's dialog test adds `"dialog_on"`, L-P33) into the work directory it runs the driver in; the generated driver loads the fake when, and only when, that file is in its work directory (`VK_DRIVER_WORK_DIR`). Never an environment variable: `VKFORGE_FAKE` does not exist. A mount's work directory is the kernel's private `<state_dir>/drivers/<name>/work`, which nothing writes a `fake.json` into.
 - **L-P3 (fallback, spec §5.3):** `vk driver learn --deliberate VERB` produces a *proposed projection rule* from the verb's ontology entry and the catalogue slice through one task with one `Draft` step on the given arch (no harness, no application driving in this chantier), written to `<out>/proposals/<verb>.json` for human review; COM-call tracing of a live deliberate run is deferred to a later chantier and said so in the TCB.
 - **L-P4 (the gate):** a `kind: com` driver mounts only when its `driver_id` has a `driver.qualified` record on the `learned` table meeting the plan's thresholds (`passes ≥ min_passes`, `passes / (passes + failures) ≥ min_rate`) and its `qualification.json` still hashes to the stored `qualification_sha256`.
 - **L-P5 (the debrief, founder decision 2026-10-17; no ledger row, founder 2026-10-18):** `vkforge debrief` is a stage like the others (deterministic, stdlib only, no model, no socket) whose requirements are `docs/technical/debriefs/2026-10-17-maskai-driver.md` §4; `driver.debrief` is a machine act (no presence proof) run under the same governor as `learn`'s stages; it adds **no ledger kind** and it **applies nothing**: its proposals are the operator's to apply, or, for a learned driver, the deliberate run's (L-P3).
@@ -58,6 +58,18 @@
 - **L-P18 (CI naming and guard):** the new smoke tests are named `vk_forge_*`, outside the `driver-install` job's filter `smoke vk_driver_` (`.github/workflows/ci.yml` 294); in the three-OS `test` job, every Rust test that spawns vkforge first runs the vkforge interpreter on `-I -c "import lxml, comtypes"` and, when that fails, says so on stderr and returns.
 - **L-P20 (the mock arch):** no `VK_MOCK_ANSWER` seam exists or is added. The ambiguity test uses the mock arch's deterministic echo (`MockAdapter::complete`, `crates/vk-kernel/src/arch.rs` 249–258: the role, then the first 200 characters of the prompt): the register's goal is the ambiguity JSON, so the echo carries the first candidate's value, which the answer rule (Task 9) reads as the choice; the test asserts `resolved_by: arch:<id>` and that recorded value.
 - **L-P21 (fixtures in order):** Task 3 ends with a step run by the controller on the founder's node — recording `catalogue-word.json` and `catalogue-powerpoint.json` — before Task 4 starts; Task 4's tests write and pin `drivers/vkforge/tests/fixtures/binding-word.json`, Task 6's write and pin `invariants-word-maison.json` and `plan-word-maison.json`, all three committed, for Task 7 and Task 8.
+- **L-P22 (Office version, spec §6; amended on the rescan):** the type-library fingerprint lives **outside** the contracts. Task 3's catalogue carries `typelib_sha256` (the SHA-256 of the type library file's bytes, its path read from the registry); Task 4's `bind` copies it, with the catalogue's `typelib` `{guid, version}`, into `binding-<app>.json`; Task 7 writes the binding into the generated driver as `binding.json`, inside `hash_dir`, hence in `driver_id`. The generated driver's `probe` (`app().probe()`, before an action opens its document) recomputes it from the live registry and refuses `precondition` "office version changed; remedy: vk driver qualify" when it differs. `DriverManifest` is unchanged; the kernel never loads COM.
+- **L-P23 (`--deliberate`'s flags; provisional):** spec §4.10's `vk driver learn --deliberate VERB --app A` is a usage example, not an interface table: the plan's required `--out` and `--arch` stand (Task 10). Provisional — a CLI surface: the founder confirms it in the Task 2 checkpoint batch, and the spec's §5 usage line is aligned at the merge.
+- **L-P25 (a `Ctx` for the two stages that write the ledger):** `forge::learn` and `forge::qualify` take `ctx: &Ctx`; their pre-lock arms build it exactly as the `driver.pack` arm does (`crates/vk-ipc/src/server.rs` 882–895: one short lock phase, `ctx_for(&k, presence.take(), now)`), and `ctx_for` (753), private today, becomes `pub(crate)` (Task 9).
+- **L-P26 (`ForgeConfig::at` is infallible):** `ForgeConfig::at(root: PathBuf) -> ForgeConfig`; a root without `vkforge/__main__.py` is refused by `run_stage` before its first spawn (`vkforge root not found; remedy: start vkd with --vkforge-root <drivers/>`), so `vkd` does `a.vkforge_root.map(ForgeConfig::at)` into an `Option<ForgeConfig>` (Task 9).
+- **L-P27 (the kind on screen):** `render::driver` (`crates/vk-cli/src/render.rs` 368–394) gains a `kind` row, pinned by one test (Task 9); the JSON output already carries the manifest. Rendering, not CLI surface.
+- **L-P28 (Task 3's count):** until Step 6 records the catalogues, five tests of `test_inventory.py` fail (word, powerpoint, hash-stable, restrict, cli); the live one is skipped off the node.
+- **L-P29 (the proposal's answer):** the proposal file records the arch's answer verbatim — the Draft step's decision, `draft: <text>` (`crates/vk-kernel/src/tasks.rs` 917) — so Task 10's test asserts the `draft: ` prefix.
+- **L-P30 (the governor pinned):** Task 9's `vk_forge_a_stage_past_its_deadline_is_killed_in_its_root` gives the daemon a stand-in root, as `--vkforge-root` gives one (`ForgeConfig::at`), whose `vkforge/__main__.py` writes `os.getcwd()` (and the ids of itself and of a child it starts) to a file, then sleeps 60 s: the kernel refuses within the deadline plus 5 s, the file names the root, and no python process of the stage survives (Job governor). `ForgeConfig.stage_deadline` (`STAGE_DEADLINE` from `at`) lets the test set 5 s.
+- **L-P31 (no application name in the adapter):** `runtime/com.py` names no application. The ProgID, the collection (`Documents`/`Presentations`) and the arguments of `Open` come from the ontology's `applications` block through the binding's `application` — with the two other per-application values the adapter needs, the arguments of the document's `Close` and the `DisplayAlerts` value that silences the application (Tasks 4, 7); `inventory.APPS` keeps no ProgID. The fake stays Word `.docx` only, declared in the TCB (Task 10); the PowerPoint driver is qualified on the real PowerPoint at Task 12, which is how spec §8.2 is proven.
+- **L-P32 (supervision, spec §2 L8 and §5.2):** "supervised, every act approved" holds for the **mounted** learned driver: every `vk_driver_act` is a job step under the harness today. `qualify` spawns the driver directly, inside its own stage's Job (the governor), as a stage — a deviation declared in the TCB and in the self-review notes (Task 10).
+- **L-P33 (dialogs, spec §6):** `com.guarded` runs each COM call on its own thread, joined for `CALL_DEADLINE_S` (30 s); past it, the top-level windows of the application's processes are enumerated (`ctypes` `EnumWindows` + `GetWindowThreadProcessId`, class `#32770`): a dialog box found is closed (`WM_CLOSE`), never answered, and the action refuses `dialog`; none, it refuses `timeout`. The fake exposes the `__dialog__` hook (`fake.json` key `"dialog_on": "<verb>"`), so Task 7 tests `dialog` without Office (`test_a_surviving_dialog_is_a_dialog_refusal`).
+- **L-P34 (TCB, spec §8.4):** Task 10 reproduces spec §5.5's data-boundary table in `contracts/tcb.md`.
 
 **Always**
 
@@ -66,7 +78,7 @@
 - Generated files are byte-reproducible: written by `canon.dumps` or as fixed text with `\n` line endings, no timestamps; the manifest's `files_sha256` is `hash_dir` of the output directory (R5).
 - **Placeholders:** no test body in this plan is `...`/`…` or a comment; every test a step names has its code in that step.
 - Model tiering (founder rule): Sonnet for Tasks 0, 1, 2, 3, 5, 10; Opus for Tasks 4, 6, 7, 8, 9, 11; Task 12 is the controller's and the founder's, on the node; Fable for the final whole-branch review. One implementer at a time (node memory), one fresh reviewer per task before the next starts; founder checkpoints after Task 2 and at Task 12.
-- Commits: conventional prefix, one sentence of intent, trailers `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_01UUDLpkwxsZXmLptqCeNL2R`.
+- Commits: conventional prefix, one sentence of intent, trailers (ruling L-P24: the same whatever model implements the task) `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_01UUDLpkwxsZXmLptqCeNL2R`.
 
 ## Review Focus
 
@@ -95,7 +107,7 @@
   - The stage contract: a module with `add_arguments(parser: argparse.ArgumentParser) -> None` and `run(ns: argparse.Namespace) -> int`, registering nothing at import.
   - `drivers/vkforge/tests/__init__.py`, which puts `drivers/` on `sys.path` for every test module.
 
-- [ ] **Step 1: Failing tests** (`drivers/vkforge/tests/test_package.py`)
+- [x] **Step 1: Failing tests** (`drivers/vkforge/tests/test_package.py`)
 
 ```python
 import contextlib
@@ -176,9 +188,9 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run** `python -I -m unittest discover -s drivers/vkforge/tests -t .` → FAIL (`ModuleNotFoundError: vkforge`).
+- [x] **Step 2: Run** `python -I -m unittest discover -s drivers/vkforge/tests -t .` → FAIL (`ModuleNotFoundError: vkforge`).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `tests/__init__.py` (under `-I`, and with CI's `discover -s drivers -p "test_*.py" -t .` importing the tests as `drivers.vkforge.tests.*`, nothing else puts `drivers/` on `sys.path`):
 
@@ -304,9 +316,9 @@ CI, job `driver-browser` (`.github/workflows/ci.yml` 196–219): in the step "In
 
 (The existing step "The driver contract tests", `discover -s drivers -p "test_*.py" -t .`, also collects the vkforge suite: it runs twice on Ubuntu, which is harmless.)
 
-- [ ] **Step 4: Run** `python -I -m unittest discover -s drivers/vkforge/tests -t .` → 5 tests green; `python -I -m unittest discover -s drivers -p "test_*.py" -t .` green; `python -I scripts/check-workflows.py` green.
+- [x] **Step 4: Run** `python -I -m unittest discover -s drivers/vkforge/tests -t .` → 5 tests green; `python -I -m unittest discover -s drivers -p "test_*.py" -t .` green; `python -I scripts/check-workflows.py` green.
 
-- [ ] **Step 5: Commit** `feat(vkforge): the learning pipeline's package, stage stubs, canonical writer and refusal voice`
+- [x] **Step 5: Commit** `feat(vkforge): the learning pipeline's package, stage stubs, canonical writer and refusal voice` — done, `4227287`.
 
 ---
 
@@ -830,17 +842,17 @@ mod tests {
 
 ```python
 # drivers/vkforge/inventory.py — stage `inventory` (STAGES["inventory"])
+# No ProgID here: the adapter's ProgID is the ontology's `applications` block's (L-P31, Task 4).
 APPS = {
-    "word":       {"exe": "WINWORD.EXE",  "progid": "Word.Application",       "kind": "docx",
-                   "typelib": "{00020905-0000-0000-C000-000000000046}"},
-    "powerpoint": {"exe": "POWERPNT.EXE", "progid": "PowerPoint.Application", "kind": "pptx",
-                   "typelib": "{91493440-5A91-11CF-8700-00AA0060263B}"},
+    "word":       {"exe": "WINWORD.EXE",  "kind": "docx", "typelib": "{00020905-0000-0000-C000-000000000046}"},
+    "powerpoint": {"exe": "POWERPNT.EXE", "kind": "pptx", "typelib": "{91493440-5A91-11CF-8700-00AA0060263B}"},
 }
 def typelib_path(guid: str) -> str              # HKCR\TypeLib\{guid}\<highest version>\0\win64, then \win32; Refusal if absent
 def office_present(app: str) -> bool            # False off Windows; else typelib_path succeeds
-def catalogue_from_typelib(app: str, path: str) -> dict   # comtypes.typeinfo.LoadTypeLibEx → the catalogue (spec §4.1)
+def catalogue_from_typelib(app: str, path: str) -> dict   # comtypes.typeinfo.LoadTypeLibEx → the catalogue (spec §4.1),
+                                                          # its "typelib_sha256" = canon.sha256_file(path) (L-P22)
 def catalogue_from_fixture(app: str, fixture: Path) -> dict  # Refusal for an app not in APPS (checked first) or a file of another app
-def restrict(cat: dict, types: list[str]) -> dict  # only the named types, every enum kept
+def restrict(cat: dict, types: list[str]) -> dict  # only the named types; every enum and every other key kept
 def catalogue_sha256(cat: dict) -> str          # canon.sha256(cat) = SHA-256 of catalogue.json's bytes
 def write_catalogue(cat: dict, out: Path) -> Path  # canon.write to out/catalogue.json; returns the path
 # CLI: vkforge inventory --app {word,powerpoint} --out DIR [--fixture FILE] [--only-types NAME,NAME…]
@@ -848,7 +860,7 @@ def write_catalogue(cat: dict, out: Path) -> Path  # canon.write to out/catalogu
 #      "vkforge inventory: type library of word {00020905-…} is not registered; remedy: install Microsoft 365 desktop"
 ```
 
-Catalogue shape (spec §4.1): `{"app", "typelib": {"guid", "version"}, "types": [{"name", "kind": "dispatch|coclass|enum", "members": [{"name", "kind": "method|property_get|property_put", "params": [{"name", "type"}], "returns"}]}], "enums": {"WdBuiltinStyle": {"wdStyleHeading1": -2, …}}}`, types and members sorted by name.
+Catalogue shape (spec §4.1): `{"app", "typelib": {"guid", "version"}, "typelib_sha256": "sha256:<hex of the type library file's bytes>", "types": [{"name", "kind": "dispatch|coclass|enum", "members": [{"name", "kind": "method|property_get|property_put", "params": [{"name", "type"}], "returns"}]}], "enums": {"WdBuiltinStyle": {"wdStyleHeading1": -2, …}}}`, types and members sorted by name.
 
 - [ ] **Step 1: Failing tests** (`drivers/vkforge/tests/test_inventory.py`)
 
@@ -885,6 +897,7 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(cat["enums"]["WdSaveFormat"]["wdFormatPDF"], 17)
         doc = next(t for t in cat["types"] if t["name"] == "Document")
         self.assertIn("SaveAs2", {m["name"] for m in doc["members"]})
+        self.assertRegex(cat["typelib_sha256"], r"^sha256:[0-9a-f]{64}$")   # L-P22: the Office it was recorded on
 
     def test_the_recorded_powerpoint_catalogue_has_placeholders_and_export(self):
         cat = inventory.catalogue_from_fixture("powerpoint", FIXTURES / "catalogue-powerpoint.json")
@@ -906,12 +919,15 @@ class InventoryTest(unittest.TestCase):
         small = inventory.restrict(cat, ["Document", "Font"])
         self.assertEqual([t["name"] for t in small["types"]], ["Document", "Font"])
         self.assertEqual(small["enums"], cat["enums"])
+        self.assertEqual((small["typelib"], small["typelib_sha256"]), (cat["typelib"], cat["typelib_sha256"]))
 
     @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("word"), "Word not installed")
     def test_the_live_type_library_matches_the_fixture_on_the_members_the_ontology_needs(self):
-        live = inventory.catalogue_from_typelib("word", inventory.typelib_path(inventory.APPS["word"]["typelib"]))
+        path = inventory.typelib_path(inventory.APPS["word"]["typelib"])
+        live = inventory.catalogue_from_typelib("word", path)
         fixture = inventory.catalogue_from_fixture("word", FIXTURES / "catalogue-word.json")
         self.assertEqual(live["enums"]["WdBuiltinStyle"], fixture["enums"]["WdBuiltinStyle"])
+        self.assertEqual(live["typelib_sha256"], canon.sha256_file(path), "the file's bytes (L-P22)")
 
     def test_an_unknown_app_is_refused_before_any_file_is_read(self):
         with self.assertRaises(Refusal) as cm:
@@ -929,9 +945,9 @@ class InventoryTest(unittest.TestCase):
 
 - [ ] **Step 2: Run** `python -I -m unittest discover -s drivers/vkforge/tests -t . -p test_inventory.py` → errors (the stub has no `catalogue_from_fixture`).
 
-- [ ] **Step 3: Implement** `catalogue_from_typelib` with `comtypes.typeinfo.LoadTypeLibEx(path)` (`comtypes` imported inside the function, never at module top: the module imports on Linux); iterate `tlib.GetTypeInfoCount()`, for each `GetTypeInfo(i)` / `GetTypeAttr()`: `typekind` `TKIND_ENUM` → read `GetVarDesc(j)` constants; `TKIND_DISPATCH`/`TKIND_INTERFACE` → `GetFuncDesc(j)` for name (`GetDocumentation(memid)[0]`), `invkind` (`INVOKE_FUNC`→method, `INVOKE_PROPERTYGET`, `INVOKE_PROPERTYPUT`), params (`GetNames(memid, cMaxNames=cParams+1)`, types rendered through `TYPEDESC.vt` → a name table `VT_BSTR: "BSTR"`, `VT_VARIANT: "VARIANT"`, `VT_I4: "long"`, `VT_BOOL: "bool"`, `VT_DISPATCH: "IDispatch"`, else `f"vt{vt}"`); `TKIND_COCLASS` → listed with no members. `typelib_path`: `winreg.OpenKey(HKEY_CLASSES_ROOT, rf"TypeLib\{guid}")`, enumerate the version subkeys, take the highest, read `0\win64` then `0\win32`. `office_present(app)` → `sys.platform == "win32"` and `typelib_path` does not refuse. `restrict` keeps `types` by name, in the catalogue's order. `run(ns)`: the fixture when `--fixture` is given, else the live type library; `restrict` when `--only-types`; `write_catalogue`; the print line of the interface; return 0.
+- [ ] **Step 3: Implement** `catalogue_from_typelib` with `comtypes.typeinfo.LoadTypeLibEx(path)` (`comtypes` imported inside the function, never at module top: the module imports on Linux); iterate `tlib.GetTypeInfoCount()`, for each `GetTypeInfo(i)` / `GetTypeAttr()`: `typekind` `TKIND_ENUM` → read `GetVarDesc(j)` constants; `TKIND_DISPATCH`/`TKIND_INTERFACE` → `GetFuncDesc(j)` for name (`GetDocumentation(memid)[0]`), `invkind` (`INVOKE_FUNC`→method, `INVOKE_PROPERTYGET`, `INVOKE_PROPERTYPUT`), params (`GetNames(memid, cMaxNames=cParams+1)`, types rendered through `TYPEDESC.vt` → a name table `VT_BSTR: "BSTR"`, `VT_VARIANT: "VARIANT"`, `VT_I4: "long"`, `VT_BOOL: "bool"`, `VT_DISPATCH: "IDispatch"`, else `f"vt{vt}"`); `TKIND_COCLASS` → listed with no members. `typelib_path`: `winreg.OpenKey(HKEY_CLASSES_ROOT, rf"TypeLib\{guid}")`, enumerate the version subkeys, take the highest (`major.minor` compared as hexadecimal numbers, as Task 7's `com.live_typelib_sha256` does), read `0\win64` then `0\win32`; the catalogue's `typelib` is `{"guid", "version"}` of that key and its `typelib_sha256` is `canon.sha256_file(path)` (L-P22). `office_present(app)` → `sys.platform == "win32"` and `typelib_path` does not refuse. `restrict` keeps `types` by name, in the catalogue's order. `run(ns)`: the fixture when `--fixture` is given, else the live type library; `restrict` when `--only-types`; `write_catalogue`; the print line of the interface; return 0.
 
-- [ ] **Step 4: Run** the suite: every test of this task passes except the three that read `catalogue-word.json`/`catalogue-powerpoint.json` (`FileNotFoundError` until Step 6), and on the node `test_the_live_type_library_…` passes too. Nothing hand-written stands in for the recorded fixtures (L-P21).
+- [ ] **Step 4: Run** the suite: five tests of this task fail until Step 6 — the five that read `catalogue-word.json`/`catalogue-powerpoint.json` (`…word_catalogue…`, `…powerpoint_catalogue…`, `…hash_is_stable…`, `test_restrict_…`, `test_the_cli_…`: `FileNotFoundError`), ruling L-P28; `test_an_unknown_app_…` passes; the live one is skipped off the node, and on the node it passes once Step 6 has run. Nothing hand-written stands in for the recorded fixtures (L-P21).
 
 - [ ] **Step 5: Commit** `feat(vkforge): inventory of a type library into a catalogue`
 
@@ -948,7 +964,7 @@ foreach ($app in "word", "powerpoint") {
 & "$V\Scripts\python.exe" -I -m unittest discover -s drivers/vkforge/tests -t . -p test_inventory.py
 ```
 
-Expected: `inventory: <n> types, <m> enums -> …` twice, then every test of `test_inventory.py` green (7, the live one included). Size expected 1–3 MB each; above 4 MB, record again with `--only-types` naming the types the ontology's patterns walk (Task 4 lists them) — every enum is kept. **Commit** `test(vkforge): the Word and PowerPoint catalogues, recorded on the founder's node`.
+Expected: `inventory: <n> types, <m> enums -> …` twice, then every test of `test_inventory.py` green (7, the live one included); each recorded catalogue carries this node's `typelib_sha256` (L-P22), which the bindings and the generated drivers inherit. Size expected 1–3 MB each; above 4 MB, record again with `--only-types` naming the types the ontology's patterns walk (Task 4 lists them) — every enum is kept. **Commit** `test(vkforge): the Word and PowerPoint catalogues, recorded on the founder's node`.
 
 ---
 
@@ -961,7 +977,7 @@ Expected: `inventory: <n> types, <m> enums -> …` twice, then every test of `te
 - Modify: `drivers/vkforge/ontology.py` (Task 0's stub; the module of the stage `bind`)
 
 **Interfaces:**
-- Consumes: `inventory.catalogue_from_fixture` (Task 3), the recorded catalogues (Task 3, Step 6), `vkforge.canon` (Task 0).
+- Consumes: `inventory.catalogue_from_fixture`, `inventory.APPS` and the catalogue's `typelib`/`typelib_sha256` (Task 3), the recorded catalogues (Task 3, Step 6), `vkforge.canon` (Task 0).
 - Produces (consumed by Tasks 6, 7, 9):
 
 ```python
@@ -970,6 +986,7 @@ ONTOLOGY = Path(__file__).resolve().parent / "ontology" / "office-document.json"
 ARG_TYPES = frozenset({"Path", "ParagraphSelector", "BuiltinStyle", "FontSpec", "Text", "Format"})
 PRECONDITIONS = frozenset({"none", "document_open"})
 POSTCONDITIONS = frozenset({"document_open", "paragraph_style", "font_run", "footer", "header", "pdf_exists", "saved", "none"})
+APPLICATION_KEYS = ("alerts_off", "close", "collection", "open", "progid")   # the keys of each `applications` entry (L-P31)
 def is_selector(s: str) -> bool                  # first | body | all | title | index:<n> (n ≥ 1)
 def load(path: Path | None = None) -> dict       # default ONTOLOGY; validates
 def validate(ont: dict) -> None                  # Refusal naming the verb and the field
@@ -980,7 +997,18 @@ def write_binding(binding: dict, out: Path) -> Path   # canon.write to out/bindi
 #      prints "bind: <b> bound, <p> partial, <u> unbound on <app> -> <path>" then one line per unbound verb
 ```
 
-Ontology file: `{"family": "office-document", "version": 1, "verbs": [...]}`, stored in `canon.dumps` form. Every verb (spec §4.2) has `verb`, `args` (name → a type of `ARG_TYPES`), `pre` (one of `PRECONDITIONS`), `post` (one of `POSTCONDITIONS`), `reversible` (bool: `true` for `open`, `close`, `select_paragraph`, `count_paragraphs`, `read_document_property` and every `verify_*`; `false` for every verb that writes the document or a file), and `projection` per app, written as **patterns** over the catalogue:
+Ontology file: `{"family": "office-document", "version": 1, "applications": {...}, "verbs": [...]}`, stored in `canon.dumps` form. The `applications` block (ruling L-P31) holds, per app of `inventory.APPS`, exactly the keys of `APPLICATION_KEYS` — everything `runtime/com.py` would otherwise have to name about one application; the adapter receives the app's entry as the binding's `application` and names no application itself:
+
+```json
+"applications": {
+  "powerpoint": { "alerts_off": 1, "close": {}, "collection": "Presentations",
+                  "open": { "WithWindow": false }, "progid": "PowerPoint.Application" },
+  "word":       { "alerts_off": 0, "close": { "SaveChanges": false }, "collection": "Documents",
+                  "open": { "AddToRecentFiles": false, "ReadOnly": false, "Visible": false },
+                  "progid": "Word.Application" } }
+```
+
+(`progid` for `GetActiveObject`/`CreateObject`; `collection`, the application's member whose `Open(path, **open)` opens a document; `close`, the keyword arguments of the document's `Close` — PowerPoint's takes none; `alerts_off`, the `DisplayAlerts` value that silences the application: `wdAlertsNone` 0, `ppAlertsNone` 1.) Every verb (spec §4.2) has `verb`, `args` (name → a type of `ARG_TYPES`), `pre` (one of `PRECONDITIONS`), `post` (one of `POSTCONDITIONS`), `reversible` (bool: `true` for `open`, `close`, `select_paragraph`, `count_paragraphs`, `read_document_property` and every `verify_*`; `false` for every verb that writes the document or a file), and `projection` per app, written as **patterns** over the catalogue:
 
 ```json
 { "verb": "apply_paragraph_style",
@@ -991,7 +1019,7 @@ Ontology file: `{"family": "office-document", "version": 1, "verbs": [...]}`, st
     "powerpoint": { "member": "Shape.PlaceholderFormat.Type", "constants": "PpPlaceholderType", "status": "partial" } } }
 ```
 
-Binding (`binding-<app>.json`): `{"app", "ontology_sha256", "catalogue_sha256", "verbs": [{"verb", "status": "bound|partial|unbound", "member": "Type.Member[.Member]" | null, "constants": {"<Enum>": {"<name>": <int>, …}} | null, "why": "<which pattern failed>" | null}]}`, verbs sorted by name. A runtime indexes it with `{v["verb"]: v for v in binding["verbs"]}`.
+Binding (`binding-<app>.json`): `{"app", "ontology_sha256", "catalogue_sha256", "typelib": {"guid", "version"}, "typelib_sha256", "application": {<the ontology's applications[app]>}, "verbs": [{"verb", "status": "bound|partial|unbound", "member": "Type.Member[.Member]" | null, "constants": {"<Enum>": {"<name>": <int>, …}} | null, "why": "<which pattern failed>" | null}]}`, verbs sorted by name; `typelib` and `typelib_sha256` are the catalogue's, copied (L-P22: the generated driver's `probe` compares them with the live registry), `application` the ontology's entry for the app (L-P31). A runtime indexes it with `{v["verb"]: v for v in binding["verbs"]}`.
 
 The v1 verb list (32 verbs), all with Word projections, PowerPoint projections where the model has a counterpart: `open`, `close`, `save`, `save_as`, `export` (pdf), `select_paragraph` (selectors `first | body | all | index:n | title`, `title` being PowerPoint's title placeholder and Word's first paragraph), `apply_paragraph_style`, `set_font_run` (name, size), `set_font_bold`, `set_font_italic`, `set_paragraph_alignment`, `set_paragraph_spacing`, `set_line_spacing`, `set_header` (text), `set_footer` (text), `set_page_margins`, `set_page_orientation`, `set_document_property` (title/author/subject), `insert_page_number`, `apply_numbering`, `set_table_style`, `set_table_borders`, `verify_paragraph_style`, `verify_font_run`, `verify_footer`, `verify_header`, `verify_pdf`, `count_paragraphs`, `read_document_property`, `set_slide_layout` (powerpoint only; word `unbound` by design), `set_placeholder_text`, `apply_theme`. The types the Word patterns walk: `Document`, `Documents`, `Paragraphs`, `Paragraph`, `Range`, `Font`, `Sections`, `Section`, `HeadersFooters`, `HeaderFooter`, `Style`, `PageSetup`, `Table`, `ListFormat`, `BuiltInDocumentProperties` (Step 6 of Task 3 restricts to these if a catalogue is too large).
 
@@ -1027,6 +1055,8 @@ class OntologyTest(unittest.TestCase):
         self.assertEqual(status["set_slide_layout"], "unbound")
         self.assertEqual((b["app"], b["catalogue_sha256"], b["ontology_sha256"]),
                          ("word", inventory.catalogue_sha256(self.word), ontology.ontology_sha256(self.ont)))
+        self.assertEqual((b["typelib"], b["typelib_sha256"]), (self.word["typelib"], self.word["typelib_sha256"]))  # L-P22
+        self.assertEqual(b["application"], self.ont["applications"]["word"])                                       # L-P31
 
     def test_the_same_ontology_binds_on_powerpoint_without_code(self):
         b = ontology.bind(self.ont, self.ppt)
@@ -1073,6 +1103,22 @@ class OntologyTest(unittest.TestCase):
         self.assertTrue(ontology.is_selector("index:3") and ontology.is_selector("title"))
         self.assertFalse(ontology.is_selector("index:0") or ontology.is_selector("Titre"))
 
+    def test_the_applications_block_gives_the_adapter_what_it_must_not_name(self):
+        # L-P31: runtime/com.py names no application; each app's entry reaches it as binding["application"].
+        self.assertEqual(self.ont["applications"], {
+            "powerpoint": {"alerts_off": 1, "close": {}, "collection": "Presentations",
+                           "open": {"WithWindow": False}, "progid": "PowerPoint.Application"},
+            "word": {"alerts_off": 0, "close": {"SaveChanges": False}, "collection": "Documents",
+                     "open": {"AddToRecentFiles": False, "ReadOnly": False, "Visible": False},
+                     "progid": "Word.Application"}})
+        self.assertEqual(sorted(self.ont["applications"]), sorted(inventory.APPS))
+        self.assertEqual(ontology.bind(self.ont, self.ppt)["application"], self.ont["applications"]["powerpoint"])
+        bad = ontology.load()
+        del bad["applications"]["powerpoint"]["collection"]
+        with self.assertRaises(Refusal) as cm:
+            ontology.validate(bad)
+        self.assertIn("powerpoint", str(cm.exception))
+
     def test_the_committed_word_binding_is_what_bind_produces(self):
         # Ruling L-P21: written on the first run, compared on every later one; Tasks 6–8 read it.
         path = FIXTURES / "binding-word.json"
@@ -1092,9 +1138,9 @@ class OntologyTest(unittest.TestCase):
 
 - [ ] **Step 2: Run** `python -I -m unittest discover -s drivers/vkforge/tests -t . -p test_ontology.py` → errors (stub).
 
-- [ ] **Step 3: Implement** `bind`: for each verb and the catalogue's app, split `member` on `.`, walk the catalogue: the first segment is a type name (exact), each next segment a member name (exact) whose `returns` type (for a chain) names the next type (strip `*`/`IDispatch` wrappers; when the return type is `VARIANT`/`IDispatch`, accept the next segment if any type in the catalogue has that member — `partial`); `constants` must be an enum of the catalogue, and the binding carries that whole enum (numbers, keyed by the built-in constant names), else `unbound` with `why`. A projection that declares `"status": "partial"` stays `partial` when it binds. A verb with no projection for the app is `unbound` with `why: "no projection for <app>"`. `validate(ont)` checks every verb's fields, arg types in `ARG_TYPES`, `pre` in `PRECONDITIONS`, `post` in `POSTCONDITIONS`, `reversible` a bool, verb names unique; the ontology file itself is written once with `canon.dumps` and edited only in that form.
+- [ ] **Step 3: Implement** `bind`: for each verb and the catalogue's app, split `member` on `.`, walk the catalogue: the first segment is a type name (exact), each next segment a member name (exact) whose `returns` type (for a chain) names the next type (strip `*`/`IDispatch` wrappers; when the return type is `VARIANT`/`IDispatch`, accept the next segment if any type in the catalogue has that member — `partial`); `constants` must be an enum of the catalogue, and the binding carries that whole enum (numbers, keyed by the built-in constant names), else `unbound` with `why`. A projection that declares `"status": "partial"` stays `partial` when it binds. A verb with no projection for the app is `unbound` with `why: "no projection for <app>"`. The binding's `typelib` and `typelib_sha256` are copied from the catalogue (`bind` refuses a catalogue without `typelib_sha256`: `Refusal("catalogue of <app> has no typelib_sha256", "record it again with vkforge inventory")`, L-P22) and its `application` is `ont["applications"][app]` (L-P31). `validate(ont)` checks every verb's fields, arg types in `ARG_TYPES`, `pre` in `PRECONDITIONS`, `post` in `POSTCONDITIONS`, `reversible` a bool, verb names unique, and that `applications` has one entry per `inventory.APPS` key with exactly the keys of `APPLICATION_KEYS` (a refusal names the app and the key); the ontology file itself is written once with `canon.dumps` and edited only in that form.
 
-- [ ] **Step 4: Run** the suite green (8 tests; the first run writes `binding-word.json`). **Commit** `feat(vkforge): the office-document ontology v1 and the binding by patterns over a catalogue` (the binding fixture included).
+- [ ] **Step 4: Run** the suite green (9 tests; the first run writes `binding-word.json`). **Commit** `feat(vkforge): the office-document ontology v1 and the binding by patterns over a catalogue` (the binding fixture included).
 
 ---
 
@@ -1615,34 +1661,52 @@ class PlanTest(unittest.TestCase):
 There is no template file: `generate.py` composes `driver.py` from fixed text and per-step lines (below), with no template engine.
 
 **Interfaces:**
-- Consumes: `drivers/vkforge/tests/fixtures/plan-word-maison.json`, `invariants-word-maison.json` (Task 6), `binding-word.json` (Task 4); `plan.build`, `plan.EMITTED_VERBS` (Task 6); `ontology.load` (Task 4); `mine.mine_file`, `mine.mine_corpus`, `mine.redact`, `ooxml_fixtures.docx`, `ooxml_fixtures.FOOTER` (Task 5); `inventory.APPS`, `inventory.office_present` (Task 3); `canon`, `Refusal` (Task 0); `vkdriver.hash_dir.{hash_dir, list_files}` and `vkdriver.protocol.{DriverRefusal, serve}` (`drivers/vkdriver/`).
+- Consumes: `drivers/vkforge/tests/fixtures/plan-word-maison.json`, `invariants-word-maison.json` (Task 6), `binding-word.json` (Task 4); `plan.build`, `plan.EMITTED_VERBS` (Task 6); `ontology.load` (Task 4); `mine.mine_file`, `mine.mine_corpus`, `mine.redact`, `ooxml_fixtures.docx`, `ooxml_fixtures.FOOTER` (Task 5); `inventory.APPS`, `inventory.office_present`, `inventory.typelib_path` (Task 3); the binding's `application`, `typelib` and `typelib_sha256` (Task 4; L-P22, L-P31); `VK_DRIVER_APPLICATIONS` in the driver's environment (Task 1); `canon`, `Refusal` (Task 0); `vkdriver.hash_dir.{hash_dir, list_files}` and `vkdriver.protocol.{DriverRefusal, serve}` (`drivers/vkdriver/`).
 - Produces (consumed by Tasks 8, 9, 10, 12):
 
 ```python
 # drivers/vkforge/runtime/com.py — the only module that touches COM; vendored as vendor/vkforge_runtime/com.py
-# (L-P19). Imports only the stdlib, vkdriver.protocol and, lazily and on Windows only, comtypes.
+# (L-P19). Imports only the stdlib, vkdriver.protocol and, lazily and on Windows only, comtypes. Names no
+# application (L-P31): the ProgID, the collection, Open's and Close's arguments and DisplayAlerts are binding["application"].
+CALL_DEADLINE_S = 30.0       # one COM call (L-P33)
 VERBS: dict[str, Callable]   # verb → fn(app, doc, **args); every verb of plan.EMITTED_VERBS but open; verify_* return bool
+def executables() -> set[str]                   # VK_DRIVER_APPLICATIONS, upper-case: the executables the manifest names
+def dialogs(exes: set[str]) -> list             # the visible top-level #32770 windows of those processes; [] off Windows
+def close_window(hwnd) -> None                  # PostMessageW(hwnd, WM_CLOSE): closed, never answered
+def guarded(fn, what: str, deadline_s: float = CALL_DEADLINE_S, find_dialogs=None, close=None)
+                                                # fn() on its own thread joined for deadline_s; past it, a dialog box found is
+                                                # closed → DriverRefusal("dialog", …), none → DriverRefusal("timeout", …) (L-P33)
+def live_typelib_sha256(guid: str) -> str       # the type library file the registry names for guid today, hashed (L-P22)
+def probe(binding: dict) -> None                # ≠ binding["typelib_sha256"] → DriverRefusal("precondition",
+                                                # "office version changed; remedy: vk driver qualify") (L-P22)
 class Application:
-    def __init__(self, progid: str, binding: dict): ...
-        # comtypes.client.GetActiveObject(progid), else CreateObject (the user's own instance, spike verdict 3);
-        # DisplayAlerts off; off Windows, or no such server → DriverRefusal("precondition", "<progid> cannot be started …")
-    def open(self, path: str): ...
-        # Documents.Open(path, ReadOnly=False, AddToRecentFiles=False, Visible=False) / Presentations.Open(path, WithWindow=False);
-        # doc.ReadOnly → close it, DriverRefusal("precondition", "document opened read-only (locked elsewhere)")
-    def call(self, verb: str, doc, **args): ...   # VERBS[verb](self, doc, **args), the member and constants from the binding
-                                                  # ({v["verb"]: v for v in binding["verbs"]}); a built-in style "Heading1" → the
-                                                  # binding's wdStyleHeading1, never a localised name
-    def close(self, doc) -> None: ...             # Close(SaveChanges=False)
-    def quit(self) -> None: ...                   # only when this adapter started the instance
+    def __init__(self, binding: dict): ...      # GetActiveObject(progid), else CreateObject (the user's own instance, spike
+                                                # verdict 3); DisplayAlerts = alerts_off; off Windows, or no such server →
+                                                # DriverRefusal("precondition", "<progid> cannot be started: …")
+    def probe(self) -> None: ...                # probe(self.binding)
+    def open(self, path: str): ...              # <collection>.Open(path, **open); doc.ReadOnly → close it,
+                                                # DriverRefusal("precondition", "document opened read-only (locked elsewhere)")
+    def call(self, verb: str, doc, **args): ... # guarded VERBS[verb](self, doc, **args), the member and constants from the
+                                                # binding ({v["verb"]: v for v in binding["verbs"]}); a built-in style "Heading1"
+                                                # → the binding's wdStyleHeading1, never a localised name
+    def close(self, doc) -> None: ...           # doc.Close(**close)
+    def quit(self) -> None: ...                 # only when this adapter started the instance
 
 # drivers/vkforge/runtime/fake.py — repository only, never vendored (L-P19); reached only through <work>/fake.json
 VERBS: dict[str, Callable]   # the same keys as com.VERBS
+FAKE_CALL_DEADLINE_S = 1.0   # the guard's deadline when the fake raises its dialog box (L-P33)
 class FakeApplication:
-    def __init__(self, binding: dict): ...
+    def __init__(self, binding: dict, config: dict | None = None): ...
+        # Word .docx only (L-P31): another app → DriverRefusal("precondition", "the fake application implements Word .docx
+        # only; remedy: qualify on the real application"); config is <work>/fake.json's content (L-P19), read for its
+        # optional "dialog_on": "<verb>" (L-P33)
+    def probe(self) -> None: ...                  # no type library behind the fake: nothing to compare (L-P22)
     def open(self, path: str): ...                # a file the OS says is read-only → DriverRefusal("precondition",
                                                   # "document opened read-only (locked elsewhere)"), as the adapter on doc.ReadOnly
-    def call(self, verb: str, doc, **args): ...   # edits the parts in memory; save writes them with ooxml.write_parts; export
-                                                  # writes "%PDF-1.4 fake\n" + 1 186 bytes; verify_* re-read the saved file with mine.mine_file
+    def call(self, verb: str, doc, **args): ...   # verb == dialog_on → self.__dialog__(verb); else edits the parts in memory;
+                                                  # save writes them with ooxml.write_parts; export writes "%PDF-1.4 fake\n" +
+                                                  # 1 186 bytes; verify_* re-read the saved file with mine.mine_file
+    def __dialog__(self, verb: str): ...          # the hook (L-P33): the call blocks behind a box com.guarded closes → "dialog"
     def close(self, doc) -> None: ...
     def quit(self) -> None: ...
 
@@ -1658,10 +1722,243 @@ def generate(plan: dict, binding: dict, invariants: dict, vault: dict, out: Path
 #      (--venv defaults to VKFORGE_VENV; prints "generate: <name> <files_sha256> -> <out>")
 ```
 
+`runtime/com.py`, all of it but the `VERBS` table (Step 3 writes it after this code) — the per-call deadline and the window enumeration (L-P33), the probe (L-P22), the application read from the binding (L-P31):
+
+```python
+"""The COM adapter of a learned driver (L-P1): the only module that touches COM. Vendored into every
+generated driver as vendor/vkforge_runtime/com.py (L-P19): the stdlib, vkdriver.protocol and, lazily
+and on Windows only, comtypes. It names no application (L-P31): what differs between Word and
+PowerPoint at this level is binding["application"], the ontology's applications block for the app."""
+import ctypes
+import hashlib
+import os
+import sys
+import threading
+from pathlib import Path
+
+from vkdriver.protocol import DriverRefusal
+
+CALL_DEADLINE_S = 30.0   # one COM call (L-P33); a qualification pass has 120 s (qualify.PASS_DEADLINE_S)
+DIALOG_CLASS = "#32770"  # the Win32 dialog box class: a sign-in, an overwrite, a repair prompt
+WM_CLOSE = 0x0010
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def executables() -> set:
+    """The executables this driver drives: its manifest's `applications`, which the host puts in
+    VK_DRIVER_APPLICATIONS (Task 1) and `vkforge qualify` too (Task 8)."""
+    return {e.strip().upper() for e in os.environ.get("VK_DRIVER_APPLICATIONS", "").split(",") if e.strip()}
+
+
+def dialogs(exes: set) -> list:
+    """The visible top-level dialog boxes (class #32770) of the processes running one of `exes`."""
+    if sys.platform != "win32" or not exes:
+        return []
+    from ctypes import wintypes
+
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.EnumWindows.argtypes = (enum_proc, wintypes.LPARAM)
+    user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                    ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    found = []
+
+    def image_of(pid: int) -> str:
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ""
+        try:
+            buf, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+            ok = kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+            return Path(buf.value).name.upper() if ok else ""
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def each(hwnd, _lparam):
+        name = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, name, 64)
+        if name.value == DIALOG_CLASS and user32.IsWindowVisible(hwnd):
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if image_of(pid.value) in exes:
+                found.append(hwnd)
+        return True
+
+    user32.EnumWindows(enum_proc(each), 0)
+    return found
+
+
+def close_window(hwnd) -> None:
+    """WM_CLOSE, posted: the box's own close, never one of its answers (spec §6)."""
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+
+
+def guarded(fn, what: str, deadline_s: float = CALL_DEADLINE_S, find_dialogs=None, close=None):
+    """fn() on its own thread, joined for `deadline_s` (L-P33). Past it, the application's dialog boxes
+    are closed and the action refuses `dialog`, the box never answered (spec §6); with none open it
+    refuses `timeout`. A thread that finds comtypes loaded joins the multithreaded apartment that
+    Application keeps alive, so the proxies one call's thread made serve the next."""
+    find_dialogs = find_dialogs or (lambda: dialogs(executables()))
+    close = close or close_window
+    box = {}
+
+    def run():
+        com = sys.modules.get("comtypes")    # loaded by Application only: the fake's hook runs without COM
+        if com is not None:
+            com.CoInitializeEx(com.COINIT_MULTITHREADED)
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 — raised again on the caller's thread
+            box["error"] = e
+        finally:
+            if com is not None:
+                com.CoUninitialize()
+
+    worker = threading.Thread(target=run, name=f"com {what}", daemon=True)
+    worker.start()
+    worker.join(deadline_s)
+    if worker.is_alive():
+        boxes = find_dialogs()
+        for hwnd in boxes:
+            close(hwnd)
+        if boxes:
+            raise DriverRefusal("dialog", f"{what}: a dialog box of the application held the call; "
+                                          "closed, never answered")
+        raise DriverRefusal("timeout", f"{what}: no answer within {deadline_s:g} s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def live_typelib_sha256(guid: str) -> str:
+    """The type library file the registry names for `guid` today — HKCR\\TypeLib\\{guid}, its highest
+    version (hexadecimal major.minor), 0\\win64 then 0\\win32, the path inventory read — hashed as the
+    catalogue's `typelib_sha256` is (L-P22)."""
+    if sys.platform == "win32":
+        import winreg
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"TypeLib\{guid}") as key:
+                versions = [winreg.EnumKey(key, i) for i in range(winreg.QueryInfoKey(key)[0])]
+            version = max(versions, key=lambda v: tuple(int(p, 16) for p in v.split(".")))
+            for arch in ("win64", "win32"):
+                try:
+                    path = winreg.QueryValue(winreg.HKEY_CLASSES_ROOT, rf"TypeLib\{guid}\{version}\0\{arch}")
+                    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                except OSError:
+                    continue
+        except (OSError, ValueError):
+            pass
+    raise DriverRefusal("precondition", f"type library {guid} is not registered; remedy: install Microsoft 365 desktop")
+
+
+def probe(binding: dict) -> None:
+    """L-P22: the type library on this node is the one the driver was learned on (binding.json is in its
+    driver_id); else every action refuses before its document is opened."""
+    if live_typelib_sha256(binding["typelib"]["guid"]) != binding["typelib_sha256"]:
+        raise DriverRefusal("precondition", "office version changed; remedy: vk driver qualify")
+
+
+class Application:
+    """The application binding["application"] names, the user's own instance (spike verdict 3)."""
+
+    def __init__(self, binding: dict):
+        self.binding, self.spec = binding, binding["application"]
+        self.verbs = {v["verb"]: v for v in binding["verbs"]}
+        progid = self.spec["progid"]
+        if sys.platform != "win32":
+            raise DriverRefusal("precondition", f"{progid} cannot be started: not Windows")
+        cookie = ctypes.c_void_p()
+        ctypes.oledll.ole32.CoIncrementMTAUsage(ctypes.byref(cookie))   # the calls' apartment lives with the driver
+        import comtypes
+        import comtypes.client
+
+        def start():
+            try:
+                return comtypes.client.GetActiveObject(progid), False
+            except (OSError, comtypes.COMError):
+                return comtypes.client.CreateObject(progid), True
+
+        try:
+            self.app, self.started = guarded(start, f"start {progid}")
+            guarded(lambda: setattr(self.app, "DisplayAlerts", self.spec["alerts_off"]), "DisplayAlerts")
+        except (OSError, comtypes.COMError) as e:
+            raise DriverRefusal("precondition", f"{progid} cannot be started: {e}") from e
+
+    def probe(self) -> None:
+        probe(self.binding)
+
+    def open(self, path: str):
+        doc = guarded(lambda: getattr(self.app, self.spec["collection"]).Open(path, **self.spec["open"]), "open")
+        if guarded(lambda: bool(doc.ReadOnly), "open"):
+            self.close(doc)
+            raise DriverRefusal("precondition", "document opened read-only (locked elsewhere)")
+        return doc
+
+    def call(self, verb: str, doc, **args):
+        return guarded(lambda: VERBS[verb](self, doc, **args), verb)
+
+    def close(self, doc) -> None:
+        guarded(lambda: doc.Close(**self.spec["close"]), "close")
+
+    def quit(self) -> None:
+        if self.started:
+            guarded(lambda: self.app.Quit(), "quit")
+```
+
+`runtime/fake.py`, the parts the dialog hook and the probe add (the verb table, `open`, `close`, `quit` are Step 3's):
+
+```python
+import threading
+
+from vkdriver.protocol import DriverRefusal
+from vkforge.runtime import com    # the repository's adapter: its guard is the one the real driver runs
+
+FAKE_CALL_DEADLINE_S = 1.0   # the guard's deadline when the fake raises its dialog box: a test waits 1 s, not 30
+
+
+class FakeApplication:
+    def __init__(self, binding: dict, config: dict | None = None):
+        if binding["app"] != "word":
+            raise DriverRefusal("precondition", "the fake application implements Word .docx only; "
+                                                "remedy: qualify on the real application")
+        self.binding = binding
+        self.verbs = {v["verb"]: v for v in binding["verbs"]}
+        self.dialog_on = (config or {}).get("dialog_on")   # <work>/fake.json's, handed over by the driver (L-P33)
+
+    def probe(self) -> None:
+        """No type library behind the fake: nothing to compare (L-P22)."""
+
+    def call(self, verb: str, doc, **args):
+        if verb == self.dialog_on:
+            return self.__dialog__(verb)
+        return VERBS[verb](self, doc, **args)
+
+    def __dialog__(self, verb: str):
+        """fake.json's `dialog_on` (L-P33): the call blocks behind a modal box, as Word's does behind a
+        sign-in or an overwrite prompt, until the adapter's own guard closes the box — so the refusal
+        `dialog` comes from com.guarded, the code the real driver runs."""
+        closed = threading.Event()
+        return com.guarded(lambda: closed.wait(60), verb, deadline_s=FAKE_CALL_DEADLINE_S,
+                           find_dialogs=lambda: [] if closed.is_set() else ["the fake's dialog box"],
+                           close=lambda hwnd: closed.set())
+```
+
 `generate` refuses, before writing anything: a non-empty `out`; a `name` that is not 1 to 32 characters of `a-z`, `0-9`, `-`; a step verb (other than `open`) absent from `com.VERBS` (`"verb <v> has no runtime implementation"`, remedy `implement it in drivers/vkforge/runtime/com.py and fake.py`); an args key that is not a Python identifier or is a keyword; a `$secret.<id>` it cannot resolve (`"secret <id> has no clear value in the vault"`, remedy `learn again: the vault is deleted after generation`) — the token is `invariants`' value of `<id>`, else the plan ambiguity's `value` for `<id>`, and the clear text is `vault[token]`; a `venv` that has no `Scripts/python.exe` (`"no virtualenv at <dir>"`, remedy `powershell -ExecutionPolicy Bypass -File drivers\vkforge\setup.ps1`). Then it writes, every file with `\n` line endings:
 
 - `driver.py` = `render_driver(plan, binding, name)`;
-- `binding.json` (`canon.dumps(binding)`);
+- `binding.json` (`canon.dumps(binding)`): the verbs, the `application` the adapter opens (L-P31) and the `typelib`/`typelib_sha256` its probe checks (L-P22) — inside `hash_dir`, hence in `driver_id`;
 - `secrets.json` = `canon.dumps({id: clear})` for the ids the plan references, only when it references one (mode `0o600` where the OS honours it): a driver file, so hashed into `files_sha256` — a different footer is a different driver — and in clear on the node only (spec §5.5);
 - `vendor/vkdriver/` — every `*.py` of `Path(vkdriver.protocol.__file__).parent` but `test_*.py`, byte for byte, sorted (L-P6); `vendor/vkforge_runtime/__init__.py` and `vendor/vkforge_runtime/com.py`, byte copies of `runtime/__init__.py` and `runtime/com.py` (L-P19); never `fake.py`, never a `pack.json` (L-P9);
 - `.venv`, a junction (Windows, `_winapi.CreateJunction`) or a symlink to `venv`, when one is given (L-P12): outside the fingerprint, as every `.venv` is;
@@ -1707,7 +2004,6 @@ from vkforge_runtime.com import Application  # noqa: E402
 
 NAME = 'word-maison'
 VERSION = '<plan_sha256>'
-PROGID = 'Word.Application'
 BINDING = json.loads((DRIVER_DIR / "binding.json").read_text(encoding="utf-8"))
 SECRETS = (json.loads((DRIVER_DIR / "secrets.json").read_text(encoding="utf-8"))
            if (DRIVER_DIR / "secrets.json").is_file() else {})
@@ -1721,11 +2017,12 @@ def app():
     if _app is None:
         fake = Path(os.environ.get("VK_DRIVER_WORK_DIR") or os.getcwd()) / "fake.json"
         if fake.is_file():
-            sys.path.insert(0, json.loads(fake.read_text(encoding="utf-8"))["vkforge_root"])
+            config = json.loads(fake.read_text(encoding="utf-8"))
+            sys.path.insert(0, config["vkforge_root"])
             from vkforge.runtime.fake import FakeApplication
-            _app = FakeApplication(BINDING)
+            _app = FakeApplication(BINDING, config)
         else:
-            _app = Application(PROGID, BINDING)
+            _app = Application(BINDING)
     return _app
 
 
@@ -1737,6 +2034,7 @@ def appliquer_style_maison(args: dict, evidence_dir: str):
     doc_path = args["document"]
     if not Path(doc_path).is_file() or Path(doc_path).suffix.lower() != ".docx":
         raise DriverRefusal("precondition", "not a .docx file")
+    app().probe()   # the type library this driver was learned on (L-P22), else "office version changed"
     before = _sha(doc_path)
     doc = app().open(doc_path)
     try:
@@ -1769,7 +2067,7 @@ if __name__ == "__main__":
     serve(NAME, VERSION, ACTIONS)
 ```
 
-(`.docx` is `inventory.APPS[plan["app"]]["kind"]`, `PROGID` its `progid`, `VERSION` the plan's `plan_sha256`.)
+(`.docx` is `inventory.APPS[plan["app"]]["kind"]`, `VERSION` the plan's `plan_sha256`; the ProgID is not in `driver.py`: the adapter reads it from `binding.json`'s `application`, L-P31. `binding.json` also carries the `typelib_sha256` that `app().probe()` checks, L-P22.)
 
 - [ ] **Step 1: Failing tests**
 
@@ -1818,10 +2116,10 @@ def fake_venv() -> Path:
 class Session:
     """The generated driver as a host runs it: from its own directory, in a work directory, protocol 1 on stdio."""
 
-    def __init__(self, driver_dir: Path, fake: bool, extra_env=None):
+    def __init__(self, driver_dir: Path, fake: bool, extra_env=None, fake_extra=None):
         self.work = Path(tempfile.mkdtemp())
         if fake:
-            canon.write({"vkforge_root": str(DRIVERS)}, self.work / "fake.json")
+            canon.write({"vkforge_root": str(DRIVERS), **(fake_extra or {})}, self.work / "fake.json")
         env = {**os.environ, "VK_DRIVER_WORK_DIR": str(self.work), "VK_DRIVER_PROFILE_DIR": tempfile.mkdtemp(),
                **(extra_env or {})}
         self.p = subprocess.Popen([sys.executable, "-I", str(driver_dir / "driver.py")], cwd=self.work, env=env,
@@ -1945,6 +2243,29 @@ class GenerateTest(unittest.TestCase):
         finally:
             os.chmod(doc, stat.S_IREAD | stat.S_IWRITE)
 
+    def test_a_surviving_dialog_is_a_dialog_refusal(self):
+        # Spec §6, L-P33: a modal box raised mid-action is closed, never answered, and the action refuses
+        # `dialog`; fake.json's "dialog_on" makes the fake raise one on `save`, through com.guarded itself.
+        doc = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "c.docx", title_style="Normal", body_font=("Calibri", 12))
+        before = doc.read_bytes()
+        fake = FakeApplication(self.binding, {"dialog_on": "save"})
+        opened = fake.open(str(doc))
+        try:
+            with self.assertRaises(DriverRefusal) as cm:
+                fake.call("save", opened)
+        finally:
+            fake.close(opened)
+        self.assertEqual(cm.exception.reason, "dialog")
+        self.assertIn("never answered", cm.exception.detail)
+        s = Session(self.gen(), fake=True, fake_extra={"dialog_on": "save"})
+        started = time.monotonic()
+        ans = s.act("appliquer_style_maison", {"document": str(doc), "pdf": str(doc.with_suffix(".pdf"))})
+        s.close()
+        self.assertLess(time.monotonic() - started, 30, "the guard's deadline, not the host's")
+        self.assertEqual((ans["ok"], ans["reason"]), (False, "dialog"), ans)
+        self.assertEqual(doc.read_bytes(), before, "nothing saved behind the box")
+        self.assertFalse(doc.with_suffix(".pdf").exists())
+
     @unittest.skipIf(inventory.office_present("word"), "Word is installed here: the adapter would really run")
     def test_without_fake_json_the_driver_never_reaches_the_fake(self):
         # L-P19: no <work>/fake.json, no fake — and no environment variable can say otherwise.
@@ -1998,8 +2319,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from vkforge import inventory, mine, plan
+from vkdriver.protocol import DriverRefusal
+from vkforge import canon, inventory, mine, plan
 from vkforge.runtime import com, fake
 from vkforge.runtime.fake import FakeApplication
 from vkforge.tests import ooxml_fixtures
@@ -2043,10 +2366,28 @@ class RuntimeTest(unittest.TestCase):
         obs = mine.mine_file(doc)["obs"]
         self.assertIn({"kind": "font_run", "where": "body", "value": {"name": "Garamond", "size": 11}}, obs)
 
+    def test_a_changed_type_library_is_an_office_version_refusal(self):
+        # L-P22: the binding carries the hash of the type library the driver was learned on; another one on
+        # the node (Office updated) refuses before any document is opened. No Office needed: the registry
+        # read is replaced, the comparison is the adapter's own.
+        self.assertRegex(self.binding["typelib_sha256"], r"^sha256:[0-9a-f]{64}$")
+        with mock.patch.object(com, "live_typelib_sha256", return_value=self.binding["typelib_sha256"]) as live:
+            com.probe(self.binding)
+        live.assert_called_once_with(self.binding["typelib"]["guid"])
+        with mock.patch.object(com, "live_typelib_sha256", return_value="sha256:" + "0" * 64):
+            with self.assertRaises(DriverRefusal) as cm:
+                com.probe(self.binding)
+        self.assertEqual((cm.exception.reason, cm.exception.detail),
+                         ("precondition", "office version changed; remedy: vk driver qualify"))
+        self.assertIsNone(FakeApplication(self.binding).probe(), "no type library behind the fake")
+
     @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("word"), "Word not installed")
     def test_the_adapter_applies_the_house_style_on_the_real_word(self):
         doc = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "c.docx", title_style="Normal", body_font=("Calibri", 12))
-        app = com.Application("Word.Application", self.binding)
+        guid = inventory.APPS["word"]["typelib"]
+        self.assertEqual(com.live_typelib_sha256(guid), canon.sha256_file(inventory.typelib_path(guid)),
+                         "the probe reads the file inventory hashed (L-P22)")
+        app = com.Application(self.binding)
         try:
             checks, wrong = self.house_style(app, doc)
         finally:
@@ -2058,9 +2399,9 @@ class RuntimeTest(unittest.TestCase):
 
 - [ ] **Step 2: Run** `python -I -m unittest discover -s drivers/vkforge/tests -t . -p "test_[gr]*.py"` → errors (no `vkforge.runtime`, stub `generate`).
 
-- [ ] **Step 3: Implement** `ooxml.write_parts`; `runtime/com.py` (lazy `comtypes`, the `VERBS` table over the object model, the binding's members and constants, `open`'s read-only refusal); `runtime/fake.py` (the same `VERBS` keys over the OOXML parts: `apply_paragraph_style` writes `w:pStyle` (adding the built-in style to `styles.xml` with its English `w:name` when absent), `set_font_run` rewrites `w:rFonts`/`w:sz` on the selected runs, `set_footer`/`set_header` write `word/footer1.xml`/`word/header1.xml` with their relationship and `w:sectPr` reference when absent, `save` writes the edited parts with `write_parts`, `export` writes the fake PDF, `verify_*` re-read the saved file through `mine.mine_file` and compare with the arguments (`verify_footer` compares `mine.redact(text)`)); `generate.py` (`render_driver`, the refusals, the layout above, `files_sha256` with `vkdriver.hash_dir.hash_dir(out)` last, `add_arguments`/`run`; the CLI reads `--vault` and deletes nothing — the kernel deletes the vault, Task 9).
+- [ ] **Step 3: Implement** `ooxml.write_parts`; `runtime/com.py` (the code above — the guard, the probe, the application from the binding — then the `VERBS` table over the object model, each verb walking the binding's members and constants and reached only through `Application.call`, hence under `guarded` like `open`, `close` and `quit` (the adapter's every call to the application has its deadline); no application name in the module, L-P31); `runtime/fake.py` (the code above — Word only, `probe`, the `dialog_on` hook — and the same `VERBS` keys over the OOXML parts: `apply_paragraph_style` writes `w:pStyle` (adding the built-in style to `styles.xml` with its English `w:name` when absent), `set_font_run` rewrites `w:rFonts`/`w:sz` on the selected runs, `set_footer`/`set_header` write `word/footer1.xml`/`word/header1.xml` with their relationship and `w:sectPr` reference when absent, `save` writes the edited parts with `write_parts`, `export` writes the fake PDF, `verify_*` re-read the saved file through `mine.mine_file` and compare with the arguments (`verify_footer` compares `mine.redact(text)`)); `generate.py` (`render_driver`, the refusals, the layout above, `files_sha256` with `vkdriver.hash_dir.hash_dir(out)` last, `add_arguments`/`run`; the CLI reads `--vault` and deletes nothing — the kernel deletes the vault, Task 9).
 
-- [ ] **Step 4: Run** the suite green (`test_generate.py` 11 tests, `test_runtime.py` 3, the real-Word ones skipped off the node). **Commit** `feat(vkforge): the COM adapter with its fake twin, and the generator — a protocol-1 driver from a plan, vendoring vkdriver and its adapter`
+- [ ] **Step 4: Run** the suite green (`test_generate.py` 12 tests, `test_runtime.py` 4, the real-Word ones skipped off the node). **Commit** `feat(vkforge): the COM adapter with its fake twin, and the generator — a protocol-1 driver from a plan, vendoring vkdriver and its adapter`
 
 ---
 
@@ -2088,7 +2429,7 @@ def qualify(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: 
 
 `qualification.json` (`canon.dumps`): `{"files_sha256": <the manifest's>, "plan_sha256": canon.sha256(plan), "fake": bool, "passes", "failures", "rate": round(passes / n, 4), "runs": [{"index", "file_sha256", "duration_ms", "post": {<post id>: bool}, "ok", "reason"}]}` — runs in the order of the corpus files' names, which never appear in the record (spec §5.5: file names are content). The kernel, not this stage, computes `driver_id` from `manifest.json` (Task 9): Python cannot reproduce `hash_canonical`.
 
-`qualify` refuses, in this order and **before any copy**: a non-empty `work` (`"work <dir> is not empty"`, remedy `a new directory: a qualification never reuses one`); a driver directory without `vendor/vkdriver/protocol.py` (`"driver <dir> does not vendor vkdriver"`, remedy `generate it again: the generator vendors vkdriver (L-P6)`); a driver whose `hash_dir` is not its manifest's `files_sha256`; a plan whose `invariants_sha256` is not `canon.sha256(invariants)` (`"plan and invariants do not belong together"`); `mine.content_sha256(corpus) != invariants["corpus"]["content_sha256"]` (`"corpus changed since vkforge mine"`, remedy `qualify on the corpus the driver was learned from, or learn again`). Then: `work` made; with `fake`, `<work>/fake.json` = `{"vkforge_root": <drivers/ of this vkforge>}` (L-P19); one driver process for the run, `[sys.executable, "-I", <driver_dir>/driver.py]` — the vkforge interpreter, the virtualenv the manifest's `.venv` links to (L-P12) — `cwd = work`, environment `VK_DRIVER_WORK_DIR = work`, `VK_DRIVER_PROFILE_DIR = work/profile`, `VK_DRIVER_APPLICATIONS` = the manifest's, never the repository's directory (L-P6); its hello read within `HELLO_TIMEOUT_S`. Per corpus file `i` (the files `mine_corpus` mines, sorted by name): `shutil.copy2` to `work/<i>/<name>` (the read-only attribute travels: a document Word holds stays locked); the request `{"id": i + 1, "action": <the plan's action>, "args": {"document": <copy>, "pdf": <copy>.pdf}}` (`pdf` when the manifest's action requires it), `"deadline_ms"`, `"evidence_dir": work/<i>/evidence`; an answer past `deadline_s` → the process is killed, the pass recorded `reason: "timeout"`, a new process started for the next; an `ok` answer → the copy re-mined with `mine.mine_file`: each post id holds when the observation of its `(kind, where)` (`mine.INVARIANT_IDS`, reversed) has the invariant's value — or the plan ambiguity's `value` for a resolved one — and `pdf_exists` when `<copy>.pdf` starts with `%PDF`; a refusal → `ok: false`, `reason` the protocol word, `post` all false.
+`qualify` refuses, in this order and **before any copy**: a non-empty `work` (`"work <dir> is not empty"`, remedy `a new directory: a qualification never reuses one`); a driver directory without `vendor/vkdriver/protocol.py` (`"driver <dir> does not vendor vkdriver"`, remedy `generate it again: the generator vendors vkdriver (L-P6)`); a driver whose `hash_dir` is not its manifest's `files_sha256`; a plan whose `invariants_sha256` is not `canon.sha256(invariants)` (`"plan and invariants do not belong together"`); `mine.content_sha256(corpus) != invariants["corpus"]["content_sha256"]` (`"corpus changed since vkforge mine"`, remedy `qualify on the corpus the driver was learned from, or learn again`). Then: `work` made; with `fake`, `<work>/fake.json` = `{"vkforge_root": <drivers/ of this vkforge>}` (L-P19); one driver process for the run, `[sys.executable, "-I", <driver_dir>/driver.py]` — the vkforge interpreter, the virtualenv the manifest's `.venv` links to (L-P12) — `cwd = work`, environment `VK_DRIVER_WORK_DIR = work`, `VK_DRIVER_PROFILE_DIR = work/profile`, `VK_DRIVER_APPLICATIONS` = the manifest's, never the repository's directory (L-P6); its hello read within `HELLO_TIMEOUT_S`. Per corpus file `i` (the files `mine_corpus` mines, sorted by name): `shutil.copy2` to `work/<i>/<name>` (the read-only attribute travels: a document Word holds stays locked); the request `{"id": i + 1, "action": <the plan's action>, "args": {"document": <copy>, "pdf": <copy>.pdf}}` (`pdf` when the manifest's action requires it), `"deadline_ms"`, `"evidence_dir": work/<i>/evidence`; an answer past `deadline_s` → the process is killed, the pass recorded `reason: "timeout"`, a new process started for the next; an `ok` answer → the copy re-mined with `mine.mine_file`: each post id holds when the observation of its `(kind, where)` (`mine.INVARIANT_IDS`, reversed) has the invariant's value — or the plan ambiguity's `value` for a resolved one — and `pdf_exists` when `<copy>.pdf` starts with `%PDF`; a refusal → `ok: false`, `reason` the protocol word (`dialog` when the adapter's guard closed a box, L-P33; `precondition` for a read-only copy or an Office version change, L-P22), `post` all false. The driver process is this stage's child, inside its Job (the governor), not a job step under the harness: the deviation from spec §5.2's "under the harness, supervised" that L-P32 declares.
 
 - [ ] **Step 1: Failing tests** (`drivers/vkforge/tests/test_qualify.py`)
 
@@ -2225,13 +2566,13 @@ class QualifyTest(unittest.TestCase):
 **Files:**
 - Create: `crates/vk-ipc/src/forge.rs`, `crates/vk-ipc/tests/common/mod.rs`, `crates/vk-ipc/tests/forge.rs`, `crates/vk-kernel/src/learn.rs`, `crates/vk-kernel/tests/learn.rs`, `drivers/vkforge/setup.ps1`
 - Modify: `crates/vk-ipc/src/lib.rs` (`pub mod forge;` beside `pub mod drivers;`, 20–24)
-- Modify: `crates/vk-ipc/src/server.rs` — `ServerConfig` (40–94: the field `forge: Option<crate::forge::ForgeConfig>`; its `Debug`, 96–109; `ServerConfig::new`, 114–126: `forge: None`); `takes_presence` (714–746: `driver.learn`); `dispatch` (784–): `forge_context` and three arms **before** the general lock, after the `driver.pack` arm (882–895), ruling L-P17; `boot.info` (958–): a `vkforge_root` field
+- Modify: `crates/vk-ipc/src/server.rs` — `ServerConfig` (40–94: the field `forge: Option<crate::forge::ForgeConfig>`; its `Debug`, 96–109; `ServerConfig::new`, 114–126: `forge: None`); `takes_presence` (714–746: `driver.learn`); `ctx_for` (753) becomes `pub(crate)` (ruling L-P25); `dispatch` (784–): `forge_context` and three arms **before** the general lock, after the `driver.pack` arm (882–895), ruling L-P17, the `learn` and `qualify` arms building their `Ctx` as that arm does (L-P25); `boot.info` (958–): a `vkforge_root` field
 - Modify: `crates/vk-ipc/src/drivers.rs` — `mount` (632–736): `check_qualified` after each of the two `check_context` calls (649, 664), before anything is spawned. `MountParams` (482–496) is **unchanged** (no `--unqualified`, L-P16).
 - Modify: `crates/vk-ipc/src/capital.rs` — `stage_files` (373–413): three lines (L-P9), and one unit test beside `a_driver_with_a_vkdriver_of_its_own_beside_the_shared_one_is_refused` (1143–1167)
 - Modify: `crates/vk-ipc/tests/capital.rs` — `PYTHON`, `python_available` (49–67), `Node` and its `impl` (226–413) and `call_error` (415–418) move to `tests/common/mod.rs`; the file gains `mod common; use common::*;` and loses its now-unused imports (L-P17)
 - Modify: `crates/vk-kernel/src/lib.rs` (`pub mod learn;`, 2–7), `crates/vk-kernel/src/drivers.rs` (`mount_driver`, 566–678: `self.check_qualified(&manifest)?;` right after `self.check_context(&manifest, &root)?;`)
 - Modify: `crates/vk-store/src/db.rs` (`TABLES`, 14–42: `learned`)
-- Modify: `crates/vk-cli/src/main.rs` (`DriverCmd`, 528–562: `Learn`, `Qualify`, `Plan`; `enum PlanCmd`; their arms beside `DriverCmd::Umount`, 1198–1208), `crates/vk-cli/src/render.rs` (`learned`, `qualified`, `plan_shown`, beside `mounted_driver`, 1165), `crates/vkd/src/lib.rs` (`Args`, 21–135: `--vkforge-root`; the `ServerConfig` literal, 608–629: `forge`)
+- Modify: `crates/vk-cli/src/main.rs` (`DriverCmd`, 528–562: `Learn`, `Qualify`, `Plan`; `enum PlanCmd`; their arms beside `DriverCmd::Umount`, 1198–1208), `crates/vk-cli/src/render.rs` (`learned`, `qualified`, `plan_shown`, beside `mounted_driver`, 1165; a `kind` row in `driver`, 368–394, and its test in the tests module, ruling L-P27), `crates/vkd/src/lib.rs` (`Args`, 21–135: `--vkforge-root`; the `ServerConfig` literal, 608–629: `forge`)
 - Test: `crates/vk-cli/tests/smoke.rs` (helpers `forge_python`, `forge_available`, `forge_node`, `ooxml_corpus`; two tests)
 
 **Interfaces:**
@@ -2249,15 +2590,21 @@ pub struct ForgeConfig {
     /// `VK_FORGE_FIXTURES=1`, a test seam like `VK_TEST_PYTHON_RELEASE`: the recorded catalogues
     /// (`inventory --fixture`) and the fake application (`qualify --fake`). `vkd` warns when it is set.
     pub fixtures: bool,
+    /// The deadline of each `learn` stage: `STAGE_DEADLINE` from `at`; a test sets it shorter
+    /// (L-P30). `qualify` and `debrief` keep their own.
+    pub stage_deadline: Duration,
 }
 impl ForgeConfig {
-    /// `root` with the interpreter and the seam read from the environment; `None` when
-    /// `<root>/vkforge/__main__.py` is not there.
-    pub fn at(root: PathBuf) -> Option<ForgeConfig>;
+    /// `root` as `vkd --vkforge-root` gives it, with the interpreter and the seam read from the
+    /// environment and `STAGE_DEADLINE`. Infallible (L-P26): a root without
+    /// `vkforge/__main__.py` is refused by `run_stage`, at the first spawn.
+    pub fn at(root: PathBuf) -> ForgeConfig;
 }
 pub struct StageRun { pub stage: &'static str, pub args: Vec<String>, pub exit: i32, pub duration_ms: u64, pub stdout_tail: String }
 pub const STAGE_DEADLINE: Duration = Duration::from_secs(600);
-/// Spawns `<python> -I <root>/vkforge/__main__.py <stage> <args>` with `current_dir = root` — the
+/// Refuses, before spawning, a root without `vkforge/__main__.py`: `bad("vkforge root not found;
+/// remedy: start vkd with --vkforge-root <drivers/>")` (L-P26). Then spawns
+/// `<python> -I <root>/vkforge/__main__.py <stage> <args>` with `current_dir = root` — the
 /// script path, never `-m` — under `vk_harness::confine::for_this_platform(1 << 30, None)`
 /// (`Governor::contain` the moment the child exists, failing closed on Windows as the harness does),
 /// stdout to `<work>/forge-<stage>.out`, stderr to `<work>/forge-<stage>.err`, killed at `deadline`
@@ -2265,8 +2612,10 @@ pub const STAGE_DEADLINE: Duration = Duration::from_secs(600);
 /// `bad(<the last non-empty line of the .err file>)`, verbatim: the stage speaks the kernel's voice
 /// (L-P15); an exit with no line is `internal("vkforge <stage> exited <code>; see <log>")`.
 pub fn run_stage(cfg: &ForgeConfig, stage: &'static str, args: &[String], work: &Path, deadline: Duration) -> Result<StageRun, RpcError>;
-pub fn learn(kernel: &Shared, cfg: &ForgeConfig, state_dir: &Path, ctx: Ctx, p: Value) -> Result<Value, RpcError>;
-pub fn qualify(kernel: &Shared, cfg: &ForgeConfig, state_dir: &Path, p: Value) -> Result<Value, RpcError>;
+/// Both take the `Ctx` their pre-lock arm built as the `driver.pack` arm does (L-P25): `learn`'s is
+/// human (`driver_learned`), `qualify`'s whatever the caller presented (`driver_qualified` is kernel-written).
+pub fn learn(kernel: &Shared, cfg: &ForgeConfig, state_dir: &Path, ctx: &Ctx, p: Value) -> Result<Value, RpcError>;
+pub fn qualify(kernel: &Shared, cfg: &ForgeConfig, state_dir: &Path, ctx: &Ctx, p: Value) -> Result<Value, RpcError>;
 pub fn plan_show(p: Value) -> Result<Value, RpcError>;
 
 // crates/vk-ipc/src/server.rs
@@ -2319,7 +2668,7 @@ impl RealKernel {
 ```
 
 IPC (all four are dispatched before the general kernel lock, L-P17):
-- `driver.learn` (presence; in `takes_presence`): params `{family, app, corpus, out, threshold?, arch?}` (`deny_unknown_fields`; `arch` an arch id — the CLI resolves a name, as recipes do). Refused before any stage is spawned: a machine principal (`I1: learning a driver writes code this node will run, which is a human act; re-run it with a presence proof`); `family` other than `office-document` (`family <f> is not known; remedy: --family office-document`); `app` other than `word`/`powerpoint` (`app <a> is not known; remedy: --app word or --app powerpoint`); a relative `corpus`/`out` (`… is not absolute`); an `out` that holds anything (`out <dir> is not empty; remedy: a new directory`); an `out` whose last component is not a driver name (it becomes the driver's name: `word-maison`); `threshold` outside `(0, 1]`. Then, logs under `<state_dir>/forge/<name>/`:
+- `driver.learn` (presence; in `takes_presence`): params `{family, app, corpus, out, threshold?, arch?}` (`deny_unknown_fields`; `arch` an arch id — the CLI resolves a name, as recipes do). Refused before any stage is spawned: a machine principal (`I1: learning a driver writes code this node will run, which is a human act; re-run it with a presence proof`); `family` other than `office-document` (`family <f> is not known; remedy: --family office-document`); `app` other than `word`/`powerpoint` (`app <a> is not known; remedy: --app word or --app powerpoint`); a relative `corpus`/`out` (`… is not absolute`); an `out` that holds anything (`out <dir> is not empty; remedy: a new directory`); an `out` whose last component is not a driver name (it becomes the driver's name: `word-maison`); `threshold` outside `(0, 1]`. Then, each stage through `run_stage` with the deadline `cfg.stage_deadline` (L-P30), logs under `<state_dir>/forge/<name>/`:
   1. `inventory --app A --out OUT` (with `--fixture <root>/vkforge/tests/fixtures/catalogue-A.json` when `cfg.fixtures`);
   2. `bind --catalogue OUT/catalogue.json --out OUT`;
   3. `mine --corpus CORPUS --out OUT --threshold T` — from here a guard deletes `OUT/.vault.json` on every way out;
@@ -2373,7 +2722,7 @@ CLI (`crates/vk-cli/src/main.rs`):
 
 `enum PlanCmd { Show { dir: PathBuf } }`. Arms: `Learn` — paths made absolute (`std::path::absolute`), `--arch` resolved through `arch.ls` as `resolve_arch_names` does (an id kept, a name to the one arch carrying it), then `presence(&c).await?` and `driver.learn`, shown with `render::learned`; `Qualify` → `driver.qualify`, `render::qualified`; `Plan { Show }` → `driver.plan_show`, `render::plan_shown`. Renders: `learned` — `learned <name>  <driver_id>`, `plan <plan_sha256> -> <out>\plan.json (read it: vk driver plan show <out>)`, `unbound: <verbs>|none`, `ambiguities: <invariant> <resolved_by>, …|none`, `excluded: <invariant> (<why>), …|none`; `qualified` — `qualified <name>: <passes>/<passes + failures> passes (<failures> failures), fake <bool> -> <record>`; `plan_shown` — per action `<name> (reversible: yes|no)`, its numbered steps `  <n>. <verb>(<key>=<value>, …)` (values as JSON, compact), `  pre: …`, `  post: <ids, comma-separated>`, `  note: …` when present, then `ambiguities:` and one line `  <invariant>  <resolved_by>[  <value>]` each (or `ambiguities: none`), then `excluded:` likewise (or `excluded: none`).
 
-`vkd` (`crates/vkd/src/lib.rs`): `--vkforge-root DIR` (no default: the target directory is outside the checkout, so nothing can be guessed from the executable's place); a given root without `vkforge/__main__.py` stops the daemon at start (`--vkforge-root <dir>: no vkforge/__main__.py there`); `ServerConfig.forge = a.vkforge_root.map(ForgeConfig::at)`; a `tracing::warn!` when `VK_FORGE_FIXTURES=1`. `boot.info` gains `"vkforge_root"` (null without one).
+`vkd` (`crates/vkd/src/lib.rs`): `--vkforge-root DIR` (no default: the target directory is outside the checkout, so nothing can be guessed from the executable's place); `ServerConfig.forge = a.vkforge_root.map(ForgeConfig::at)`, an `Option<ForgeConfig>` (`at` is infallible, L-P26: a root without `vkforge/__main__.py` is not checked at start but refused by `run_stage` at the first spawn, `vkforge root not found; remedy: start vkd with --vkforge-root <drivers/>`); a `tracing::warn!` when `VK_FORGE_FIXTURES=1`. `boot.info` gains `"vkforge_root"` (null without one).
 
 `drivers/vkforge/setup.ps1` (French, the pattern of `drivers/maskai-recette/setup.ps1`): `-Python`, `-VenvHome` (default `%LOCALAPPDATA%\vk\venvs\vkforge`); the base Python is `-Python`, else uv's managed 3.13, else `python`; a base under `WindowsApps` is refused, for a new and an existing virtualenv (R27); the virtualenv is reused when it exists (Task 3's Step 6 made it), else created; `pip install -r drivers\vkforge\requirements.txt`; `& <venv>\Scripts\python.exe -I -c "import lxml, comtypes"` must succeed; last line `VK_FORGE_PYTHON par défaut : <venv>\Scripts\python.exe`. No junction under `drivers/vkforge` (the daemon runs the virtualenv's interpreter by its path; each generated driver gets its own `.venv` junction from the generator).
 
@@ -2441,7 +2790,7 @@ pub fn ooxml_corpus(dir: &Path, garamond: u32, calibri: u32) -> PathBuf {
 }
 ```
 
-`Node::start` sets `forge: Some(ForgeConfig { root: repo_root().join("drivers"), python: forge_python(), fixtures: true })` in its `ServerConfig`; `Node` gains `pub fn dir(&self) -> &Path { self.d.path() }` and `pub async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value>` (`self.c.call(method, params, None)`, a machine call); `shutdown` drops the host of every mounted driver (names from `self.k.lock().unwrap().drivers()`), not only `fake`.
+`Node` gains `pub async fn start_with_forge(forge: ForgeConfig) -> Node`, which is today's `start` with `forge: Some(forge)` in its `ServerConfig` — the in-process form of `vkd --vkforge-root` (L-P26, L-P30) — and `Node::start()` becomes `Node::start_with_forge(ForgeConfig { python: forge_python(), fixtures: true, ..ForgeConfig::at(repo_root().join("drivers")) }).await` (`use vk_ipc::forge::ForgeConfig;` at the top of `common/mod.rs`); `Node` also gains `pub fn dir(&self) -> &Path { self.d.path() }` and `pub async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value>` (`self.c.call(method, params, None)`, a machine call); `shutdown` drops the host of every mounted driver (names from `self.k.lock().unwrap().drivers()`), not only `fake`.
 
 `crates/vk-ipc/tests/forge.rs`:
 
@@ -2454,9 +2803,11 @@ mod common;
 use common::*;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use vk_contracts::driver::{DriverLearned, DriverManifest, DriverQualified};
 use vk_contracts::plan::{plan_sha256, Ambiguity, DriverPlan};
 use vk_contracts::{hash_bytes, hash_canonical};
+use vk_ipc::forge::ForgeConfig;
 
 fn learn_params(corpus: &Path, out: &Path) -> Value {
     json!({"family": "office-document", "app": "word", "corpus": corpus, "out": out})
@@ -2651,6 +3002,76 @@ async fn an_ambiguity_with_a_mock_arch_is_resolved_and_traced() {
     assert_eq!(node.events("task.submitted").len(), 1, "one model call, for the one ambiguity");
     node.shutdown().await;
 }
+
+/// The stand-in vkforge of the deadline test (L-P30): it writes its working directory, its own id and
+/// the id of a child it starts, then sleeps a minute — longer than any deadline the test gives it.
+const SLEEPER: &str = r#"import os, subprocess, sys, time
+from pathlib import Path
+child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
+Path(__file__).resolve().parents[1].joinpath("stage.txt").write_text(
+    f"{os.getcwd()}\n{os.getpid()}\n{child.pid}\n", encoding="utf-8")
+time.sleep(60)
+"#;
+
+/// Is the Windows process `pid` running? `tasklist` filtered on the id, in CSV, as
+/// `crates/vk-driver/tests/fake_driver.rs` asks it (the forge tests run where comtypes imports: Windows).
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+        .unwrap_or(false)
+}
+
+/// L-P2, L-P30: a stage is a governed one-shot process — started in the vkforge root, refused by the
+/// kernel within its deadline plus five seconds, and killed with its whole tree (the Job governor).
+/// The root is a stand-in, given the way `vkd --vkforge-root` gives one (`ForgeConfig::at`).
+#[tokio::test]
+async fn vk_forge_a_stage_past_its_deadline_is_killed_in_its_root() {
+    if !forge_available() {
+        return;
+    }
+    let roots = tempfile::tempdir().unwrap();
+    let root = roots.path().join("drivers");
+    std::fs::create_dir_all(root.join("vkforge")).unwrap();
+    std::fs::write(root.join("vkforge").join("__main__.py"), SLEEPER).unwrap();
+    let deadline = Duration::from_secs(5);
+    let node = Node::start_with_forge(ForgeConfig {
+        python: forge_python(),
+        stage_deadline: deadline,
+        ..ForgeConfig::at(root.clone())
+    })
+    .await;
+    let corpus = node.dir().join("corpus"); // never read: the first stage, inventory, is the sleeper
+    std::fs::create_dir_all(&corpus).unwrap();
+    let started = Instant::now();
+    let e = node
+        .call_human("driver.learn", learn_params(&corpus, &node.dir().join("word-maison")))
+        .await
+        .unwrap_err();
+    let waited = started.elapsed();
+    assert!(waited < deadline + Duration::from_secs(5), "the kernel answered after {waited:?}");
+    let message = call_error(&e).message.clone();
+    assert!(message.contains("vkforge inventory ran past its deadline of 5 s"), "{message}");
+    let stage = std::fs::read_to_string(root.join("stage.txt")).expect("the stage ran and wrote stage.txt");
+    let lines: Vec<&str> = stage.lines().collect();
+    assert_eq!(
+        std::fs::canonicalize(lines[0]).unwrap(),
+        std::fs::canonicalize(&root).unwrap(),
+        "current_dir is the vkforge root (L-P2)"
+    );
+    for pid in &lines[1..3] {
+        let pid: u32 = pid.parse().unwrap();
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while process_alive(pid) {
+            assert!(Instant::now() < gone_by, "python {pid} outlived its stage: the Job holds the tree");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    assert!(node.events("driver.learned").is_empty());
+    node.shutdown().await;
+}
 ```
 
 `crates/vk-kernel/tests/learn.rs` (no Python: it runs on the three operating systems):
@@ -2811,6 +3232,17 @@ fn driver_qualified_then_the_com_gate_reads_the_record() {
     }
 ```
 
+`crates/vk-cli/src/render.rs`, in its tests module (ruling L-P27: `vk driver show` says the kind; the JSON output already carries the manifest):
+
+```rust
+    #[test]
+    fn vk_driver_show_says_the_kind() {
+        let shown = driver(&json!({"driver_id": "sha256:1", "state": {"state": "ready"}, "root": "C:\\d",
+                                   "manifest": {"name": "word-maison", "kind": "com", "governed": false, "actions": []}}));
+        assert!(shown.lines().any(|l| l.split_whitespace().eq(["kind", "com"])), "{shown}");
+    }
+```
+
 `crates/vk-cli/tests/smoke.rs`, helpers beside `python_on_path` (2637) and two tests:
 
 ```rust
@@ -2917,7 +3349,7 @@ fn vk_forge_plan_show_prints_the_actions_and_the_ambiguities() {
 }
 ```
 
-- [ ] **Step 2: Run** `cargo test --locked -p vk-kernel --test learn` → compile errors (no `vk_kernel::learn`); `cargo test --locked -p vk-ipc --test forge` → compile errors (no `common`, no `forge`).
+- [ ] **Step 2: Run** `cargo test --locked -p vk-kernel --test learn` → compile errors (no `vk_kernel::learn`); `cargo test --locked -p vk-ipc --test forge` → compile errors (no `common`, no `forge`); `cargo test --locked -p vk-cli vk_driver_show_says_the_kind` → FAIL (no `kind` row).
 
 - [ ] **Step 3: Implement** as specified: `vk-store` `TABLES` gains `"learned"` (comment: one row per learned driver keyed by `driver_id`, typed `vk_kernel::learn::LearnedRow`); `learn.rs`; the `check_qualified` calls; `forge.rs` (`learn`, `qualify`, `plan_show`, `run_stage`); the `server.rs` arms, placed after the `driver.pack` arm:
 
@@ -2938,11 +3370,17 @@ fn vk_forge_plan_show_prints_the_actions_and_the_ambiguities() {
             ));
         }
         let (cfg, state_dir) = forge_context(kernel, config)?;
-        return crate::forge::learn(kernel, cfg, &state_dir, ctx, req.params);
+        return crate::forge::learn(kernel, cfg, &state_dir, &ctx, req.params);
     }
     if req.method == "driver.qualify" {
+        // Kernel-written (`driver.qualified`), no presence required; the `Ctx` is built here as
+        // for driver.pack, in one short lock phase (ruling L-P25).
+        let ctx = {
+            let k = lock(kernel)?;
+            ctx_for(&k, presence.take(), now)?
+        };
         let (cfg, state_dir) = forge_context(kernel, config)?;
-        return crate::forge::qualify(kernel, cfg, &state_dir, req.params);
+        return crate::forge::qualify(kernel, cfg, &state_dir, &ctx, req.params);
     }
     if req.method == "driver.plan_show" {
         return crate::forge::plan_show(req.params);
@@ -2959,7 +3397,18 @@ fn vk_forge_plan_show_prints_the_actions_and_the_ambiguities() {
     }
 ```
 
-the CLI and its renders, `vkd`, `setup.ps1`; `tests/capital.rs` on `tests/common/mod.rs`.
+`ctx_for`'s `fn` becomes `pub(crate) fn` (L-P25); the CLI and its renders — `render::driver` gains the `kind` row right after `name` (L-P27):
+
+```rust
+    let mut rows = vec![
+        ("name", text(&m["name"])),
+        ("kind", text(&m["kind"])),
+        ("driver_id", text(&v["driver_id"])),
+        ("state", text(&v["state"]["state"])),
+    ];
+```
+
+— `vkd`, `setup.ps1`; `tests/capital.rs` on `tests/common/mod.rs`.
 
 - [ ] **Step 4:** `cargo test --locked -p vk-store -p vk-kernel -p vk-ipc -p vk-cli` green (the forge and smoke tests run where `forge_available` says yes, and say why on stderr where not); `cargo clippy --workspace --all-targets -- -D warnings` clean. **Commit** `feat(kernel,ipc,cli): vk driver learn and qualify — vkforge under the Job governor, the one model call, the qualification gate at mount`
 
@@ -2970,13 +3419,13 @@ the CLI and its renders, `vkd`, `setup.ps1`; `tests/capital.rs` on `tests/common
 **Model:** Sonnet.
 
 **Files:**
-- Modify: `crates/vk-ipc/src/forge.rs` (`deliberate`, reached from `learn` when `deliberate` is given), `crates/vk-ipc/tests/forge.rs` (one test), `crates/vk-cli/src/main.rs` (`DriverCmd::Learn`: `--deliberate VERB`), `crates/vk-cli/src/render.rs` (`proposed`), `.github/workflows/ci.yml` (job `driver-learn`, after `driver-install`), `scripts/check-workflows.py` (`EXPECTED_JOBS`, line 29: `driver-learn`), `docs/technical/technical-readme.md` (new section "Learned drivers"), `contracts/tcb.md` §Drivers, `README.md` (status table)
+- Modify: `crates/vk-ipc/src/forge.rs` (`deliberate`, reached from `learn` when `deliberate` is given), `crates/vk-ipc/tests/forge.rs` (one test), `crates/vk-cli/src/main.rs` (`DriverCmd::Learn`: `--deliberate VERB`), `crates/vk-cli/src/render.rs` (`proposed`), `.github/workflows/ci.yml` (job `driver-learn`, after `driver-install`), `scripts/check-workflows.py` (`EXPECTED_JOBS`, line 29: `driver-learn`), `docs/technical/technical-readme.md` (new section "Learned drivers"), `contracts/tcb.md` §Drivers (the sentences of Step 4, the L-P32 deviation and spec §5.5's table, rulings L-P31, L-P32, L-P34), `README.md` (status table)
 - Create: `docs/technical/runbooks/learn-office-driver.md`
 
 **Interfaces:**
 - Consumes: `forge::learn`, `ForgeConfig`, `forge_context`, the `common` test module (`Node`, `forge_available`, `ooxml_corpus`, `repo_root`, `call_error`) and `learn_params` of `tests/forge.rs` (Task 9); `vk_kernel::tasks::StepKind::Draft`, `RealKernel::{create_task, run_task_step}`, `Kernel::read_register` (master); the ontology file (Task 4).
 - Produces:
-  - `driver.learn` with `deliberate: VERB` (presence): params `{family, app, out, arch, deliberate}` — `corpus` not required, `arch` required (`--deliberate needs --arch: a proposal is drafted by an arch; remedy: --arch NAME`), `out` a learn's output holding `catalogue.json` (`out <dir> holds no catalogue.json; remedy: --out names a learned driver's output`), the verb in the ontology. One task (`create_task` + `run_task_step`, one short lock phase) with one `StepKind::Draft { arch_id }` step over a register whose goal is `propose a projection rule as JSON {"member": "Type.Member", "constants": "<Enum>" | null} for the verb <verb> on <app>`, constraint the verb's ontology entry (JSON, read from `<cfg.root>/vkforge/ontology/office-document.json`), evidence the catalogue slice — the members of the types the verb's patterns name for any app and this catalogue has, else the catalogue's type names alone, at most 20 kB — label scope `business`; no harness, no application driving (L-P3). Written to `<out>/proposals/<verb>.json`: `{"verb", "app", "proposed_by": "arch:<id>", "task": <task id>, "rule": {"member", "constants"} | null, "answer": <the drafted text, at most 2 000 characters>}` (`rule` is the first JSON object of the answer with exactly those two keys, else null); nothing is written to the ontology, to `driver.py` or to the ledger beyond the task's own rows. → `{proposal: <that object>, path}`.
+  - `driver.learn` with `deliberate: VERB` (presence): params `{family, app, out, arch, deliberate}` — `corpus` not required, `arch` required (`--deliberate needs --arch: a proposal is drafted by an arch; remedy: --arch NAME`), `out` a learn's output holding `catalogue.json` (`out <dir> holds no catalogue.json; remedy: --out names a learned driver's output`), the verb in the ontology. One task (`create_task` + `run_task_step`, one short lock phase) with one `StepKind::Draft { arch_id }` step over a register whose goal is `propose a projection rule as JSON {"member": "Type.Member", "constants": "<Enum>" | null} for the verb <verb> on <app>`, constraint the verb's ontology entry (JSON, read from `<cfg.root>/vkforge/ontology/office-document.json`), evidence the catalogue slice — the members of the types the verb's patterns name for any app and this catalogue has, else the catalogue's type names alone, at most 20 kB — label scope `business`; no harness, no application driving (L-P3). Written to `<out>/proposals/<verb>.json`: `{"verb", "app", "proposed_by": "arch:<id>", "task": <task id>, "rule": {"member", "constants"} | null, "answer": <the arch's answer verbatim, the Draft step's decision "draft: <text>", at most 2 000 characters>}` (ruling L-P29: the decision as `arch::raise` pushed it, `crates/vk-kernel/src/tasks.rs` 917; `rule` is the first JSON object of the answer with exactly those two keys, else null); nothing is written to the ontology, to `driver.py` or to the ledger beyond the task's own rows. → `{proposal: <that object>, path}`.
   - CLI: `Learn` gains `#[arg(long, value_name = "VERB", requires = "arch")] deliberate: Option<String>`, and `corpus` becomes `Option<PathBuf>` with `required_unless_present = "deliberate"`; `vk driver learn --deliberate VERB --app A --out DIR --arch NAME --family office-document`. Render `proposed`: `proposal for <verb> on <app> by <proposed_by> -> <path>`, then `rule: <member> / <constants>` or `rule: none (read the answer in the file)`, then `nothing applied: a human versions a rule into the ontology`.
   - CI job `driver-learn` (Windows): the vkforge suite, the generated-driver vendor test, and the three Rust suites, through the vkforge virtualenv.
 
@@ -3010,7 +3459,7 @@ async fn deliberate_writes_a_proposal_and_touches_nothing_else() {
     assert_eq!(proposal["proposed_by"], json!(format!("arch:{arch}")));
     assert_eq!((proposal["verb"].as_str(), proposal["app"].as_str()), (Some("set_slide_layout"), Some("word")));
     assert_eq!(proposal["rule"], Value::Null, "the mock's echo is no {member, constants} rule");
-    assert!(proposal["answer"].as_str().unwrap().starts_with("DRAFT:"), "{proposal}");
+    assert!(proposal["answer"].as_str().unwrap().starts_with("draft: "), "the Draft decision, verbatim (L-P29): {proposal}");
     assert_eq!(r["proposal"], proposal);
     assert_eq!(hash_of(&ontology), ontology_before, "the ontology is a human's to edit");
     assert_eq!(hash_of(&out.join("driver/driver.py")), driver_before, "never code");
@@ -3082,7 +3531,18 @@ async fn deliberate_writes_a_proposal_and_touches_nothing_else() {
 
 - [ ] **Step 3: Implement** `forge::deliberate` and its CLI as the interface says.
 
-- [ ] **Step 4: Docs** — `docs/technical/technical-readme.md`, a section "Learned drivers": the six stages and their artefacts (names of Task 9's step list), the seams (`VK_FORGE_FIXTURES`, `VK_FORGE_PYTHON`, `--vkforge-root`, `<work>/fake.json` written by `qualify --fake` only), the `learned` table and the mount gate, the deliberate fallback. `contracts/tcb.md` §Drivers: spec §11's five sentences, plus L-P1/L-P19 (the fake is a test double of the adapter, reachable only through a `fake.json` that `vkforge qualify --fake` writes into its own work directory, never in a mount's), L-P2 (a governed one-shot process; the Job does not block the network, the package opens no socket, pinned by a test), L-P3 (the deliberate fallback proposes, never traces nor writes code), L-P4 (the qualification gate at mount for `kind: com`, on the hash of the record the kernel stored). `README.md`: one status row. `docs/technical/runbooks/learn-office-driver.md`, in French, the register of `docs/technical/runbooks/recette-maskai.md` (firmware analogies kept): `setup.ps1`; the daemon started with `--vkforge-root`; `vk driver learn`, `vk driver plan show`, `vk driver qualify`, `vk mount driver`, and `vk driver learn --deliberate`, each with its expected line (the render texts of Tasks 9 and 10).
+- [ ] **Step 4: Docs** — `docs/technical/technical-readme.md`, a section "Learned drivers": the six stages and their artefacts (names of Task 9's step list), the seams (`VK_FORGE_FIXTURES`, `VK_FORGE_PYTHON`, `--vkforge-root`, `<work>/fake.json` written by `qualify --fake` only), the `learned` table and the mount gate, the deliberate fallback. `contracts/tcb.md` §Drivers: spec §11's five sentences, plus L-P1/L-P19 (the fake is a test double of the adapter, reachable only through a `fake.json` that `vkforge qualify --fake` writes into its own work directory, never in a mount's), L-P2 (a governed one-shot process; the Job does not block the network, the package opens no socket, pinned by a test), L-P3 (the deliberate fallback proposes, never traces nor writes code), L-P4 (the qualification gate at mount for `kind: com`, on the hash of the record the kernel stored), L-P22 (a learned driver carries the hash of the type library it was learned on in its `binding.json`, hence in its `driver_id`, and refuses every action with `precondition` "office version changed" on another; the kernel itself never loads COM), L-P31 (the fake application implements Word `.docx` only: a PowerPoint driver is qualified against the real PowerPoint, on the node), L-P33 (a dialog box raised during an action is closed, never answered, and the action refuses `dialog`). Then the deviation of L-P32, in these words: "Spec §2 L8 and §5.2 — a learned driver runs supervised, every act approved: this holds for the **mounted** learned driver, each `vk_driver_act` being a job step under the harness. `vk driver qualify` runs the driver directly, as the child of its stage inside the stage's Job (the governor), not under the harness: the replay is on copies, and its record is what the mount checks." And spec §5.5's data-boundary table, reproduced as it stands (ruling L-P34):
+
+```markdown
+| Actor | Sees | Never sees |
+|---|---|---|
+| Miner (code) | the OOXML formatting parts | `document.xml` beyond formatting attributes |
+| Arch (model) | `plan.ambiguities`: kinds, supports, numeric values, hashes | content, file names, free strings |
+| Generated driver (on the node) | the clear values its actions need (footer text) | the original corpus |
+| Ledger | hashes and counts | any artefact in clear |
+```
+
+`README.md`: one status row. `docs/technical/runbooks/learn-office-driver.md`, in French, the register of `docs/technical/runbooks/recette-maskai.md` (firmware analogies kept): `setup.ps1`; the daemon started with `--vkforge-root`; `vk driver learn`, `vk driver plan show`, `vk driver qualify`, `vk mount driver`, and `vk driver learn --deliberate`, each with its expected line (the render texts of Tasks 9 and 10).
 
 - [ ] **Step 5:** `python -I scripts/check-workflows.py`, `python -I scripts/docs/check_docs.py`, `cargo test --locked -p vk-ipc --test forge` green; push, `gh run watch` (the `driver-learn` job green). **Commit** `feat(vkforge,ci): the deliberate fallback as a proposal; the driver-learn job; learned drivers in the readme, the TCB and a runbook`
 
@@ -3096,7 +3556,7 @@ Founder decision 2026-10-17: the post-launch retro-learning loop becomes a stage
 
 **Files:**
 - Create: `drivers/vkforge/debrief.py`, `drivers/vkforge/tests/test_debrief.py`, `drivers/vkforge/tests/debrief_fixtures.py`, `drivers/vkforge/tests/fixtures/debrief-2026-10-17/journal-essai1.jsonl`, `drivers/vkforge/tests/fixtures/debrief-2026-10-17/driver.log`, `drivers/vkforge/tests/fixtures/debrief-2026-10-17/vkd-console.log`
-- Modify: `drivers/vkforge/__main__.py` (`debrief` imported and added to the `STAGES` table), `crates/vk-ipc/src/forge.rs` (`debrief`, `DEBRIEF_DEADLINE`), `crates/vk-ipc/src/server.rs` (`dispatch`: `driver.debrief` before the general kernel lock, after Task 9's `driver.plan_show` arm, ruling L-P17; **not** added to `takes_presence`), `crates/vk-cli/src/main.rs` (`DriverCmd::Debrief { run, out, until }` and its dispatch arm), `crates/vk-cli/src/render.rs` (`debriefed`), `docs/technical/runbooks/recette-maskai.md` (new §16, French), `docs/technical/technical-readme.md` (the "Learned drivers" section of Task 10: one paragraph), `contracts/tcb.md` §Drivers (one sentence)
+- Modify: `drivers/vkforge/__main__.py` (`debrief` imported and added to the `STAGES` table), `drivers/vkforge/tests/test_package.py` (Task 0's `STAGE_NAMES` gains `"debrief"`, Step 4), `crates/vk-ipc/src/forge.rs` (`debrief`, `DEBRIEF_DEADLINE`), `crates/vk-ipc/src/server.rs` (`dispatch`: `driver.debrief` before the general kernel lock, after Task 9's `driver.plan_show` arm, ruling L-P17; **not** added to `takes_presence`), `crates/vk-cli/src/main.rs` (`DriverCmd::Debrief { run, out, until }` and its dispatch arm), `crates/vk-cli/src/render.rs` (`debriefed`), `docs/technical/runbooks/recette-maskai.md` (new §16, French), `docs/technical/technical-readme.md` (the "Learned drivers" section of Task 10: one paragraph), `contracts/tcb.md` §Drivers (one sentence)
 - Test: `crates/vk-ipc/tests/forge.rs` (two tests), `crates/vk-cli/tests/smoke.rs` (one test)
 
 **Interfaces:**
@@ -4071,7 +4531,11 @@ STAGES = {"inventory": inventory, "bind": ontology, "mine": mine, "plan": plan, 
           "qualify": qualify, "debrief": debrief}
 ```
 
-with `"debrief"` added to the stage list of Task 0's `test_the_stage_table_is_built_in_main_and_no_stage_registers_itself`.
+and in `drivers/vkforge/tests/test_package.py` (Task 0's), the stage list both of its stage tests read — `test_the_cli_lists_its_stages_and_refuses_an_unknown_one_from_any_directory` and `test_the_stage_table_is_built_in_main_and_no_stage_registers_itself` — gains `"debrief"`, in its sorted place:
+
+```python
+STAGE_NAMES = ["bind", "debrief", "generate", "inventory", "mine", "plan", "qualify"]
+```
 
 - [ ] **Step 5: Run** the vkforge suite green.
 
@@ -4316,10 +4780,10 @@ Attendu : `debrief: N proposals -> …`, une ligne par proposition (genre, cible
 
 - [ ] `powershell -ExecutionPolicy Bypass -File drivers\vkforge\setup.ps1` (uv CPython 3.13, `lxml`, `comtypes`; it reuses the virtualenv of Task 3's Step 6); `& "$env:LOCALAPPDATA\vk\venvs\vkforge\Scripts\python.exe" -I -m unittest discover -s drivers/vkforge/tests -t .` green, the `office_present` tests included (real Word: `test_the_live_type_library_…`, `test_the_adapter_applies_the_house_style_on_the_real_word`).
 - [ ] The two catalogues are committed (Task 3, Step 6); the daemon runs with `--vkforge-root <repository>\drivers` and **without** `VK_FORGE_FIXTURES`.
-- [ ] A corpus of 10 Word contracts (`python -I drivers\vkforge\tests\ooxml_fixtures.py <dir> 10` on the node, or real anonymised firm documents in a private folder): `vk driver learn --family office-document --app word --corpus … --out dist\word-maison`; `vk driver plan show dist\word-maison` read and approved; `vk driver qualify --driver dist\word-maison\driver --corpus …` → `10/10 passes (0 failures), fake false`, zero tokens (`vk dmesg` shows no `infer` between `driver.learned` and `driver.qualified`), under 15 s per document (the record's `duration_ms`); `vk mount driver --manifest dist\word-maison\driver\manifest.json` mounts; `vk driver show word-maison` shows `kind: com` (L-P11: `driver.mounted` carries no kind).
+- [ ] A corpus of 10 Word contracts (`python -I drivers\vkforge\tests\ooxml_fixtures.py <dir> 10` on the node, or real anonymised firm documents in a private folder): `vk driver learn --family office-document --app word --corpus … --out dist\word-maison`; `vk driver plan show dist\word-maison` read and approved; `vk driver qualify --driver dist\word-maison\driver --corpus …` → `10/10 passes (0 failures), fake false`, zero tokens (`vk dmesg` shows no `infer` between `driver.learned` and `driver.qualified`), under 15 s per document (the record's `duration_ms`); `vk mount driver --manifest dist\word-maison\driver\manifest.json` mounts; `vk driver show word-maison` shows the row `kind  com` (Task 9's `kind` row, L-P27; L-P11: `driver.mounted` carries no kind).
 - [ ] The learned driver runs alone (L-P6, L-P9, L-P19): `dist\word-maison\driver\vendor\vkdriver\protocol.py` is byte-identical to `drivers\vkdriver\protocol.py` and `vendor\vkforge_runtime\com.py` to `drivers\vkforge\runtime\com.py`; there is no `pack.json` and no `fake.py` anywhere under `dist\word-maison\driver`; the qualification and the mount spawned `driver.py` from `dist\…`, with no repository around it.
 - [ ] Optional, L-P9: `vk driver pack --manifest dist\word-maison\driver\manifest.json --version 0.1.0 --out dist\pack-word-maison` succeeds without a `pack.json` and its files layer holds `vendor/vkdriver/` once. (The installed copy has another `driver_id`; the gate refuses to mount it until the packaging chantier carries the qualification — see the self-review notes.)
-- [ ] A corpus of 10 presentations: the same commands with `--app powerpoint --out dist\ppt-maison`; `git diff --stat` shows no file changed outside `drivers/vkforge/ontology/office-document.json` since the Word run; qualification ≥ 9/10 (spec §8.2; the plan's own thresholds, 10 at rate 1.0, decide whether it mounts).
+- [ ] A corpus of 10 presentations: the same commands with `--app powerpoint --out dist\ppt-maison`; `git diff --stat` shows no file changed outside `drivers/vkforge/ontology/office-document.json` since the Word run (`runtime/com.py` names no application: the ProgID, `Presentations`, `Open`'s and `Close`'s arguments and `DisplayAlerts` come from the ontology's `applications` block, L-P31); qualification ≥ 9/10 against the real PowerPoint — the fake is Word `.docx` only, so this run is the proof of spec §8.2 (the plan's own thresholds, 10 at rate 1.0, decide whether it mounts).
 - [ ] A fictitious document carrying personal data added to a copy of the corpus: `learn` again into `dist\purge-check`; `findstr /s` of each personal string over `dist\purge-check` finds it only under `driver\secrets.json` if it was a footer, nowhere otherwise.
 - [ ] CI green on every job, `driver-learn` included; TCB updated; the chantier's SDD ledger closed; plan archived under `docs/archive/technical/plans/` at the merge (filing rule).
 
@@ -4327,11 +4791,11 @@ Attendu : `debrief: N proposals -> …`, une ligne par proposition (genre, cible
 
 ## Self-review notes (run by the author before handoff; revised 2026-10-18)
 
-- **Spec coverage:** §3.2 components → Tasks 0, 3–9; §4.1 catalogue → 3; §4.2 ontology → 4; §4.3 binding → 4; §4.4 invariants + purge → 5; §4.5 plan → 2 (contract), 6 (producer); §4.6 generated driver → 7; §4.7 qualification → 8; §4.8 ledger → 2, 9; §4.9 contract additions → 1, 2; §4.10 CLI → 9, 10; §5.1–5.2 flows → 9; §5.3 fallback → 10 (L-P3, reduced); §5.4 PowerPoint → 4, 6, 12; §5.5 boundaries → 5, 7, 8, 9; §6 failure modes → 3 (Office absent), 5 (corpus too small, mixed, skipped, every invariant under the threshold), 6 (unbound, ambiguity, bad answer), 7/8 (read-only, postconditions), 8 (corpus changed), 9 (stage failure; thresholds unmet → mount refused); §7 tests → every task; §8 → 12; §11 → 2, 10, 11.
+- **Spec coverage:** §3.2 components → Tasks 0, 3–9; §4.1 catalogue → 3; §4.2 ontology → 4; §4.3 binding → 4; §4.4 invariants + purge → 5; §4.5 plan → 2 (contract), 6 (producer); §4.6 generated driver → 7; §4.7 qualification → 8; §4.8 ledger → 2, 9; §4.9 contract additions → 1, 2; §4.10 CLI → 9, 10; §5.1–5.2 flows → 9; §5.3 fallback → 10 (L-P3, reduced); §5.4 PowerPoint → 4 (the `applications` block), 6, 7 (no application name in the adapter), 12 (L-P31); §5.5 boundaries → 5, 7, 8, 9, and the table in the TCB → 10 (L-P34); §2 L8 and §5.2 supervision → 10 (declared, L-P32); §6 failure modes → 3 (Office absent), 3/4/7 (Office version differs: the probe, L-P22), 5 (corpus too small, mixed, skipped, every invariant under the threshold), 6 (unbound, ambiguity, bad answer), 7 (unexpected dialog: the guard, L-P33), 7/8 (read-only, postconditions), 8 (corpus changed), 9 (stage failure; thresholds unmet → mount refused); §7 tests → every task; §8 → 12; §11 → 2, 10, 11.
 - **Founder decisions not in the spec:** the debrief stage (2026-10-17) → Task 11, from the 17/10 debrief §4 and the defects of its §2/§3: D1, D2, D5, D8, D11 and the maintenance page become proposals; D4, D6, D7, D9, D10, D12, D13 and S15–S17 signals; S14 (the judge's claims against the journal, D3) is out — the judge's text is in the register, not in clear on the node. No ledger row for it (founder 2026-10-18, L-P5). Fixture outcome: three of the four manual loops of 17/10 answered before their relaunch, one left.
 - **Open items of spec §10 settled:** verb list v1 (Task 4, 32 verbs); `lxml==6.1.3` and `comtypes==1.4.17` pinned (Task 0), type library located through the registry (Task 3); threshold default 0.8, one value for every kind, `--threshold` on the CLI (Task 5); no COM server in CI — the fake adapter (L-P1, L-P19, Task 7); `vk driver plan show` format (Task 9's `render::plan_shown`).
-- **Plan rulings and where they land:** **L-P1** fake application behind the one adapter (Global Constraints; Tasks 7, 8); **L-P2** `learn` is a governed one-shot process, not a protocol-1 driver (Task 9 `run_stage`); **L-P3** the deliberate fallback is a proposal from the catalogue through one task with one Draft step, no live application driving (Task 10); **L-P4** a `kind: com` driver mounts only with a `driver.qualified` record meeting the plan's thresholds, whose file still hashes to the stored hash (Task 9 `check_qualified`); **L-P5** the debrief is a machine act, writes no ledger row and applies nothing (Task 11); **L-P6** the generated driver vendors `vkdriver` and resolves it vendor-first (Tasks 7, 8, 10, 12); **L-P7** identity on the frozen fixture and the existing `PILOT_ID` (Task 1); **L-P8** per-kind schema rules through `if`/`then`, invalid examples only what the schema refuses (Tasks 1, 2); **L-P9** no `pack.json`, `stage_files` skips the shared copy when `vendor/vkdriver` exists (Tasks 7, 9, 12); **L-P10** `Capability::Plan` for the ambiguity call (Task 9); **L-P11** no kind on `driver.mounted`, tests read the row (Tasks 9, 12); **L-P12** the vkforge virtualenv as interpreter and as the generated driver's `.venv` (Tasks 3, 7, 8, 9, 10); **L-P13** canonical artefacts and hashes, `reversible`/`note`, `plan-excluded.json`, the ambiguity shape, `where`, `qualify`'s signature, the selectors, `--vault`, the gate on the stored hash (Tasks 0, 2, 4–9); **L-P14** stage stubs in Task 0, modified by Tasks 3–8; **L-P15** `vkforge <stage>: …; remedy: …` everywhere (Tasks 0, 5, 9); **L-P16** no `--unqualified`, `MountParams` unchanged (Task 9); **L-P17** the four vkforge methods before the general lock, `Node` in `tests/common/mod.rs` (Tasks 9, 11); **L-P18** `vk_forge_*` smoke tests and the `lxml`/`comtypes` guard (Tasks 9, 10, 11); **L-P19** the adapter vendored, the fake reached only through `<work>/fake.json` (Tasks 7, 8, 10); **L-P20** the mock's echo and the answer rule, no `VK_MOCK_ANSWER` (Task 9); **L-P21** catalogues recorded on the node before Task 4, binding and plan fixtures committed by Tasks 4 and 6 (Tasks 3, 4, 6, 7, 8).
+- **Plan rulings and where they land:** **L-P1** fake application behind the one adapter (Global Constraints; Tasks 7, 8); **L-P2** `learn` is a governed one-shot process, not a protocol-1 driver (Task 9 `run_stage`); **L-P3** the deliberate fallback is a proposal from the catalogue through one task with one Draft step, no live application driving (Task 10); **L-P4** a `kind: com` driver mounts only with a `driver.qualified` record meeting the plan's thresholds, whose file still hashes to the stored hash (Task 9 `check_qualified`); **L-P5** the debrief is a machine act, writes no ledger row and applies nothing (Task 11); **L-P6** the generated driver vendors `vkdriver` and resolves it vendor-first (Tasks 7, 8, 10, 12); **L-P7** identity on the frozen fixture and the existing `PILOT_ID` (Task 1); **L-P8** per-kind schema rules through `if`/`then`, invalid examples only what the schema refuses (Tasks 1, 2); **L-P9** no `pack.json`, `stage_files` skips the shared copy when `vendor/vkdriver` exists (Tasks 7, 9, 12); **L-P10** `Capability::Plan` for the ambiguity call (Task 9); **L-P11** no kind on `driver.mounted`, tests read the row (Tasks 9, 12); **L-P12** the vkforge virtualenv as interpreter and as the generated driver's `.venv` (Tasks 3, 7, 8, 9, 10); **L-P13** canonical artefacts and hashes, `reversible`/`note`, `plan-excluded.json`, the ambiguity shape, `where`, `qualify`'s signature, the selectors, `--vault`, the gate on the stored hash (Tasks 0, 2, 4–9); **L-P14** stage stubs in Task 0, modified by Tasks 3–8; **L-P15** `vkforge <stage>: …; remedy: …` everywhere (Tasks 0, 5, 9); **L-P16** no `--unqualified`, `MountParams` unchanged (Task 9); **L-P17** the four vkforge methods before the general lock, `Node` in `tests/common/mod.rs` (Tasks 9, 11); **L-P18** `vk_forge_*` smoke tests and the `lxml`/`comtypes` guard (Tasks 9, 10, 11); **L-P19** the adapter vendored, the fake reached only through `<work>/fake.json` (Tasks 7, 8, 10); **L-P20** the mock's echo and the answer rule, no `VK_MOCK_ANSWER` (Task 9); **L-P21** catalogues recorded on the node before Task 4, binding and plan fixtures committed by Tasks 4 and 6 (Tasks 3, 4, 6, 7, 8); **L-P22** (amended) `typelib_sha256` in the catalogue, the binding and the driver's `binding.json`, the probe's `precondition` refusal (Tasks 3, 4, 7, 10); **L-P23** `--deliberate` keeps `--out` and `--arch`, provisional until the Task 2 checkpoint (Task 10); **L-P24** the Fable trailer whatever the model (Always); **L-P25** `ctx: &Ctx` on `forge::learn`/`forge::qualify`, `ctx_for` `pub(crate)` (Task 9); **L-P26** `ForgeConfig::at` infallible, the root refused at the first spawn (Task 9); **L-P27** the `kind` row of `vk driver show` (Tasks 9, 12); **L-P28** five inventory tests wait for the recorded catalogues (Task 3); **L-P29** the proposal's `answer` is the `draft: ` decision verbatim (Task 10); **L-P30** the deadline, the root and the tree kill pinned (Task 9); **L-P31** the `applications` block, `Application(binding)`, a Word-only fake (Tasks 3, 4, 7, 10, 12); **L-P32** supervision holds for the mounted driver, `qualify`'s direct spawn declared (Tasks 8, 10); **L-P33** the per-call guard and the `dialog_on` hook (Tasks 7, 8); **L-P34** spec §5.5's table in the TCB (Task 10).
 - **Invocation and stage table** (corrected while writing Task 11, both defects reproduced on CPython 3.13): `python -I -m vkforge` does not find the package (`-I` implies `-P`), so every invocation is `python -I drivers/vkforge/__main__.py <stage>` with `drivers/` put on `sys.path` by `__main__.py` and, for the suite, by `tests/__init__.py` (Tasks 0, 3, 9, 10, 11); `STAGES` is built in `__main__.py` by explicit imports and a stage module only defines `add_arguments` and `run` (Tasks 0, 3–8, 11).
-- **Type consistency (exact names, producer → consumers):** `Refusal`, `canon.{dumps, sha256, sha256_file, write}`, `STAGES`, `main` (0) → every task; `inventory.{APPS, catalogue_from_fixture, catalogue_sha256, office_present, write_catalogue}` (3) → 4, 6, 7, 9; `ontology.{load, bind, ontology_sha256, ONTOLOGY}` and the binding shape (4) → 6, 7, 8, 10; `mine.{redact, mine_file, mine_corpus, content_sha256, write_invariants, INVARIANT_IDS}`, `ooxml_fixtures.{docx, pptx, corpus, FOOTER}` (5) → 6, 7, 8, 9; `plan.{build, validate, plan_sha256, write_plan, load_resolver, EMITTED_VERBS, RULES}` (6) → 7, 8, 9; `generate.generate`, `com.{Application, VERBS}`, `fake.{FakeApplication, VERBS}`, `ooxml.write_parts` (7) → 8, 9; `qualify.qualify` (8) → 9; `DriverPlan`/`PlanAction`/`PlanStep`/`Ambiguity`/`Qualification`/`plan_sha256`, `DriverLearned`/`DriverQualified` (2) → 9, 10; `DriverKind::Com`/`applications` (1) → 7's manifest, 9's gate; `ForgeConfig`/`run_stage`/`forge_context`, `common::{Node, forge_available, forge_python, repo_root, ooxml_corpus, call_error}`, smoke `forge_node`/`forge_python`/`forge_available` (9) → 10, 11; `LearnedRow`, `check_qualified`, `learn_ambiguity`, `answer_choice` (9) → 12.
-- **Spec statements that differ from the code, left for the founder (not changed here):** (a) "the pipeline is itself run as a driver of the kernel (protocol 1, Job Object)" — protocol 1 is request/response with evidence directories; the plan runs the stages as a governed one-shot process (L-P2); (b) "no network" for governed processes — a Job Object does not block sockets on Windows; the plan pins "no socket in the package" by a test instead; (c) §5.3 "the COM calls are traced" in the deliberate run — deferred (L-P3); (d) §4.6 says `kind: com` driver's `hosts: []` — today's validator refuses empty hosts, hence Task 1's per-kind rule; (e) §3.2 names `vk driver learn --deliberate <verb>` as a human act producing "a proposed projection rule reviewed by a human before it is versioned" — the plan writes the proposal file only; versioning into the ontology stays a manual edit + commit; (f) the spec has no debrief stage — it comes from the founder's decision of 2026-10-17 (`docs/technical/debriefs/2026-10-17-maskai-driver.md` §4), and §3.2's components and §4.10's CLI table should name `debrief` and `vk driver debrief` at the spec's next revision. Added by this revision: (g) §4.4's `title_style.value = "Heading1"` is `{"builtin": "Heading1"}` here (a custom style is `{"custom": <token>}`); (h) §4.5's post entry `pdf exists` is the id `pdf_exists`; (i) §4.10's `vk driver learn --deliberate VERB --app A` needs `--out` (the learn output holding the catalogue, where the proposal is written) and `--arch` here; (j) §7's "fake COM server registered for the job" is the fake adapter (L-P1, L-P19).
+- **Type consistency (exact names, producer → consumers):** `Refusal`, `canon.{dumps, sha256, sha256_file, write}`, `STAGES`, `main` (0) → every task; `inventory.{APPS, catalogue_from_fixture, catalogue_sha256, office_present, write_catalogue}` (3) → 4, 6, 7, 9; `ontology.{load, bind, ontology_sha256, ONTOLOGY}` and the binding shape (4) → 6, 7, 8, 10; `mine.{redact, mine_file, mine_corpus, content_sha256, write_invariants, INVARIANT_IDS}`, `ooxml_fixtures.{docx, pptx, corpus, FOOTER}` (5) → 6, 7, 8, 9; `plan.{build, validate, plan_sha256, write_plan, load_resolver, EMITTED_VERBS, RULES}` (6) → 7, 8, 9; the catalogue's `typelib`/`typelib_sha256` (3) → 4 → the binding's, with `application` (4) → 7; `generate.generate`, `com.{Application, VERBS, guarded, probe, live_typelib_sha256, CALL_DEADLINE_S}`, `fake.{FakeApplication, VERBS}` with `<work>/fake.json`'s `dialog_on`, `ooxml.write_parts` (7) → 8, 9; `qualify.qualify` (8) → 9; `DriverPlan`/`PlanAction`/`PlanStep`/`Ambiguity`/`Qualification`/`plan_sha256`, `DriverLearned`/`DriverQualified` (2) → 9, 10; `DriverKind::Com`/`applications` (1) → 7's manifest, 9's gate; `ForgeConfig` (with `stage_deadline`)/`ForgeConfig::at`/`run_stage`/`forge_context`, `forge::{learn, qualify}` with `ctx: &Ctx`, `common::{Node, Node::start_with_forge, forge_available, forge_python, repo_root, ooxml_corpus, call_error}`, smoke `forge_node`/`forge_python`/`forge_available` (9) → 10, 11; `LearnedRow`, `check_qualified`, `learn_ambiguity`, `answer_choice` (9) → 12.
+- **Spec statements that differ from the code, left for the founder (not changed here):** (a) "the pipeline is itself run as a driver of the kernel (protocol 1, Job Object)" — protocol 1 is request/response with evidence directories; the plan runs the stages as a governed one-shot process (L-P2); (b) "no network" for governed processes — a Job Object does not block sockets on Windows; the plan pins "no socket in the package" by a test instead; (c) §5.3 "the COM calls are traced" in the deliberate run — deferred (L-P3); (d) §4.6 says `kind: com` driver's `hosts: []` — today's validator refuses empty hosts, hence Task 1's per-kind rule; (e) §3.2 names `vk driver learn --deliberate <verb>` as a human act producing "a proposed projection rule reviewed by a human before it is versioned" — the plan writes the proposal file only; versioning into the ontology stays a manual edit + commit; (f) the spec has no debrief stage — it comes from the founder's decision of 2026-10-17 (`docs/technical/debriefs/2026-10-17-maskai-driver.md` §4), and §3.2's components and §4.10's CLI table should name `debrief` and `vk driver debrief` at the spec's next revision. Added by this revision: (g) §4.4's `title_style.value = "Heading1"` is `{"builtin": "Heading1"}` here (a custom style is `{"custom": <token>}`); (h) §4.5's post entry `pdf exists` is the id `pdf_exists`; (i) §4.10's `vk driver learn --deliberate VERB --app A` needs `--out` (the learn output holding the catalogue, where the proposal is written) and `--arch` here (L-P23, provisional: the founder confirms it at the Task 2 checkpoint); (j) §7's "fake COM server registered for the job" is the fake adapter (L-P1, L-P19). Added on the rescan: (k) §2 L8 and §5.2 — "supervised, every act approved" and "each copy processed by the driver under the harness" hold for the mounted learned driver (every `vk_driver_act` is a job step under the harness); `qualify` spawns the driver directly, inside its stage's Job, as a stage (L-P32, declared in the TCB by Task 10); (l) §6's "catalogue hash changes → driver regenerated, never mounted on the old binding" is met at act time, not at mount: the kernel never loads COM, so the generated driver's probe refuses `precondition` "office version changed; remedy: vk driver qualify" on another type library (L-P22) — a re-qualification on the new Office then fails every pass, which is what sends the operator back to `vk driver learn`; (m) the fake application is Word `.docx` only, so spec §8.2's PowerPoint run is proven on the node against the real PowerPoint, not in CI (L-P31).
 - **Consequences to know (not decided here):** a packed learned driver is installed with another `driver_id` (its `files_sha256` becomes the package fingerprint), so the gate (L-P4) refuses it until the packaging chantier carries the qualification across; `secrets.json` is a driver file and would travel in such a package. The PowerPoint driver of Task 12 may be qualified at 9/10 (spec §8.2) and still be refused at mount by the plan's own thresholds (10 at rate 1.0).
