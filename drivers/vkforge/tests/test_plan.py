@@ -116,7 +116,7 @@ class PlanTest(unittest.TestCase):
         self.assertNotIn("Comic", json.dumps(p))
 
     def test_the_resolver_file_is_read_by_invariant_id(self):
-        path = Path(tempfile.mkdtemp()) / "resolver.json"
+        path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "resolver.json"
         canon.write({"body_font": {"value": {"name": "Garamond", "size": 11}, "resolved_by": ARCH}}, path)
         resolve = plan.load_resolver(path)
         self.assertEqual(resolve(TIE), {"value": {"name": "Garamond", "size": 11}, "resolved_by": ARCH})
@@ -169,7 +169,7 @@ class PlanTest(unittest.TestCase):
 
     def test_plan_sha256_is_the_hash_of_the_file_bytes(self):
         p, excluded = plan.build(house_invariants(), self.binding, self.ont)
-        out = Path(tempfile.mkdtemp())
+        out = Path(self.enterContext(tempfile.TemporaryDirectory()))
         path = plan.write_plan(p, excluded, out)
         self.assertEqual(path, out / "plan.json")
         self.assertEqual(plan.plan_sha256(path), "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest())
@@ -177,7 +177,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(json.loads((out / "plan-excluded.json").read_text(encoding="utf-8")), excluded)
 
     def test_the_cli_reads_the_artefacts_and_refuses_hand_edited_invariants(self):
-        work = Path(tempfile.mkdtemp())
+        work = Path(self.enterContext(tempfile.TemporaryDirectory()))
         canon.write(house_invariants(), work / "invariants.json")
         out = work / "out"
         printed = io.StringIO()
@@ -191,6 +191,25 @@ class PlanTest(unittest.TestCase):
             self.assertEqual(entry.main(["plan", "--invariants", str(work / "invariants.json"),
                                          "--binding", str(FIXTURES / "binding-word.json"), "--out", str(work / "o2")]), 2)
         self.assertIn("vkforge plan: invariants.json is not in canonical form; remedy:", err.getvalue())
+
+    def test_an_ontology_the_binding_was_not_built_from_is_refused(self):
+        # Ruling L-P45: family and the reversible flags come from the ontology, its hash from the binding.
+        other = copy.deepcopy(self.ont)
+        other["family"] = "office-other"
+        with self.assertRaises(Refusal) as cm:
+            plan.build(house_invariants(), self.binding, other)
+        self.assertEqual(str(cm.exception), "ontology is not the one the binding was built from; "
+                                            "remedy: pass the same --ontology to bind and plan")
+        work = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        canon.write(other, work / "ontology.json")
+        canon.write(house_invariants(), work / "invariants.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(entry.main(["plan", "--invariants", str(work / "invariants.json"),
+                                         "--binding", str(FIXTURES / "binding-word.json"), "--out", str(work / "out"),
+                                         "--ontology", str(work / "ontology.json")]), 2)
+        self.assertIn("vkforge plan: ontology is not the one the binding was built from; remedy:", err.getvalue())
+        self.assertFalse((work / "out" / "plan.json").exists())
 
     def test_the_fixtures_for_tasks_7_and_8_are_committed(self):
         # Ruling L-P21: written on the first run, compared on every later one.

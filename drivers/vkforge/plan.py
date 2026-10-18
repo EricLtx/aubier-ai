@@ -19,6 +19,7 @@ from pathlib import Path
 
 from . import canon, inventory, ontology
 from .errors import Refusal
+from .ontology import ontology_sha256     # build's `ontology` parameter shadows the module inside build
 
 
 def step(verb: str, **args) -> dict:
@@ -75,6 +76,9 @@ def build(invariants: dict, binding: dict, ontology: dict, resolve=None) -> tupl
     if app not in inventory.APPS or not isinstance(binding.get("verbs"), list):
         raise Refusal(f"the binding names no application of {', '.join(sorted(inventory.APPS))}",
                       "bind it again with vkforge bind")
+    # L-P45: family and every reversible flag come from `ontology`, its hash from the binding — one ontology.
+    if ontology_sha256(ontology) != binding.get("ontology_sha256"):
+        raise Refusal("ontology is not the one the binding was built from", "pass the same --ontology to bind and plan")
     if not (isinstance(invariants, dict) and isinstance(invariants.get("invariants"), list)
             and isinstance(invariants.get("ambiguities"), list)):
         raise Refusal("invariants.json holds no invariants and ambiguities lists", "run vkforge mine again")
@@ -190,7 +194,9 @@ def _rust_f64(x):
 
 
 def validate(plan: dict) -> None:
-    """Refusal on the first rule of DriverPlan::validate the plan breaks, in the Rust order."""
+    """Refusal on the first rule of DriverPlan::validate the plan breaks, in the Rust order. The
+    parse-level rules (unknown keys, field types, missing fields) are the kernel's serde parse, not
+    mirrored here: `build` cannot produce a plan that breaks them."""
     for field in ("family", "app"):
         if not _is(_DRIVER_NAME, plan[field]):
             raise Refusal(f"{field} `{plan[field]}` must be 1 to 32 characters of a-z, 0-9 and `-`",
@@ -279,7 +285,7 @@ def load_resolver(path: Path):
     """resolver.json (written by the kernel) → resolve(ambiguity) -> {"value", "resolved_by"} | None."""
     path = Path(path)
     remedy = "run vk driver learn again (the kernel writes resolver.json)"
-    answers = ontology._read_json(path, "resolver", remedy)
+    answers, _ = ontology.read_json(path, "resolver", remedy)
     if not isinstance(answers, dict):
         raise Refusal(f"resolver {path} is not an object", remedy)
     for ident, answer in sorted(answers.items()):
@@ -304,10 +310,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run(ns: argparse.Namespace) -> int:
     ont = ontology.load(ns.ontology)
-    invariants = ontology._read_json(ns.invariants, "invariants", "run vkforge mine again")
-    if ns.invariants.read_bytes() != canon.dumps(invariants):     # so canon.sha256(invariants) is the file's hash
+    invariants, data = ontology.read_json(ns.invariants, "invariants", "run vkforge mine again")
+    if data != canon.dumps(invariants):                 # so canon.sha256(invariants) is the file's hash
         raise Refusal("invariants.json is not in canonical form", "run vkforge mine again")
-    binding = ontology._read_json(ns.binding, "binding", "run vkforge bind again")
+    binding, _ = ontology.read_json(ns.binding, "binding", "run vkforge bind again")
     resolve = None if ns.resolver is None else load_resolver(ns.resolver)
     p, excluded = build(invariants, binding, ont, resolve)
     path = write_plan(p, excluded, ns.out)

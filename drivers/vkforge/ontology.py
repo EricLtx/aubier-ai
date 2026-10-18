@@ -40,7 +40,11 @@ def is_selector(s: str) -> bool:
     return isinstance(s, str) and _SELECTOR.fullmatch(s) is not None
 
 
-def _read_json(path: Path, what: str, remedy: str):
+def read_json(path: Path, what: str, remedy: str) -> tuple:
+    """(the JSON at `path`, the bytes it was parsed from), from one read: a caller that checks the
+    canonical form compares those bytes and never reads the file twice. Refusal naming `what` and the
+    path when the file is missing, cannot be read, or is not JSON (vkforge's stages share this one)."""
+    path = Path(path)
     if not path.is_file():
         raise Refusal(f"{what} {path} not found", remedy)
     try:
@@ -48,7 +52,7 @@ def _read_json(path: Path, what: str, remedy: str):
     except OSError:                                         # locked (OneDrive sync, an editor), access denied
         raise Refusal(f"{what} {path} cannot be read", "close what holds it open and check its permissions")
     try:
-        return json.loads(data.decode("utf-8"))
+        return json.loads(data.decode("utf-8")), data
     except ValueError:                                      # not UTF-8, not JSON
         raise Refusal(f"{what} {path} is not JSON", remedy)
 
@@ -57,10 +61,10 @@ def load(path: Path | None = None) -> dict:
     """The ontology at `path` (default ONTOLOGY), validated and in canon.dumps form, so that
     ontology_sha256 of what it returns is the hash of the file's bytes."""
     path = ONTOLOGY if path is None else Path(path)
-    ont = _read_json(path, "ontology",
-                     "--ontology names an ontology file, else drivers/vkforge/ontology/office-document.json")
+    ont, data = read_json(path, "ontology",
+                          "--ontology names an ontology file, else drivers/vkforge/ontology/office-document.json")
     validate(ont)
-    if path.read_bytes() != canon.dumps(ont):
+    if data != canon.dumps(ont):
         raise Refusal(f"ontology {path} is not in canonical form",
                       "rewrite it with vkforge.canon.dumps (sorted keys, indent 1, UTF-8, final newline)")
     return ont
@@ -237,7 +241,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run(ns: argparse.Namespace) -> int:
     ont = load(ns.ontology)
-    catalogue = _read_json(ns.catalogue, "catalogue", "vkforge inventory --app APP --out DIR writes one")
+    catalogue, _ = read_json(ns.catalogue, "catalogue", "vkforge inventory --app APP --out DIR writes one")
     binding = bind(ont, catalogue)
     path = write_binding(binding, ns.out)
     count = {s: sum(v["status"] == s for v in binding["verbs"]) for s in ("bound", "partial", "unbound")}
