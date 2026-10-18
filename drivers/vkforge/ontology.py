@@ -44,8 +44,12 @@ def _read_json(path: Path, what: str, remedy: str):
     if not path.is_file():
         raise Refusal(f"{what} {path} not found", remedy)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):                           # unreadable, not UTF-8, not JSON
+        data = path.read_bytes()
+    except OSError:                                         # locked (OneDrive sync, an editor), access denied
+        raise Refusal(f"{what} {path} cannot be read", "close what holds it open and check its permissions")
+    try:
+        return json.loads(data.decode("utf-8"))
+    except ValueError:                                      # not UTF-8, not JSON
         raise Refusal(f"{what} {path} is not JSON", remedy)
 
 

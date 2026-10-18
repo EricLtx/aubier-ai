@@ -14,7 +14,7 @@
   "progid": "Word.Application"
  },
  "catalogue_sha256": "sha256:35b989fbc6c37cb5c67900e47a8d89fd99c723ad9d5c6b77564da2aedb83a9bd",
- "ontology_sha256": "sha256:bc50d25eb34875b391349ae01a9f523f5c222a3483314dc1c0e24dbed03c9150",
+ "ontology_sha256": "sha256:117706338c6b1e091d1a60002135147bf01891b89415f03056d10d21b96d24df",
  "typelib": {
   "guid": "{00020905-0000-0000-C000-000000000046}",
   "version": "8.7"

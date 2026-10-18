@@ -301,7 +301,7 @@
    "projection": {
     "powerpoint": {
      "constants": null,
-     "member": "Slide.HeadersFooters.Footer"
+     "member": "Master.HeadersFooters.Footer"
     },
     "word": {
      "constants": "WdHeaderFooterIndex",
@@ -485,7 +485,7 @@
    "projection": {
     "powerpoint": {
      "constants": null,
-     "member": "Slide.HeadersFooters.Footer"
+     "member": "Master.HeadersFooters.Footer"
     },
     "word": {
      "constants": "WdHeaderFooterIndex",

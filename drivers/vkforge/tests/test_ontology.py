@@ -116,7 +116,7 @@ class OntologyTest(unittest.TestCase):
         self.assertEqual(path.read_bytes(), produced, "binding-word.json is stale: delete it, run this test, commit it")
 
     def test_the_cli_writes_the_binding_and_lists_the_unbound_verbs(self):
-        out = Path(tempfile.mkdtemp())
+        out = Path(self.enterContext(tempfile.TemporaryDirectory()))
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
             self.assertEqual(entry.main(["bind", "--catalogue", str(FIXTURES / "catalogue-word.json"), "--out", str(out)]), 0)
@@ -131,7 +131,7 @@ class OntologyTest(unittest.TestCase):
         self.assertEqual(str(cm.exception), "catalogue of word has no typelib_sha256; "
                                             "remedy: record it again with vkforge inventory")
         # L-P15/L-P39: a file the stage cannot read is one refusal line, exit 2, nothing written.
-        d = Path(tempfile.mkdtemp())
+        d = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (d / "bad.json").write_bytes(b"{not json")
         (d / "compact.json").write_text(json.dumps(self.ont), encoding="utf-8")   # valid, but its hash is not canon's
         word = str(FIXTURES / "catalogue-word.json")
