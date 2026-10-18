@@ -3,8 +3,11 @@
 A .docx or .pptx is a zip of XML parts. The miner reads them as a datasheet, not as a document:
 no Office, no automation, no external entity, no network. A package is untrusted input, so parts
 are parsed without entity resolution and a part above MAX_PART bytes is refused (zip bomb).
+`write_parts` is the reader's twin, for the fake application's `save` (Task 7): parts in, package out.
 """
 import fnmatch
+import os
+import tempfile
 import zipfile
 import zlib
 from pathlib import Path
@@ -75,3 +78,40 @@ def part(zf: zipfile.ZipFile, name: str):
 
 def parts(zf: zipfile.ZipFile, pattern: str) -> list[str]:
     return sorted(n for n in zf.namelist() if fnmatch.fnmatchcase(n, pattern))
+
+
+_EPOCH = (1980, 1, 1, 0, 0, 0)        # the zip epoch: an added member carries no date of its own
+
+
+def _member(name: str, like: zipfile.ZipInfo | None = None) -> zipfile.ZipInfo:
+    """A fresh header for `name`: the date, compression and mode of the member it replaces, else the
+    epoch, deflated, 0o644 (never a stale size or extra field copied from the old header)."""
+    info = zipfile.ZipInfo(name, like.date_time if like is not None else _EPOCH)
+    info.compress_type = like.compress_type if like is not None else zipfile.ZIP_DEFLATED
+    info.external_attr = like.external_attr if like is not None else 0o644 << 16
+    info.create_system = like.create_system if like is not None else 3
+    return info
+
+
+def write_parts(package: Path, parts: dict[str, bytes]) -> None:
+    """Each member of `parts` written (added when the package has none), every other member copied
+    byte for byte in the package's order, then the package replaced with one os.replace: a reader
+    sees the old document or the new one, never half of one."""
+    package = Path(package)
+    fd, tmp = tempfile.mkstemp(prefix=".~vkforge-", suffix=".tmp", dir=package.parent)
+    os.close(fd)
+    try:
+        with open_package(package) as src, zipfile.ZipFile(tmp, "w") as dst:
+            seen = set()
+            for info in src.infolist():
+                if info.filename in seen:
+                    continue
+                seen.add(info.filename)
+                data = parts[info.filename] if info.filename in parts else src.read(info)
+                dst.writestr(_member(info.filename, info), data)
+            for name in sorted(set(parts) - seen):
+                dst.writestr(_member(name), parts[name])
+        os.replace(tmp, package)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
