@@ -61,6 +61,14 @@
     <button type="button" id="enc" aria-haspopup="dialog" aria-expanded="false" data-slot="popover-trigger"
             aria-label="Chiffré — aucune PII détectée">Chiffré</button>
     <textarea id="prompt" placeholder="Votre message"></textarea>
+    <button type="button" id="mic" aria-label="Dictate a message in real time (microphone)" aria-pressed="false"
+            data-status="idle" title="Dictée">&#127908;</button>
+    <script>
+      // ?dictating=1 : a dictation the user started (18/10), the button active and never ours to touch.
+      if (new URLSearchParams(location.search).get('dictating') === '1') {
+        const m = document.getElementById('mic'); m.dataset.status = 'listening'; m.setAttribute('aria-pressed', 'true');
+      }
+    </script>
     <button type="button" id="send" aria-label="Envoyer">Envoyer</button>
     <button type="button" id="stop" aria-label="Stop generating" hidden>Stop</button>
   </form>

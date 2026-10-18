@@ -55,7 +55,7 @@ powershell -ExecutionPolicy Bypass -File drivers\maskai-recette\setup.ps1
 ```
 Attendu, en première ligne, `python de base : ` suivi du chemin du 1.1, puis en dernières lignes :
 ```
-files_sha256 : sha256:ea9b2eb4b50a12c03080ec92ef754189a8d76c64ce28385c1e2ec5c1d40e357f
+files_sha256 : sha256:af8ae32c522f3f1117d0983a4c8cac394900894555d26694bc369341050b52cb
 manifest.json : à jour
 manifest-fixture.json : à jour
 ```
@@ -307,7 +307,7 @@ Get-Content "$S\drivers\maskai-1\work\journal.jsonl" -Encoding UTF8 | ForEach-Ob
 ```
 Attendu : une ligne par cas joué, par exemple `N1-1     OK       disponibilite,performance`.
 
-**Premier passage : confirmer les SELECTORS.** C'est à faire après N0, N1 et N5. Le banc d'essai imite l'interface du 17/10, mais une partie des `SELECTORS` de `drivers/maskai-recette/driver.py` reste une hypothèse :
+**Premier passage : confirmer les SELECTORS.** C'est à faire après N0, N1 et N5. Le banc d'essai imite l'interface des 17 et 18/10, mais une partie des `SELECTORS` de `drivers/maskai-recette/driver.py` reste une hypothèse :
 
 | Sélecteur | Rôle | Le 17/10 |
 |---|---|---|
@@ -318,11 +318,13 @@ Attendu : une ligne par cas joué, par exemple `N1-1     OK       disponibilite,
 | `conversation_items` | Les entrées de l'historique des conversations. | vu (`a[href*="/conversation/"]`) |
 | `attach_remove` | Le bouton « Retirer <fichier> » ; la puce est son ancêtre qui porte du texte. | vu |
 | `attach_pending`, `attach_uploading`, `attach_failed`, `attach_busy`, `attach_ready` | Les états de la puce. | « Indexing in progress » et « Failed » vus les 12–13/10 ; l'état prêt et l'indicateur d'activité à confirmer |
-| `sent_trigger`, `sent_popover`, `sent_text` | La pastille « Chiffré » du compositeur, son popover et son bloc de texte (`sent.json`). | pastille vue ; contenu à confirmer |
+| `sent_trigger`, `sent_popover`, `sent_text` | La pastille « Chiffré » du compositeur, son popover et son bloc de texte (`sent.json`). | pastille vue (le 18/10 : `aria-label="Data encrypted — no PII detected in this conversation"`) ; contenu à confirmer |
 | `stop_button` | Le bouton d'arrêt de la génération, cliqué à l'abandon. | un bouton vu sur la capture N1-3 ; aria-label à confirmer |
-| `send_button` | Le bouton d'envoi, utilisé seulement si Entrée n'a rien envoyé. | à confirmer |
-| `model_button`, `listbox`, `option` | Le bouton du compositeur qui ouvre la liste des modèles (`choisir_modele`) : par structure d'abord, `form button[aria-haspopup="listbox"]`, puis les libellés « Model: … » / « Modèle … » en secours. | structure vue le 17/10 ; libellés absents de l'interface française au premier essai de la recette 2 ; liste à confirmer |
-| `web_button`, `web_words` | Le bouton de recherche web (`recherche_web`) : par structure d'abord, `form button[data-mode]` (`auto`, `off`, `on`), puis les libellés « Web search: … » / « Recherche web … » en secours. | `data-mode` vu le 17/10 ; cycle ou menu à confirmer |
+| `send_button` | Le bouton d'envoi, utilisé seulement si Entrée n'a rien envoyé. | vu le 18/10 (`aria-label="Send message"`, `data-action="send"`) |
+| `model_button`, `listbox`, `option` | Le bouton du compositeur qui ouvre la liste des modèles (`choisir_modele`) : par structure d'abord, `button[aria-haspopup="listbox"]` (le compositeur n'est pas un `<form>` le 18/10), puis les libellés « Model: … » / « Modèle … » en secours. | liste vue le 18/10 : quatorze options `role="option"` dans une liste cmdk, `data-value` = identifiant fournisseur/modèle (`google/eu.claude-haiku-5-5`), texte = libellé affiché (« claude haiku 5-5 ») ; tous ouverts |
+| `web_button`, `web_words` | Le bouton de recherche web (`recherche_web`) : par structure d'abord, `button[data-mode]` (`auto`, `off`, `on`), puis les libellés « Web search: … » / « Recherche web … » en secours. | cycle de clics vu le 18/10 : auto → on → off → auto, sans menu ; `data-mode` fait foi |
+| `mic_button` | Le bouton de dictée (micro), `button[data-status][aria-pressed]` : jamais activé ; un état autre que `idle` au début d'une action est un refus `precondition` « dictée en cours » (§11). | vu le 18/10 (`aria-label="Dictate a message in real time (microphone)"`, `data-status="idle"`) |
+| `auth_error` | La page d'erreur d'authentification, `/api/auth/error` sur l'URL : la garde recharge la page d'entrée une fois, puis refuse `precondition` « session perdue » (§11). | vue le 18/10 pendant une coupure réseau ; revenue d'elle-même |
 | `maintenance` | La page de maintenance (« MAINTENANCE EN COURS / ON REVIENT TRÈS VITE ! »), lue sur le texte quand aucune zone de saisie n'est visible (§11). | vue au premier essai réel de la recette 2 |
 | `mask` | Les zones masquées des captures : la barre latérale et le bloc du compte. | `nav[aria-label="Main navigation"]` et `aside` vus ; `data-slot` à confirmer |
 | `sent_label` | Le panneau « SENT TO THE LLM » du 13/10, en secours du popover. | disparu |

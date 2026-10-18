@@ -51,7 +51,13 @@ Ce que la v2 ajoute (debrief du 2026-10-17, docs/technical/debriefs/) :
 - la seconde recette (PROCEDURE-2.md, grille M0–M7) : cas de configuration jugés sur `@model` et
   `@web`, configuration épinglée réappliquée par nouvelle_conversation si l'interface l'a perdue,
   modèle et mode web lus sur chaque ligne, document joint cherché dans le texte envoyé,
-  empreinte du texte envoyé pour comparer les passages a et b (`replay_of`).
+  empreinte du texte envoyé pour comparer les passages a et b (`replay_of`) ;
+- relevé du 18/10 (plateforme revenue de maintenance) : le compositeur n'est plus un <form>
+  (sélecteurs de structure sans `form` en premier), quatorze modèles tous ouverts (data-value =
+  identifiant fournisseur/modèle, texte = libellé affiché), un bouton de dictée (micro,
+  `data-status`) que le driver n'active jamais et dont un état autre que `idle` est un refus
+  `precondition`, et une page d'erreur d'authentification (/api/auth/error) qui est un refus
+  `precondition` « session perdue » plutôt que 15 s d'attente d'une zone de saisie.
 
 Environnement (posé par l'hôte) : VK_DRIVER_PROFILE_DIR, VK_DRIVER_WORK_DIR,
 VK_DRIVER_HEADLESS, VK_DRIVER_CHANNEL, VK_DRIVER_HOSTS ; MASKAI_ENTRY_URL
@@ -196,14 +202,19 @@ SELECTORS = {
     # Par structure d'abord (le 17/10 : le bouton du compositeur qui ouvre une liste,
     # aria-haspopup="listbox") ; les libellés, localisés (au premier essai de la recette 2,
     # l'interface française ne les avait pas), en secours.
-    "model_button": ['form button[aria-haspopup="listbox"]', 'button[aria-haspopup="listbox"]',
+    # Le 18/10 : le compositeur est un <div>, pas un <form> ; la structure sans `form` en premier.
+    # Quatorze options ce jour-là (role="option", data-value = « fournisseur/modèle », texte = libellé
+    # affiché : « claude haiku 5-5 » pour google/eu.claude-haiku-5-5) dans une liste cmdk.
+    "model_button": ['button[aria-haspopup="listbox"]', 'form button[aria-haspopup="listbox"]',
                      'button[aria-label^="Model:"]', 'button[aria-label^="Modèle"]'],
     "model_prefix": r"^\s*(?:model|modèle)\s*:\s*",
     "listbox": '[role="listbox"]',
     "option": '[role="option"]',
     # Par structure d'abord (le 17/10 : le bouton qui porte data-mode="auto|off|on"), les libellés
     # en secours.
-    "web_button": ['form button[data-mode]', 'button[data-mode]',
+    # Le 18/10 : un cycle de clics auto → on → off → auto, sans menu ; data-mode fait foi (le texte
+    # du bouton cumule les libellés le temps de l'animation).
+    "web_button": ['button[data-mode]', 'form button[data-mode]',
                    'button[aria-label^="Web search:"]', 'button[aria-label^="Recherche web"]'],
     "web_menu": '[role="menu"], [role="listbox"]',
     "web_menu_item": '[role="menuitemradio"], [role="menuitem"], [role="option"]',
@@ -219,6 +230,13 @@ SELECTORS = {
     # zone de saisie. Motif sur le texte de la page replié (casse et accents), retenu seulement
     # quand aucune zone de saisie n'est visible : les mêmes mots dans une réponse ne comptent pas.
     "maintenance": r"maintenance en cours|on revient tr[èe]s vite|maintenance in progress",
+    # Bouton de dictée (vu le 18/10 : aria-label « Dictate a message in real time (microphone) »,
+    # aria-pressed, data-status="idle"). Jamais activé par le driver ; un état autre que idle au
+    # début d'une action (dictée lancée par l'utilisateur) est un refus `precondition`.
+    "mic_button": 'button[data-status][aria-pressed]',
+    # Page d'erreur d'authentification (vue le 18/10 lors d'une coupure réseau : l'application
+    # renvoie sur /api/auth/error, sans zone de saisie) ; motif sur l'URL de la page.
+    "auth_error": r"/api/auth/error",
     # Fenêtres modales (CSS).
     "modal": '[role="dialog"], [role="alertdialog"], [aria-modal="true"], .modal',
 }
@@ -519,8 +537,10 @@ OPTIONS_JS = "(a) => {" + _VISIBLE + """
 
 # Le texte de la page et la présence d'une zone de saisie visible (page de maintenance).
 MAINTENANCE_JS = "(a) => {" + _VISIBLE + """
+  const mic = a.mic ? document.querySelector(a.mic) : null;
   return { text: ((document.body && document.body.innerText) || '').slice(0, 20000),
-           textarea: [...document.querySelectorAll(a.textarea)].some(visible) };
+           textarea: [...document.querySelectorAll(a.textarea)].some(visible),
+           mic: mic ? (mic.getAttribute('data-status') || null) : null };
 }"""
 
 LIST_OPEN_JS = "(a) => {" + _VISIBLE + " return [...document.querySelectorAll(a.list)].some(visible); }"
@@ -1453,14 +1473,37 @@ class Recette:
         rechargée (le service a pu revenir depuis)."""
         b = self.browser
 
-        def maintenance() -> dict | None:
+        def auth_error() -> dict | None:  # 18/10: the app bounced the session to /api/auth/error
+            if re.search(SELECTORS["auth_error"], page.url or ""):
+                return {"t": now_iso(), "url": short_url(page.url)}
+            return None
+
+        seen_auth = auth_error()
+        if seen_auth and reload:  # a blip on 18/10 came back on its own: the entry page once more
+            self._goto(page, self.entry)
+            seen_auth = auth_error()
+        if seen_auth:
+            if self._action_case:
+                self.observations.setdefault(self._action_case, {})["auth_error"] = seen_auth
+            log.warning("authentication error page: %s", seen_auth["url"])
+            raise DriverRefusal("precondition", "session perdue (page d'erreur d'authentification) ; "
+                                                "reconnecter MaskAI dans Chrome", extra={"auth_error": seen_auth})
+
+        def state() -> dict | None:
             try:
-                got = b.call(MAINTENANCE_JS, {"textarea": SELECTORS["textarea"]}, page=page, timeout_ms=3000)
+                return b.call(MAINTENANCE_JS, {"textarea": SELECTORS["textarea"], "mic": SELECTORS["mic_button"]},
+                              page=page, timeout_ms=3000)
             except PWTimeout:
                 if b.pending():
                     raise
                 return None
-            if got["textarea"] or not evaluer.find(SELECTORS["maintenance"], got["text"]):
+
+        def maintenance() -> dict | None:
+            got = state()
+            if got and got.get("mic") not in (None, "idle"):  # 18/10: a dictation the user started
+                raise DriverRefusal("precondition", f"dictée en cours (micro « {got['mic']} ») ; "
+                                                    "arrêter la dictée dans Chrome", extra={"mic": got["mic"]})
+            if not got or got["textarea"] or not evaluer.find(SELECTORS["maintenance"], got["text"]):
                 return None
             return got
 

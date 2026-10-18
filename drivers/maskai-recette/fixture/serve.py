@@ -54,6 +54,14 @@ setInterval(() => fetch('/ping?' + Math.random()), 200);
 setTimeout(async () => { await fetch('/popup-created'); window.open('/popup'); }, 3000);
 </script></body></html>"""
 STATS = {"created_ms": None, "popup_ms": None}
+# The authentication error page seen on 18/10 during a network blip: app.maskai.fr/api/auth/error,
+# no composer. Any page asked with `dictating=1` shows the dictation button active (data-status
+# "listening"), as a dictation the user started would.
+AUTH_ERROR_PAGE = b"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Erreur</title></head>
+<body><main><h1>Authentication error</h1><p>Your session could not be verified.</p>
+<a href="/">Sign in again</a></main></body></html>
+"""
+
 # MaskAI's maintenance card, as the first live attempt of recette 2 met it on app.maskai.fr.
 MAINTENANCE_PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Mask AI</title></head>
 <body><main><h1>MAINTENANCE EN COURS</h1><p>ON REVIENT TRÈS VITE !</p>
@@ -96,6 +104,8 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(302, headers=[("Location", "http://unreachable.invalid/")])
         elif "maintenance=1" in self.path.partition("?")[2]:
             self.reply(200, MAINTENANCE_PAGE)
+        elif path == "/api/auth/error":  # 18/10: the session bounced here, no composer
+            self.reply(200, AUTH_ERROR_PAGE)
         else:
             with open(os.path.join(HERE, "index.html"), "rb") as f:
                 self.reply(200, f.read())

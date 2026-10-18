@@ -1532,6 +1532,42 @@ class FieldFixesOnFixture(FixtureBench):
         self.assertIn("BONJOUR", res["answer"])
         self.assertEqual(self.act(A, "verdict_oracle", {"case": "v2-maint-2"})[0]["verdict"], "OK")
 
+    def test_an_authentication_error_page_is_a_precondition_refusal_unless_the_entry_page_is_back(self):
+        """18/10: a network blip bounced the session to /api/auth/error and the entry page came back
+        on its own. The guard reloads the entry page once; an error page that stays is « session
+        perdue », within seconds, never 15 s of waiting for a composer."""
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "nouvelle_conversation")
+        error_url = f"http://127.0.0.1:{self.port}/api/auth/error"
+        recette.browser.page().goto(error_url)  # the blip: the entry page is still there behind it
+        self.act(A, "nouvelle_conversation")
+        recette.entry = error_url  # the session is gone: the reload lands on the error page again
+        recette.browser.page().goto(error_url)
+        t0 = time.monotonic()
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "nouvelle_conversation")
+        self.assertLess(time.monotonic() - t0, 10, "no 15 s wait for a textarea that will not come")
+        self.assertEqual(refused.exception.reason, "precondition")
+        self.assertIn("session perdue", refused.exception.detail)
+
+    def test_a_dictation_the_user_started_is_a_precondition_refusal_and_the_microphone_is_never_touched(self):
+        """18/10: the composer has a dictation button (data-status). The driver never presses it; a
+        dictation already running when an action starts is refused, the button left as it is."""
+        drv, recette, A = self.make()
+        recette.entry = f"http://127.0.0.1:{self.port}/new?dictating=1"
+        recette.open()
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "nouvelle_conversation")
+        self.assertEqual(refused.exception.reason, "precondition")
+        self.assertIn("dictée en cours", refused.exception.detail)
+        page = recette.browser.page()
+        self.assertEqual(page.locator("#mic").get_attribute("data-status"), "listening")
+        recette.entry = f"http://127.0.0.1:{self.port}/new"  # the user stopped dictating
+        page.goto(recette.entry)
+        self.act(A, "nouvelle_conversation")
+        self.assertEqual(page.locator("#mic").get_attribute("data-status"), "idle")
+
     def test_maintenance_words_in_an_answer_are_no_maintenance(self):
         drv, recette, A = self.make()
         recette.open()
@@ -1573,8 +1609,9 @@ class FieldFixesOnFixture(FixtureBench):
         self.assertTrue(drv.model_matches("gemini", res["model"]), res)
         res, _ = self.act(A, "recherche_web", {"mode": "off"})
         self.assertEqual((res["mode"], res["previous"]), ("off", "auto"))
-        self.assertEqual(drv.SELECTORS["model_button"][0], 'form button[aria-haspopup="listbox"]')
-        self.assertEqual(drv.SELECTORS["web_button"][0], 'form button[data-mode]')
+        # 18/10: the live composer is no <form>; the structure comes first, without it.
+        self.assertEqual(drv.SELECTORS["model_button"][0], 'button[aria-haspopup="listbox"]')
+        self.assertEqual(drv.SELECTORS["web_button"][0], 'button[data-mode]')
 
 
 if __name__ == "__main__":

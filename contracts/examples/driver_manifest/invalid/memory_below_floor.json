@@ -8,7 +8,7 @@
       "-I",
       "driver.py"
     ],
-    "files_sha256": "sha256:ea9b2eb4b50a12c03080ec92ef754189a8d76c64ce28385c1e2ec5c1d40e357f",
+    "files_sha256": "sha256:af8ae32c522f3f1117d0983a4c8cac394900894555d26694bc369341050b52cb",
     "browser_channel": "chrome",
     "headless": false,
     "max_memory_bytes": 6144

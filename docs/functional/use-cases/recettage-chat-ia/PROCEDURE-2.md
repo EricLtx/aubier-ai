@@ -76,7 +76,7 @@ N7 (historique) n'est pas repris : il attend un compte de test dédié, qui est 
 | M0 Socle | La page se charge-t-elle, et la configuration est-elle celle de la base ? | M0-1, M0-2 chargement ; M0-3 modèle épinglé, options du sélecteur relevées ; M0-4 recherche web off épinglée, état trouvé relevé | 3 s ; 10 s | performance, conformité |
 | M1 Masquage | Les données identifiantes partent-elles masquées et reviennent-elles intactes ? | 6 documents × 2 canaux × 2 passages = 24 : M1-J1a … M1-J6b en pièce jointe, M1-C1a … M1-C6b collés | 20 s | sécurité, conformité, véracité ; disponibilité en pièce jointe |
 | M2 Pièces jointes, état observé | Le canal pièce jointe marche-t-il quand on attend vraiment la puce ? | M2-1 … M2-10 = `DOC-01` … `DOC-10` du corpus v1 | 20 s ; 60 s pour M2-9 | disponibilité, véracité ; sécurité (M2-1, 2, 5, 10) ; scalabilité (M2-9) |
-| M3 Modèles | Le choix de modèle est-il réel, et le résultat en dépend-il ? | 3 questions × 3 modèles = 9 : M3-A1 … M3-C3 | 10 s | conformité, véracité, performance |
+| M3 Modèles | Le choix de modèle est-il réel, et le résultat en dépend-il ? | 3 questions × 14 modèles = 42 : M3-A1 … M3-N3 | 10 s | conformité, véracité, performance |
 | M4 Recherche web | Que coûte le mode auto, et sert-il ? | 4 questions × 2 modes = 8 : M4-O1 … M4-O4 (off), M4-A1 … M4-A4 (auto) | 15 s | performance, véracité |
 | M5 Conversation longue | Le contexte tient-il sur huit tours, correction comprise ? | M5-1 | 10 s par tour | véracité, disponibilité |
 | M6 Charge concurrente | Deux traitements courts qui passent seuls passent-ils ensemble ? | M6-1 = M4-O1 + M4-O2 ; M6-2 = M4-O3 + M4-O4 | 15 s | disponibilité, scalabilité |
@@ -121,15 +121,20 @@ Les questions, valeurs attendues et inventaires sont ceux de `corpus/oracles.jso
 une injection cachée, et la règle « dialog » s'y applique.
 
 **M3 — modèles.** Trois questions sans donnée identifiante (le masquage ne doit pas interférer),
-chacune sur trois modèles :
+chacune sur chaque modèle du sélecteur (quatorze le 18/10) :
 - M3-x1, factuelle : la question de N3-1 (Canberra) ;
 - M3-x2, calcul : celle de N3-2 (2 505 €) ;
 - M3-x3, piège de raisonnement : cinq machines, cinq pièces, cinq minutes.
 
-Le modèle A est **claude haiku 5-5** (bannière « google/eu.claude-haiku-5-5 » le 17/10). B et C
-sont lus dans le sélecteur à l'exécution : les cas portent `<modele-B>` et `<modele-C>`, et le
-harnais recopie les libellés que rend le premier `choisir_modele`. Pour chaque cas, le harnais
-ouvre une conversation neuve, choisit le modèle, puis pose la question. Le verdict ajoute à
+Le modèle A est **claude haiku 5-5** (bannière « google/eu.claude-haiku-5-5 » le 17/10). B à N
+sont les treize autres modèles du sélecteur relevés le 18/10, dans l'ordre de la liste, par leur
+libellé exact (claude-haiku-4-5, ministral-3-3b, mistral-small-4, claude opus 5, claude sonnet 5,
+deepseek v4 pro, gemini 3.5 flash, gemini 3.8 flash, gpt-6 luna, mistral-large-4,
+mistral-medium-3.5, claude-opus-4-8, mistral-large-3) : tous les modèles de la plateforme entrent
+au banc (décision du fondateur, 18/10). Un modèle disparu du sélecteur est un refus `precondition`
+de `choisir_modele` et son cas reste NON TESTÉ ; un modèle apparu est ajouté à la grille à la
+révision suivante. Pour chaque cas, le harnais ouvre une conversation neuve, choisit le modèle,
+puis pose la question. Le verdict ajoute à
 `must` une condition : la bannière nomme le modèle choisi, sinon le choix n'est pas appliqué
 (KO conformité). Le 13/10, 2 505 € était juste sur quatre modèles, et le 31 février détecté
 quatre fois.
@@ -191,7 +196,7 @@ restent ceux de la classe. Un dépassement donne PARTIEL, un abandon KO disponib
 | M0 | 13 | 49 | 1800 |
 | M1 | 112 | 346 | 2700 |
 | M2 | 54 | 172 | 2700 |
-| M3 | 50 | 160 | 1800 |
+| M3 | 215 | 655 | 3600 |
 | M4 | 44 | 142 | 1800 |
 | M5 | 8 | 34 | 2700 |
 | M6 | 10 | 40 | 1800 |
