@@ -391,6 +391,11 @@ fn stage_files(driver_dir: &Path, dest: &Path) -> Result<(), RpcError> {
     if let Some(plan) = plan {
         return vendor(&plan, dest);
     }
+    // A learned driver vendors its own vkdriver and has no pack.json (ruling
+    // L-P9): nothing to copy beside it, and no repository is asked for.
+    if dest.join("vendor").join("vkdriver").is_dir() {
+        return Ok(());
+    }
     let shared = driver_dir.parent().map(|p| p.join("vkdriver"));
     let Some(shared) = shared.filter(|s| std::fs::symlink_metadata(s).is_ok_and(|m| m.is_dir()))
     else {
@@ -1164,6 +1169,37 @@ mod tests {
             e.message.contains("remedy: keep one of the two"),
             "{}",
             e.message
+        );
+    }
+
+    /// A learned driver vendors its own `vkdriver` and carries no `pack.json`
+    /// (ruling L-P9): it packs with its own copy alone, the shared library
+    /// beside it is not copied, and no repository (`Cargo.toml`) is needed.
+    #[test]
+    fn a_driver_that_vendors_its_own_vkdriver_packs_it_alone_without_a_repository() {
+        let t = tempfile::tempdir().unwrap();
+        let drv = t.path().join("drivers").join("word-maison");
+        write(&drv.join("driver.py"), "");
+        write(
+            &drv.join("vendor").join("vkdriver").join("protocol.py"),
+            "vendored",
+        );
+        write(
+            &t.path()
+                .join("drivers")
+                .join("vkdriver")
+                .join("protocol.py"),
+            "repository",
+        );
+        let dest = t.path().join("files");
+        stage_files(&drv, &dest).unwrap();
+        assert_eq!(
+            files_under(&dest),
+            ["driver.py", "vendor/vkdriver/protocol.py"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("vendor/vkdriver/protocol.py")).unwrap(),
+            "vendored"
         );
     }
 

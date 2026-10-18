@@ -1,0 +1,857 @@
+//! vkforge under the daemon (driver-learning spec §4.10, plan Task 9): `driver.learn`,
+//! `driver.qualify` and `driver.plan_show`.
+//!
+//! Learning a driver is six stages of `drivers/vkforge` — inventory, bind, mine, plan, generate,
+//! qualify — each a **governed one-shot process** (ruling L-P2): `<python> -I
+//! <root>/vkforge/__main__.py <stage> …`, started in the vkforge root, put under the platform's
+//! governor the moment it exists, killed with its whole tree at its deadline, its stdout and
+//! stderr kept under the state directory. Never protocol 1: a pipeline is not request/response.
+//! A stage that refuses speaks the kernel's voice — one line, `vkforge <stage>: …; remedy: …`
+//! (ruling L-P15) — and that line is the refusal, verbatim.
+//!
+//! None of it runs under the kernel lock (ruling L-P17): the arms are dispatched before the
+//! general lock, as `driver.pack` is, and a stage runs for seconds to minutes on the connection's
+//! blocking thread. The kernel is asked, in short phases, for what only it does: the one model
+//! call per ambiguity, `driver.learned`, the `learned` row, `driver.qualified`.
+//!
+//! OS analogy: the factory line that turns a reference board's datasheet and a stack of sample
+//! boards into a driver — each station a separate jig on a timer, the line's supervisor
+//! recording the build and the bench test, and the boot ROM refusing an image without its test
+//! report.
+use crate::server::{bad, internal, kerr, lock, Shared};
+use crate::{RpcError, E_STORE};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+use vk_contracts::driver::{is_driver_name, DriverLearned, DriverManifest, DriverQualified};
+use vk_contracts::hash_bytes;
+use vk_contracts::plan::{plan_sha256, DriverPlan};
+use vk_contracts::syscalls::Ctx;
+
+/// What the daemon runs vkforge with (L-P2): `vkd --vkforge-root`, the interpreter and the test
+/// seam, read once at start.
+#[derive(Debug, Clone)]
+pub struct ForgeConfig {
+    /// The `drivers/` directory: vkforge is `<root>/vkforge/__main__.py`.
+    pub root: PathBuf,
+    /// The interpreter (L-P12): `VK_FORGE_PYTHON`, else `%LOCALAPPDATA%\vk\venvs\vkforge\Scripts\python.exe`.
+    pub python: PathBuf,
+    /// `VK_FORGE_FIXTURES=1`, a test seam like `VK_TEST_PYTHON_RELEASE`: the recorded catalogues
+    /// (`inventory --fixture`) and the fake application (`qualify --fake`). `vkd` warns when it is set.
+    pub fixtures: bool,
+    /// The deadline of each `learn` stage: `STAGE_DEADLINE` from `at`; a test sets it shorter
+    /// (L-P30). `qualify` and `debrief` keep their own.
+    pub stage_deadline: Duration,
+}
+
+impl ForgeConfig {
+    /// `root` as `vkd --vkforge-root` gives it, with the interpreter and the seam read from the
+    /// environment and `STAGE_DEADLINE`. Infallible (L-P26): a root without
+    /// `vkforge/__main__.py` is refused by `run_stage`, at the first spawn.
+    pub fn at(root: PathBuf) -> ForgeConfig {
+        let python = std::env::var_os("VK_FORGE_PYTHON")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default())
+                    .join("vk")
+                    .join("venvs")
+                    .join("vkforge")
+                    .join("Scripts")
+                    .join("python.exe")
+            });
+        ForgeConfig {
+            root,
+            python,
+            fixtures: std::env::var("VK_FORGE_FIXTURES").is_ok_and(|v| v == "1"),
+            stage_deadline: STAGE_DEADLINE,
+        }
+    }
+}
+
+/// One stage that ran to a zero exit.
+#[derive(Debug, Clone)]
+pub struct StageRun {
+    pub stage: &'static str,
+    pub args: Vec<String>,
+    pub exit: i32,
+    pub duration_ms: u64,
+    /// The end of what the stage printed: its one summary line.
+    pub stdout_tail: String,
+}
+
+/// The deadline of each stage of `driver.learn`.
+pub const STAGE_DEADLINE: Duration = Duration::from_secs(600);
+
+/// The memory cap of a stage's whole tree: a corpus parsed with lxml, or a driver replayed on
+/// the fake application, stays far below it.
+const STAGE_MEMORY: u64 = 1 << 30;
+
+/// `driver.qualify`'s budget (ruling L-P53): a minute, and 130 s per document — above the stage's
+/// own 90 s per pass plus 10 s for the driver's hello, so the stage's own timeout always speaks
+/// first.
+const QUALIFY_BASE: Duration = Duration::from_secs(60);
+const QUALIFY_PER_DOCUMENT: Duration = Duration::from_secs(130);
+
+/// How much of a stage's stdout a [`StageRun`] keeps.
+const TAIL_BYTES: usize = 2000;
+
+/// Refuses, before spawning, a root without `vkforge/__main__.py`: `bad("vkforge root not found;
+/// remedy: start vkd with --vkforge-root <drivers/>")` (L-P26). Then spawns
+/// `<python> -I <root>/vkforge/__main__.py <stage> <args>` with `current_dir = root` — the
+/// script path, never `-m` — under `vk_harness::confine::for_this_platform(1 << 30, None)`
+/// (`Governor::contain` the moment the child exists, failing closed on Windows as the harness does),
+/// stdout to `<work>/forge-<stage>.out`, stderr to `<work>/forge-<stage>.err`, killed at `deadline`
+/// (`internal("vkforge <stage> ran past its deadline of <n> s; see <log>")`). A non-zero exit is
+/// `bad(<the last non-empty line of the .err file>)`, verbatim: the stage speaks the kernel's voice
+/// (L-P15); an exit with no line is `internal("vkforge <stage> exited <code>; see <log>")`.
+pub fn run_stage(
+    cfg: &ForgeConfig,
+    stage: &'static str,
+    args: &[String],
+    work: &Path,
+    deadline: Duration,
+) -> Result<StageRun, RpcError> {
+    let script = cfg.root.join("vkforge").join("__main__.py");
+    if !script.is_file() {
+        return Err(bad(
+            "vkforge root not found; remedy: start vkd with --vkforge-root <drivers/>",
+        ));
+    }
+    vk_store::paths::private_dir(work)
+        .map_err(|e| io_failed("create the vkforge log directory", &e))?;
+    let out_log = work.join(format!("forge-{stage}.out"));
+    let err_log = work.join(format!("forge-{stage}.err"));
+    let stdout =
+        File::create(&out_log).map_err(|e| io_failed("create the stage's stdout log", &e))?;
+    let stderr =
+        File::create(&err_log).map_err(|e| io_failed("create the stage's stderr log", &e))?;
+    // Made before the child, so a governor the OS refuses is no spawn.
+    let governor = vk_harness::confine::for_this_platform(STAGE_MEMORY, None).map_err(|e| {
+        internal(&format!(
+            "vkforge {stage}: no governor for the stage: {e:#}"
+        ))
+    })?;
+    let mut cmd = Command::new(&cfg.python);
+    cmd.arg("-I")
+        .arg(&script)
+        .arg(stage)
+        .args(args)
+        .current_dir(&cfg.root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    #[cfg(unix)]
+    {
+        // The stage leads its own process group, so `kill_tree` signals all of it.
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let started = Instant::now();
+    let mut child = cmd.spawn().map_err(|e| {
+        internal(&format!(
+            "vkforge {stage} could not start {} ({e}); remedy: drivers\\vkforge\\setup.ps1 makes \
+             the virtualenv, or set VK_FORGE_PYTHON",
+            cfg.python.display()
+        ))
+    })?;
+    // Immediately, before the stage can do much: contained, or — on Windows, where a governor
+    // exists and refused — killed before it ran (the harness's Ruling 21.8).
+    if let Err(e) = governor.contain(&child) {
+        if cfg!(windows) {
+            vk_harness::launch::kill_tree(&mut child);
+            let _ = child.wait();
+            return Err(internal(&format!(
+                "vkforge {stage} could not be put under the governor, so it was killed before it \
+                 ran: {e:#}"
+            )));
+        }
+        tracing::warn!(stage, error = %format!("{e:#}"), "vkforge stage runs ungoverned");
+    }
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < deadline => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
+            Ok(None) => {
+                vk_harness::launch::kill_tree(&mut child);
+                let _ = child.wait();
+                // The Job Object closes with the governor: whatever the stage started goes too.
+                drop(governor);
+                return Err(internal(&format!(
+                    "vkforge {stage} ran past its deadline of {} s; see {}",
+                    deadline.as_secs(),
+                    err_log.display()
+                )));
+            }
+            Err(e) => {
+                vk_harness::launch::kill_tree(&mut child);
+                let _ = child.wait();
+                drop(governor);
+                return Err(internal(&format!(
+                    "vkforge {stage}: its exit could not be read ({e}); see {}",
+                    err_log.display()
+                )));
+            }
+        }
+    };
+    // Whatever the stage left running ends with its Job.
+    drop(governor);
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let exit = status.code().unwrap_or(-1);
+    if !status.success() {
+        let said = std::fs::read(&err_log).unwrap_or_default();
+        let said = String::from_utf8_lossy(&said);
+        return Err(match said.lines().map(str::trim).rfind(|l| !l.is_empty()) {
+            Some(line) => bad(line),
+            None => internal(&format!(
+                "vkforge {stage} exited {exit}; see {}",
+                err_log.display()
+            )),
+        });
+    }
+    let printed = std::fs::read(&out_log).unwrap_or_default();
+    let printed = String::from_utf8_lossy(&printed);
+    let printed = printed.trim_end();
+    let mut cut = printed.len().saturating_sub(TAIL_BYTES);
+    while !printed.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let run = StageRun {
+        stage,
+        args: args.to_vec(),
+        exit,
+        duration_ms,
+        stdout_tail: printed[cut..].to_string(),
+    };
+    tracing::info!(stage, duration_ms, tail = %run.stdout_tail, "vkforge stage done");
+    Ok(run)
+}
+
+/// What `driver.learn` takes, and nothing else.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LearnParams {
+    family: String,
+    app: String,
+    corpus: PathBuf,
+    out: PathBuf,
+    #[serde(default)]
+    threshold: Option<f64>,
+    /// An arch id: the CLI resolves a name, as recipes do.
+    #[serde(default)]
+    arch: Option<String>,
+}
+
+/// The one family vkforge v1 knows, and its applications.
+const FAMILY: &str = "office-document";
+const APPS: [&str; 2] = ["word", "powerpoint"];
+const DEFAULT_THRESHOLD: f64 = 0.8;
+
+/// `OUT/.vault.json`, the clear text the miner set aside for the generator: deleted on every
+/// way out of `learn` once `mine` may have written it — a refusal, an error, a panic — and,
+/// strictly, after `generate`.
+struct Vault(PathBuf);
+
+impl Vault {
+    fn remove(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(&self.0) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
+}
+
+impl Drop for Vault {
+    fn drop(&mut self) {
+        if let Err(e) = self.remove() {
+            tracing::error!(vault = %self.0.display(), error = %e, "the vault could not be deleted");
+        }
+    }
+}
+
+/// `driver.learn {family, app, corpus, out, threshold?, arch?}`, for a principal `dispatch` has
+/// already proved human (I1). Both take the `Ctx` their pre-lock arm built as the `driver.pack`
+/// arm does (L-P25): `learn`'s is human (`driver_learned`).
+///
+/// Refused before any stage is spawned: an unknown family or app, a relative or missing
+/// corpus, a relative `out`, an `out` that holds anything or lies inside the corpus, an `out`
+/// whose last component is not a driver name (it becomes the driver's), a threshold outside
+/// `(0, 1]`, an arch this node has not mounted. Then the stages, each through [`run_stage`] with
+/// `cfg.stage_deadline`, their logs under `<state_dir>/forge/<name>/`; the one model call per
+/// ambiguity when `arch` is given; `driver.learned` and the `learned` row last.
+pub fn learn(
+    kernel: &Shared,
+    cfg: &ForgeConfig,
+    state_dir: &Path,
+    ctx: &Ctx,
+    p: Value,
+) -> Result<Value, RpcError> {
+    let LearnParams {
+        family,
+        app,
+        corpus,
+        out,
+        threshold,
+        arch,
+    } = serde_json::from_value(p).map_err(|e| {
+        bad(&format!(
+            "driver.learn takes family, app, corpus, out, threshold and arch, nothing else ({e}); \
+             remedy: vk driver learn --family office-document --app word --corpus DIR --out DIR"
+        ))
+    })?;
+    if family != FAMILY {
+        return Err(bad(&format!(
+            "family {family} is not known; remedy: --family {FAMILY}"
+        )));
+    }
+    if !APPS.contains(&app.as_str()) {
+        return Err(bad(&format!(
+            "app {app} is not known; remedy: --app word or --app powerpoint"
+        )));
+    }
+    for (flag, path) in [("corpus", &corpus), ("out", &out)] {
+        if !path.is_absolute() {
+            return Err(bad(&format!(
+                "{flag} {} is not absolute; remedy: name it by its absolute path",
+                path.display()
+            )));
+        }
+    }
+    if !corpus.is_dir() {
+        return Err(bad(&format!(
+            "corpus {} is not a directory; remedy: --corpus names a folder of the firm's documents \
+             of one kind",
+            corpus.display()
+        )));
+    }
+    if !empty_or_absent(&out) {
+        return Err(bad(&format!(
+            "out {} is not empty; remedy: a new directory",
+            out.display()
+        )));
+    }
+    if out.starts_with(&corpus) {
+        return Err(bad(&format!(
+            "out {} is inside the corpus; remedy: a new directory outside it",
+            out.display()
+        )));
+    }
+    let name = out
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| is_driver_name(n))
+        .ok_or_else(|| {
+            bad(&format!(
+                "out {}: its last component becomes the driver's name, and it is not a driver \
+                 name (1 to 32 characters of a-z, 0-9 and -); remedy: name the directory like \
+                 word-maison",
+                out.display()
+            ))
+        })?
+        .to_string();
+    let threshold = threshold.unwrap_or(DEFAULT_THRESHOLD);
+    if !(threshold > 0.0 && threshold <= 1.0) {
+        return Err(bad(&format!(
+            "threshold {threshold} is not in (0, 1]; remedy: --threshold 0.8"
+        )));
+    }
+    if let Some(arch) = &arch {
+        let mounted = lock(kernel)?.arches().iter().any(|(id, _)| id == arch);
+        if !mounted {
+            return Err(bad(&format!(
+                "arch {arch} is not mounted on this node; remedy: vk ls /arches lists the arches \
+                 this node has, by name and id"
+            )));
+        }
+    }
+
+    let logs = state_dir.join("forge").join(&name);
+    if logs.exists() {
+        // The daemon's own scratch: the logs of an earlier learning under this name.
+        std::fs::remove_dir_all(&logs)
+            .map_err(|e| io_failed("clear the earlier vkforge logs", &e))?;
+    }
+    let deadline = cfg.stage_deadline;
+    let stage =
+        |stage: &'static str, args: Vec<String>| run_stage(cfg, stage, &args, &logs, deadline);
+    let binding = out.join(format!("binding-{app}.json"));
+    let invariants = out.join("invariants.json");
+    let plan_file = out.join("plan.json");
+
+    // 1. The type library's catalogue (or the recorded one, under the test seam).
+    let mut args = vec!["--app".into(), app.clone(), "--out".into(), arg(&out)];
+    if cfg.fixtures {
+        let fixture = cfg
+            .root
+            .join("vkforge")
+            .join("tests")
+            .join("fixtures")
+            .join(format!("catalogue-{app}.json"));
+        args.extend(["--fixture".into(), arg(&fixture)]);
+    }
+    stage("inventory", args)?;
+    // 2. The binding of the ontology's verbs to that catalogue.
+    stage(
+        "bind",
+        vec![
+            "--catalogue".into(),
+            arg(&out.join("catalogue.json")),
+            "--out".into(),
+            arg(&out),
+        ],
+    )?;
+    // 3. The invariants of the corpus. From here the vault may exist, and goes on every way out.
+    let vault = Vault(out.join(".vault.json"));
+    stage(
+        "mine",
+        vec![
+            "--corpus".into(),
+            arg(&corpus),
+            "--out".into(),
+            arg(&out),
+            "--threshold".into(),
+            threshold.to_string(),
+        ],
+    )?;
+    // 4. With an arch, one model call per ambiguity; then the plan.
+    let mut args = vec![
+        "--invariants".into(),
+        arg(&invariants),
+        "--binding".into(),
+        arg(&binding),
+        "--out".into(),
+        arg(&out),
+    ];
+    if let Some(arch) = &arch {
+        let mined = read_json(&invariants, "mine", "invariants.json")?;
+        let mut resolver = BTreeMap::new();
+        for ambiguity in mined["ambiguities"]
+            .as_array()
+            .map_or(&[][..], |a| a.as_slice())
+        {
+            let Some(invariant) = ambiguity["invariant"].as_str() else {
+                return Err(internal(
+                    "vkforge mine wrote an ambiguity without an invariant",
+                ));
+            };
+            // One short lock phase each; the act is stamped when it happens.
+            let now = Ctx {
+                now_ms: vk_kernel::now_ms(),
+                ..ctx.clone()
+            };
+            let chosen = lock(kernel)?
+                .learn_ambiguity(&now, arch, ambiguity)
+                .map_err(kerr)?;
+            if let Some(value) = chosen {
+                resolver.insert(
+                    invariant.to_string(),
+                    json!({"value": value, "resolved_by": format!("arch:{arch}")}),
+                );
+            }
+        }
+        let file = out.join("resolver.json");
+        let mut bytes = serde_json::to_vec_pretty(&resolver)
+            .map_err(|e| internal(&format!("resolver.json does not encode: {e}")))?;
+        bytes.push(b'\n');
+        std::fs::write(&file, bytes).map_err(|e| io_failed("write resolver.json", &e))?;
+        args.extend(["--resolver".into(), arg(&file)]);
+    }
+    stage("plan", args)?;
+    // 5. The driver, generated from the plan, its secrets resolved from the vault.
+    stage(
+        "generate",
+        vec![
+            "--plan".into(),
+            arg(&plan_file),
+            "--binding".into(),
+            arg(&binding),
+            "--invariants".into(),
+            arg(&invariants),
+            "--vault".into(),
+            arg(&vault.0),
+            "--out".into(),
+            arg(&out.join("driver")),
+            "--name".into(),
+            name.clone(),
+        ],
+    )?;
+    // 6. The vault goes, strictly; then what was learned is read back and recorded.
+    vault.remove().map_err(|e| {
+        internal(&format!(
+            "the vault {} could not be deleted ({e}); remedy: delete it by hand, it holds clear \
+             text from the corpus",
+            vault.0.display()
+        ))
+    })?;
+    let plan_bytes =
+        std::fs::read(&plan_file).map_err(|e| io_failed("read the plan vkforge wrote", &e))?;
+    let plan: DriverPlan = serde_json::from_slice(&plan_bytes).map_err(|e| {
+        internal(&format!(
+            "vkforge plan wrote a plan.json that does not parse: {e}"
+        ))
+    })?;
+    plan.validate().map_err(|e| {
+        internal(&format!(
+            "vkforge plan wrote a plan that does not validate: {e}"
+        ))
+    })?;
+    let mined = read_json(&invariants, "mine", "invariants.json")?;
+    let corpus_schema_sha256 = mined["corpus"]["schema_sha256"]
+        .as_str()
+        .ok_or_else(|| internal("vkforge mine wrote no corpus.schema_sha256"))?
+        .to_string();
+    let manifest_file = out.join("driver").join("manifest.json");
+    let manifest: DriverManifest = serde_json::from_value(read_json(
+        &manifest_file,
+        "generate",
+        "driver/manifest.json",
+    )?)
+    .map_err(|e| {
+        internal(&format!(
+            "vkforge generate wrote a manifest that does not parse: {e}"
+        ))
+    })?;
+    manifest.validate().map_err(|e| {
+        internal(&format!(
+            "vkforge generate wrote a manifest that does not validate: {e}"
+        ))
+    })?;
+    let excluded = read_json(
+        &out.join("plan-excluded.json"),
+        "plan",
+        "plan-excluded.json",
+    )?;
+    let unbound: Vec<Value> = read_json(&binding, "bind", "the binding")?["verbs"]
+        .as_array()
+        .map_or(&[][..], |v| v.as_slice())
+        .iter()
+        .filter(|v| v["status"] == "unbound")
+        .map(|v| v["verb"].clone())
+        .collect();
+    let learned = DriverLearned {
+        family,
+        app,
+        catalogue_sha256: plan.catalogue_sha256.clone(),
+        ontology_sha256: plan.ontology_sha256.clone(),
+        corpus_schema_sha256,
+        invariants_sha256: plan.invariants_sha256.clone(),
+        plan_sha256: plan_sha256(&plan_bytes),
+        driver_id: manifest.driver_id(),
+        // The kernel's to set, from the principal.
+        by: String::new(),
+    };
+    let now = Ctx {
+        now_ms: vk_kernel::now_ms(),
+        ..ctx.clone()
+    };
+    lock(kernel)?
+        .driver_learned(
+            &now,
+            learned.clone(),
+            &manifest.name,
+            &out,
+            plan.qualification.clone(),
+        )
+        .map_err(kerr)?;
+    Ok(json!({
+        "driver_id": learned.driver_id,
+        "name": manifest.name,
+        "plan_sha256": learned.plan_sha256,
+        "out": out.display().to_string(),
+        "unbound": unbound,
+        "ambiguities": plan.ambiguities,
+        "excluded": excluded,
+    }))
+}
+
+/// What `driver.qualify` takes, and nothing else.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualifyParams {
+    driver: PathBuf,
+    corpus: PathBuf,
+}
+
+/// `driver.qualify {driver, corpus}`: the `qualify` stage replays the learned driver on copies
+/// of the corpus, and `driver.qualified` records the replay (kernel-written: whatever principal
+/// the caller presented, L-P25). Refused before anything is spawned: relative paths, a directory
+/// that is not `<learn out>/driver` with `plan.json` and `invariants.json` beside it, a driver
+/// this node did not learn. The stage's work directory is the daemon's own scratch,
+/// `<state_dir>/drivers/<name>/work/qualify`, emptied first; its logs go under
+/// `<state_dir>/forge/qualify-<name>/`; its deadline is a minute and 130 s per document.
+pub fn qualify(
+    kernel: &Shared,
+    cfg: &ForgeConfig,
+    state_dir: &Path,
+    ctx: &Ctx,
+    p: Value,
+) -> Result<Value, RpcError> {
+    let QualifyParams { driver, corpus } = serde_json::from_value(p).map_err(|e| {
+        bad(&format!(
+            "driver.qualify takes driver and corpus, nothing else ({e}); remedy: vk driver \
+             qualify --driver DIR --corpus DIR"
+        ))
+    })?;
+    for (flag, path) in [("driver", &driver), ("corpus", &corpus)] {
+        if !path.is_absolute() {
+            return Err(bad(&format!(
+                "{flag} {} is not absolute; remedy: name it by its absolute path",
+                path.display()
+            )));
+        }
+    }
+    let not_learned_dir = || {
+        bad(&format!(
+            "{} is not a learned driver's directory; remedy: vk driver qualify --driver <learn \
+             out>\\driver",
+            driver.display()
+        ))
+    };
+    let out = driver.parent().ok_or_else(not_learned_dir)?;
+    let (plan_file, invariants) = (out.join("plan.json"), out.join("invariants.json"));
+    let manifest_file = driver.join("manifest.json");
+    if !(manifest_file.is_file() && plan_file.is_file() && invariants.is_file()) {
+        return Err(not_learned_dir());
+    }
+    let manifest: DriverManifest = std::fs::read(&manifest_file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(not_learned_dir)?;
+    let documents = documents_in(&corpus)?;
+    let driver_id = manifest.driver_id();
+    let row = lock(kernel)?
+        .learned(&driver_id)
+        .map_err(kerr)?
+        .ok_or_else(|| kerr(vk_kernel::learn::not_learned(&driver_id)))?;
+    let name = manifest.name.clone();
+    if !is_driver_name(&name) {
+        return Err(not_learned_dir());
+    }
+    let work_parent = state_dir.join("drivers").join(&name).join("work");
+    let work = work_parent.join("qualify");
+    vk_store::paths::private_dir(&work_parent)
+        .map_err(|e| io_failed("create the driver's work directory", &e))?;
+    if work.exists() {
+        std::fs::remove_dir_all(&work)
+            .map_err(|e| io_failed("empty the qualification's work directory", &e))?;
+    }
+    let logs = state_dir.join("forge").join(format!("qualify-{name}"));
+    let mut args = vec![
+        "--driver".into(),
+        arg(&driver),
+        "--corpus".into(),
+        arg(&corpus),
+        "--plan".into(),
+        arg(&plan_file),
+        "--invariants".into(),
+        arg(&invariants),
+        "--work".into(),
+        arg(&work),
+    ];
+    if cfg.fixtures {
+        args.push("--fake".into());
+    }
+    let deadline = QUALIFY_BASE + QUALIFY_PER_DOCUMENT * documents;
+    run_stage(cfg, "qualify", &args, &logs, deadline)?;
+    let record = work.join("qualification.json");
+    let bytes = std::fs::read(&record).map_err(|e| io_failed("read qualification.json", &e))?;
+    let rec: Value = serde_json::from_slice(&bytes).map_err(|e| {
+        internal(&format!(
+            "vkforge qualify wrote a record that does not parse: {e}"
+        ))
+    })?;
+    if rec["plan_sha256"].as_str() != Some(row.learned.plan_sha256.as_str()) {
+        return Err(bad(
+            "the plan changed since vk driver learn; remedy: learn again",
+        ));
+    }
+    let count = |field: &str| {
+        rec[field]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| internal(&format!("vkforge qualify wrote no {field} count")))
+    };
+    let (passes, failures) = (count("passes")?, count("failures")?);
+    let now = Ctx {
+        now_ms: vk_kernel::now_ms(),
+        ..ctx.clone()
+    };
+    lock(kernel)?
+        .driver_qualified(
+            &now,
+            DriverQualified {
+                driver_id: driver_id.clone(),
+                passes,
+                failures,
+                qualification_sha256: hash_bytes(&bytes),
+            },
+            &record,
+        )
+        .map_err(kerr)?;
+    Ok(json!({
+        "driver_id": driver_id,
+        "name": name,
+        "passes": passes,
+        "failures": failures,
+        "rate": rec["rate"],
+        "fake": rec["fake"],
+        "record": record.display().to_string(),
+    }))
+}
+
+/// What `driver.plan_show` takes, and nothing else.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanShowParams {
+    dir: PathBuf,
+}
+
+/// `driver.plan_show {dir}`: a learned driver's plan, for review before `vk driver qualify` —
+/// `{plan: <DriverPlan, validated>, plan_sha256, excluded: <plan-excluded.json, or []>}`. Reads
+/// two files; no kernel state, no presence.
+pub fn plan_show(p: Value) -> Result<Value, RpcError> {
+    let PlanShowParams { dir } = serde_json::from_value(p).map_err(|e| {
+        bad(&format!(
+            "driver.plan_show takes dir, nothing else ({e}); remedy: vk driver plan show DIR"
+        ))
+    })?;
+    if !dir.is_absolute() {
+        return Err(bad(&format!(
+            "dir {} is not absolute; remedy: name it by its absolute path",
+            dir.display()
+        )));
+    }
+    let file = dir.join("plan.json");
+    let bytes = std::fs::read(&file).map_err(|e| {
+        bad(&format!(
+            "{} cannot be read ({}); remedy: vk driver plan show <the directory vk driver learn \
+             wrote>",
+            file.display(),
+            e.kind()
+        ))
+    })?;
+    let plan: DriverPlan = serde_json::from_slice(&bytes).map_err(|e| {
+        bad(&format!(
+            "{} does not parse ({e}); remedy: learn the driver again",
+            file.display()
+        ))
+    })?;
+    plan.validate()
+        .map_err(|e| bad(&format!("{}: {e}", file.display())))?;
+    let excluded_file = dir.join("plan-excluded.json");
+    let excluded = match std::fs::read(&excluded_file) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            bad(&format!(
+                "{} does not parse ({e}); remedy: learn the driver again",
+                excluded_file.display()
+            ))
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!([]),
+        Err(e) => return Err(io_failed("read plan-excluded.json", &e)),
+    };
+    Ok(json!({
+        "plan": plan,
+        "plan_sha256": plan_sha256(&bytes),
+        "excluded": excluded,
+    }))
+}
+
+/// A path as a stage argument. The paths came in as JSON strings, so they are UTF-8.
+fn arg(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// A JSON file a stage wrote, or the internal error naming the stage that should have.
+fn read_json(file: &Path, stage: &str, what: &str) -> Result<Value, RpcError> {
+    let bytes = std::fs::read(file)
+        .map_err(|e| internal(&format!("vkforge {stage} wrote no readable {what} ({e})")))?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        internal(&format!(
+            "vkforge {stage} wrote a {what} that does not parse ({e})"
+        ))
+    })
+}
+
+/// The documents of a corpus, as the miner counts them: the `.docx` and `.pptx` files directly
+/// in it, an Office lock file (`~$…`) aside. The qualification budget is per document.
+fn documents_in(corpus: &Path) -> Result<u32, RpcError> {
+    let entries = std::fs::read_dir(corpus).map_err(|e| {
+        bad(&format!(
+            "corpus {} cannot be read ({}); remedy: --corpus names the folder the driver was \
+             learned from",
+            corpus.display(),
+            e.kind()
+        ))
+    })?;
+    let mut n = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let named = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let document = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("docx") || e.eq_ignore_ascii_case("pptx"));
+        if document && !named.starts_with("~$") && path.is_file() {
+            n = n.saturating_add(1);
+        }
+    }
+    Ok(n)
+}
+
+/// Absent, or an empty directory.
+fn empty_or_absent(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound && !dir.exists(),
+    }
+}
+
+fn io_failed(what: &str, e: &std::io::Error) -> RpcError {
+    RpcError {
+        code: E_STORE,
+        message: format!("{what}: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A root without `vkforge/__main__.py` is refused at the first spawn, before anything is
+    /// written (L-P26): `ForgeConfig::at` checks nothing.
+    #[test]
+    fn a_root_without_vkforge_is_refused_at_the_first_spawn() {
+        let t = tempfile::tempdir().unwrap();
+        let cfg = ForgeConfig::at(t.path().join("nowhere"));
+        let logs = t.path().join("logs");
+        let e = run_stage(&cfg, "inventory", &[], &logs, STAGE_DEADLINE).unwrap_err();
+        assert_eq!(
+            e.message,
+            "vkforge root not found; remedy: start vkd with --vkforge-root <drivers/>"
+        );
+        assert!(!logs.exists(), "refused before the log directory was made");
+    }
+
+    /// The qualification budget counts the documents the miner would, and nothing else.
+    #[test]
+    fn the_qualification_budget_counts_documents() {
+        let t = tempfile::tempdir().unwrap();
+        for f in [
+            "a.docx",
+            "b.DOCX",
+            "c.pptx",
+            "a.pdf",
+            "~$a.docx",
+            "notes.txt",
+        ] {
+            std::fs::write(t.path().join(f), b"x").unwrap();
+        }
+        std::fs::create_dir(t.path().join("sub.docx")).unwrap();
+        assert_eq!(documents_in(t.path()).unwrap(), 3);
+    }
+}

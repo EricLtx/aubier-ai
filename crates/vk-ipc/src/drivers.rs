@@ -626,7 +626,8 @@ pub(crate) fn development_hold(manifest: &DriverManifest, root: &Path) -> anyhow
 ///   publisher signed and hashes to its fingerprint
 ///   ([`crate::capital::installed`]), and the context rules hold on it too.
 ///
-/// All of that before anything runs — the context rules included, so no
+/// All of that before anything runs — the context rules included, and for a
+/// learned driver (`kind: com`) the qualification gate (ruling L-P4), so no
 /// process is started for a driver the kernel would refuse. Then the process
 /// is started with the kernel lock released and the row written under it
 /// with what the host observed (`governed`) and, for an installed tree, the
@@ -651,9 +652,13 @@ pub(crate) fn mount(
             (Some(manifest), Some(root), None) => {
                 checked_mount(&manifest, &root).map_err(|e| bad(&format!("{e:#}")))?;
                 let root = vk_kernel::drivers::resolved(&root);
-                lock(kernel)?
-                    .check_context(&manifest, &root)
-                    .map_err(kerr)?;
+                {
+                    let k = lock(kernel)?;
+                    k.check_context(&manifest, &root).map_err(kerr)?;
+                    // A learned (`kind: com`) driver only qualified (ruling
+                    // L-P4), refused before anything is spawned.
+                    k.check_qualified(&manifest).map_err(kerr)?;
+                }
                 if manifest.source == DriverSource::Installed {
                     return Err(bad(&format!(
                         "a manifest that says installed mounts by name@version; remedy: vk mount \
@@ -666,9 +671,11 @@ pub(crate) fn mount(
             }
             (None, None, Some(spec)) => {
                 let tree = crate::capital::installed(kernel, &spec)?;
-                lock(kernel)?
-                    .check_context(&tree.manifest, &tree.root)
-                    .map_err(kerr)?;
+                {
+                    let k = lock(kernel)?;
+                    k.check_context(&tree.manifest, &tree.root).map_err(kerr)?;
+                    k.check_qualified(&tree.manifest).map_err(kerr)?;
+                }
                 (
                     tree.manifest,
                     tree.root,

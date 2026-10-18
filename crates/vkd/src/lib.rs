@@ -120,6 +120,16 @@ pub struct Args {
     /// which one was taken.
     #[arg(long, default_value_t = vk_web::DEFAULT_PORT)]
     pub web_port: u16,
+    /// The `drivers/` directory of a checkout, whose `vkforge/__main__.py`
+    /// `vk driver learn` and `vk driver qualify` run (driver-learning plan
+    /// Task 9). No default: the daemon's executable lives in a target
+    /// directory outside the checkout, so nothing can be guessed from its
+    /// place. Without it, both verbs refuse. Daemon configuration only — no
+    /// pipe client can name the code the daemon runs. The interpreter is
+    /// `VK_FORGE_PYTHON`, else the virtualenv `drivers\vkforge\setup.ps1`
+    /// makes.
+    #[arg(long, value_name = "DIR")]
+    pub vkforge_root: Option<PathBuf>,
     /// Run as the Windows service account (SP1b Task 6): the state directory
     /// is `%ProgramData%\VerticalAI\vk` rather than a user's app data, the
     /// keyring entries are the service account's own, and the pipe is created
@@ -602,6 +612,21 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         kernel.clone(),
         std::time::Duration::from_secs(60 * 60),
     ));
+    // vkforge, when this daemon was given a root (driver-learning plan Task 9).
+    let forge = a.vkforge_root.map(vk_ipc::forge::ForgeConfig::at);
+    if let Some(f) = &forge {
+        tracing::info!(
+            root = %f.root.display(),
+            python = %f.python.display(),
+            "vkforge: vk driver learn and vk driver qualify are served"
+        );
+        if f.fixtures {
+            tracing::warn!(
+                "VK_FORGE_FIXTURES=1: vk driver learn reads the recorded catalogues and vk driver \
+                 qualify replays on the fake application, not Office — a test seam, never a node's"
+            );
+        }
+    }
     // The endpoint travels with the server so a harness run can write it into the
     // run's `mcp.json` for the harness's `vk-mcp` to dial back on; the harness
     // settings travel with it because they are this daemon's, never a request's.
@@ -626,6 +651,9 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         python_archive: std::env::var_os("VK_TEST_PYTHON_RELEASE")
             .filter(|p| !p.is_empty())
             .map(std::path::PathBuf::from),
+        // `at` is infallible (ruling L-P26): a root without
+        // `vkforge/__main__.py` is refused at the first spawn, naming the flag.
+        forge,
     };
     vk_ipc::server::serve_on(kernel, listener, config).await
 }

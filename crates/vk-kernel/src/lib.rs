@@ -2,6 +2,7 @@
 pub mod arch;
 pub mod capital;
 pub mod drivers;
+pub mod learn;
 pub mod ns;
 pub mod presence;
 pub mod tasks;

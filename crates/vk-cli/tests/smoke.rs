@@ -2648,6 +2648,195 @@ fn python_on_path() -> bool {
     found
 }
 
+fn repo_drivers() -> PathBuf {
+    std::path::absolute(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../drivers"))
+        .unwrap()
+}
+
+fn vkforge_venv_python() -> PathBuf {
+    PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default())
+        .join("vk")
+        .join("venvs")
+        .join("vkforge")
+        .join("Scripts")
+        .join("python.exe")
+}
+
+/// `VK_FORGE_PYTHON`, else the vkforge virtualenv's interpreter (L-P12).
+fn forge_python() -> PathBuf {
+    std::env::var_os("VK_FORGE_PYTHON")
+        .map(PathBuf::from)
+        .unwrap_or_else(vkforge_venv_python)
+}
+
+/// The vkforge interpreter imports lxml and comtypes and the virtualenv exists; else says so (L-P18).
+fn forge_available() -> bool {
+    let imports = Command::new(forge_python())
+        .args(["-I", "-c", "import lxml, comtypes"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !(imports && vkforge_venv_python().is_file()) {
+        eprintln!("vkforge: no interpreter with lxml and comtypes, or no virtualenv; skipping");
+        return false;
+    }
+    true
+}
+
+/// A `vkd` with vkforge (`--vkforge-root`, `VK_FORGE_PYTHON`) and its test seam (`VK_FORGE_FIXTURES=1`),
+/// over its own temporary state directory, and the shell that drives it.
+fn forge_node() -> (tempfile::TempDir, Daemon, Shell) {
+    let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let root = repo_drivers();
+    let mut cmd = vkd_cmd(
+        dir.path(),
+        &endpoint,
+        &["--vkforge-root", root.to_str().unwrap()],
+    );
+    cmd.env("VK_FORGE_FIXTURES", "1")
+        .env("VK_FORGE_PYTHON", forge_python());
+    let daemon = Daemon(
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell {
+        endpoint,
+        node_key: dir.path().join("node.key"),
+    };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    (dir, daemon, sh)
+}
+
+/// drivers/vkforge/tests/ooxml_fixtures.py DIR GARAMOND CALIBRI.
+fn ooxml_corpus(dir: &std::path::Path, garamond: u32, calibri: u32) -> PathBuf {
+    let script = repo_drivers().join("vkforge/tests/ooxml_fixtures.py");
+    assert!(Command::new(forge_python())
+        .arg("-I")
+        .arg(&script)
+        .arg(dir)
+        .arg(garamond.to_string())
+        .arg(calibri.to_string())
+        .status()
+        .unwrap()
+        .success());
+    dir.to_path_buf()
+}
+
+#[test]
+fn vk_forge_learn_then_qualify_then_mount_from_the_cli() {
+    if !forge_available() {
+        return;
+    }
+    let (dir, _daemon, sh) = forge_node();
+    let corpus = ooxml_corpus(&dir.path().join("corpus"), 10, 0);
+    let out = dir.path().join("word-maison");
+    let (c, o) = (corpus.to_str().unwrap(), out.to_str().unwrap());
+    let learned = sh.ok(&[
+        "driver",
+        "learn",
+        "--family",
+        "office-document",
+        "--app",
+        "word",
+        "--corpus",
+        c,
+        "--out",
+        o,
+    ]);
+    assert!(learned.contains("learned word-maison"), "{learned}");
+    let shown = sh.ok(&["driver", "plan", "show", o]);
+    for needle in [
+        "appliquer_style_maison",
+        "set_font_run",
+        "post: title_style, body_font, footer_text, pdf_exists",
+    ] {
+        assert!(shown.contains(needle), "{needle}:\n{shown}");
+    }
+    let driver = out.join("driver");
+    let qualified = sh.ok(&[
+        "driver",
+        "qualify",
+        "--driver",
+        driver.to_str().unwrap(),
+        "--corpus",
+        c,
+    ]);
+    assert!(qualified.contains("10/10 passes"), "{qualified}");
+    sh.ok(&[
+        "mount",
+        "driver",
+        "--manifest",
+        driver.join("manifest.json").to_str().unwrap(),
+    ]);
+    let row = sh.json(&["driver", "show", "word-maison", "--json"]);
+    assert_eq!(row["manifest"]["kind"], "com", "{row}"); // driver.mounted carries no kind (L-P11)
+    let tail = sh.json(&["dmesg", "-n", "60", "--json"]);
+    let kinds = dmesg_kinds(&tail);
+    let at = |k: &str| {
+        kinds
+            .iter()
+            .position(|x| *x == k)
+            .unwrap_or_else(|| panic!("no {k} in {kinds:?}"))
+    };
+    assert!(
+        at("driver.learned") < at("driver.qualified")
+            && at("driver.qualified") < at("driver.mounted")
+    );
+    assert!(
+        !kinds.contains(&"infer"),
+        "zero model tokens on the nominal path"
+    );
+    sh.ok(&["driver", "umount", "word-maison"]);
+}
+
+#[test]
+fn vk_forge_plan_show_prints_the_actions_and_the_ambiguities() {
+    if !forge_available() {
+        return;
+    }
+    let (dir, _daemon, sh) = forge_node();
+    let corpus = ooxml_corpus(&dir.path().join("corpus"), 7, 3);
+    let out = dir.path().join("word-maison");
+    let (c, o) = (corpus.to_str().unwrap(), out.to_str().unwrap());
+    let learned = sh.ok(&[
+        "driver",
+        "learn",
+        "--family",
+        "office-document",
+        "--app",
+        "word",
+        "--corpus",
+        c,
+        "--out",
+        o,
+    ]);
+    assert!(
+        learned.contains("ambiguities: body_font purged"),
+        "{learned}"
+    );
+    let shown = sh.ok(&["driver", "plan", "show", o]);
+    assert!(
+        shown.contains("appliquer_style_maison (reversible: no)"),
+        "{shown}"
+    );
+    assert!(shown.contains("1. open(path=\"$arg.document\")"), "{shown}");
+    assert!(
+        !shown.contains("set_font_run"),
+        "a purged ambiguity drives nothing:\n{shown}"
+    );
+    assert!(
+        shown.contains("ambiguities:\n  body_font  purged"),
+        "{shown}"
+    );
+    assert!(shown.contains("excluded: none"), "{shown}");
+}
+
 /// A `vkd` over `dir` — its install root at `<dir>/installed` and its
 /// publisher key in `<dir>/publisher.key`, as [`vkd_cmd`] sets them — with
 /// `extra_env` and no CPython release unless it names one, and the shell

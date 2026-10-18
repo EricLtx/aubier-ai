@@ -38,6 +38,12 @@ pub const TABLES: &[&str] = &[
     // resolves against, its state and when it last acted. The typed row is
     // `vk_kernel::drivers::DriverRow`.
     "drivers",
+    // One row per learned driver (driver-learning spec §4.10), keyed by its
+    // `driver_id`: what `driver.learned` recorded, the plan's qualification
+    // thresholds, and — once `vk driver qualify` ran — the record's path and
+    // hash, which the mount gate of a `kind: com` driver checks. The typed
+    // row is `vk_kernel::learn::LearnedRow`.
+    "learned",
     "kv_test",
 ];
 
