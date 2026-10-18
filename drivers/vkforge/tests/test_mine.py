@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 import zipfile
+import zlib
 from pathlib import Path
 
 from vkforge import __main__ as entry
@@ -162,3 +163,84 @@ class MineTest(unittest.TestCase):
         self.assertEqual(len(list(d.glob("*.pdf"))), 10)
         inv, _ = mine.mine_corpus(d)
         self.assertEqual([a["invariant"] for a in inv["ambiguities"]], ["body_font"])
+
+
+def _rewrite(doc: Path, member: str, old: bytes, new: bytes) -> None:
+    with zipfile.ZipFile(doc) as zf:
+        members = {n: zf.read(n) for n in zf.namelist()}
+    assert old in members[member]
+    members[member] = members[member].replace(old, new)
+    with zipfile.ZipFile(doc, "w", zipfile.ZIP_DEFLATED) as zf:
+        for n, data in members.items():
+            zf.writestr(n, data)
+
+
+class MineRobustnessTest(unittest.TestCase):
+    def test_a_damaged_member_is_skipped_and_the_run_goes_on(self):
+        d = Path(tempfile.mkdtemp())
+        for i in range(5):
+            ooxml_fixtures.docx(d / f"c{i}.docx")
+        bad = ooxml_fixtures.docx(d / "bad.docx", body_font=("Garamond", 11))
+        _rewrite(bad, "word/document.xml", b"Titre du document", b"Titre du document" * 40)   # a deflated member
+        with zipfile.ZipFile(bad) as zf:
+            info = zf.getinfo("word/document.xml")
+        raw = bytearray(bad.read_bytes())
+        start = info.header_offset + 30 + len(info.filename.encode("utf-8"))
+        for k in range(start + 4, start + 16):
+            raw[k] ^= 0xFF
+        bad.write_bytes(bytes(raw))
+        with zipfile.ZipFile(bad) as zf, self.assertRaises((zlib.error, EOFError, ValueError)):
+            zf.read("word/document.xml")             # the damage is real
+        inv, _ = mine.mine_corpus(d)
+        self.assertEqual((inv["corpus"]["files"], inv["corpus"]["skipped"]), (5, 1))
+
+    def test_orientation_is_never_a_free_string(self):
+        doc = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "c.docx")
+        _rewrite(doc, "word/document.xml", b"<w:sectPr>",
+                 b'<w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="Jean Dupont"/>'
+                 b'<w:pgMar w:top="1" w:right="2" w:bottom="3" w:left="4"/>')
+        obs = mine.mine_file(doc)["obs"]
+        self.assertIn({"kind": "orientation", "where": None, "value": "landscape"}, obs)
+        self.assertIn({"kind": "page_size", "where": None, "value": {"height": 11906, "width": 16838}}, obs)
+        self.assertIn({"kind": "margins", "where": None, "value": {"top": 1, "right": 2, "bottom": 3, "left": 4}}, obs)
+        self.assertNotIn("Dupont", json.dumps(obs))
+
+    def test_out_inside_the_corpus_is_refused(self):
+        d = Path(tempfile.mkdtemp())
+        for i in range(5):
+            ooxml_fixtures.docx(d / f"c{i}.docx")
+        for out in (d, d / "out"):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(entry.main(["mine", "--corpus", str(d), "--out", str(out)]), 2)
+            self.assertIn("is inside the corpus; remedy: write elsewhere", err.getvalue())
+        self.assertEqual(sorted(p.name for p in d.iterdir()), [f"c{i}.docx" for i in range(5)])
+
+    def test_a_custom_style_reaches_the_vault_by_its_name_and_the_artefact_by_its_token(self):
+        d = Path(tempfile.mkdtemp())
+        for i in range(5):
+            ooxml_fixtures.docx(d / f"c{i}.docx", title_style="Clause Dupont", style_id="ClauseId7")
+        inv, vault = mine.mine_corpus(d)
+        token = mine.redact("Clause Dupont")
+        by_id = {i["id"]: i for i in inv["invariants"]}
+        self.assertEqual(by_id["title_style"]["value"], {"custom": token})
+        self.assertEqual(vault, {token: "Clause Dupont"}, "the name, never the styleId")
+        out = Path(tempfile.mkdtemp())
+        mine.write_invariants(inv, vault, out)
+        blob = (out / "invariants.json").read_bytes() + b"\n" + (out / ".vault.json").read_bytes()
+        self.assertNotIn(b"ClauseId7", blob)
+        self.assertNotIn(b"Dupont", (out / "invariants.json").read_bytes())
+
+    def test_a_value_that_looks_like_a_token_does_not_break_the_vault(self):
+        d = Path(tempfile.mkdtemp())
+        for i in range(5):
+            ooxml_fixtures.docx(d / f"c{i}.docx", body_font=("<redacted:sha256:feed>", 11))
+        inv, vault = mine.mine_corpus(d)
+        self.assertEqual(vault, {})
+
+    def test_the_fixtures_are_byte_identical_whatever_the_platform(self):
+        a = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "a.docx", footer=FOOTER)
+        with zipfile.ZipFile(a) as zf:
+            for info in zf.infolist():
+                self.assertEqual((info.date_time, info.create_system, info.compress_type, info.external_attr >> 16),
+                                 ((1980, 1, 1, 0, 0, 0), 3, zipfile.ZIP_STORED, 0o644), info.filename)

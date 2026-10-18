@@ -104,13 +104,17 @@ class _Styles:
         return font, size
 
 
-def _style_value(sid: str, styles: _Styles, vault: dict) -> dict:
-    """The built-in anchor of a style, found by its English w:name and never by its styleId."""
+def _style_value(sid: str, styles: _Styles, vault: dict) -> dict | None:
+    """The built-in anchor of a style, found by its English w:name and never by its styleId. A custom
+    style is its w:name (what Word's Styles(name) takes) as a token, the name going to the vault; the
+    styleId is never stored. A style that styles.xml does not declare has no name: None."""
     name = styles.name(sid)
-    if name is not None and name.lower() in BUILTIN_STYLES:
+    if not name:
+        return None
+    if name.lower() in BUILTIN_STYLES:
         return {"builtin": BUILTIN_STYLES[name.lower()]}
-    token = redact(sid)
-    vault[token] = sid
+    token = redact(name)
+    vault[token] = name
     return {"custom": token}
 
 
@@ -145,15 +149,16 @@ def _docx(zf, obs: list, vault: dict) -> None:
 
     if paragraphs:
         first = style_id(paragraphs[0]) or styles.default
-        if first is not None:
-            obs.append({"kind": "paragraph_style", "where": "first", "value": _style_value(first, styles, vault)})
+        value = None if first is None else _style_value(first, styles, vault)
+        if value is not None:
+            obs.append({"kind": "paragraph_style", "where": "first", "value": value})
         rest = paragraphs[1:]
         explicit = [style_id(p) for p in rest]
         if rest and all(explicit):
-            values = {canon.dumps(_style_value(sid, styles, {})): sid for sid in explicit}
-            if len(values) == 1:
-                obs.append({"kind": "paragraph_style", "where": "all",
-                            "value": _style_value(explicit[0], styles, vault)})
+            values = {canon.dumps(_style_value(sid, styles, {})) for sid in explicit}
+            value = _style_value(explicit[0], styles, vault)
+            if len(values) == 1 and value is not None:
+                obs.append({"kind": "paragraph_style", "where": "all", "value": value})
         pairs = []
         for p in rest:
             pfont, psize = styles.font_of(style_id(p) or styles.default)
@@ -183,7 +188,9 @@ def _docx(zf, obs: list, vault: dict) -> None:
             width, height = _int(size.get(q("w", "w"))), _int(size.get(q("w", "h")))
             if width is not None and height is not None:
                 obs.append({"kind": "page_size", "where": None, "value": {"height": height, "width": width}})
-                orient = size.get(q("w", "orient")) or ("landscape" if width > height else "portrait")
+                orient = size.get(q("w", "orient"))
+                if orient not in ("portrait", "landscape"):      # a free attribute: never copied as it stands
+                    orient = "landscape" if width > height else "portrait"
                 obs.append({"kind": "orientation", "where": None, "value": orient})
         if margins is not None:
             sides = {s: _int(margins.get(q("w", s))) for s in ("top", "right", "bottom", "left")}
@@ -315,7 +322,7 @@ def mine_corpus(corpus: Path, threshold: float = 0.8) -> tuple[dict, dict]:
                       "schema_sha256": canon.sha256(invariants)},
            "threshold": threshold, "invariants": invariants, "ambiguities": ambiguities}
     used = set(_tokens(invariants)) | set(_tokens(ambiguities))
-    return inv, {t: vault[t] for t in sorted(used)}
+    return inv, {t: vault[t] for t in sorted(used) if t in vault}
 
 
 def write_invariants(inv: dict, vault: dict, out: Path) -> None:
@@ -340,6 +347,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 def run(ns: argparse.Namespace) -> int:
     if not 0 < ns.threshold <= 1:
         raise Refusal(f"threshold {ns.threshold} is not in (0, 1]", "--threshold 0.8")
+    corpus, out = Path(ns.corpus).resolve(), Path(ns.out).resolve()
+    if out == corpus or corpus in out.parents:
+        raise Refusal(f"out {ns.out} is inside the corpus", "write elsewhere")
     inv, vault = mine_corpus(ns.corpus, ns.threshold)
     write_invariants(inv, vault, ns.out)
     print(f"mine: {len(inv['invariants'])} invariants, {len(inv['ambiguities'])} ambiguities over "

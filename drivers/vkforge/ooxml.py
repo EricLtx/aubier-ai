@@ -6,6 +6,7 @@ are parsed without entity resolution and a part above MAX_PART bytes is refused 
 """
 import fnmatch
 import zipfile
+import zlib
 from pathlib import Path
 
 from lxml import etree
@@ -39,7 +40,7 @@ def open_package(path: Path) -> zipfile.ZipFile:
     path = Path(path)
     try:
         zf = zipfile.ZipFile(path)
-    except (zipfile.BadZipFile, OSError):
+    except (zipfile.BadZipFile, OSError, EOFError, ValueError):
         raise Refusal(f"{path.name} is not an OOXML package", "a .docx or .pptx saved by Office")
     if "[Content_Types].xml" not in zf.namelist():
         zf.close()
@@ -67,7 +68,8 @@ def part(zf: zipfile.ZipFile, name: str):
         raise Refusal(f"{name} is larger than {MAX_PART} bytes", "a document saved by Office")
     try:
         return etree.fromstring(zf.read(name), _PARSER)
-    except (etree.XMLSyntaxError, zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError):
+    except (etree.XMLSyntaxError, zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError, zlib.error,
+            EOFError, ValueError):
         raise Refusal(f"{name} cannot be read as XML", "a document saved by Office")
 
 

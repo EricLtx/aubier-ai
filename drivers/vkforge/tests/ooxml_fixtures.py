@@ -5,7 +5,9 @@ Used by test_mine.py and, as a script, to build the corpus the Rust tests and CI
     python -I drivers/vkforge/tests/ooxml_fixtures.py DIR GARAMOND [CALIBRI]
 
 Stdlib only and no import from vkforge, so that it runs under -I as a script. The archives are
-byte-reproducible (fixed member dates), so a corpus built twice has the same content hash.
+byte-identical on every platform (members stored, not deflated, with a fixed date, creator system
+and mode), so a corpus built twice has the same content hash. The packages are meant to open in
+the real Word and PowerPoint (Task 12).
 """
 import sys
 import zipfile
@@ -21,7 +23,7 @@ _R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 _CT = "http://schemas.openxmlformats.org/package/2006/content-types"
 _XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-_DATE = (2026, 1, 1, 0, 0, 0)
+_DATE = (1980, 1, 1, 0, 0, 0)         # the zip epoch
 _WORD_NAMES = {"Normal": "Normal", "Title": "Title", "Subtitle": "Subtitle"}
 _BODY = ("Premier paragraphe du corps.", "Deuxième paragraphe du corps.", "Troisième paragraphe du corps.")
 
@@ -32,7 +34,9 @@ def _write(path: Path, members: dict) -> Path:
     with zipfile.ZipFile(path, "w") as zf:
         for name, text in members.items():
             info = zipfile.ZipInfo(name, _DATE)
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_type = zipfile.ZIP_STORED
+            info.create_system = 3                  # Unix, whatever the host: zipfile writes 0 on Windows
+            info.external_attr = 0o644 << 16
             zf.writestr(info, (_XML + text).encode("utf-8"))
     return path
 
@@ -71,7 +75,8 @@ def docx(path, title_style="Heading1", body_font=("Garamond", 11), footer=None, 
                     f'<w:sz w:val="{int(size * 2)}"/></w:rPr><w:t>{escape(text)}</w:t></w:r></w:p>')
     refs, rels = "", [("rIdS", f"{_R}/styles", "styles.xml")]
     wml = "application/vnd.openxmlformats-officedocument.wordprocessingml."
-    overrides = {"word/document.xml": wml + "document.main+xml", "word/styles.xml": wml + "styles+xml"}
+    overrides = {"word/document.xml": wml + "document.main+xml", "word/styles.xml": wml + "styles+xml",
+                 "docProps/app.xml": "application/vnd.openxmlformats-officedocument.extended-properties+xml"}
     members = {}
     for kind, text in (("header", header), ("footer", footer)):
         if text is None:
@@ -94,7 +99,8 @@ def docx(path, title_style="Heading1", body_font=("Garamond", 11), footer=None, 
               f'{title_def}</w:styles>')
     _write(path, {
         "[Content_Types].xml": _content_types(overrides),
-        "_rels/.rels": _rels([("rId1", f"{_R}/officeDocument", "word/document.xml")]),
+        "_rels/.rels": _rels([("rId1", f"{_R}/officeDocument", "word/document.xml"),
+                              ("rId2", f"{_R}/extended-properties", "docProps/app.xml")]),
         "docProps/app.xml": '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">'
                             '<Application>vkforge-fixture</Application></Properties>',
         "word/document.xml": document,
@@ -105,6 +111,23 @@ def docx(path, title_style="Heading1", body_font=("Garamond", 11), footer=None, 
     if pdf:
         path.with_suffix(".pdf").write_bytes(b"%PDF-1.4 fake\n")
     return path
+
+
+def _theme() -> str:
+    """The smallest theme PowerPoint accepts: 12 colours, one font pair, three of each format style."""
+    colours = "".join(f'<a:{n}><a:srgbClr val="{v}"/></a:{n}>' for n, v in (
+        ("dk1", "000000"), ("lt1", "FFFFFF"), ("dk2", "1F1F1F"), ("lt2", "EEEEEE"), ("accent1", "4472C4"),
+        ("accent2", "ED7D31"), ("accent3", "A5A5A5"), ("accent4", "FFC000"), ("accent5", "5B9BD5"),
+        ("accent6", "70AD47"), ("hlink", "0563C1"), ("folHlink", "954F72")))
+    fonts = '<a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/>'
+    fill = '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    line = f'<a:ln w="9525">{fill}</a:ln>'
+    effect = "<a:effectStyle><a:effectLst/></a:effectStyle>"
+    return (f'<a:theme xmlns:a="{_A}" name="Fixture"><a:themeElements><a:clrScheme name="Fixture">{colours}</a:clrScheme>'
+            f'<a:fontScheme name="Fixture"><a:majorFont>{fonts}</a:majorFont><a:minorFont>{fonts}</a:minorFont></a:fontScheme>'
+            f'<a:fmtScheme name="Fixture"><a:fillStyleLst>{fill * 3}</a:fillStyleLst><a:lnStyleLst>{line * 3}</a:lnStyleLst>'
+            f'<a:effectStyleLst>{effect * 3}</a:effectStyleLst><a:bgFillStyleLst>{fill * 3}</a:bgFillStyleLst></a:fmtScheme>'
+            '</a:themeElements></a:theme>')
 
 
 def pptx(path, title_font=("Garamond", 32), footer=None) -> Path:
@@ -122,24 +145,32 @@ def pptx(path, title_font=("Garamond", 32), footer=None) -> Path:
             if footer is not None else "")
     tree = ('<p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
             '<p:grpSpPr/>{}</p:spTree></p:cSld>')
-    master = f'<p:sldMaster {ns}>{tree.format(title + foot)}<p:txStyles><p:titleStyle/></p:txStyles></p:sldMaster>'
+    clr_map = ('<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" '
+               'accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>')
+    master = (f'<p:sldMaster {ns}>{tree.format(title + foot)}{clr_map}'
+              '<p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst>'
+              '<p:txStyles><p:titleStyle/></p:txStyles></p:sldMaster>')
     layout = f'<p:sldLayout {ns} type="title">{tree.format("")}</p:sldLayout>'
     slide = f'<p:sld {ns}>{tree.format("")}</p:sld>'
     pres = (f'<p:presentation {ns}><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>'
-            '<p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/></p:presentation>')
+            '<p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/><p:notesSz cx="6858000" cy="9144000"/></p:presentation>')
     ct = "application/vnd.openxmlformats-officedocument.presentationml."
     return _write(Path(path), {
         "[Content_Types].xml": _content_types({"ppt/presentation.xml": ct + "presentation.main+xml",
                                                "ppt/slideMasters/slideMaster1.xml": ct + "slideMaster+xml",
                                                "ppt/slideLayouts/slideLayout1.xml": ct + "slideLayout+xml",
-                                               "ppt/slides/slide1.xml": ct + "slide+xml"}),
+                                               "ppt/slides/slide1.xml": ct + "slide+xml",
+                                               "ppt/theme/theme1.xml": "application/vnd.openxmlformats-officedocument.theme+xml"}),
         "_rels/.rels": _rels([("rId1", f"{_R}/officeDocument", "ppt/presentation.xml")]),
         "ppt/presentation.xml": pres,
         "ppt/_rels/presentation.xml.rels": _rels([("rId1", f"{_R}/slideMaster", "slideMasters/slideMaster1.xml"),
-                                                  ("rId2", f"{_R}/slide", "slides/slide1.xml")]),
+                                                  ("rId2", f"{_R}/slide", "slides/slide1.xml"),
+                                                  ("rId3", f"{_R}/theme", "theme/theme1.xml")]),
         "ppt/slideMasters/slideMaster1.xml": master,
         "ppt/slideMasters/_rels/slideMaster1.xml.rels": _rels([("rId1", f"{_R}/slideLayout",
-                                                                "../slideLayouts/slideLayout1.xml")]),
+                                                                "../slideLayouts/slideLayout1.xml"),
+                                                               ("rId2", f"{_R}/theme", "../theme/theme1.xml")]),
+        "ppt/theme/theme1.xml": _theme(),
         "ppt/slideLayouts/slideLayout1.xml": layout,
         "ppt/slideLayouts/_rels/slideLayout1.xml.rels": _rels([("rId1", f"{_R}/slideMaster",
                                                                 "../slideMasters/slideMaster1.xml")]),
