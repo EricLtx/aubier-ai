@@ -98,4 +98,4 @@ Proprietary — all rights reserved. See `LICENSE`.
 
 ---
 
-**Technical documentation (SP0 to the pilot: state directory, arches, harness, passkeys, Windows service, drivers, demo, recovery):** see `docs/technical/technical-readme.md`. **Running a governed process on a node:** `docs/technical/runbooks/`.
+**Documentation** is filed by axis under `docs/` (technical, functional, users public; strategy, marketing, commercial, research private): the map and the filing rule are in `docs/README.md`. **Technical documentation (SP0 to the pilot: state directory, arches, harness, passkeys, Windows service, drivers and their packaging with `vk-capital`, demo, recovery):** see `docs/technical/technical-readme.md`. **Running a governed process on a node:** `docs/technical/runbooks/`.

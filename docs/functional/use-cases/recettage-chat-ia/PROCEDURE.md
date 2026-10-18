@@ -7,6 +7,12 @@ point de validation humaine. Les outils cités sont dans ce dépôt (`scripts/re
 `docs/functional/use-cases/recettage-chat-ia/`). La compétence agent correspondante est
 `.claude/skills/recettage-chat-ia/SKILL.md`.
 
+La seconde recette (« MaskAI en profondeur », grille M0–M7, 94 cas depuis le 18/10 : masquage par
+document et par canal, pièces jointes à puce observée, les quatorze modèles du sélecteur, recherche
+web off contre auto, conversation longue, charge concurrente, transparence) est décrite par son delta
+`PROCEDURE-2.md`, livré avec le pilote v2 (branche `maskai-driver-v2` jusqu'à son merge). Le contrat
+de masquage que le juge applique y sera écrit avant la prochaine exécution (décision ouverte D-17).
+
 ## 1. Pourquoi ce cas d'usage démontre la valeur d'Aubier
 
 Une recette de chat IA est longue, répétitive et doit être refaite à chaque version. Elle

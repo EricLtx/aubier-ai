@@ -1,4 +1,4 @@
-draft: # 2026-10-17-maskai-benchmark.md
+# 2026-10-17-maskai-benchmark.md
 
 **Recette fonctionnelle et benchmark — MaskAI (app.maskai.fr, entrée https://app.maskai.fr/new)**
 Version évaluée : production au 17/10/2026. Référentiel : PROCEDURE.md (sept étapes, grille N0–N9, barème §7). Ce document est **nouveau** ; il ne modifie pas `2026-10-13-maskai-benchmark.md`, qui reste intact et sert de base au delta présenté ici.
