@@ -24,6 +24,7 @@
 - Every refusal is one line in the kernel's voice ending in `remedy: …` (R28); the generated driver's own refusal reasons are the protocol's five words.
 - Generated files are byte-reproducible: the generator writes with `\n` line endings, sorted keys, no timestamps; the manifest's `files_sha256` is `hash_dir` of the output directory (R5).
 - **L-P5 (the debrief, founder decision 2026-10-17, Task 11):** `vkforge debrief` is a stage like the others (deterministic, stdlib only, no model, no socket) whose requirements are `docs/technical/debriefs/2026-10-17-maskai-driver.md` §4; `driver.debrief` is a machine act (no presence proof) run under the same governor as `learn`'s stages; it adds **no ledger kind** — the optional kernel-written row `driver.debriefed {run_task_ids, debrief_sha256, proposals_sha256}` is an open founder decision — and it **applies nothing**: its proposals are the operator's to apply, or, for a learned driver, the deliberate run's (L-P3).
+- **L-P6 (the generated driver vendors `vkdriver`, controller ruling):** the generator writes into the generated driver's directory `vendor/vkdriver/` — a byte copy of `drivers/vkdriver/*.py` (the `vkdriver` vkforge itself imported), without `test_*.py` or `__pycache__` — and a `pack.json` `{"vendor": ["drivers/vkdriver"]}`, the shape the packaging chantier reads. The generated `driver.py` resolves `vkdriver` vendor-first (`DRIVER_DIR/vendor/vkdriver`), then the repository layout (`<repo>/drivers/vkdriver`, the driver at `drivers/office-com/<name>/`, spec §3.2), exactly like `drivers/maskai-recette/driver.py` on `maskai-driver-v2`; it never looks one directory up. `vendor/` is inside the driver directory, so it is in `hash_dir`'s fingerprint (`files_sha256`, hence `driver_id`): the protocol module the driver speaks is a calibration input, as it is in the MaskAI driver's `inputs_sha256`. Whatever spawns a generated driver (Task 7's test, Task 8's qualification, the kernel's mount, CI, the node) runs it from its own directory, with no repository around it.
 - Model tiering (founder rule): Sonnet for Tasks 0, 1, 2, 3, 5, 10; Opus for Tasks 4, 6, 7, 8, 9, 11; Task 12 is the controller's and the founder's, on the node; Fable for the final whole-branch review. One fresh reviewer per task before the next starts.
 - Commits: conventional prefix, one sentence of intent, trailers `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_01UUDLpkwxsZXmLptqCeNL2R`.
 
@@ -627,12 +628,13 @@ class Application:
     def quit(self): ...                                               # only if this driver started the instance
 
 # generate.py — generate(plan: dict, binding: dict, vault: dict, out: Path, name: str) -> None
+#   writes out/vendor/vkdriver/ (copied from Path(vkdriver.protocol.__file__).parent, *.py but test_*.py) and out/pack.json (L-P6)
 # CLI: vkforge generate --plan FILE --binding FILE --vault FILE --out DIR --name NAME   (add_arguments/run of this module, read by __main__.STAGES; nothing registered at import; Task 9 calls it with these flags)
 
 # runtime/fake.py — FakeApplication(binding): the same verbs implemented on OOXML with ooxml.py's writer twin (`ooxml.write_part`): apply_paragraph_style writes w:pStyle, set_font_run rewrites w:rFonts/w:sz on the body runs, set_footer writes footer1.xml, export writes a 1 200-byte "%PDF-1.4 fake" file; verify_* re-read through mine.mine_file.
 ```
 
-Generated driver layout (`<out>/driver.py`, `<out>/vkcom.py`, `<out>/binding.json`, `<out>/manifest.json`, `<out>/secrets.json` with private ACL on the node — written by the generator from the vault, never in the package of a later `vk driver pack`… it is a driver file and therefore hashed; the spec §5.5 accepts clear values in the driver on the node):
+Generated driver layout (`<out>/driver.py`, `<out>/vkcom.py`, `<out>/binding.json`, `<out>/manifest.json`, `<out>/pack.json` = `{"vendor": ["drivers/vkdriver"]}`, `<out>/vendor/vkdriver/{__init__,hash_dir,protocol}.py` — byte copies, no test, no `__pycache__`, inside the fingerprint (L-P6) —, `<out>/secrets.json` with private ACL on the node — written by the generator from the vault, never in the package of a later `vk driver pack`… it is a driver file and therefore hashed; the spec §5.5 accepts clear values in the driver on the node):
 
 ```python
 # driver.py (template, rendered with the plan)
@@ -640,7 +642,24 @@ Generated driver layout (`<out>/driver.py`, `<out>/vkcom.py`, `<out>/binding.jso
 import json, os, sys, hashlib
 from pathlib import Path
 DRIVER_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(DRIVER_DIR.parent))           # drivers/ — for vkdriver
+# vkdriver vendor-first (L-P6): the generator copied drivers/vkdriver into vendor/, so the driver
+# runs alone wherever it was written (dist\…, a temp dir, an install root); the repository layout
+# (<repo>/drivers/vkdriver, the driver at drivers/office-com/<name>/) only without vendor/ — as
+# drivers/maskai-recette/driver.py does. Never one directory up.
+VENDOR_DIR = DRIVER_DIR / "vendor"
+
+
+def _first_dir(candidates: tuple, needs: tuple) -> Path:
+    """The first directory holding every file of `needs`; else the last (the repository), so the
+    import error names the development path."""
+    for d in candidates:
+        if all((d / n).is_file() for n in needs):
+            return d
+    return candidates[-1]
+
+
+VKDRIVER_DIR = _first_dir((VENDOR_DIR / "vkdriver", DRIVER_DIR.parents[1] / "vkdriver"), ("protocol.py", "hash_dir.py"))
+sys.path.insert(0, str(VKDRIVER_DIR.parent))
 sys.path.insert(0, str(DRIVER_DIR))
 from vkdriver.protocol import DriverRefusal, serve     # noqa: E402
 from vkcom import Application                          # noqa: E402
@@ -701,10 +720,27 @@ class GenerateTest(unittest.TestCase):
         a, b = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
         generate.generate(self.plan, self.binding, self.vault, a, name="word-maison")
         generate.generate(self.plan, self.binding, self.vault, b, name="word-maison")
-        for f in ("driver.py", "vkcom.py", "binding.json", "manifest.json", "secrets.json"):
+        for f in ("driver.py", "vkcom.py", "binding.json", "manifest.json", "secrets.json", "pack.json",
+                  "vendor/vkdriver/__init__.py", "vendor/vkdriver/hash_dir.py", "vendor/vkdriver/protocol.py"):
             self.assertEqual((a / f).read_bytes(), (b / f).read_bytes(), f)
         m = json.loads((a / "manifest.json").read_text())
         self.assertEqual(m["program"]["files_sha256"], hash_dir(str(a)))
+        self.assertIn("vendor/vkdriver/protocol.py", [rel for rel, _ in list_files(str(a))])   # in the fingerprint (L-P6)
+
+    def test_the_generated_driver_imports_vkdriver_from_its_own_vendor(self):
+        drivers = Path(__file__).resolve().parents[2]
+        out = Path(tempfile.mkdtemp()) / "word-maison"        # a temp dir: no repository around it
+        generate.generate(self.plan, self.binding, self.vault, out, name="word-maison")
+        self.assertEqual(json.loads((out / "pack.json").read_text()), {"vendor": ["drivers/vkdriver"]})
+        for f in ("__init__.py", "hash_dir.py", "protocol.py"):
+            self.assertEqual((out / "vendor/vkdriver" / f).read_bytes(), (drivers / "vkdriver" / f).read_bytes(), f)
+        self.assertFalse((out / "vendor/vkdriver/test_protocol.py").exists())
+        self.assertFalse((out / "vendor/vkdriver/__pycache__").exists())
+        probe = "import runpy, sys; runpy.run_path(sys.argv[1], run_name='probe'); print(sys.modules['vkdriver.protocol'].__file__)"
+        got = subprocess.run([sys.executable, "-I", "-c", probe, str(out / "driver.py")], cwd=tempfile.gettempdir(),
+                             env={**os.environ, "VKFORGE_FAKE": "1"}, capture_output=True, text=True)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(Path(got.stdout.strip()).resolve().parent, (out / "vendor" / "vkdriver").resolve())
 
     def test_no_localised_name_and_no_corpus_text_in_the_driver(self):
         out = Path(tempfile.mkdtemp())
@@ -739,7 +775,7 @@ class GenerateTest(unittest.TestCase):
 
 `test_runtime.py`: `the_fake_and_the_adapter_share_one_verb_table` (every bound verb of the fixture binding has an implementation in both `Application` and `FakeApplication`; a verb missing in either fails the test), and, `skipUnless(office_present("word"))`, `the_adapter_applies_the_house_style_on_the_real_word` (runs on the node only).
 
-- [ ] **Step 2–4:** implement (`generate.py` renders the template, writes `vkcom.py` as a copy of `runtime/com.py` with `runtime/fake.py` appended under `if fake:` import, writes `binding.json`, `secrets.json` from the vault entries the plan references, then `manifest.json`), green, commit `feat(vkforge): COM runtime with its fake twin, and the generator — a protocol-1 driver from a plan`
+- [ ] **Step 2–4:** implement (`generate.py` renders the template, writes `vkcom.py` as a copy of `runtime/com.py` with `runtime/fake.py` appended under `if fake:` import, writes `binding.json`, `secrets.json` from the vault entries the plan references, copies the `*.py` of `Path(vkdriver.protocol.__file__).parent` except `test_*.py` into `vendor/vkdriver/` (sorted, bytes unchanged) and writes `pack.json` `{"vendor": ["drivers/vkdriver"]}` (sorted keys, `\n`) — L-P6 —, then `manifest.json` last, its `files_sha256` covering `vendor/`; the test module imports `list_files` beside `hash_dir` from `vkdriver.hash_dir`), green, commit `feat(vkforge): COM runtime with its fake twin, and the generator — a protocol-1 driver from a plan`
 
 ---
 
@@ -752,12 +788,12 @@ class GenerateTest(unittest.TestCase):
 
 ```python
 def qualify(driver_dir: Path, corpus: Path, invariants: dict, work: Path, fake: bool, deadline_s: float = 120.0) -> dict
-# refuses when sha256 of the corpus != invariants["corpus"]["content_sha256"]; copies each file to work/<i>/<name>; runs the driver once per copy (one process for the whole run, protocol 1 over stdio, the same lines the kernel sends); re-mines each output with mine.mine_file and checks every id of plan["post"] holds; records per pass {file_sha256, duration_ms, post: {...}, ok, reason}
+# refuses when sha256 of the corpus != invariants["corpus"]["content_sha256"]; refuses a driver directory without vendor/vkdriver/protocol.py before any copy (Refusal "driver <dir> does not vendor vkdriver", remedy "generate it again: the generator vendors vkdriver (L-P6)"); copies each file to work/<i>/<name>; runs the driver once per copy (one process for the whole run, `python -I <driver_dir>/driver.py` with cwd = work, never the repository: vkdriver comes from the driver's own vendor/, L-P6; protocol 1 over stdio, the same lines the kernel sends); re-mines each output with mine.mine_file and checks every id of plan["post"] holds; records per pass {file_sha256, duration_ms, post: {...}, ok, reason}
 # → {"driver_id", "plan_sha256", "passes", "failures", "rate", "runs": [...]} ; written as qualification.json
 # CLI: vkforge qualify --driver DIR --corpus DIR --invariants FILE --work DIR [--fake]   (add_arguments/run of this module, read by __main__.STAGES; nothing registered at import)
 ```
 
-- [ ] **Step 1: Failing tests** — `ten_copies_pass_against_the_fake` (10/10, `rate == 1.0`, every `runs[i].post` all true, durations present), `a_locked_copy_is_a_failed_pass_not_a_hang` (make one copy read-only / `~$` lock marker the fake honours → that pass `ok False, reason "precondition"`, run completes under the deadline, 9/10), `a_changed_corpus_is_refused_before_any_copy` (append a file → `Refusal` "corpus changed", `work` empty), `the_record_is_reproducible_but_for_durations`.
+- [ ] **Step 1: Failing tests** — `ten_copies_pass_against_the_fake` (10/10, `rate == 1.0`, every `runs[i].post` all true, durations present), `a_locked_copy_is_a_failed_pass_not_a_hang` (make one copy read-only / `~$` lock marker the fake honours → that pass `ok False, reason "precondition"`, run completes under the deadline, 9/10), `a_changed_corpus_is_refused_before_any_copy` (append a file → `Refusal` "corpus changed", `work` empty), `a_driver_without_its_vendor_is_refused_before_any_copy` (the generated directory copied to a temp dir without `vendor/` → `Refusal` "does not vendor vkdriver", `work` empty), `the_record_is_reproducible_but_for_durations`. The driver under test is generated into a temp dir (Task 7), so every pass also proves it runs with no repository around it.
 - [ ] **Step 2–4:** implement, green, commit `feat(vkforge): qualification — replay on copies, postconditions re-mined, a record the mount checks`
 
 ---
@@ -892,6 +928,8 @@ fn an_ambiguity_with_a_mock_arch_is_resolved_and_traced() {
         run: python -I -m unittest discover -s drivers/vkforge/tests -t .
       - name: vkforge runs as the kernel spawns it (the script path under -I, never -m)
         run: python -I drivers/vkforge/__main__.py --help
+      - name: A generated driver runs alone, vkdriver from its own vendor/ (L-P6)
+        run: python -I -m unittest discover -s drivers/vkforge/tests -t . -p test_generate.py -k vendor
       - name: Build
         run: cargo build --locked -p vk-cli -p vkd -p vk-mcp
       - name: learn → qualify → mount through the daemon
@@ -2120,6 +2158,7 @@ Attendu : `debrief: N proposals -> …`, une ligne par proposition (genre, cible
 - [ ] `drivers\vkforge\setup.ps1` on the node (uv CPython, `lxml`, `comtypes`); `python -I -m unittest discover -s drivers/vkforge/tests -t .` green including the `office_present` tests (real Word, real PowerPoint).
 - [ ] Record the two catalogues (Task 3 step 5) if not yet committed; commit.
 - [ ] A corpus of 10 Word contracts (the spike's `make_fixtures.py` on the node, or real anonymised firm documents in a private folder): `vk driver learn --family office-document --app word --corpus … --out dist\word-maison`; `vk driver plan show dist\word-maison` read and approved; `vk driver qualify --driver dist\word-maison\driver --corpus …` → 10/10, zero tokens (`vk dmesg` shows no `infer` between `driver.learned` and `driver.qualified`), under 15 s per document; `vk mount driver --manifest dist\word-maison\driver\manifest.json` → `driver.mounted` with `kind: com`.
+- [ ] The learned driver runs alone (L-P6): `dist\word-maison\driver\vendor\vkdriver\protocol.py` is there, byte-identical to `drivers\vkdriver\protocol.py`, and `dist\word-maison\driver\pack.json` reads `{"vendor": ["drivers/vkdriver"]}`; the qualification and the mount above spawned `driver.py` from `dist\…`, with no repository around it.
 - [ ] A corpus of 10 presentations: the same commands with `--app powerpoint --out dist\ppt-maison`; `git diff --stat` shows no file changed outside `drivers/vkforge/ontology/office-document.json` since the Word run; qualification ≥ 9/10.
 - [ ] A fictitious document carrying personal data added to a copy of the corpus: `learn` again into `dist\purge-check`; `findstr /s` of each personal string over `dist\purge-check` finds it only under `driver\secrets.json` if it was a footer, nowhere otherwise.
 - [ ] CI green on every job, `driver-learn` included; TCB updated; the chantier's SDD ledger closed; plan archived under `docs/archive/technical/plans/` at the merge (filing rule).
@@ -2131,7 +2170,7 @@ Attendu : `debrief: N proposals -> …`, une ligne par proposition (genre, cible
 - Spec coverage: §3.2 components → Tasks 0, 3–9; §4.1 catalogue → 3; §4.2 ontology → 4; §4.3 binding → 4; §4.4 invariants + purge → 5; §4.5 plan → 2 (contract), 6 (producer); §4.6 generated driver → 7; §4.7 qualification → 8; §4.8 ledger → 2, 9; §4.9 contract additions → 1, 2; §4.10 CLI → 9, 10; §5.1–5.2 flows → 9; §5.3 fallback → 10 (L-P3, reduced); §5.4 PowerPoint → 4, 12; §5.5 boundaries → 5, 7, 9; §6 failure modes → 5 (corpus too small, mixed, skipped), 6 (unbound, ambiguity, bad answer), 7/8 (read-only, postconditions), 8 (corpus changed), 9 (stage failure); §7 tests → every task; §8 → 12; §11 → 10.
 - Founder decision 2026-10-17, not in the spec (the debrief stage) → Task 11, from the 17/10 debrief §4 and the defects of its §2/§3: D1, D2, D5, D8, D11 and the maintenance page become proposals; D4, D6, D7, D9, D10, D12, D13 and S15–S17 signals; S14 (the judge's claims against the journal, D3) is out — the judge's text is in the register, not in clear on the node. Open founder decision: the optional `driver.debriefed` ledger row (default: none, L-P5). Fixture outcome: three of the four manual loops of 17/10 answered before their relaunch, one left.
 - Open items of spec §10 settled: verb list v1 (Task 4, 32 verbs); `comtypes` pinned in `requirements.txt`, type library located through the registry (Task 3); threshold default 0.8, one value for every kind, `--threshold` on the CLI (Task 5); no COM server in CI — the fake adapter (L-P1, Task 7); `vk driver plan show` format (Task 9).
-- Plan rulings: **L-P1** fake application behind the one adapter; **L-P2** `learn` is a governed one-shot process, not a protocol-1 driver; **L-P3** the deliberate fallback is a proposal from the catalogue through a Draft step, no live application driving in this chantier; **L-P4** a `kind: com` driver mounts only with a `driver.qualified` record meeting the plan's thresholds; **L-P5** the debrief is a machine act, writes no ledger row and applies nothing.
+- Plan rulings: **L-P1** fake application behind the one adapter; **L-P2** `learn` is a governed one-shot process, not a protocol-1 driver; **L-P3** the deliberate fallback is a proposal from the catalogue through a Draft step, no live application driving in this chantier; **L-P4** a `kind: com` driver mounts only with a `driver.qualified` record meeting the plan's thresholds; **L-P5** the debrief is a machine act, writes no ledger row and applies nothing; **L-P6** (controller ruling) the generated driver vendors `vkdriver` (`vendor/vkdriver/`, `pack.json`) and resolves it vendor-first, then the repository layout, never one directory up — Tasks 7 (template, generator, tests), 8 (a driver without its vendor refused; spawned from its own directory), 10 (CI step), 12 (checked on the node).
 - Invocation and stage table, corrected while writing Task 11 (both defects reproduced on CPython 3.13): `python -I -m vkforge` does not find the package (`-I` implies `-P`), so every invocation is `python -I drivers/vkforge/__main__.py <stage>` with `drivers/` put on `sys.path` by `__main__.py` and, for the suite, by `tests/__init__.py` (Tasks 0, 3, 9, 10, 11); stages registering through `from .__main__ import STAGES` filled a second copy of `__main__`, so `STAGES` is now built in `__main__.py` by explicit imports and a stage module only defines `add_arguments` and `run` (Tasks 0, 3–8, 11).
 - Type consistency: `Refusal` (0) used everywhere; `catalogue_from_fixture`/`catalogue_sha256` (3) in 4, 9; `bind` output shape (4) consumed by 6, 7 (`binding.json` copied), 9; `mine_file`/`mine_corpus`/vault (5) in 6, 7, 8; `build`/`write_plan` (6) in 7, 9; `generate` (7) in 8, 9; `qualify` (8) in 9; `DriverPlan`/`DriverLearned`/`DriverQualified` (2) in 9; `DriverKind::Com`/`applications` (1) in 7's manifest and 9's gate; `Refusal` and `STAGES` (0), `ForgeConfig`/`run_stage` (9) in 11.
 - Spec statements that differ from the code, left for the founder (not changed here): (a) "the pipeline is itself run as a driver of the kernel (protocol 1, Job Object)" — protocol 1 is request/response with evidence directories; the plan runs the stages as a governed one-shot process (L-P2); (b) "no network" for governed processes — a Job Object does not block sockets on Windows; the plan pins "no socket in the package" by a test instead; (c) §5.3 "the COM calls are traced" in the deliberate run — deferred (L-P3); (d) §4.6 says `kind: com` driver's `hosts: []` — today's validator refuses empty hosts, hence Task 1's per-kind rule; (e) §3.2 names `vk driver learn --deliberate <verb>` as a human act producing "a proposed projection rule reviewed by a human before it is versioned" — the plan writes the proposal file only; versioning into the ontology stays a manual edit + commit; (f) the spec has no debrief stage — it comes from the founder's decision of 2026-10-17 (`docs/technical/debriefs/2026-10-17-maskai-driver.md` §4), and §3.2's components and §4.10's CLI table should name `debrief` and `vk driver debrief` at the spec's next revision.
