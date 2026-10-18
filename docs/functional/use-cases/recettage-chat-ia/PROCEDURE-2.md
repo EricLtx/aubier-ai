@@ -15,7 +15,7 @@ pour cette recette, la grille N0–N9 par la grille M0–M7. Il dit aussi ce que
 | `corpus-v3/oracles-v3.json` | 12 oracles (`V3-J1` à `V3-J6` en pièce jointe, `V3-C1` à `V3-C6` collés), format de `oracles-v2.json` |
 | `corpus-v3/gen-corpus-v3.py` | générateur déterministe, qui vérifie IBAN, NIR, plaques et oracles avant d'écrire |
 | `corpus/oracles.json` | oracles du corpus v1, repris tels quels par M2 (`DOC-01` à `DOC-10`) |
-| `drivers/maskai-recette/cases.json` | les 61 cas M0–M7, fusionnés par le pilote v2 avec les cas N0–N9 (ils venaient de `cases-2.json`, retiré à la fusion) |
+| `drivers/maskai-recette/cases.json` | les 94 cas M0–M7 (61 jusqu'au 18/10, M3 étendu aux quatorze modèles), fusionnés par le pilote v2 avec les cas N0–N9 (ils venaient de `cases-2.json`, retiré à la fusion) |
 | `recipes/recette-maskai-2.json` | la recette gouvernée : plan, huit niveaux de harnais, juge, signature, rédaction, signature, publication |
 | `docs/technical/debriefs/2026-10-17-maskai-driver.md` | le débriefing du pilote, dont les réserves motivent cette recette |
 | `2026-10-17-maskai-benchmark.md`, `2026-10-13-maskai-benchmark.md` | les deux bases du delta (§6) |
@@ -82,7 +82,7 @@ N7 (historique) n'est pas repris : il attend un compte de test dédié, qui est 
 | M6 Charge concurrente | Deux traitements courts qui passent seuls passent-ils ensemble ? | M6-1 = M4-O1 + M4-O2 ; M6-2 = M4-O3 + M4-O4 | 15 s | disponibilité, scalabilité |
 | M7 Conformité et identité | L'assistant dit-il qui il est, ce qu'on peut choisir, où vont les données ? | M7-1 (proche de N5-1), M7-2 (même question que N9-3), M7-3 (hébergement) | 10 s | conformité |
 
-61 cas, 59 conversations créées (M6 ouvre deux onglets par paire).
+94 cas, 92 conversations créées (M6 ouvre deux onglets par paire) ; 61 et 59 avant l'extension de M3 aux quatorze modèles, le 18/10.
 
 ## 4. Détail par niveau
 

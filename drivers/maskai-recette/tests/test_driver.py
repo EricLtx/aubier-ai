@@ -93,9 +93,10 @@ class CasesTest(unittest.TestCase):
                                  f"{c['id']} replays {first['id']} with the same entry")
         for n in range(10):
             self.assertGreaterEqual(len(levels.get(f"N{n}", [])), 2, f"N{n}")
-        for n in range(8):  # PROCEDURE-2 §3: 61 cases, M5 has one
+        for n in range(8):  # PROCEDURE-2 §3: 94 cases since 18/10 (M3 on every model), M5 has one
             self.assertGreaterEqual(len(levels.get(f"M{n}", [])), 1, f"M{n}")
-        self.assertEqual(sum(len(v) for k, v in levels.items() if k.startswith("M")), 61)
+        self.assertEqual(sum(len(v) for k, v in levels.items() if k.startswith("M")), 94)
+        self.assertEqual(len(levels["M3"]), 42, "3 questions × 14 models (18/10)")
         self.assertEqual(len([c for c in levels["M1"] if c.get("replay_of")]), 12)
         oracle_m = {c["oracle"] for c in cases.values() if c.get("oracle") and c["level"].startswith("M")}
         self.assertEqual(oracle_m, {f"V3-{x}{n}" for x in "JC" for n in range(1, 7)} | {f"DOC-{n:02d}" for n in range(1, 11)})
