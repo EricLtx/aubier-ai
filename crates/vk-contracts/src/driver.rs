@@ -242,8 +242,9 @@ impl DriverManifest {
 
     /// Every refusal names its remedy. Checked in this order: name, command,
     /// `files_sha256`, the memory cap's floor, the service context's headless
-    /// requirement, hosts or applications (by kind), actions (count, duplicates, names,
-    /// `args`, evidence), the interval ceiling, and last the credential-shaped keys.
+    /// requirement, hosts or applications (by kind), actions (count, duplicates,
+    /// names, `args`, evidence), the interval ceiling, and last the
+    /// credential-shaped keys.
     pub fn validate(&self) -> Result<(), DriverError> {
         if !is_driver_name(&self.name) {
             return invalid(format!(

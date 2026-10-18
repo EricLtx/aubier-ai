@@ -109,14 +109,18 @@ fn bad_reference(v: &Value) -> Option<&str> {
 }
 
 impl DriverPlan {
-    /// Refusals, in this order, each naming its field and its remedy: family and app plain tokens;
-    /// the three hashes `sha256:` + 64 lower-case hex; `actions is empty`; per action: name 1..32 of
-    /// a-z and `_`, unique; steps non-empty and the first step's verb `open`; every verb 1..40 of a-z
-    /// and `_`; every args key 1..32 of a-z, 0-9 and `_`, starting with a letter; every string arg
-    /// starting with `$` is `$arg.<key>` or `$secret.<id>` (key/id as an args key); every `post` entry
-    /// 1..40 of a-z, 0-9 and `_`, and as many entries as `verify_*` steps; every ambiguity's
-    /// `resolved_by` is `purged`, `human` or `arch:<non-empty>`, with `value` present exactly when it
-    /// is not `purged`; `min_passes ≥ 1`; `0 ≤ min_rate ≤ 1`.
+    /// Refusals, in this order, each naming its field and its remedy: `family` and `app` each 1..32
+    /// of a-z, 0-9 and `-` (the driver-name rule, `is_driver_name`: no upper case, no `_`); the three
+    /// hashes `sha256:` + 64 lower-case hex; `actions is empty`; then per action, in action order:
+    /// name 1..32 of a-z and `_`, unique; steps non-empty and the first step's verb `open`; then per
+    /// step, in step order, and for each step in this order: its verb 1..40 of a-z and `_`; its args
+    /// keys 1..32 of a-z, 0-9 and `_`, starting with a letter; its references, that is every string
+    /// starting with `$`, at any depth of an args value (nested objects and arrays too), is
+    /// `$arg.<key>` or `$secret.<id>` (key/id as an args key); then, once the action's steps are
+    /// done, every `post` entry 1..40 of a-z, 0-9 and `_` (first the format of each entry, then the
+    /// count: as many entries as `verify_*` steps); then per ambiguity, in order: `resolved_by` is
+    /// `purged`, `human` or `arch:<non-empty>`, then `value` present exactly when it is not
+    /// `purged`; then `min_passes ≥ 1`; then `0 ≤ min_rate ≤ 1`.
     pub fn validate(&self) -> Result<(), String> {
         for (field, value) in [("family", &self.family), ("app", &self.app)] {
             if !is_driver_name(value) {
@@ -329,6 +333,22 @@ mod tests {
         );
         refuse(&|p| p.qualification.min_rate = 1.5, "min_rate");
         refuse(&|p| p.qualification.min_passes = 0, "min_passes");
+        // The driver-name rule on app (and family): no upper case.
+        refuse(
+            &|p| p.app = "Word".into(),
+            "app `Word` must be 1 to 32 characters of a-z, 0-9 and `-`",
+        );
+        // A reference is checked at any depth of an args value, not only at the top.
+        refuse(
+            &|p| {
+                p.actions[0].steps[2].args["font"]["name"] = json!("$env.X");
+            },
+            "reference `$env.X` is neither `$arg.<key>` nor `$secret.<id>`",
+        );
+        refuse(
+            &|p| p.actions[0].post[0] = "Body-Font".into(),
+            "post entry `Body-Font` must be 1 to 40 characters of a-z, 0-9 and `_`",
+        );
     }
 
     #[test]
@@ -360,6 +380,7 @@ mod tests {
         let garamond = json!({"name": "Garamond", "size": 11});
         assert!(with("purged", None).is_ok());
         assert!(with("arch:sha256:abc", Some(garamond.clone())).is_ok());
+        assert!(with("human", Some(garamond.clone())).is_ok());
         assert!(with("purged", Some(garamond.clone()))
             .unwrap_err()
             .contains("value"));
