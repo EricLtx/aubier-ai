@@ -757,25 +757,29 @@ A human reads the proposal and versions a rule into `office-document.json`.
 
 **The debrief stage.** After a governed run, `vk driver debrief --run DIR --out DIR
 [--until TASK]` runs vkforge's seventh stage (founder decision 2026-10-17; requirements in
-[`debriefs/2026-10-17-maskai-driver.md`](debriefs/2026-10-17-maskai-driver.md) §4) on a run
-directory the operator assembles from what the node holds in clear: `journal.jsonl` and
-`tasks/<id>.json` (`vk task show --json`) are required; journals set aside
+[`debriefs/2026-10-17-maskai-driver.md`](debriefs/2026-10-17-maskai-driver.md) §4) on a
+run directory the operator assembles from what the node holds in clear: `journal.jsonl`
+and `tasks/<id>.json` (`vk task show --json`) are required; journals set aside
 (`journal-*.jsonl`), `driver.log`, the daemon's console (`vkd-console.log`, its harness
-notes), `vk dmesg --json`, `cases.json` and `manifest.json` are read when present. It writes
-three files into a new directory outside the run: `debrief.json` (the signals: per case,
-per task and per harness pass, refusals by reason, the defects of the 17/10 debrief),
-`proposals.json` and `debrief.md` (sections 1 to 3 of a debrief; 4 and 5 stay human). A
-proposal is the list form of the deliberate run's: `{kind, target, evidence, evidence_total,
-proposal, confidence, tasks, proposed_by: "debrief", human}`, `kind` one of `selector`,
-`modal`, `budget`, `oracle`, `recipe`, each with the lines (`file:line`) that support it;
-a suspect that needs a screen to be confirmed stays a signal, without a proposal. It is a
-machine act: no presence proof, no ledger row — the answer carries `debrief_sha256` and
-`proposals_sha256`, so whoever applies a proposal can name the evidence — and nothing is
-applied: selectors and modals mean a new `driver_id` and a signed remount, budgets and
-oracles a new `inputs_sha256`, a recipe change a reviewed commit. For a learned driver
-(`manifest.json` with `kind: com`) the selector and modal proposals name
-`vk driver learn --deliberate VERB` instead: a learned driver's code is never edited by
-hand. The operator's procedure is [`runbooks/recette-maskai.md`](runbooks/recette-maskai.md) §16.
+notes), `vk dmesg --json`, `cases.json` and `manifest.json` are read when present. It
+writes three files into a new directory outside the run and outside any driver:
+`debrief.json` (the signals: per case, per task and per harness pass, refusals by reason,
+the defects of the 17/10 debrief), `proposals.json` and `debrief.md` (sections 1 to 3 of a
+debrief; 4 and 5 stay human). A proposal is the list form of the deliberate run's: `{kind,
+target, evidence, evidence_total, proposal, confidence, tasks, proposed_by: "debrief",
+human}`, `kind` one of `selector`, `modal`, `budget`, `oracle`, `recipe`, each with the
+lines (`file:line`) that support it, cut before any answer, sent text or document content
+(ruling L-P57); a suspect that needs a screen to be confirmed stays a signal, without a
+proposal. The console, `driver.log`, the journal and `vk dmesg` are read only inside the
+run's window (first task created to last task ended, plus a minute), and a malformed input
+is one refusal line naming the file and the field. It is a machine act: no presence proof,
+no ledger row — the answer carries `debrief_sha256` and `proposals_sha256`, so whoever
+applies a proposal can name the evidence — and nothing is applied: selectors and modals
+mean a new `driver_id` and a signed remount, budgets and oracles a new `inputs_sha256`, a
+recipe change a reviewed commit. For a learned driver (`manifest.json` with `kind: com`)
+the selector and modal proposals name `vk driver learn --deliberate VERB` instead: a
+learned driver's code is never edited by hand. The operator's procedure is
+[`runbooks/recette-maskai.md`](runbooks/recette-maskai.md) §16.
 
 What the kernel enforces and what it trusts is in
 [`contracts/tcb.md`](../../contracts/tcb.md), §Drivers.

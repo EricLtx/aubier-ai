@@ -1030,14 +1030,16 @@ struct DebriefParams {
 
 /// `driver.debrief {run, out, until?}` (founder decision 2026-10-17): vkforge's `debrief` stage
 /// on a run directory the operator assembled, under the same governor as `learn`'s stages, its
-/// logs under `<state_dir>/forge/debrief/`. A machine act: no presence proof and no ledger row
-/// (ruling L-P5) — the answer carries the hashes of `debrief.json` and `proposals.json`, so
-/// whoever applies a proposal can name the evidence that motivated it. Nothing is applied.
+/// logs under `<state_dir>/forge/debrief/<run name>/`. A machine act: no presence proof and no
+/// ledger row (ruling L-P5) — the answer carries the hashes of `debrief.json` and
+/// `proposals.json`, so whoever applies a proposal can name the evidence that motivated it.
+/// Nothing is applied.
 ///
 /// Refused before spawning, in the kernel's voice, what the stage would refuse: a relative path
 /// (the stage runs in the vkforge root, not in the daemon's working directory), a run without
-/// `journal.jsonl`, an `out` that is a file, is not empty or lies inside the run directory; and
-/// a debrief while another one runs.
+/// `journal.jsonl`, an `out` that is a file, is not empty, lies inside the run directory or inside
+/// a driver's directory (its files are the driver's identity); and a second debrief of a run of
+/// the same name while one runs.
 pub fn debrief(cfg: &ForgeConfig, state_dir: &Path, p: Value) -> Result<Value, RpcError> {
     let DebriefParams { run, out, until } = serde_json::from_value(p).map_err(|e| {
         bad(&format!(
@@ -1080,15 +1082,26 @@ pub fn debrief(cfg: &ForgeConfig, state_dir: &Path, p: Value) -> Result<Value, R
             out.display()
         )));
     }
-    // One debrief at a time (L-P55's lock, under the name of its log directory): two would
-    // write the same stage logs, and a `learn` of a driver named `debrief` would clear them.
-    let _claim = Claim::take(state_dir, "debrief", "debrief")?;
+    // Three new files in a driver's directory would change its `files_sha256`: the next spawn of
+    // a mounted driver would be refused, and the TCB says the debrief never writes into a driver.
+    if driver_above(&out, state_dir).is_some() {
+        return Err(bad(&format!(
+            "out {} is inside a driver; remedy: an output directory of its own",
+            out.display()
+        )));
+    }
+    // One debrief per run name at a time (L-P55's lock): two would write the same stage logs. The
+    // key holds a `/`, which no driver name does, so it never meets a `learn` or a `qualify`.
+    let run_name = run
+        .file_name()
+        .map_or_else(|| "run".to_string(), |n| n.to_string_lossy().into_owned());
+    let _claim = Claim::take(state_dir, &format!("debrief/{run_name}"), "debrief")?;
     let mut args = vec!["--run".into(), arg(&run), "--out".into(), arg(&out)];
     if let Some(task) = until {
         // One argument, so a value that starts with `-` is still the value.
         args.push(format!("--until={task}"));
     }
-    let logs = state_dir.join("forge").join("debrief");
+    let logs = state_dir.join("forge").join("debrief").join(&run_name);
     run_stage(cfg, "debrief", &args, &logs, DEBRIEF_DEADLINE)?;
     let signals = read_output(&out.join("debrief.json"), "debrief", "debrief.json")?;
     let proposals = read_output(&out.join("proposals.json"), "debrief", "proposals.json")?;
@@ -1115,6 +1128,24 @@ pub fn debrief(cfg: &ForgeConfig, state_dir: &Path, p: Value) -> Result<Value, R
         "debrief_sha256": hash_bytes(&signals),
         "proposals_sha256": hash_bytes(&proposals),
     }))
+}
+
+/// The driver directory `out` would land in: `out` itself or an ancestor holding a `driver.py` or
+/// a `manifest.json`, looked for on canonical paths up to the state directory (excluded).
+fn driver_above(out: &Path, state_dir: &Path) -> Option<PathBuf> {
+    let state = std::fs::canonicalize(state_dir).ok();
+    for dir in out
+        .ancestors()
+        .filter_map(|a| std::fs::canonicalize(a).ok())
+    {
+        if state.as_ref() == Some(&dir) {
+            break;
+        }
+        if dir.join("driver.py").is_file() || dir.join("manifest.json").is_file() {
+            return Some(dir);
+        }
+    }
+    None
 }
 
 /// A path as a stage argument. The paths came in as JSON strings, so they are UTF-8.
@@ -1345,29 +1376,69 @@ mod tests {
         drop((other_name, other_node));
     }
 
-    /// One debrief at a time per state directory, and not while a driver named `debrief` is being
-    /// learned: both would use `<state>/forge/debrief`. Refused before the stage is spawned.
+    /// One debrief per run name and state directory at a time, refused before the stage is
+    /// spawned; a `learn` of a driver named `debrief` holds another key, and another run name too.
     #[test]
-    fn a_debrief_waits_for_the_one_in_progress() {
+    fn a_debrief_waits_for_the_one_in_progress_on_its_run() {
         let t = tempfile::tempdir().unwrap();
         let (state, run) = (t.path().join("state"), t.path().join("run"));
         std::fs::create_dir_all(&run).unwrap();
         std::fs::write(run.join("journal.jsonl"), "").unwrap();
         let cfg = ForgeConfig::at(t.path().join("nowhere"));
         let params = json!({"run": run, "out": t.path().join("out")});
-        let held = Claim::take(&state, "debrief", "learn").unwrap();
+        let held = Claim::take(&state, "debrief/run", "debrief").unwrap();
         let e = debrief(&cfg, &state, params.clone()).unwrap_err();
         assert_eq!(
             e.message,
-            "learn of debrief already in progress; remedy: wait for it"
+            "debrief of debrief/run already in progress; remedy: wait for it"
         );
         assert!(!state.join("forge").exists(), "refused before a spawn");
         drop(held);
+        let others = (
+            Claim::take(&state, "debrief", "learn").unwrap(),
+            Claim::take(&state, "debrief/other-run", "debrief").unwrap(),
+        );
         let e = debrief(&cfg, &state, params).unwrap_err();
         assert!(
             e.message.starts_with("vkforge root not found"),
             "{}",
             e.message
+        );
+        drop(others);
+    }
+
+    /// An `out` in a driver's directory, or below one, is refused: three new files there would
+    /// change the driver's `files_sha256`. The search stops at the state directory.
+    #[test]
+    fn out_inside_a_driver_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let (state, run) = (t.path().join("state"), t.path().join("run"));
+        for d in [
+            &state,
+            &run,
+            &t.path().join("drivers").join("word-maison").join("sub"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(run.join("journal.jsonl"), "{}").unwrap();
+        let driver = t.path().join("drivers").join("word-maison");
+        std::fs::write(driver.join("driver.py"), "").unwrap();
+        std::fs::write(state.join("manifest.json"), "{}").unwrap();
+        let cfg = ForgeConfig::at(t.path().join("nowhere"));
+        for out in [driver.join("debrief"), driver.join("sub").join("debrief")] {
+            let e = debrief(&cfg, &state, json!({"run": run, "out": out})).unwrap_err();
+            assert_eq!(
+                e.message,
+                format!(
+                    "out {} is inside a driver; remedy: an output directory of its own",
+                    out.display()
+                )
+            );
+        }
+        assert_eq!(
+            driver_above(&state.join("debrief").join("out"), &state),
+            None,
+            "the state directory itself is not searched"
         );
     }
 

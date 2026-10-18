@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 DRIVERS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(DRIVERS))
@@ -28,6 +29,45 @@ def tree_sha(d: Path) -> str:
     for p in sorted(x for x in d.rglob("*") if x.is_file()):
         h.update(p.relative_to(d).as_posix().encode() + b"\0" + p.read_bytes())
     return h.hexdigest()
+
+
+def stage(run: Path, out: Path = None, until: str = None) -> tuple:
+    """The stage through its CLI entry, as the kernel spawns it: (exit code, stderr)."""
+    from vkforge.__main__ import main
+    argv = ["debrief", "--run", str(run), "--out", str(out or Path(tempfile.mkdtemp()) / "out")]
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        code = main(argv + (["--until", until] if until else []))
+    return code, err.getvalue()
+
+
+def task_dump(run: Path) -> Path:
+    return run / "tasks" / "task-node-1-50.json"
+
+
+def edit_json(path: Path, change) -> None:
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    new = change(doc)
+    path.write_text(json.dumps(doc if new is None else new), encoding="utf-8")
+
+
+def edit_line(path: Path, n: int, change) -> None:
+    """Line n (1-based) of a JSON-lines file, changed by `change(event) -> event`."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lines[n - 1] = json.dumps(change(json.loads(lines[n - 1])), ensure_ascii=False)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def drop(key):
+    def change(doc):
+        doc.pop(key)
+        return doc
+    return change
+
+
+def with_cases(run: Path, budget) -> None:
+    (run / "cases.json").write_text(json.dumps({"cases": {"N1-1": {"level": "N1", "kind": "message",
+                                                                    "budget_s": budget}}}), encoding="utf-8")
 
 
 class Debrief17_10Test(unittest.TestCase):
@@ -218,6 +258,163 @@ class DebriefContractTest(unittest.TestCase):
             self.assertIn(said, err.getvalue())
             self.assertTrue(err.getvalue().startswith("vkforge debrief: "), err.getvalue())
         self.assertFalse((RUN_17_10 / "debrief").exists())
+
+    def test_the_evidence_carries_no_answer_no_sent_text_and_no_page_text(self):
+        """Ruling L-P57: proposals.json's evidence is cut before « réponse : « », « texte envoyé » and
+        the oracle's must-patterns (« manque : »); a driver.log line keeps the driver's own words;
+        a harness note, the operator's own vk_log line, is kept as it is."""
+        s, p, _ = debrief.debrief(RUN_17_10)
+        texts = [e["text"] for x in p for e in x["evidence"]]
+        for cut in ("réponse : «", "texte envoyé", "manque :", "Aucune donnée personnelle", "MAINTENANCE EN COURS"):
+            self.assertFalse([t for t in texts if cut in t], cut)
+        by = {(x["kind"], x["target"]): x for x in p}
+        scope = by["oracle", "answer_scope"]["evidence"][0]
+        self.assertIn('"evidence": "[…]"', scope["text"])  # the line's fields stay, its quoted text goes
+        self.assertIn('"case": "N1-1"', scope["text"])
+        self.assertEqual(by["recipe", "maintenance"]["evidence"][0]["text"], "WARNING service in maintenance […]")
+        self.assertIn("modale inconnue : Votre avis — Aidez-nous", by["modal", "Votre avis"]["evidence"][0]["text"])
+        md = debrief.debrief(RUN_17_10)[2]
+        self.assertNotIn("réponse : «", md)
+
+
+# Each probe breaks one thing in a copy of the clean run; each must end in one refusal line naming
+# the file and the field (L-P15), never a traceback (review I1, I2, M3).
+PROBES = [
+    ("a task dump without steps", lambda r: edit_json(task_dump(r), drop("steps")),
+     "tasks/task-node-1-50.json: no field steps"),
+    ("a task dump without created_ms", lambda r: edit_json(task_dump(r), drop("created_ms")),
+     "tasks/task-node-1-50.json: no field created_ms"),
+    ("a task dump without id", lambda r: edit_json(task_dump(r), drop("id")),
+     "tasks/task-node-1-50.json: no field id"),
+    ("a task dump that is a list", lambda r: edit_json(task_dump(r), lambda d: [d]),
+     "tasks/task-node-1-50.json is not a JSON object"),
+    ("a step kind that is a string", lambda r: edit_json(task_dump(r), lambda d: d["steps"][0].update(kind="plan")),
+     "tasks/task-node-1-50.json steps[0]: kind is not object"),
+    ("a journal line without ts", lambda r: edit_line(r / "journal.jsonl", 1, drop("ts")),
+     "journal.jsonl:1: no field ts"),
+    ("a journal line whose ts is not a time", lambda r: edit_line(r / "journal.jsonl", 1, lambda e: dict(e, ts="hier")),
+     "journal.jsonl:1: ts 'hier' is not an ISO 8601 time"),
+    ("a naive ts", lambda r: edit_line(r / "journal.jsonl", 1, lambda e: dict(e, ts="2026-10-20T11:01")),
+     "journal.jsonl:1: ts 2026-10-20T11:01 has no UTC offset"),
+    ("an exec line without case", lambda r: edit_line(r / "journal.jsonl", 2, drop("case")),
+     "journal.jsonl:2: no field case"),
+    ("an exec line without verdict", lambda r: edit_line(r / "journal.jsonl", 2, drop("verdict")),
+     "journal.jsonl:2: no field verdict"),
+    ("a journal line that is a list", lambda r: edit_line(r / "journal.jsonl", 2, lambda e: [e]),
+     "journal.jsonl:2 is not a JSON object"),
+    ("a pipeline_ms value that is text", lambda r: edit_line(
+        r / "journal.jsonl", 2, lambda e: dict(e, pipeline_ms=dict(e["pipeline_ms"], call_llm="1840"))),
+     "journal.jsonl:2: pipeline_ms.call_llm is not a number"),
+    ("dmesg.json that is an object", lambda r: (r / "dmesg.json").write_text('{"rows": []}', encoding="utf-8"),
+     "dmesg.json is not a JSON list"),
+    ("a dmesg row without wall_ms", lambda r: edit_json(r / "dmesg.json", lambda rows: [drop("wall_ms")(rows[0])] + rows[1:]),
+     "dmesg.json[0]: no field wall_ms"),
+    ("cases.json without cases", lambda r: (r / "cases.json").write_text('{"N1-1": {}}', encoding="utf-8"),
+     "cases.json: no field cases"),
+    ("a budget_s that is text", lambda r: with_cases(r, "10"), "cases.json N1-1: budget_s is not number or null"),
+    ("manifest.json that is a list", lambda r: (r / "manifest.json").write_text("[]", encoding="utf-8"),
+     "manifest.json is not a JSON object"),
+    ("a harness note whose time is not ISO", lambda r: (r / "vkd-console.log").write_text(
+        "hier INFO vk_ipc::server: harness log task=task-node-1-50 harness=N1 : x\n", encoding="utf-8"),
+     "vkd-console.log:1: time 'hier' is not an ISO 8601 time"),
+    ("a driver.log line whose date does not exist", lambda r: (r / "driver.log").write_text(
+        "2026-13-45 11:00:12,004 INFO maskai-recette browser up\n", encoding="utf-8"),
+     "driver.log:1: time 2026-13-45 11:00:12 is not a date"),
+    ("a task dump written by > in Windows PowerShell 5.1", lambda r: task_dump(r).write_bytes(
+        task_dump(r).read_text(encoding="utf-8").encode("utf-16")),
+     "tasks/task-node-1-50.json is UTF-16; remedy: rewrite it with Out-File -Encoding utf8"),
+    ("a journal written by >", lambda r: (r / "journal.jsonl").write_bytes(
+        (r / "journal.jsonl").read_text(encoding="utf-8").encode("utf-16")),
+     "journal.jsonl is UTF-16; remedy: rewrite it with Out-File -Encoding utf8"),
+    ("a journal in another code page", lambda r: (r / "journal.jsonl").write_bytes(
+        (r / "journal.jsonl").read_text(encoding="utf-8").encode("cp1252")),
+     "journal.jsonl is not UTF-8"),
+    ("an empty journal", lambda r: (r / "journal.jsonl").write_text("\n", encoding="utf-8"),
+     "journal.jsonl is empty; remedy: a run that journaled at least one case"),
+    ("no task dump", lambda r: task_dump(r).unlink(),
+     "remedy: vk task show TASK --json | Out-File -Encoding utf8 tasks/TASK.json"),
+]
+
+
+class DebriefInputTest(unittest.TestCase):
+    """What a real node hands the stage: malformed copies, other encodings, append-only logs."""
+
+    def test_every_malformed_input_is_one_refusal_line_naming_the_file_and_the_field(self):
+        self.assertGreaterEqual(len(PROBES), 15)
+        for label, breaks, said in PROBES:
+            with self.subTest(label):
+                run = debrief_fixtures.clean_run(Path(tempfile.mkdtemp()) / "run")
+                breaks(run)
+                code, err = stage(run)
+                self.assertEqual(code, 2, err)
+                self.assertTrue(err.startswith("vkforge debrief: "), err)
+                self.assertEqual(err.count("\n"), 1, err)
+                self.assertIn("; remedy: ", err)
+                self.assertIn(said, err)
+
+    def test_the_last_resort_turns_anything_else_into_one_line(self):
+        run = debrief_fixtures.clean_run(Path(tempfile.mkdtemp()) / "run")
+        with mock.patch.object(debrief, "signals", side_effect=KeyError("steps")):
+            code, err = stage(run)
+        self.assertEqual((code, err), (2, "vkforge debrief: the run directory: KeyError: 'steps'; "
+                                          "remedy: check the run directory's files\n"))
+
+    def test_append_only_logs_are_bounded_to_the_run(self):
+        """The console, driver.log, the journal and vk dmesg hold other runs' lines: a note of a task
+        that is not the run's, a line of another day, are not read (review I3)."""
+        run = debrief_fixtures.clean_run(Path(tempfile.mkdtemp()) / "run")
+        foreign = [
+            "2026-10-17T13:49:14.302877Z  INFO vk_ipc::server: harness log task=task-node-1-16 harness=N5 : "
+            "nouvelle_conversation refusée (dialog) : modale inconnue : Votre avis — Aidez-nous",
+            "2026-10-17T13:49:22.640019Z  INFO vk_ipc::server: harness log task=task-node-1-16 harness=N5 : "
+            "capture_ecran refusée (dialog) : modale inconnue : Votre avis — Aidez-nous",
+            "2026-10-21T09:02:40.000001Z  INFO vk_ipc::server: harness log task=task-node-1-50 harness=N1 : "
+            "verdict_oracle refusé (precondition) : rejeu du lendemain"]
+        console = run / "vkd-console.log"
+        console.write_text("\n".join(foreign) + "\n" + console.read_text(encoding="utf-8"), encoding="utf-8")
+        log = run / "driver.log"
+        log.write_text(log.read_text(encoding="utf-8") + "2026-10-21 10:29:14,207 WARNING maskai-recette service "
+                       "in maintenance: MAINTENANCE EN COURS\n", encoding="utf-8")
+        with (run / "journal.jsonl").open("a", encoding="utf-8") as f:
+            for case in ("N1-1", "N1-3"):
+                f.write(json.dumps({"ts": "2026-10-19T15:24+02:00", "step": "exec", "case": case, "verdict": "KO",
+                                    "timing_s": 5.0, "evidence": "réponse vide : échec silencieux",
+                                    "pipeline_ms": {"call_llm": 2444}}, ensure_ascii=False) + "\n")
+        edit_json(run / "dmesg.json", lambda rows: rows + [{"seq": 99, "kind": "driver.acted", "wall_ms": 1}])
+        s, p, _ = debrief.debrief(run)
+        self.assertEqual(p, [])
+        self.assertEqual(s["refusals"], {"timeout": 0, "dialog": 0, "precondition": 0, "host": 0, "internal": 0})
+        self.assertEqual((s["maintenance"], s["selector_suspects"], s["modal_refusals"]), ([], [], []))
+        self.assertEqual(len(s["cases"]), 4)
+        self.assertEqual(s["acts_total"], 12)
+        self.assertEqual(s["run"]["console_from_ms"], debrief_fixtures.ms("11:02:40", "2026-10-20"))
+        self.assertEqual((s["run"]["from_ms"], s["run"]["to_ms"]),
+                         (debrief_fixtures.ms("11:00:00", "2026-10-20"), debrief_fixtures.ms("11:04:40", "2026-10-20")))
+
+    def test_line_references_count_blank_lines_and_supersedes_does_not(self):
+        """`file:line` is the physical line, as an editor shows it (review M2); journal.py's
+        `supersedes` indexes the non-blank lines."""
+        run = debrief_fixtures.clean_run(Path(tempfile.mkdtemp()) / "run")
+        journal = run / "journal.jsonl"
+        lines = journal.read_text(encoding="utf-8").splitlines()
+        fix = {"ts": "2026-10-20T11:04+02:00", "step": "correction", "case": "N1-3", "verdict": "PARTIEL",
+               "timing_s": 7.9, "evidence": "réponse : « Relancez. »", "supersedes": 3}
+        journal.write_text("\n".join(lines[:1] + [""] + lines[1:] + [json.dumps(fix, ensure_ascii=False)]) + "\n",
+                           encoding="utf-8")
+        cases = debrief.debrief(run)[0]["cases"]
+        self.assertEqual([(c["case"], c["at"]) for c in cases],
+                         [("N0-1", "journal.jsonl:1"), ("N1-1", "journal.jsonl:3"), ("N1-2", "journal.jsonl:4"),
+                          ("N1-3", "journal.jsonl:6")])
+        self.assertEqual(cases[-1]["verdict"], "PARTIEL")
+
+    def test_a_bar_in_a_cell_is_escaped(self):
+        run = debrief_fixtures.clean_run(Path(tempfile.mkdtemp()) / "run")
+        with (run / "vkd-console.log").open("a", encoding="utf-8") as f:
+            f.write("2026-10-20T09:03:00.000001Z  INFO vk_ipc::server: harness log task=task-node-1-50 harness=N1 : "
+                    "nouvelle_conversation refusée (dialog) : modale inconnue : A | B\n")
+        md = debrief.debrief(run)[2]
+        self.assertIn("« A \\| B » × 1", md)
+        self.assertIn("modal `A \\| B` (medium)", md)
 
 
 if __name__ == "__main__":

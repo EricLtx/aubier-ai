@@ -15,8 +15,16 @@ Run directory (fixed names; only journal.jsonl and tasks/ are required):
   dmesg.json             `vk dmesg -n N --json` covering the run (`kind`, `wall_ms` are read)
   cases.json             the driver's cases (`level`, `kind`, `budget_s` per case are read)
   manifest.json          the driver's manifest (`kind: com` marks a learned driver)
+
+Every file is UTF-8 (a BOM tolerated) and checked for the fields read; anything else is one
+refusal line naming the file and the field (L-P15). The append-only files are bounded to the run:
+from the first task's creation to the last task's end plus a minute, harness notes of the run's
+tasks only. The evidence of proposals.json never carries an answer, a sent text or a document's
+content (ruling L-P57): a journal line is cut before them, a driver.log line keeps the driver's
+own words; a harness note, the operator's own vk_log line, is kept as it is.
 """
 import argparse
+import contextlib
 import json
 import math
 import re
@@ -92,18 +100,168 @@ def _answer(e: dict):
     return m.group(1) if m else None
 
 
+# Every input refusal points at the copies the operator made (L-P15: one line, never a traceback).
+REMEDY = ("the run directory holds copies: copy that file again as runbook recette-maskai §16 does, "
+          "or drop the line from the copy")
+# L-P57: evidence never carries an answer, a sent text or a document's content. A journal line is
+# cut where its evidence starts quoting the product (`réponse : «`), the sent text (`texte envoyé`)
+# or the oracle's must-patterns, which spell the documents' facts (`manque :`).
+CUT = re.compile(r"réponse : «|texte envoyé|manque :")
+_TYPES = {"text": str, "integer": int, "number": (int, float), "object": dict, "list": list, "boolean": bool}
+
+
+def _read(root: Path, name: str) -> str:
+    """A file of the run directory as text: UTF-8, a BOM tolerated. UTF-16 — what `>` writes in
+    Windows PowerShell 5.1 — and any other encoding are refused in one line."""
+    data = (root / name).read_bytes()
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in data[:64]:
+        raise Refusal(f"{name} is UTF-16", "rewrite it with Out-File -Encoding utf8")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise Refusal(f"{name} is not UTF-8 (byte {e.start})", "rewrite it with Out-File -Encoding utf8") from None
+
+
+def _lines(text: str) -> list:
+    """Physical lines, numbered as an editor numbers them: blank ones count, and only a newline
+    ends a line (a JSON string may hold U+2028, which `splitlines` would cut)."""
+    return [x.rstrip("\r") for x in text.split("\n")]
+
+
 def _json(at: str, text: str):
-    """A JSON document or journal line of the run directory, or the refusal naming where it breaks
-    (L-P15: one line, never a traceback): a journal line cut mid-write, a dump that is not JSON."""
+    """A JSON document or journal line of the run directory, or the refusal naming where it breaks:
+    a journal line cut mid-write, a dump that is not JSON."""
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        raise Refusal(f"{at} is not JSON ({e})", "the run directory holds copies: copy that file again, "
-                      "or drop a line cut mid-write from the copy") from None
+        raise Refusal(f"{at} is not JSON ({e})", REMEDY) from None
+
+
+def _is(value, kinds) -> bool:
+    for k in kinds:
+        if k == "null":
+            if value is None:
+                return True
+        elif not (k in ("integer", "number") and isinstance(value, bool)) and isinstance(value, _TYPES[k]):
+            return True
+    return False
+
+
+def _object(value, at: str) -> dict:
+    if not isinstance(value, dict):
+        raise Refusal(f"{at} is not a JSON object", REMEDY)
+    return value
+
+
+def _field(doc: dict, key: str, at: str, kinds: tuple, required: bool = True):
+    """`doc[key]`, of one of `kinds`, or the refusal naming the file, the place and the field."""
+    if key not in doc:
+        if required:
+            raise Refusal(f"{at}: no field {key}", REMEDY)
+        return None
+    if not _is(doc[key], kinds):
+        raise Refusal(f"{at}: {key} is not {' or '.join(kinds)}", REMEDY)
+    return doc[key]
+
+
+def _when(text: str, at: str, field: str) -> datetime:
+    """An ISO 8601 time with its UTC offset: a naive one would be read in this machine's zone."""
+    try:
+        t = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        raise Refusal(f"{at}: {field} {text!r} is not an ISO 8601 time", REMEDY) from None
+    if t.utcoffset() is None:
+        raise Refusal(f"{at}: {field} {text} has no UTC offset",
+                      "journal.py writes the offset (…T15:31+02:00): add it to the line in the copy")
+    return t
+
+
+def _task_shape(t, at: str) -> dict:
+    """A `vk task show --json` dump, the fields the debrief reads."""
+    _object(t, at)
+    _field(t, "id", at, ("text",))
+    _field(t, "created_ms", at, ("integer",))
+    _field(t, "status", at, ("text", "object"))
+    for i, s in enumerate(_field(t, "steps", at, ("list",))):
+        sat = f"{at} steps[{i}]"
+        kind = _field(_object(s, sat), "kind", sat, ("object",))
+        _field(kind, "kind", f"{sat}.kind", ("text",), required=False)
+        _field(kind, "instruction", f"{sat}.kind", ("text", "null"), required=False)
+        for d in _field(kind, "drivers", f"{sat}.kind", ("list",), required=False) or []:
+            if not isinstance(d, str):
+                raise Refusal(f"{sat}.kind: drivers holds a non-text entry", REMEDY)
+        _field(s, "status", sat, ("text", "object"))
+        _field(s, "started_ms", sat, ("integer", "null"), required=False)
+        _field(s, "ended_ms", sat, ("integer", "null"), required=False)
+    for i, u in enumerate(_field(t, "usage", at, ("list", "null"), required=False) or []):
+        uat = f"{at} usage[{i}]"
+        _object(u, uat)
+        _field(u, "step_index", uat, ("integer", "null"), required=False)
+        _field(u, "cost_list_usd", uat, ("number", "null"), required=False)
+    return t
+
+
+def _line_shape(e, at: str) -> dict:
+    """A journal line (scripts/recette/journal.py), the fields the debrief reads."""
+    _object(e, at)
+    _field(e, "ts", at, ("text",))
+    _field(e, "case", at, ("text",))
+    if _field(e, "step", at, ("text", "null"), required=False) in ("exec", "correction"):
+        _field(e, "verdict", at, ("text",))
+    _field(e, "timing_s", at, ("number", "null"), required=False)
+    _field(e, "evidence", at, ("text", "null"), required=False)
+    _field(e, "supersedes", at, ("integer", "null"), required=False)
+    for key in ("inputs_sha256", "ui_profile_sha256"):
+        _field(e, key, at, ("text", "null"), required=False)
+    for node, ms in (_field(e, "pipeline_ms", at, ("object", "null"), required=False) or {}).items():
+        if not _is(ms, ("number",)):
+            raise Refusal(f"{at}: pipeline_ms.{node} is not a number", REMEDY)
+    for key in ("model", "web"):
+        _field(_field(e, "config", at, ("object", "null"), required=False) or {}, key, f"{at} config",
+               ("text", "number", "boolean", "null"), required=False)
+    return e
+
+
+def _shown_line(e: dict) -> str:
+    """A journal line as evidence (L-P57): its fields, the evidence cut before any quoted text."""
+    ev = e.get("evidence") or ""
+    m = CUT.search(ev)
+    if m:
+        e = dict(e, evidence=(ev[: m.start()].rstrip(" ;:") + " […]").lstrip())
+    return json.dumps(e, ensure_ascii=False)
+
+
+def _shown_log(message: str) -> str:
+    """A driver.log message as evidence (L-P57): the driver's own words before the first colon —
+    what follows may be the page's text (a maintenance banner, a URL) and is dropped. A known
+    modal's line, the driver's own name and selector, is kept whole."""
+    if DISMISSED.search(message):
+        return message
+    head, colon, _ = message.partition(": ")
+    return head + (" […]" if colon else "")
+
+
+@contextlib.contextmanager
+def _reading(where: str):
+    """The last resort (L-P15) around reading one file: what the shape checks did not foresee is
+    still one line naming the file, never a traceback."""
+    try:
+        yield
+    except Refusal:
+        raise
+    except Exception as e:  # noqa: BLE001 — the point is that nothing escapes as a traceback
+        raise _unexpected(where, e) from None
+
+
+def _unexpected(where: str, e: Exception) -> Refusal:
+    return Refusal(f"{where}: {type(e).__name__}: {' '.join(str(e).split())}", "check the run directory's files")
 
 
 class Run:
-    """The run directory, loaded: every line keeps its place (`at`), its time and its task."""
+    """The run directory, loaded and checked: every line keeps its place (`at`, the physical line),
+    its time and its task. The append-only files — the daemon's console, driver.log, the driver's
+    journal, `vk dmesg` — are bounded to the run: from the first task's creation to the last task's
+    end plus a minute, and a harness note must name a task of the run."""
 
     def __init__(self, root: Path, until=None):
         if not (root / "journal.jsonl").is_file():
@@ -112,14 +270,19 @@ class Run:
         dumps = sorted((root / "tasks").glob("*.json")) if (root / "tasks").is_dir() else []
         if not dumps:
             raise Refusal(f"no task dump under {root / 'tasks'}",
-                          "vk task show TASK --json > tasks/TASK.json for each task of the run")
-        self.root, self.text = root, {}
+                          "vk task show TASK --json | Out-File -Encoding utf8 tasks/TASK.json for each task of the run")
+        self.root, self.text, self.shown = root, {}, {}
         tasks = []
         for p in dumps:
-            t = _json(f"tasks/{p.name}", p.read_text(encoding="utf-8-sig"))
-            ends = [x for s in t["steps"] for x in (s.get("started_ms"), s.get("ended_ms")) if x]
-            tasks.append(dict(t, _file=f"tasks/{p.name}", _end=max(ends + [t["created_ms"]])))
+            at = f"tasks/{p.name}"
+            with _reading(at):
+                t = _task_shape(_json(at, _read(root, at)), at)
+                ends = [x for s in t["steps"] for x in (s.get("started_ms"), s.get("ended_ms")) if x]
+                tasks.append(dict(t, _file=at, _end=max(ends + [t["created_ms"]])))
         self.tasks = sorted(tasks, key=lambda t: t["created_ms"])
+        self.ids = {t["id"] for t in self.tasks}
+        self.start = self.tasks[0]["created_ms"]
+        self.stop = max(t["_end"] for t in self.tasks) + 60_000
         self.limit = None
         if until is not None:
             hit = [t for t in self.tasks if t["id"] == until]
@@ -127,72 +290,124 @@ class Run:
                 raise Refusal(f"until: no task {until} in the run", "name a task of the run's tasks/ directory")
             self.limit = hit[0]["_end"]
             self.tasks = [t for t in self.tasks if t["created_ms"] <= self.limit]
-        cases = root / "cases.json"
-        self.cases = _json("cases.json", cases.read_text(encoding="utf-8-sig"))["cases"] if cases.is_file() else {}
-        manifest = root / "manifest.json"
-        self.learned = manifest.is_file() and _json("manifest.json", manifest.read_text(encoding="utf-8-sig")).get(
-            "kind") == "com"
+        self.cases = {}
+        if (root / "cases.json").is_file():
+            with _reading("cases.json"):
+                doc = _object(_json("cases.json", _read(root, "cases.json")), "cases.json")
+                cases = _field(doc, "cases", "cases.json", ("object",))
+                for cid, c in cases.items():
+                    cat = f"cases.json {cid}"
+                    _object(c, cat)
+                    _field(c, "level", cat, ("text",), required=False)
+                    _field(c, "kind", cat, ("text",), required=False)
+                    _field(c, "budget_s", cat, ("number", "null"), required=False)
+                self.cases = cases
+        self.learned = False
+        if (root / "manifest.json").is_file():
+            with _reading("manifest.json"):
+                manifest = _object(_json("manifest.json", _read(root, "manifest.json")), "manifest.json")
+                self.learned = manifest.get("kind") == "com"
         self.journal = self._journal("journal.jsonl", effective=True)
         self.set_aside = [e for p in sorted(root.glob("journal-*.jsonl")) for e in self._journal(p.name, effective=False)]
         first = (self.journal or self.set_aside or [None])[0]
         # driver.log carries the node's local time without an offset: the journal's offset names it
         self.tz = timezone(first["_t0"].utcoffset() if first else timedelta(0))
-        self.notes = self._notes(root / "vkd-console.log")
-        self.log = self._driver_log(root / "driver.log")
-        dmesg = root / "dmesg.json"
-        rows = _json("dmesg.json", dmesg.read_text(encoding="utf-8-sig")) if dmesg.is_file() else None
-        self.ledger = None if rows is None else [r for r in rows if self._keep(r["wall_ms"])]
+        self.notes = self._notes("vkd-console.log")
+        self.log = self._driver_log("driver.log")
+        self.ledger = None
+        if (root / "dmesg.json").is_file():
+            with _reading("dmesg.json"):
+                rows = _json("dmesg.json", _read(root, "dmesg.json"))
+                if not isinstance(rows, list):
+                    raise Refusal("dmesg.json is not a JSON list", REMEDY)
+                for i, r in enumerate(rows):
+                    _field(_object(r, f"dmesg.json[{i}]"), "kind", f"dmesg.json[{i}]", ("text",))
+                    _field(r, "wall_ms", f"dmesg.json[{i}]", ("integer",))
+                self.ledger = [r for r in rows if self._in_run(r["wall_ms"])]
 
-    def _keep(self, ms: int) -> bool:
-        return self.limit is None or ms <= self.limit
+    def _in_run(self, lo: int, hi: int = None) -> bool:
+        """Inside the run's window, and not after `--until`'s task."""
+        hi = lo if hi is None else hi
+        return hi >= self.start and lo <= self.stop and (self.limit is None or lo <= self.limit)
 
     def _task(self, lo: int, hi: int):
         hit = [t["id"] for t in self.tasks if t["created_ms"] <= hi and t["_end"] >= lo]
         return hit[-1] if hit else None
 
     def _journal(self, name: str, effective: bool) -> list:
-        raw = (x for x in (self.root / name).read_text(encoding="utf-8-sig").splitlines() if x.strip())
-        events = [_json(f"{name}:{n}", x) for n, x in enumerate(raw, 1)]
-        stamped = [(e, datetime.fromisoformat(e["ts"])) for e in events]
-        # journal.py's corrections: `supersedes` is the index of the line replaced; with --until, a
-        # correction written after the limit has not happened yet
-        dropped = {e["supersedes"] for e, t0 in stamped
-                   if effective and e.get("supersedes") is not None and self._keep(_ms(t0))}
+        events = []
+        with _reading(name):
+            for n, raw in enumerate(_lines(_read(self.root, name)), 1):
+                if raw.strip():
+                    at = f"{name}:{n}"
+                    e = _line_shape(_json(at, raw), at)
+                    t0 = _when(e["ts"], at, "ts")
+                    lo = _ms(t0)
+                    # "…T15:31+02:00" is a minute wide
+                    events.append((at, e, t0, lo, lo + (59_999 if len(e["ts"]) <= 22 else 999)))
+        if effective and not events:
+            raise Refusal(f"{name} is empty", "a run that journaled at least one case")
+        ours = [self._in_run(lo, hi) for _, _, _, lo, hi in events]
+        # journal.py's corrections: `supersedes` indexes the non-blank lines. A correction belongs to
+        # the run when the line it replaces does (a human may write it after the run); with --until,
+        # one written after the limit has not happened yet.
+        dropped, applied = set(), set()
+        for j, (_, e, _, lo, _) in enumerate(events):
+            s = e.get("supersedes") if effective else None
+            if s is not None and 0 <= s < len(events) and ours[s] and (self.limit is None or lo <= self.limit):
+                dropped.add(s)
+                applied.add(j)
         out = []
-        for i, (e, t0) in enumerate(stamped):
-            lo = _ms(t0)
-            hi = lo + (59_999 if len(e["ts"]) <= 22 else 999)  # "…T15:31+02:00" is a minute wide
-            if i in dropped or not self._keep(lo):
+        for j, (at, e, t0, lo, hi) in enumerate(events):
+            if j in dropped or not (ours[j] or j in applied):
                 continue
-            at = f"{name}:{i + 1}"
-            self.text[at] = json.dumps(e, ensure_ascii=False)
+            self.text[at], self.shown[at] = json.dumps(e, ensure_ascii=False), _shown_line(e)
             out.append(dict(e, _at=at, _t0=t0, _lo=lo, _task=self._task(lo, hi)))
         return out
 
-    def _notes(self, path: Path):
-        if not path.is_file():
+    def _notes(self, name: str):
+        """The harness notes of the run's tasks (the console is appended across runs)."""
+        if not (self.root / name).is_file():
             return None
         out = []
-        for n, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-            m = NOTE.match(ANSI.sub("", raw))
-            if m and self._keep(ms := _ms(datetime.fromisoformat(m.group(1)))):
-                self.text[f"{path.name}:{n}"] = m.group(3)
-                out.append({"at": f"{path.name}:{n}", "ms": ms, "task": m.group(2), "text": m.group(3)})
+        with _reading(name):
+            for n, raw in enumerate(_lines(_read(self.root, name)), 1):
+                m = NOTE.match(ANSI.sub("", raw))
+                if not m or m.group(2) not in self.ids:
+                    continue
+                at = f"{name}:{n}"
+                ms = _ms(_when(m.group(1), at, "time"))
+                if self._in_run(ms):
+                    self.text[at] = self.shown[at] = m.group(3)  # the operator's own vk_log lines (L-P57)
+                    out.append({"at": at, "ms": ms, "task": m.group(2), "text": m.group(3)})
         return out
 
-    def _driver_log(self, path: Path):
-        if not path.is_file():
+    def _driver_log(self, name: str):
+        """driver.log's lines inside the run's window (the host appends it across mounts)."""
+        if not (self.root / name).is_file():
             return None
         out = []
-        for n, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-            m = LOGLINE.match(raw)
-            if m and self._keep(ms := _ms(datetime.fromisoformat(m.group(1)).replace(tzinfo=self.tz))):
-                self.text[f"{path.name}:{n}"] = f"{m.group(2)} {m.group(4)}"
-                out.append({"at": f"{path.name}:{n}", "ms": ms, "task": self._task(ms, ms), "text": m.group(4)})
+        with _reading(name):
+            for n, raw in enumerate(_lines(_read(self.root, name)), 1):
+                m = LOGLINE.match(raw)
+                if not m:
+                    continue
+                at = f"{name}:{n}"
+                try:
+                    local = datetime.fromisoformat(m.group(1))
+                except ValueError:
+                    raise Refusal(f"{at}: time {m.group(1)} is not a date", REMEDY) from None
+                ms = _ms(local.replace(tzinfo=self.tz))
+                if self._in_run(ms):
+                    self.text[at] = f"{m.group(2)} {m.group(4)}"
+                    self.shown[at] = f"{m.group(2)} {_shown_log(m.group(4))}"
+                    out.append({"at": at, "ms": ms, "task": self._task(ms, ms), "text": m.group(4)})
         return out
 
     def evidence(self, items: list) -> list:
-        return [{"at": x["at"], "task": x["task"], "text": _clip(self.text[x["at"]])} for x in items]
+        """Evidence lines as proposals.json carries them (L-P57): `shown`, never the raw line."""
+        return [{"at": x["at"], "task": x["task"], "text": _clip(self.shown.get(x["at"], self.text[x["at"]]))}
+                for x in items]
 
 
 def signals(run: Run) -> dict:
@@ -297,7 +512,7 @@ def signals(run: Run) -> dict:
     return {
         "run": {"tasks": [t["id"] for t in run.tasks], "until_ms": run.limit, "learned_driver": run.learned,
                 "inputs": sorted(p.relative_to(run.root).as_posix() for p in run.root.rglob("*") if p.is_file()),
-                "console_from_ms": console_from},
+                "from_ms": run.start, "to_ms": run.stop, "console_from_ms": console_from},
         "tasks": tasks,
         "acts_total": None if run.ledger is None else sum(1 for r in run.ledger if r["kind"] == "driver.acted"),
         "relaunches": [{"after": a["id"], "next": b["id"]} for a, b in zip(run.tasks, run.tasks[1:]) if a["status"] != "done"],
@@ -402,6 +617,12 @@ def _n(x) -> str:
     return f"{x:g}".replace(".", ",")
 
 
+def _row(*cells) -> str:
+    """A Markdown table row: a `|` inside a cell is escaped, as journal.py's `render` does, and a
+    cell stays on one line."""
+    return "| " + " | ".join(" ".join(str(c).split()).replace("|", "\\|") for c in cells) + " |"
+
+
 def render(run: Run, s: dict, proposals: list) -> str:
     """Sections 1-3 of a debrief, in the register of docs/technical/debriefs/; 4 and 5 are human."""
     tz = run.tz
@@ -415,11 +636,12 @@ def render(run: Run, s: dict, proposals: list) -> str:
            "## 1. Chronologie du run", "",
            "| Tâche | Fenêtre | Niveaux | Statut | Actes | Harnais | Total |", "|---|---|---|---|---|---|---|"]
     for t in s["tasks"]:
-        out.append(f"| {t['id']} | {_hm(t['window'][0], tz)}–{_hm(t['window'][1], tz)} | {', '.join(t['levels']) or '—'} "
-                   f"| {t['status']} | {'—' if t['acts'] is None else t['acts']} | {_usd(t['harness_usd'])} | {_usd(t['cost_usd'])} |")
+        out.append(_row(t["id"], f"{_hm(t['window'][0], tz)}–{_hm(t['window'][1], tz)}", ", ".join(t["levels"]) or "—",
+                        _status(t["status"]), "—" if t["acts"] is None else t["acts"], _usd(t["harness_usd"]),
+                        _usd(t["cost_usd"])))
     out += ["", "| Niveau | Tâche | Statut | Durée | Actes | Coût | Lignes |", "|---|---|---|---|---|---|---|"]
-    out += [f"| {lv} | {p['task']} | {p['status']} | {p['duration_s']} s | {'—' if p['acts'] is None else p['acts']} | "
-            f"{_usd(p['cost_usd'])} | {p['new_lines']} |" for lv, ps in s["levels"].items() for p in ps]
+    out += [_row(lv, p["task"], p["status"], f"{p['duration_s']} s", "—" if p["acts"] is None else p["acts"],
+                 _usd(p["cost_usd"]), p["new_lines"]) for lv, ps in s["levels"].items() for p in ps]
     r = s["replays"]
     out += ["", f"Rejeux sans ligne nouvelle : {r['passes']} passes, {r['acts']} actes, {_usd(r['cost_usd'])} USD [V]. "
                 f"Relances après un arrêt : {len(s['relaunches'])} [V].", "",
@@ -428,7 +650,7 @@ def render(run: Run, s: dict, proposals: list) -> str:
 
     def row(signal, seen, items, key=None):
         at = ", ".join(x["at"] for x in items[:4]) + (" …" if len(items) > 4 else "")
-        out.append(f"| {signal} | {seen} | {at or '—'} | {ref.get(key, '—')} |")
+        out.append(_row(signal, seen, at or "—", ref.get(key, "—")))
 
     sus = s["selector_suspects"]
     row("réponse vide, call_llm présent", (", ".join(x["case"] for x in sus) + " [V]") if sus else "aucune", sus,
@@ -460,10 +682,10 @@ def render(run: Run, s: dict, proposals: list) -> str:
         if s["constant_nodes"] else "aucun", [])
     out += ["", "## 3. Mesures utiles au prochain pilote", "",
             "| Nœud (ms) | n | Médiane | p90 | Max |", "|---|---|---|---|---|"]
-    out += [f"| `{k}` | {v['n']} | {_n(v['median'])} | {_n(v['p90'])} | {_n(v['max'])} |" for k, v in s["pipeline"].items()]
+    out += [_row(f"`{k}`", v["n"], _n(v["median"]), _n(v["p90"]), _n(v["max"])) for k, v in s["pipeline"].items()]
     out += ["", "| Classe | Budget | n | Médiane | p90 | Max | Hors budget | Abandons |", "|---|---|---|---|---|---|---|---|"]
-    out += [f"| {c['kind']} | {_n(c['budget_s'])} s | {c['n']} | {_n(c['median'])} s | {_n(c['p90'])} s | {_n(c['max'])} s | "
-            f"{c['over_budget']}/{c['n']} | {c['aborted']} |" for c in s["latency_classes"]]
+    out += [_row(c["kind"], f"{_n(c['budget_s'])} s", c["n"], f"{_n(c['median'])} s", f"{_n(c['p90'])} s",
+                 f"{_n(c['max'])} s", f"{c['over_budget']}/{c['n']}", c["aborted"]) for c in s["latency_classes"]]
     out += ["", "Refus par raison (timeout lu au journal, les autres aux notes du harnais ; le ledger les hache) : "
             + ", ".join(f"`{k}` {v}" for k, v in s["refusals"].items()) + " [V].", ""]
     return "\n".join(out)
@@ -499,7 +721,15 @@ def run(ns: argparse.Namespace) -> int:
     if out.resolve().is_relative_to(root.resolve()):
         raise Refusal(f"out {out} is inside the run directory",
                       "a new directory outside it: the run directory is read, never written")
-    s, proposals, md = debrief(root, ns.until)
-    write(s, proposals, md, out)
+    try:
+        s, proposals, md = debrief(root, ns.until)
+    except Refusal:
+        raise
+    except Exception as e:  # noqa: BLE001 — the last resort (L-P15): one line, never a traceback
+        raise _unexpected("the run directory", e) from None
+    try:
+        write(s, proposals, md, out)
+    except OSError as e:
+        raise Refusal(f"out {out} cannot be written ({e.strerror})", "a directory this user can write") from None
     print(f"debrief: {len(proposals)} proposals -> {ns.out}")
     return 0

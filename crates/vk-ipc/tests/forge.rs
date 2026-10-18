@@ -795,6 +795,9 @@ async fn debrief_refuses_a_run_without_journal_and_a_used_out_before_spawning() 
         .unwrap_err()
         .to_string();
     assert!(e.contains("is not empty"), "{e}");
+    let driver = node.dir().join("drv");
+    std::fs::create_dir_all(&driver).unwrap();
+    std::fs::write(driver.join("manifest.json"), "{}").unwrap();
     let refused = [
         (
             json!({"run": "clean", "out": node.dir().join("o2")}),
@@ -811,6 +814,10 @@ async fn debrief_refuses_a_run_without_journal_and_a_used_out_before_spawning() 
         (
             json!({"run": run, "out": node.dir().join("o2"), "apply": true}),
             "driver.debrief takes run, out and until, nothing else",
+        ),
+        (
+            json!({"run": run, "out": driver.join("debrief")}),
+            "is inside a driver; remedy: an output directory of its own",
         ),
     ];
     for (params, expected) in refused {
@@ -844,6 +851,10 @@ async fn debrief_refuses_a_run_without_journal_and_a_used_out_before_spawning() 
     assert!(
         !run.join("debrief").exists(),
         "the run directory is read, never written"
+    );
+    assert!(
+        !driver.join("debrief").exists(),
+        "a driver's directory is never written"
     );
     assert!(
         !node.dir().join("forge").join("debrief").exists(),

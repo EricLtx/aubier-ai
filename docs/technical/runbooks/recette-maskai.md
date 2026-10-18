@@ -689,17 +689,24 @@ Pour garder la console, lancez le démon du §3.2 ainsi, dans son terminal dédi
 $S = "$env:LOCALAPPDATA\VerticalAI\vk\data"
 vkd --auto-enroll-node --harness-timeout-secs 2700 | ForEach-Object { $_; Add-Content -Path "$S\vkd-console.log" -Value $_ -Encoding UTF8 }
 ```
-La première ligne compte : Windows PowerShell 5.1 lit la sortie de `vkd` dans la page de codes de la console (850 sur un poste français), et sans elle « refusée », « — » ou « × » arrivent abîmés dans le fichier ; le debrief ne lit plus alors ni les refus ni les modales. `Add-Content -Encoding UTF8` écrit de l'UTF-8. `$S` est ici le répertoire d'état par défaut, écrit en dur parce que le démon ne répond pas encore à `vk status` ; c'est celui que `vk status --json` donnera ensuite.
+La première ligne compte : Windows PowerShell 5.1 lit la sortie de `vkd` dans la page de codes de la console (850 sur un poste français), et sans elle « refusée », « — » ou « × » arrivent abîmés dans le fichier ; le debrief ne lit plus alors ni les refus ni les modales. `Add-Content -Encoding UTF8` écrit de l'UTF-8. `$S` est ici le répertoire d'état par défaut, écrit en dur parce que le démon ne répond pas encore à `vk status` ; c'est celui que `vk status --json` donnera ensuite (un nœud lancé avec `--state-dir` met ici son propre répertoire).
 
-Après le tir, assemblez le dossier et lancez le debrief. `$T` liste les tâches du tir (`vk ps`), ici celles du 17/10 ; un journal mis de côté au §8 se copie aussi, renommé `journal-<suffixe>.jsonl` :
+Après le tir, assemblez le dossier et lancez le debrief. `$T` liste les tâches du tir (`vk ps`), ici celles du 17/10 ; un journal mis de côté au §8 se copie aussi, renommé `journal-<suffixe>.jsonl`. Chaque debrief a son dossier daté : un dossier de tir déjà rempli mêlerait les tâches de deux tirs.
 ```powershell
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $S = (vk status --json | ConvertFrom-Json).state_dir
 $T = "task-node-1-2", "task-node-1-7", "task-node-1-16", "task-node-1-25", "task-node-1-39"
-$R = "$S\debrief\run"; New-Item -ItemType Directory -Force "$R\tasks" | Out-Null
+$D = Get-Date -Format "yyyy-MM-dd-HHmm"
+$R = "$S\debrief\run-$D"; New-Item -ItemType Directory -Force "$R\tasks" | Out-Null
 Copy-Item "$S\drivers\maskai-1\work\journal.jsonl", "$S\drivers\maskai-1\work\driver.log", "$S\vkd-console.log", drivers\maskai-recette\cases.json $R
 foreach ($t in $T) { vk task show $t --json | Out-File -Encoding utf8 "$R\tasks\$t.json" }
 vk dmesg -n 5000 --json | Out-File -Encoding utf8 "$R\dmesg.json"
-vk driver debrief --run $R --out "$S\debrief\out"
+vk driver debrief --run $R --out "$S\debrief\out-$D"
 ```
-Attendu : `debrief: N proposals -> …`, une ligne par proposition (genre, cible, confiance, quoi changer), puis `nothing applied`. Lisez `debrief.md` (sections 1 à 3) ; les sections 4 et 5 sont les vôtres. Aucune ligne n'est ajoutée au ledger. `--until TASK` rejoue le debrief tel qu'il aurait été à la fin de cette tâche. Le dossier `--out` doit être neuf (ou vide) et hors du dossier du tir : le debrief n'écrase rien et n'écrit jamais dans ce qu'il lit.
+Attendu : `debrief: N proposals -> …`, une ligne par proposition (genre, cible, confiance, quoi changer), puis `nothing applied`. Lisez `debrief.md` (sections 1 à 3) ; les sections 4 et 5 sont les vôtres. Aucune ligne n'est ajoutée au ledger. `--until TASK` rejoue le debrief tel qu'il aurait été à la fin de cette tâche. Le dossier `--out` doit être neuf (ou vide), hors du dossier du tir et hors du dossier d'un driver : le debrief n'écrase rien, n'écrit jamais dans ce qu'il lit, et trois fichiers de plus dans un driver changeraient son `files_sha256`.
+
+Écrivez chaque fichier avec `Out-File -Encoding utf8`, jamais avec `>` : Windows PowerShell 5.1 écrit alors de l'UTF-16, que le debrief refuse (`tasks/….json is UTF-16; remedy: rewrite it with Out-File -Encoding utf8`). Plus généralement, une pièce mal formée (champ manquant, horodatage sans fuseau, ligne coupée en pleine écriture) est refusée en une ligne qui nomme le fichier, la ligne et le champ : corrigez la copie dans `$R`, jamais l'original.
+
+La console, `driver.log` et le journal du driver s'allongent d'un tir à l'autre (tant que le journal n'est pas mis de côté), et `vk dmesg` remonte avant le tir : copiez-les entiers. Le debrief n'en garde que la fenêtre du tir, de la création de la première tâche de `$T` à la fin de la dernière plus une minute, et, dans la console, les seules notes des tâches de `$T`. Une correction `supersedes` écrite après le tir compte tant qu'elle corrige une ligne du tir.
+
+Les preuves de `proposals.json` ne reprennent jamais le texte d'une réponse, le texte envoyé ni le contenu d'un document (décision L-P57). Une ligne du journal y est coupée avant « réponse : « », avant « texte envoyé » et avant « manque : » (les motifs de l'oracle, qui disent les faits des documents) : il en reste le cas, le verdict, les durées et les nœuds du pipeline. Une ligne de `driver.log` n'y garde que les mots du driver avant le premier deux-points (sélecteur, modale, refus, minutage), jamais le texte de la page. Les notes du harnais sont reprises telles quelles : ce sont vos propres lignes `vk_log`. `debrief.md` et `debrief.json` ne portent que des identifiants de cas, des renvois `fichier:ligne`, des comptes et des titres de modale.

@@ -1,22 +1,43 @@
 """Run directories for the debrief tests: the 17/10 run, and a clean one.
 
-`run_2026_10_17(dir)` assembles the governed recette of 2026-10-17 (five tasks, node-1):
-- `journal.jsonl` is the REAL published journal, copied from
-  docs/functional/use-cases/recettage-chat-ia/runs/2026-10-17/journal.jsonl;
-- `journal-essai1.jsonl`, `driver.log`, `vkd-console.log` are the excerpts of
-  tests/fixtures/debrief-2026-10-17/, written from the debrief's verified facts
-  (docs/technical/debriefs/2026-10-17-maskai-driver.md): essai 1's N1-1/N1-3 « réponse vide »
-  with call_llm (D1), the unknown « Votre avis » modal refused twice in t16 and the two
-  preconditions after it (D2, §3), the console kept from 15:42 only. The maintenance line of
-  driver.log is NOT a 17/10 event: it is the v2 driver's line, seen at recette 2's first try,
-  placed here so the fixture carries every defect the stage must detect;
-- `tasks/*.json` and `dmesg.json` are built from TASKS below: per step the window, the
-  `driver.acted` count and the cost; totals are the debrief's §1 [V] (291 acts, 4.245 USD,
-  N4 = 809 s / 33 acts / 0.320 USD over t7+t16+t25, t39's replay 329 s / 55 acts / 0.674 USD);
-  the split of N4 and of the N0-N3 replays between tasks is this fixture's;
-- `cases.json` keeps level, kind and budget_s of the 34 cases of drivers/maskai-recette/cases.json.
+`run_2026_10_17(dir)` assembles the governed recette of 2026-10-17 (five tasks, node-1). The
+provenance of every value, "debrief" being docs/technical/debriefs/2026-10-17-maskai-driver.md:
+- `journal.jsonl` is the REAL published journal, copied byte for byte from
+  docs/functional/use-cases/recettage-chat-ia/runs/2026-10-17/journal.jsonl.
+- `journal-essai1.jsonl` (tests/fixtures/debrief-2026-10-17/): from the debrief, the five cases of
+  essai 1, N1-1 and N1-3 KO « réponse vide : échec silencieux » (§1, §2 D1 [V]) and N1-1's
+  `call_llm` 2444 ms (§4); `inputs_sha256` is the published journal's (§2 D12: one value). The
+  FIXTURE'S OWN, not the debrief's: the minutes (placed in t2's window 15:22–15:26 of §1), every
+  `timing_s`, N1-1's other pipeline nodes, N1-3's whole `pipeline_ms` (`call_llm` 2391 among them),
+  the N0 load figures and N1-2's « aucun envoi ». Essai 1's set-aside journal stays on the node,
+  unpublished; its values are close to these, not equal.
+- `vkd-console.log` (same directory): from the debrief, a console kept from 15:42 only (header);
+  in t16 the unknown « Votre avis » modal refused `dialog` twice, `nouvelle_conversation` (§2 D2)
+  and `capture_ecran` (§2 D11), then two `precondition` refusals (§3); the abandons of V2-V1 (t16)
+  and V2-V3, V2-V4, V2-V5 (t25), at the minutes of their journal lines 15 to 18; N9-2's empty
+  answer without `call_llm` (§2 D1, journal line 33); t39's replay of the 34 cases (§1). The
+  FIXTURE'S OWN: the seconds, and the wording of every note (the harness's real notes are not
+  published).
+- `driver.log` (same directory): from the debrief, a browser start at the beginning of each of
+  the five tasks (§1) and the known modal `avis` dismissed after the t25 abandons, 5 to 8 s later
+  (§2 D2). The FIXTURE'S OWN: the times to the second, the number of dismissals (three, one per
+  t25 abandon) and the dismissal's wording, which `DISMISSED` reads as it reads the driver's own
+  « known modal avis dismissed by its button ». The maintenance line is NOT a 17/10 event: it is
+  the v2 driver's line, seen at recette 2's first try, placed here so the fixture carries every
+  defect the stage must detect.
+- `tasks/*.json` and `dmesg.json` are built from TASKS below. From the debrief (§1 [V]): the five
+  windows and the end of each task (N5 `failed: harness produced no artefact` in t7 and t16, 4
+  acts and 0.049 USD each; t39 `done` after 1 h 39 waiting at the first approval), each task's
+  harness and total cost, the live pass of every level (duration, acts, cost: N0-N3 in t7, N5-N9 in
+  t25, N0's 88 s counting t7's plan), N4 = 809 s / 33 acts / 0.320 USD over t7+t16+t25, t39's
+  replay 329 s / 55 acts / 0.674 USD, plans 0.29, judges 0.66, draft 0.22, 291 acts and 4.245 USD
+  in all. The FIXTURE'S OWN: the statuses `stopped` of t2 and t25, the split of N4 and of the
+  N0-N3 replays of t16 and t25 between tasks, every start and end time inside the windows, and the
+  `driver.acted` times, spread evenly over each step.
+- `cases.json` keeps level, kind and budget_s of the 34 cases of drivers/maskai-recette/cases.json
+  (checked equal).
 
-`clean_run(dir)` is a run of the v2 driver with nothing to report.
+`clean_run(dir)` is a run of the v2 driver with nothing to report; every value is the fixture's own.
 Usable from Rust tests: `python -I drivers/vkforge/tests/debrief_fixtures.py DIR 17-10|clean`.
 """
 import json
