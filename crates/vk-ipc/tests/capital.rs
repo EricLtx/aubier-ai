@@ -33,7 +33,9 @@ mod common;
 use common::*;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(windows)]
+use std::process::Stdio;
 use vk_capital::layout::{self, Annotations, Layers};
 use vk_capital::signature::{KeySource, Pins, PublisherKey};
 use vk_contracts::driver::{DriverManifest, DriverUnmounted};
