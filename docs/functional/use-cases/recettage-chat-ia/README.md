@@ -42,3 +42,17 @@ pilote après chaque réponse ; le popover « Chiffré » du compositeur, qui d�
 l'envoi, n'est plus qu'un repli) ; l'évaluateur lit un lien `pii://` resté brut comme son texte et
 une espace insécable ou fine comme une espace. L'évaluateur change, donc `inputs_sha256` aussi : la
 recette 3 ne porte pas l'empreinte de la recette 2, c'est attendu, et son delta doit le dire.
+
+## Recette 3 (en préparation)
+
+La troisième recette, « de bout en bout » en boîte noire (décisions du fondateur du 18/10), est
+décrite par `PROCEDURE-3.md`, delta de `PROCEDURE-2.md`. Sa grille M0–M9 rejoue les 94 cas M0–M7
+et ajoute M8 (fonctionnalités) et M9 (pertinence). Le juge y applique un contrat de masquage
+écrit (§7, décision D-17), une grille de pertinence et une lecture de la latence par couche, et
+marque une seule fois « indisponible » un canal pièce jointe en erreur. Les cas proposés sont dans
+`cases-3-proposal.json` : neuf que le pilote v2.2 sait jouer, cinq « à implémenter ». La recette
+gouvernée, à dix niveaux, est `recipes/recette-maskai-3.json`. Reste à faire avant l'exécution :
+fusionner les neuf cas dans `drivers/maskai-recette/cases.json` avec le changement du pilote v2.2
+(note, `files_sha256` régénéré, `test_recipe_cases.py` étendu à la recette 3 et borné par recette,
+PROCEDURE-3 §6). Les cinq cas « à implémenter » (recherche ⌘K, renommage, suppression, bouton de
+dictée, enquête « Votre avis ») attendent le pilote v2.3.
