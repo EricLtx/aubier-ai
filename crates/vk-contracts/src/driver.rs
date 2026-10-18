@@ -15,6 +15,9 @@ use std::path::Path;
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
     Browser,
+    /// A desktop application driven through its COM object model; the
+    /// application's process is not in the driver's Job (spike C).
+    Com,
 }
 
 /// Where the driver's process must live. In the manifest, so in `driver_id`.
@@ -110,7 +113,19 @@ pub struct DriverAction {
     },
     "then" = {
         "properties": { "program": { "properties": { "headless": { "const": true } } } }
-    }
+    },
+    // Per kind: what `validate` refuses about `applications`, the schema
+    // refuses too, so a manifest written by hand fails before the kernel.
+    "allOf" = [
+        {
+            "if": { "properties": { "kind": { "const": "com" } }, "required": ["kind"] },
+            "then": { "required": ["applications"], "properties": { "applications": { "minItems": 1 } } }
+        },
+        {
+            "if": { "properties": { "kind": { "const": "browser" } }, "required": ["kind"] },
+            "then": { "properties": { "applications": { "maxItems": 0 } } }
+        }
+    ]
 ))]
 pub struct DriverManifest {
     pub name: String,
@@ -118,6 +133,11 @@ pub struct DriverManifest {
     pub program: DriverProgram,
     /// Host names only (no scheme, no port, no path), lower-case.
     pub hosts: Vec<String>,
+    /// Executable names of the applications a `com` driver drives, as Windows
+    /// reports them (`WINWORD.EXE`); empty, and not serialised, for a browser
+    /// driver, so every manifest written before this field keeps its id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applications: Vec<String>,
     pub actions: Vec<DriverAction>,
     pub min_interval_ms: u64,
     pub max_action_ms: u64,
@@ -222,7 +242,7 @@ impl DriverManifest {
 
     /// Every refusal names its remedy. Checked in this order: name, command,
     /// `files_sha256`, the memory cap's floor, the service context's headless
-    /// requirement, hosts, actions (count, duplicates, names, `args`,
+    /// requirement, hosts or applications (by kind), actions (count, duplicates, names, `args`,
     /// evidence), the interval ceiling, and last the credential-shaped keys.
     pub fn validate(&self) -> Result<(), DriverError> {
         if !is_driver_name(&self.name) {
@@ -253,8 +273,34 @@ impl DriverManifest {
                 "execution_context service requires program.headless true: session 0 has no desktop",
             );
         }
-        if self.hosts.is_empty() {
-            return invalid("hosts is empty: list the host names the driver may reach");
+        match self.kind {
+            DriverKind::Browser => {
+                if self.hosts.is_empty() {
+                    return invalid("hosts is empty: list the host names the driver may reach");
+                }
+                if !self.applications.is_empty() {
+                    return invalid(
+                        "applications must be empty for a browser driver: it drives pages, not programs",
+                    );
+                }
+            }
+            DriverKind::Com => {
+                if self.applications.is_empty() {
+                    return invalid(
+                        "applications is empty: name the executables a com driver drives (WINWORD.EXE)",
+                    );
+                }
+                for a in &self.applications {
+                    if a.contains('\\') || a.contains('/') {
+                        return invalid(format!("application `{a}`: an executable name, no path"));
+                    }
+                    if a != &a.to_ascii_uppercase() || !a.ends_with(".EXE") {
+                        return invalid(format!(
+                            "application `{a}`: upper-case executable name ending in .EXE, as Windows reports it"
+                        ));
+                    }
+                }
+            }
         }
         for h in &self.hosts {
             let bad = h.is_empty()
@@ -462,7 +508,79 @@ mod tests {
         assert_eq!(m.execution_context, ExecutionContext::Interactive);
         assert!(!m.needs_input_desktop);
         assert_eq!(m.source, DriverSource::Development);
+        assert!(
+            m.applications.is_empty(),
+            "absent is empty, and never serialised"
+        );
         assert_eq!(m.driver_id(), PILOT_ID);
+    }
+
+    fn word_com() -> DriverManifest {
+        serde_json::from_str(include_str!(
+            "../../../contracts/examples/driver_manifest/valid/word_com.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_com_driver_names_its_applications_and_may_have_no_hosts() {
+        let m = word_com();
+        assert_eq!(m.kind, DriverKind::Com);
+        assert_eq!(m.applications, vec!["WINWORD.EXE"]);
+        assert!(m.hosts.is_empty());
+        m.validate().unwrap();
+        let refuse = |edit: &dyn Fn(&mut DriverManifest), needle: &str| {
+            let mut bad = word_com();
+            edit(&mut bad);
+            let e = bad.validate().unwrap_err().to_string();
+            assert!(e.contains(needle), "{needle}: {e}");
+        };
+        refuse(&|m| m.applications.clear(), "applications is empty");
+        refuse(
+            &|m| m.applications = vec!["winword.exe".into()],
+            "upper-case",
+        );
+        refuse(
+            &|m| m.applications = vec!["WINWORD".into()],
+            "ending in .EXE",
+        );
+        refuse(
+            &|m| m.applications = vec!["C:\\WINWORD.EXE".into()],
+            "no path",
+        );
+        refuse(
+            &|m| m.applications = vec!["OFFICE/WINWORD.EXE".into()],
+            "no path",
+        );
+    }
+
+    #[test]
+    fn a_browser_driver_may_not_name_applications() {
+        let mut m = manifest();
+        m.applications = vec!["WINWORD.EXE".into()];
+        let e = m.validate().unwrap_err().to_string();
+        assert!(e.contains("applications must be empty"), "{e}");
+        let mut m = manifest();
+        m.hosts.clear();
+        assert!(m
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("hosts is empty"));
+    }
+
+    #[test]
+    fn applications_are_identity_when_present_and_absent_when_empty() {
+        let mut m = word_com();
+        let id = m.driver_id();
+        m.applications.push("POWERPNT.EXE".into());
+        assert_ne!(
+            m.driver_id(),
+            id,
+            "another program driven is another driver"
+        );
+        let text = serde_json::to_string(&manifest()).unwrap();
+        assert!(!text.contains("applications"), "{text}");
     }
 
     #[test]

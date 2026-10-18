@@ -105,6 +105,7 @@ fn maskai_like() -> DriverManifest {
             max_memory_bytes: None,
         },
         hosts: vec!["app.maskai.fr".into()],
+        applications: vec![],
         actions: vec![
             DriverAction {
                 name: "echo".into(),

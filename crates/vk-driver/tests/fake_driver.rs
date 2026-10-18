@@ -54,7 +54,7 @@ for line in sys.stdin:
 const ENV_DRIVER: &str = r#"import json, os, sys
 def say(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
 say({"hello": {"protocol": 1, "driver": "env", "version": "0", "actions": ["env"]}})
-names = ["VK_DRIVER_PROFILE_DIR", "VK_DRIVER_WORK_DIR", "VK_DRIVER_HEADLESS", "VK_DRIVER_CHANNEL", "VK_DRIVER_HOSTS"]
+names = ["VK_DRIVER_PROFILE_DIR", "VK_DRIVER_WORK_DIR", "VK_DRIVER_HEADLESS", "VK_DRIVER_CHANNEL", "VK_DRIVER_HOSTS", "VK_DRIVER_APPLICATIONS"]
 for line in sys.stdin:
     r = json.loads(line)
     env = {k: os.environ.get(k) for k in names}
@@ -798,7 +798,7 @@ fn the_environment_names_the_dirs_the_mode_and_the_hosts() {
 
     // Headless and no channel: `1` and the empty string.
     let rig = Rig::new(ENV_DRIVER);
-    let m = rig.manifest(rig.command(), env_action);
+    let m = rig.manifest(rig.command(), env_action.clone());
     let mut host = rig.spawn(&m);
     let out = host
         .act(
@@ -812,6 +812,31 @@ fn the_environment_names_the_dirs_the_mode_and_the_hosts() {
     assert_eq!(out.result["VK_DRIVER_HEADLESS"], "1");
     assert_eq!(out.result["VK_DRIVER_CHANNEL"], "");
     assert_eq!(out.result["VK_DRIVER_HOSTS"], "example.invalid");
+    assert_eq!(out.result["VK_DRIVER_APPLICATIONS"], "");
+
+    // A com driver: no host, its applications comma-joined.
+    let rig = Rig::new(ENV_DRIVER);
+    let mut m = rig.manifest(rig.command(), env_action.clone());
+    m.kind = vk_contracts::driver::DriverKind::Com;
+    m.hosts.clear();
+    m.applications = vec!["WINWORD.EXE".into(), "POWERPNT.EXE".into()];
+    m.validate().unwrap();
+    let mut host = rig.spawn(&m);
+    let out = host
+        .act(
+            action(&m, "env"),
+            &json!({}),
+            Duration::from_secs(10),
+            WIDE,
+            &never,
+        )
+        .expect("env answers");
+    assert_eq!(
+        out.result["VK_DRIVER_APPLICATIONS"],
+        "WINWORD.EXE,POWERPNT.EXE"
+    );
+    assert_eq!(out.result["VK_DRIVER_HOSTS"], "");
+    host.shutdown();
 }
 
 /// Re-review of the final fix wave: the driver's own `ok: false` reason is

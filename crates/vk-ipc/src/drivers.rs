@@ -40,6 +40,11 @@ use vk_kernel::now_ms;
 /// a false KO or a dead driver mid-recette.
 const BROWSER_MAX_MEMORY: u64 = 6 * 1024 * 1024 * 1024;
 
+/// The memory cap on a com driver's tree when its manifest names none: the
+/// driver's own Python and its COM client. The application's process (Word)
+/// is the user's interactive instance, outside the Job (spike C).
+const COM_MAX_MEMORY: u64 = 1 << 30;
+
 /// The memory cap a driver's tree is spawned under: the manifest's
 /// `program.max_memory_bytes`, or its kind's default.
 fn memory_cap_of(manifest: &DriverManifest) -> u64 {
@@ -48,6 +53,7 @@ fn memory_cap_of(manifest: &DriverManifest) -> u64 {
         .max_memory_bytes
         .unwrap_or(match manifest.kind {
             DriverKind::Browser => BROWSER_MAX_MEMORY,
+            DriverKind::Com => COM_MAX_MEMORY,
         })
 }
 
