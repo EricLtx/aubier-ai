@@ -20,3 +20,17 @@ cible : MaskAI (`app.maskai.fr`), 12–13 octobre 2026.
 Rejouer sur une nouvelle version : ouvrir la session dans Chrome, charger la compétence,
 suivre `PROCEDURE.md`, journaliser chaque test, évaluer contre les oracles, n'écrire que le
 delta du rapport.
+
+## Exécution du 2026-10-18 (recette 2, en attente de signature)
+
+Seconde recette jouée sur le nœud avec le pilote v2.1 (branche `maskai-driver-v2`, 94 cas, les
+quatorze modèles du sélecteur) : tâche `task-node-1-75`, verdict rejugé après trente lignes de
+correction du journal (deux artefacts du banc : un oracle `` corrompu, une bannière de modèle non
+lue sans fournisseur) — 48 OK, 17 PARTIEL, 29 KO. Non signé le 18/10 : la grille est jugée encore
+injuste et incomplète pour servir une refonte (contrat de masquage absent de la rubrique du juge,
+texte envoyé jamais observé, canal pièces jointes hors service côté infrastructure). Le rapport
+reste privé tant que la fuite d'erreur interne constatée sur les pièces jointes (un message
+d'erreur du serveur, avec un nom d'hôte interne et une pile logicielle, affiché dans la puce)
+n'est pas corrigée. Décisions ouvertes :
+registre du 18/10 (`docs/strategy/decisions/`, privé). Le fondateur a tranché la mesure en boîte
+noire : la lecture du texte envoyé passera par le panneau « Détails » de la réponse.

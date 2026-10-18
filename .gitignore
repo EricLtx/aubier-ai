@@ -31,6 +31,12 @@ target/
 # review records, and the private parts of the functional documentation
 docs/strategy/
 docs/archive/strategy/
+docs/marketing/
+docs/archive/marketing/
+docs/commercial/
+docs/archive/commercial/
+docs/research/
+docs/archive/research/
 docs/technical/reviews/
 docs/archive/technical/reviews/
 docs/**/private/

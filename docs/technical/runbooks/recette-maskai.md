@@ -478,7 +478,7 @@ Attendu : des fichiers `<hash12>.<nom>`. On y trouve `report.md`, `verdict.md`, 
 - **Sinon**, copiez les seuls fichiers de cette tâche dans le dossier de préparation, puis cherchez les adresses et les comptes :
 ```powershell
 $mine = (vk task show $t --json | ConvertFrom-Json).artefacts | ForEach-Object { $_.hash.Substring(7, 12) }
-$dst = "docs\use-cases\recettage-chat-ia\runs\2026-10-15"   # la date de la séance
+$dst = "docs\functional\use-cases\recettage-chat-ia\runs\<AAAA-MM-JJ>"   # la date de la séance
 New-Item -ItemType Directory -Force $dst | Out-Null
 Get-ChildItem $src -File | Where-Object { $mine -contains $_.Name.Substring(0, 12) } | Copy-Item -Destination $dst
 "{0} fichiers dans le dossier publié, {1} copiés" -f (Get-ChildItem $src -File).Count, (Get-ChildItem $dst -File).Count

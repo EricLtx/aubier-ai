@@ -113,3 +113,7 @@ Marge du chien de garde mince : N3-3 à 22,9 s pour 30 s [V]. Refus par raison, 
 | 11 | Captures masquées (option `mask` de Playwright sur le compte), cadrées sur la colonne centrale | ¼ j | captures publiables |
 | 12 | Compte de test dédié, historique vide ; N7 jugé sur le delta de la liste | ½ j + décision | N7 borné au run |
 | 13 | Sonde d'UI avant N0 : chaque sélecteur résolu, modales recensées | ½ j | boucle sélecteur évitée |
+
+## Suite donnée (2026-10-18)
+
+Le pilote v2 a été livré le 17/10 au soir et porté en v2.1 le 18/10 (relevé de la plateforme revenue de maintenance : quatorze modèles, bouton de dictée, compositeur sans `<form>`, page d'erreur d'authentification, profil non connecté). Les propositions 1 à 13 ci-dessus sont tenues par la v2 sauf la 10 (export `--debrief`), remplacée par l'étage `debrief` de vkforge (décision du fondateur, 17/10 : la boucle de rétro-apprentissage après lancement est une étape de la pipeline d'apprentissage, sans nouveau kind de ledger). La seconde recette a tourné le 18/10 (`docs/functional/use-cases/recettage-chat-ia/README.md`, exécution en attente de signature).

@@ -255,9 +255,9 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $Bin) { $Bin = Join-Path $env:USERPROFILE '.cargo-target\verticalai-sp1\release' }
 $script:Vk = Join-Path $Bin 'vk.exe'
 $Vkd = Join-Path $Bin 'vkd.exe'
-$BriefPath = Join-Path $RepoRoot 'docs\demo\brief\acme-brief.md'
+$BriefPath = Join-Path $RepoRoot 'docs\functional\demo\brief\acme-brief.md'
 $RunDate = Get-Date -Format 'yyyy-MM-dd'
-$RunDir = Join-Path $RepoRoot ('docs\demo\runs\' + $RunDate)
+$RunDir = Join-Path $RepoRoot ('docs\functional\demo\runs\' + $RunDate)
 
 Write-Head 'SP1 demo'
 Write-Fact 'roles' $Roles

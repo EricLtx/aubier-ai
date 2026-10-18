@@ -2,8 +2,9 @@
 
 Two checks, both over the files git tracks:
 
-1. Every Markdown file under `docs/` sits in one of the four roots
-   (`technical`, `functional`, `strategy`, `archive`) or is `docs/README.md`.
+1. Every Markdown file under `docs/` sits in one of the seven axis roots
+   (`technical`, `functional`, `users`, `strategy`, `marketing`, `commercial`,
+   `research`) or under `archive`, or is `docs/README.md`.
 2. Every repository path a tracked text file names in back-ticks or in a
    Markdown link — `docs/...`, `contracts/...`, `scripts/...`, `drivers/...`,
    `recipes/...`, `crates/...` — exists. Not checked: a path with a glob or a
@@ -20,10 +21,13 @@ import re
 import subprocess
 import sys
 
-ROOTS = ("technical", "functional", "strategy", "archive")
+ROOTS = ("technical", "functional", "users", "strategy", "marketing", "commercial", "research", "archive")
 PATH_RE = re.compile(
     r"(?:`|\]\()((?:docs|contracts|scripts|drivers|recipes|crates)/[A-Za-z0-9._/-]+)(?:`|\))"
 )
+# A Windows path quoted in a script (`'docs\functional\demo\...'`): the same check,
+# backslashes normalised; a trailing backslash names a folder.
+WIN_PATH_RE = re.compile(r"['\"]((?:docs|contracts|scripts|drivers|recipes|crates)\\[A-Za-z0-9._\\-]+)['\"]")
 # Named as the place a document must NOT go; not a path to resolve.
 DEPRECATED = {"docs/superpowers"}
 # Historical records are not kept in step with the code they name; a spec or a
@@ -32,6 +36,12 @@ RECORDS = ("docs/archive/", "docs/functional/demo/runs/", "docs/technical/plans/
 PRIVATE_PREFIXES = (
     "docs/strategy/",
     "docs/archive/strategy/",
+    "docs/marketing/",
+    "docs/archive/marketing/",
+    "docs/commercial/",
+    "docs/archive/commercial/",
+    "docs/research/",
+    "docs/archive/research/",
     "docs/technical/reviews/",
     "docs/archive/technical/reviews/",
 )
@@ -69,8 +79,10 @@ def main() -> int:
                 text = fh.read()
         except (OSError, UnicodeDecodeError):
             continue
-        for m in PATH_RE.finditer(text):
-            p = m.group(1).rstrip("/").split("#")[0]
+        named = [m.group(1) for m in PATH_RE.finditer(text)]
+        named += [m.group(1).replace("\\", "/") for m in WIN_PATH_RE.finditer(text)]
+        for p in named:
+            p = p.rstrip("/").split("#")[0]
             if placeholder(p) or is_private(p) or p in DEPRECATED:
                 continue
             if not os.path.exists(os.path.join(repo, p)):
