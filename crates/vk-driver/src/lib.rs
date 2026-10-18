@@ -227,8 +227,9 @@ impl DriverHost {
     /// manifest names no channel) and `VK_DRIVER_HOSTS` (the manifest's hosts
     /// joined with commas, ruling R1 — the driver enforces the allow-list from
     /// it) and `VK_DRIVER_APPLICATIONS` (the executables a com driver drives,
-    /// comma-joined; empty for a browser driver); contain it under `governor` immediately, failing closed on Windows
-    /// as the harness does; read the hello within [`HELLO_TIMEOUT`]; refuse a
+    /// comma-joined; empty for a browser driver); contain it under `governor`
+    /// immediately, failing closed on Windows as the harness does; read the
+    /// hello within [`HELLO_TIMEOUT`]; refuse a
     /// protocol other than [`PROTOCOL`] and an action set that does not cover
     /// `manifest.actions`. The driver's stderr goes to `<work_dir>/driver.log`
     /// (append). A driver refused after it started is killed before this

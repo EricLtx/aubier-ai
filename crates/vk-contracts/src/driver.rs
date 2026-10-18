@@ -242,8 +242,8 @@ impl DriverManifest {
 
     /// Every refusal names its remedy. Checked in this order: name, command,
     /// `files_sha256`, the memory cap's floor, the service context's headless
-    /// requirement, hosts or applications (by kind), actions (count, duplicates, names, `args`,
-    /// evidence), the interval ceiling, and last the credential-shaped keys.
+    /// requirement, hosts or applications (by kind), actions (count, duplicates, names,
+    /// `args`, evidence), the interval ceiling, and last the credential-shaped keys.
     pub fn validate(&self) -> Result<(), DriverError> {
         if !is_driver_name(&self.name) {
             return invalid(format!(
@@ -294,9 +294,19 @@ impl DriverManifest {
                     if a.contains('\\') || a.contains('/') {
                         return invalid(format!("application `{a}`: an executable name, no path"));
                     }
-                    if a != &a.to_ascii_uppercase() || !a.ends_with(".EXE") {
+                    let stem = a.strip_suffix(".EXE").unwrap_or("");
+                    let one_token = !stem.is_empty()
+                        && stem.bytes().all(|b| {
+                            b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+                        });
+                    if !one_token {
                         return invalid(format!(
                             "application `{a}`: upper-case executable name ending in .EXE, as Windows reports it"
+                        ));
+                    }
+                    if self.applications.iter().filter(|b| *b == a).count() > 1 {
+                        return invalid(format!(
+                            "applications repeats `{a}`: name each executable once"
                         ));
                     }
                 }
@@ -551,6 +561,14 @@ mod tests {
         refuse(
             &|m| m.applications = vec!["OFFICE/WINWORD.EXE".into()],
             "no path",
+        );
+        refuse(
+            &|m| m.applications = vec!["WIN WORD.EXE".into()],
+            "upper-case",
+        );
+        refuse(
+            &|m| m.applications = vec!["WINWORD.EXE".into(), "WINWORD.EXE".into()],
+            "repeats",
         );
     }
 
