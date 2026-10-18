@@ -1,3 +1,4 @@
+import ast
 import contextlib
 import hashlib
 import io
@@ -63,13 +64,24 @@ class PackageTest(unittest.TestCase):
         self.assertEqual(canon.sha256(obj), "sha256:" + hashlib.sha256(data).hexdigest())
 
     def test_the_package_opens_no_socket(self):
+        """No module of the package imports a network module, in any form: `import a, socket`,
+        `from socket import x`, `from urllib import request`, `__import__("ssl")`."""
+        banned = {"socket", "ssl", "urllib", "http", "requests", "ftplib", "smtplib"}
         for p in (ROOT / "vkforge").rglob("*.py"):
             if "tests" in p.parts:
                 continue
-            text = p.read_text(encoding="utf-8")
-            for banned in ("import socket", "import urllib", "import http", "import requests",
-                           "from socket", "from urllib", "from http"):
-                self.assertNotIn(banned, text, f"{p}: {banned}")
+            found = []
+            for node in ast.walk(ast.parse(p.read_text(encoding="utf-8"), str(p))):
+                if isinstance(node, ast.Import):
+                    found += [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    found.append(node.module or "")
+                elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                      and node.func.id == "__import__" and node.args
+                      and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+                    found.append(node.args[0].value)
+            for name in found:
+                self.assertNotIn(name.split(".")[0], banned, f"{p}: imports {name}")
 
 
 if __name__ == "__main__":

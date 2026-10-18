@@ -332,6 +332,11 @@ pub fn learn(
         )));
     }
     if let Some(verb) = verb {
+        if corpus.is_some() || threshold.is_some() {
+            return Err(bad(
+                "--deliberate takes no corpus or threshold; remedy: drop them",
+            ));
+        }
         return deliberate(kernel, cfg, state_dir, ctx, &app, &out, arch, &verb);
     }
     let corpus = corpus.ok_or_else(|| {
@@ -1126,8 +1131,6 @@ fn io_failed(what: &str, e: &std::io::Error) -> RpcError {
 mod tests {
     use super::*;
 
-    /// A relative `--vkforge-root` is made absolute at start (review fix round 1), so the stage —
-    /// run in the root — is handed a script path and a `--fixture` path that name the same files.
     /// The rule of an answer is the first `{member, constants}` object in it (L-P29), else null.
     #[test]
     fn a_rule_is_the_first_object_with_exactly_member_and_constants() {
@@ -1172,6 +1175,8 @@ mod tests {
         assert!(catalogue_slice(&entry, &big).len() <= EVIDENCE_BYTES);
     }
 
+    /// A relative `--vkforge-root` is made absolute at start (review fix round 1), so the stage —
+    /// run in the root — is handed a script path and a `--fixture` path that name the same files.
     #[test]
     fn a_relative_root_is_made_absolute_at_start() {
         let cfg = ForgeConfig::at("drivers".into());

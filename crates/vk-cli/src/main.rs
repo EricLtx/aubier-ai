@@ -568,13 +568,18 @@ enum DriverCmd {
         family: String,
         #[arg(long)]
         app: String,
-        #[arg(long, value_name = "DIR", required_unless_present = "deliberate")]
+        #[arg(
+            long,
+            value_name = "DIR",
+            required_unless_present = "deliberate",
+            conflicts_with = "deliberate"
+        )]
         corpus: Option<PathBuf>,
         /// A new directory; its name is the driver's (word-maison). With
         /// `--deliberate`, an earlier learning's output instead.
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
-        #[arg(long, default_value_t = 0.8)]
+        #[arg(long, default_value_t = 0.8, conflicts_with = "deliberate")]
         threshold: f64,
         /// The arch that may choose among an ambiguous invariant's candidates, by
         /// name or id; without it every ambiguity is purged, and no model is called.
@@ -1285,8 +1290,11 @@ async fn call(cli: &Cli) -> Result<()> {
                 "family": family,
                 "app": app,
                 "out": plain_path(&absolute(out)?),
-                "threshold": threshold,
             });
+            if deliberate.is_none() {
+                // A fallback takes no threshold: the daemon refuses one it is sent.
+                params["threshold"] = json!(threshold);
+            }
             if let Some(corpus) = corpus {
                 params["corpus"] = json!(plain_path(&absolute(corpus)?));
             }

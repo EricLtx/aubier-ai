@@ -77,11 +77,11 @@ Attendu, cinq lignes (les valeurs de l'exemple varient avec le corpus et la vers
 ```
 learned word-maison  sha256:…
 plan sha256:… -> C:\drivers-appris\word-maison\plan.json (read it: vk driver plan show C:\drivers-appris\word-maison)
-unbound: set_slide_layout, set_placeholder_text, apply_theme
+unbound: set_slide_layout
 ambiguities: none
 excluded: none
 ```
-- `unbound` : les verbes de l'ontologie que cette application n'a pas (ici ceux de PowerPoint, sur Word). Ils sont exclus du plan ; le §6 les propose à un arch.
+- `unbound` : les verbes de l'ontologie que cette application n'a pas (ici `set_slide_layout`, propre à PowerPoint, sur Word). Ils sont exclus du plan ; le §6 les propose à un arch. Un verbe `partial` (ici `set_placeholder_text`) est lié, mais pas entièrement : il n'est pas listé ici.
 - `ambiguities` : `<invariant> purged` (aucun arch) ou `<invariant> arch:<id>`.
 - `excluded` : ce que le plan a laissé de côté et pourquoi, par exemple `title_style (a custom style has no built-in anchor (v1))`.
 
@@ -129,7 +129,7 @@ Pour un verbe `unbound`, on peut demander à un arch de **proposer** une règle 
 ```powershell
 vk driver learn --deliberate set_slide_layout --family office-document --app word --out C:\drivers-appris\word-maison --arch NOM
 ```
-`--out` est la sortie d'un apprentissage précédent (il doit contenir `catalogue.json` de cette application) ; `--arch` est obligatoire, et l'arch doit pouvoir `Generate`. Le verbe doit exister dans l'ontologie.
+`--out` est la sortie d'un apprentissage précédent (il doit contenir `catalogue.json` de cette application) ; `--arch` est obligatoire, et l'arch doit pouvoir `Generate` ; ni `--corpus` ni `--threshold` ne sont admis (`--deliberate takes no corpus or threshold; remedy: drop them`). Le verbe doit exister dans l'ontologie.
 
 Attendu, trois lignes :
 ```

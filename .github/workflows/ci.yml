@@ -309,6 +309,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
       VK_FORGE_FIXTURES: "1"
+      # The Rust suites below skip silently where vkforge cannot run; here they
+      # must run, so a missing interpreter or import fails them (L-P56).
+      VK_FORGE_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

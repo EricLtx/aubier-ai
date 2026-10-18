@@ -2669,7 +2669,8 @@ fn forge_python() -> PathBuf {
         .unwrap_or_else(vkforge_venv_python)
 }
 
-/// The vkforge interpreter imports lxml and comtypes and the virtualenv exists; else says so (L-P18).
+/// The vkforge interpreter imports lxml and comtypes and the virtualenv exists; else says so (L-P18),
+/// or, with `VK_FORGE_REQUIRED=1` (the CI job `driver-learn`, L-P56), panics with the reason.
 fn forge_available() -> bool {
     let imports = Command::new(forge_python())
         .args(["-I", "-c", "import lxml, comtypes"])
@@ -2679,7 +2680,12 @@ fn forge_available() -> bool {
         .status()
         .is_ok_and(|s| s.success());
     if !(imports && vkforge_venv_python().is_file()) {
-        eprintln!("vkforge: no interpreter with lxml and comtypes, or no virtualenv; skipping");
+        let why = "vkforge: no interpreter with lxml and comtypes, or no virtualenv";
+        assert!(
+            std::env::var("VK_FORGE_REQUIRED").map_or(true, |v| v != "1"),
+            "VK_FORGE_REQUIRED=1 and {why}"
+        );
+        eprintln!("{why}; skipping");
         return false;
     }
     true

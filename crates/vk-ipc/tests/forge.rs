@@ -580,3 +580,108 @@ async fn deliberate_writes_a_proposal_and_touches_nothing_else() {
     );
     node.shutdown().await;
 }
+
+/// Every refusal of `--deliberate` comes before the model is called: no task, no proposal.
+#[tokio::test]
+async fn deliberate_refuses_before_the_model_is_called() {
+    if !forge_available() {
+        return;
+    }
+    let node = Node::start().await;
+    let mock = node
+        .call("arch.mount_mock", json!({"name": "mock"}))
+        .await
+        .unwrap();
+    let arch = mock["arch_id"].as_str().unwrap().to_string();
+    // An arch that can plan and not draft: another identity, hence another id.
+    let shown = node
+        .call("arch.show", json!({"arch_id": mock["arch_id"]}))
+        .await
+        .unwrap();
+    let mut manifest = shown["manifest"].clone();
+    manifest["name"] = json!("planner");
+    manifest["capabilities"] = json!(["plan"]);
+    manifest["identity"]["weights_sha256"] = json!("sha256:mock-planner");
+    let planner = {
+        use vk_contracts::testing::KernelTestHooks;
+        node.k
+            .lock()
+            .unwrap()
+            .register_arch(serde_json::from_value(manifest).unwrap())
+    };
+    let corpus = ooxml_corpus(&node.dir().join("corpus"), 10, 0);
+    let out = node.dir().join("word-maison");
+    node.call_human("driver.learn", learn_params(&corpus, &out))
+        .await
+        .unwrap();
+    let bare = node.dir().join("bare");
+    let ask = |app: &str, out: &Path, verb: &str, arch: Option<&str>| {
+        let mut p =
+            json!({"family": "office-document", "app": app, "out": out, "deliberate": verb});
+        if let Some(arch) = arch {
+            p["arch"] = json!(arch);
+        }
+        p
+    };
+    let mut with_corpus = ask("word", &out, "set_slide_layout", Some(&arch));
+    with_corpus["corpus"] = json!(corpus);
+    let mut with_threshold = ask("word", &out, "set_slide_layout", Some(&arch));
+    with_threshold["threshold"] = json!(0.8);
+    let cases = [
+        (
+            "no arch",
+            ask("word", &out, "set_slide_layout", None),
+            "--deliberate needs --arch",
+        ),
+        (
+            "no catalogue in out",
+            ask("word", &bare, "set_slide_layout", Some(&arch)),
+            "holds no catalogue.json",
+        ),
+        (
+            "unknown verb",
+            ask("word", &out, "paint_it_red", Some(&arch)),
+            "verb paint_it_red is not in the ontology",
+        ),
+        (
+            "wrong app",
+            ask("powerpoint", &out, "set_slide_layout", Some(&arch)),
+            "holds the catalogue of word, not of powerpoint",
+        ),
+        (
+            "arch cannot draft",
+            ask("word", &out, "set_slide_layout", Some(&planner)),
+            "cannot draft; remedy: an arch with the Generate capability",
+        ),
+        (
+            "arch not mounted",
+            ask(
+                "word",
+                &out,
+                "set_slide_layout",
+                Some(&format!("sha256:{}", "0".repeat(64))),
+            ),
+            "is not mounted on this node",
+        ),
+        (
+            "a corpus",
+            with_corpus,
+            "--deliberate takes no corpus or threshold; remedy: drop them",
+        ),
+        (
+            "a threshold",
+            with_threshold,
+            "--deliberate takes no corpus or threshold; remedy: drop them",
+        ),
+    ];
+    for (label, params, expected) in cases {
+        let m = learn_refusal(&node, params).await;
+        assert!(m.contains(expected), "{label}: {m}");
+    }
+    assert!(!out.join("proposals").exists(), "no proposal was written");
+    assert!(
+        node.events("task.submitted").is_empty(),
+        "no task: the model was never called"
+    );
+    node.shutdown().await;
+}

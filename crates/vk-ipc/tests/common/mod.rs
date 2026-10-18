@@ -61,7 +61,9 @@ pub fn forge_python() -> PathBuf {
 }
 
 /// Whether the vkforge tests can run here (L-P18): the virtualenv a generated driver's `.venv` links
-/// to exists, and the interpreter imports lxml and comtypes. Says why on stderr when not.
+/// to exists, and the interpreter imports lxml and comtypes. Says why on stderr when not — or, with
+/// `VK_FORGE_REQUIRED=1` (the CI job `driver-learn`, ruling L-P56), panics with the reason: a job
+/// that exists to run these tests must not pass by skipping them.
 pub fn forge_available() -> bool {
     let python = forge_python();
     let venv = vkforge_venv().join("Scripts").join("python.exe");
@@ -73,12 +75,17 @@ pub fn forge_available() -> bool {
         .status()
         .is_ok_and(|s| s.success());
     if !(imports && venv.is_file()) {
-        eprintln!(
-            "vkforge: {} cannot import lxml and comtypes, or {} is absent; skipping \
+        let why = format!(
+            "vkforge: {} cannot import lxml and comtypes, or {} is absent \
              (drivers\\vkforge\\setup.ps1 makes the virtualenv)",
             python.display(),
             venv.display()
         );
+        assert!(
+            std::env::var("VK_FORGE_REQUIRED").map_or(true, |v| v != "1"),
+            "VK_FORGE_REQUIRED=1 and {why}"
+        );
+        eprintln!("{why}; skipping");
         return false;
     }
     true
