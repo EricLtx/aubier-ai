@@ -1,0 +1,113 @@
+"""word-maison: driver learned by vkforge, no timestamp.
+
+ontology_sha256   sha256:117706338c6b1e091d1a60002135147bf01891b89415f03056d10d21b96d24df
+catalogue_sha256  sha256:35b989fbc6c37cb5c67900e47a8d89fd99c723ad9d5c6b77564da2aedb83a9bd
+invariants_sha256 sha256:243d9a6e9c2905a7ef1e2d167b06facaa786dacde61545e50a1121a3b885ccb8
+plan_sha256       sha256:da04786ed9d60996ad7426aee032e4dc1a43a43ebbd4300862ab5141061eff74
+"""
+import atexit
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+DRIVER_DIR = Path(__file__).resolve().parent
+VENDOR_DIR = DRIVER_DIR / "vendor"
+
+
+def _first_dir(candidates: tuple, needs: tuple) -> Path:
+    """The first directory holding every file of `needs`; else the last (the repository), so the
+    import error names the development path."""
+    for d in candidates:
+        if all((d / n).is_file() for n in needs):
+            return d
+    return candidates[-1]
+
+
+# vkdriver vendor-first (L-P6): the generator copied drivers/vkdriver into vendor/, so the driver runs
+# alone wherever it was written; the repository layout (<repo>/drivers/vkdriver, the driver at
+# drivers/office-com/<name>/) only without vendor/. Never one directory up. The COM adapter is always
+# vendored (L-P19).
+VKDRIVER_DIR = _first_dir((VENDOR_DIR / "vkdriver", DRIVER_DIR.parents[1] / "vkdriver"), ("protocol.py", "hash_dir.py"))
+sys.path[:0] = [str(VKDRIVER_DIR.parent), str(VENDOR_DIR)]
+from vkdriver.protocol import DriverRefusal, serve  # noqa: E402
+from vkforge_runtime.com import Application  # noqa: E402
+
+NAME = 'word-maison'
+VERSION = 'sha256:da04786ed9d60996ad7426aee032e4dc1a43a43ebbd4300862ab5141061eff74'
+BINDING = json.loads((DRIVER_DIR / "binding.json").read_text(encoding="utf-8"))
+SECRETS = (json.loads((DRIVER_DIR / "secrets.json").read_text(encoding="utf-8"))
+           if (DRIVER_DIR / "secrets.json").is_file() else {})
+_app = None
+
+
+def app():
+    """The COM adapter; its fake twin only when `vkforge qualify --fake` put fake.json in this run's
+    work directory (L-P19): never an environment switch, never in a mount's work directory."""
+    global _app
+    if _app is None:
+        fake = Path(os.environ.get("VK_DRIVER_WORK_DIR") or os.getcwd()) / "fake.json"
+        if fake.is_file():
+            config = json.loads(fake.read_text(encoding="utf-8"))
+            sys.path.insert(0, config["vkforge_root"])
+            from vkforge.runtime.fake import FakeApplication
+            _app = FakeApplication(BINDING, config)
+        else:
+            _app = Application(BINDING)
+        # Once the application exists: atexit runs last-registered first, so _quit releases its COM
+        # references before the exit hook comtypes registered when Application imported it.
+        atexit.register(_quit)
+    return _app
+
+
+def _quit():
+    """The end of the session (L-P46), once, whether serve returned or the interpreter is exiting: the
+    adapter quits the instance it started if it holds no document, and puts DisplayAlerts back on any
+    instance it leaves running (L-P47)."""
+    global _app
+    if _app is not None:
+        ending, _app = _app, None
+        ending.quit()
+
+
+def _sha(path) -> str:
+    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def appliquer_style_maison(args: dict, evidence_dir: str):
+    doc_path = args["document"]
+    if not Path(doc_path).is_file() or Path(doc_path).suffix.lower() != ".docx":
+        raise DriverRefusal("precondition", "not a .docx file")
+    app().probe()   # the type library this driver was learned on (L-P22), else "office version changed"
+    before = _sha(doc_path)
+    doc = app().open(doc_path)
+    try:
+        app().call('apply_paragraph_style', doc, selector='first', style='Heading1')
+        app().call('set_font_run', doc, font={'name': 'Garamond', 'size': 11}, selector='body')
+        app().call('set_footer', doc, text=SECRETS["footer_text"])
+        app().call('save', doc)
+        app().call('export', doc, format='pdf', path=args["pdf"])
+        post = {
+            'title_style': bool(app().call('verify_paragraph_style', doc, selector='first', style='Heading1')),
+            'body_font': bool(app().call('verify_font_run', doc, font={'name': 'Garamond', 'size': 11}, selector='body')),
+            'footer_text': bool(app().call('verify_footer', doc, text=SECRETS["footer_text"])),
+            'pdf_exists': bool(app().call('verify_pdf', doc, path=args["pdf"])),
+        }
+    finally:
+        app().close(doc)
+    ev = Path(evidence_dir, "post.json")
+    ev.write_text(json.dumps({"after_sha256": _sha(doc_path), "before_sha256": before, "post": post}, sort_keys=True),
+                  encoding="utf-8")
+    files = [{"name": "post.json", "mime": "application/json", "path": str(ev)}]
+    if not all(post.values()):
+        raise DriverRefusal("precondition", "postconditions not all held: " + ",".join(k for k, v in post.items() if not v),
+                            evidence=files)
+    return {"post": post, "text": "appliquer_style_maison ok"}, files
+
+
+ACTIONS = {'appliquer_style_maison': appliquer_style_maison}
+
+if __name__ == "__main__":
+    serve(NAME, VERSION, ACTIONS)
+    _quit()

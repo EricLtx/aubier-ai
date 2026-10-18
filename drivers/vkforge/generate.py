@@ -96,12 +96,16 @@ def app():
             _app = FakeApplication(BINDING, config)
         else:
             _app = Application(BINDING)
+        # Once the application exists: atexit runs last-registered first, so _quit releases its COM
+        # references before the exit hook comtypes registered when Application imported it.
+        atexit.register(_quit)
     return _app
 
 
 def _quit():
     """The end of the session (L-P46), once, whether serve returned or the interpreter is exiting: the
-    adapter quits the instance it started and gives the user's own its DisplayAlerts back (L-P47)."""
+    adapter quits the instance it started if it holds no document, and puts DisplayAlerts back on any
+    instance it leaves running (L-P47)."""
     global _app
     if _app is not None:
         ending, _app = _app, None
@@ -127,7 +131,6 @@ _ACTION_TAIL = '''    finally:
 _FOOT = '''
 
 if __name__ == "__main__":
-    atexit.register(_quit)
     serve(NAME, VERSION, ACTIONS)
     _quit()
 '''

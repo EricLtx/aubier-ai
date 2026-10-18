@@ -286,6 +286,15 @@ class GenerateTest(unittest.TestCase):
         files_sha256 = json.loads((out / "manifest.json").read_text(encoding="utf-8"))["program"]["files_sha256"]
         self.assertEqual(printed.getvalue(), f"generate: word-maison {files_sha256} -> {out}\n")
 
+    def test_render_driver_is_the_reviewed_text(self):
+        # The plan's byte-exact driver.py (the brief's text, amended by L-P46/L-P47): _quit registered
+        # with atexit inside app(), once the application exists, and called again when serve returns.
+        expected = (FIXTURES / "driver-word-maison.expected").read_bytes()
+        self.assertEqual(generate.render_driver(self.plan, self.binding, "word-maison").encode("utf-8"), expected)
+        text = expected.decode("utf-8")
+        self.assertLess(text.index("_app = Application(BINDING)"), text.index("atexit.register(_quit)"))
+        self.assertTrue(text.endswith('    serve(NAME, VERSION, ACTIONS)\n    _quit()\n'))
+
     def test_the_driver_quits_its_application_once_when_serve_returns(self):
         # L-P46: stdin's end returns serve, the driver quits the application it used, once (atexit is
         # the backstop); a session that never touched the application quits nothing.

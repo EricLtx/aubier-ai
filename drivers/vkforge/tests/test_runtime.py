@@ -280,7 +280,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(word.quits, 1)
 
     def test_the_users_instance_gets_its_display_alerts_back_and_only_a_started_one_is_quit(self):
-        # L-P47: attached to the user's instance, DisplayAlerts is read, silenced, and put back at the end;
+        # L-P47: DisplayAlerts is read, silenced, and put back whenever the instance is left running;
         # L-P46: only an instance the adapter started is quit, and never one still holding a document.
         user = StubWord()
         attached = com.Application(self.binding, connect=lambda: (user, False))
@@ -291,7 +291,7 @@ class RuntimeTest(unittest.TestCase):
         ours = StubWord()
         started = com.Application(self.binding, connect=lambda: (ours, True))
         started.quit()
-        self.assertEqual((ours.quits, started.app), (1, None))
+        self.assertEqual((ours.quits, ours.DisplayAlerts, started.app), (1, 0, None), "quit: nothing to put back")
         busy = StubWord()
         holding = com.Application(self.binding, connect=lambda: (busy, True))
         holding.open("C:/stub/left.docx")
@@ -299,6 +299,7 @@ class RuntimeTest(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             holding.quit()
         self.assertEqual((busy.quits, len(busy.Documents.items)), (0, 1), "nothing closed, nothing quit")
+        self.assertEqual(busy.DisplayAlerts, -1, "left running: its DisplayAlerts put back")
         self.assertEqual(err.getvalue(), "quit: Word.Application still holds documents; left running\n")
 
     def test_the_cleanup_close_is_bounded_and_the_first_refusal_wins(self):
@@ -323,6 +324,31 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual((cm.exception.reason, cm.exception.detail), ("timeout", "save: no answer within 0.5 s"))
         self.assertEqual(err.getvalue(), "close: close: no answer within 0.5 s\n")
         self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_failed_close_after_a_successful_action_is_surfaced(self):
+        # After an action whose every step answered, a close that fails or hangs would leave the document
+        # open, hidden, in the user's instance: the host hears it as `internal`, nothing goes to stderr only.
+        word = StubWord()
+        app = com.Application(self.binding, connect=lambda: (word, True))
+        app.deadline_s, app.cleanup_deadline_s = 0.5, 0.5
+        locked = app.open("C:/stub/locked.docx")
+        app.call("save", locked)
+        locked.Close = lambda **kw: (_ for _ in ()).throw(OSError("the document is in use"))
+        with self.assertRaises(DriverRefusal) as cm:
+            app.close(locked)
+        self.assertEqual((cm.exception.reason, cm.exception.detail),
+                         ("internal", "close failed: the document is in use"))
+        hung = app.open("C:/stub/hung.docx")
+        app.call("save", hung)
+        wedged = threading.Event()
+        hung.Close = lambda **kw: wedged.wait(30)
+        try:
+            with self.assertRaises(DriverRefusal) as cm:
+                app.close(hung)
+        finally:
+            wedged.set()
+        self.assertEqual((cm.exception.reason, cm.exception.detail),
+                         ("internal", "close failed: close: no answer within 0.5 s"))
 
     def test_a_constant_is_the_least_qualified_member_ending_with_the_value(self):
         style = {v["verb"]: v for v in self.binding["verbs"]}["apply_paragraph_style"]

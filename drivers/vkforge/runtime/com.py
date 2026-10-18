@@ -182,21 +182,21 @@ def probe(binding: dict) -> None:
 
 
 class Application:
-    """The application binding["application"] names, the user's own instance (spike verdict 3). Attached
-    to that instance, the adapter changes only its DisplayAlerts, read first and put back by quit()
-    (L-P47); an instance the adapter started itself, quit() ends (L-P46). `connect` returns
-    (application, started); the default is the running instance, else a new one."""
+    """The application binding["application"] names, the user's own instance (spike verdict 3). The
+    adapter changes only its DisplayAlerts, read first and put back by quit() whenever the instance is
+    left running (L-P47); an instance the adapter started itself and that holds no document, quit()
+    ends (L-P46). `connect` returns (application, started); the default is the running instance, else
+    a new one."""
 
     def __init__(self, binding: dict, connect=None):
         self.binding, self.spec = binding, binding["application"]
         self.verbs = {v["verb"]: v for v in binding["verbs"]}
         self.deadline_s, self.cleanup_deadline_s = CALL_DEADLINE_S, CLEANUP_DEADLINE_S
-        self.app, self.started, self.alerts_before = None, False, None
+        self.app, self.started, self.alerts_before, self.failed = None, False, None, None
         progid = self.spec["progid"]
         try:
             self.app, self.started = (connect or self._connect)()
-            if not self.started:      # the user's instance: its own setting, put back at the end (L-P47)
-                self.alerts_before = guarded(lambda: self.app.DisplayAlerts, "DisplayAlerts")
+            self.alerts_before = guarded(lambda: self.app.DisplayAlerts, "DisplayAlerts")
             guarded(lambda: setattr(self.app, "DisplayAlerts", self.spec["alerts_off"]), "DisplayAlerts")
         except _com_errors() as e:
             raise DriverRefusal("precondition", f"{progid} cannot be started: {e}") from e
@@ -229,6 +229,7 @@ class Application:
         refusal) is `precondition`, as the fake's; a failure inside a verb is `internal` in both. The
         plan's "not open elsewhere" holds in this very instance too: there Open hands back a document the
         user already has open, unsaved edits included; refused, and that document is not closed."""
+        self.failed = None                                  # a new action begins with its document
         try:
             open_before = guarded(lambda: {d.FullName for d in _items(self._documents())}, "open", self.deadline_s)
             doc = guarded(lambda: self._documents().Open(path, **self.spec["open"]), "open", self.deadline_s)
@@ -239,6 +240,7 @@ class Application:
         if already:
             raise DriverRefusal("precondition", "document already open in the application (the user's window)")
         if read_only:
+            self.failed = "open"
             self.close(doc)
             raise DriverRefusal("precondition", "document opened read-only (locked elsewhere)")
         return doc
@@ -246,38 +248,53 @@ class Application:
     def call(self, verb: str, doc, **args):
         try:
             return guarded(lambda: VERBS[verb](self, doc, **args), verb, self.deadline_s)
-        except _com_errors() as e:
-            raise DriverRefusal("internal", f"{verb}: {e}") from e
+        except BaseException as e:
+            self.failed = verb                              # the action refuses: its close is a cleanup
+            if isinstance(e, _com_errors()):
+                raise DriverRefusal("internal", f"{verb}: {e}") from e
+            raise
 
     def close(self, doc) -> None:
-        """Closed without saving, under the short cleanup deadline; its own refusal is written to stderr,
-        never raised: the action's first refusal is the one the host gets (after a timeout, the close
-        meets the same wedged application)."""
+        """Closed without saving. After a refusal in this action, the close is a cleanup against an
+        application that may be wedged: the short cleanup deadline, its own refusal written to stderr,
+        never raised, so the action's first refusal is the one the host gets. After a successful action,
+        the normal deadline, and a failure is `internal` "close failed: …": a document the driver opened
+        must not stay open, hidden, in the user's instance without the host hearing of it."""
+        if self.failed is not None:
+            try:
+                guarded(lambda: doc.Close(**self.spec["close"]), "close", self.cleanup_deadline_s)
+            except (DriverRefusal, *_com_errors()) as e:
+                sys.stderr.write(f"close: {e}\n")
+            return
         try:
-            guarded(lambda: doc.Close(**self.spec["close"]), "close", self.cleanup_deadline_s)
+            guarded(lambda: doc.Close(**self.spec["close"]), "close", self.deadline_s)
         except (DriverRefusal, *_com_errors()) as e:
-            sys.stderr.write(f"close: {e}\n")
+            raise DriverRefusal("internal", f"close failed: {e}") from e
 
     def quit(self) -> None:
-        """The end of the session (L-P46, L-P47), once. Attached to the user's instance: its DisplayAlerts
-        put back, nothing else. Started by this adapter: the references this process dropped are
-        collected, then Quit, unless a document is still open in the instance (one the user opened there,
-        or one a failed close left): nothing is closed then, the instance is left running, stderr says
-        so. Every reference to the application is released at the end. A failure is written to stderr,
+        """The end of the session (L-P46, L-P47), once. An instance this adapter started and that holds
+        no document (after the references this process dropped are collected) is quit. Any other is left
+        running with its DisplayAlerts put back: the user's own instance, or a started one still holding a
+        document (one the user opened there, or one a failed close left; nothing is closed, stderr says
+        so). Every reference to the application is released at the end. A failure is written to stderr,
         never raised: this runs when serve returns and at exit."""
         if self.app is None:
             return
+        left_running = True
         try:
-            if not self.started:
-                if self.alerts_before is not None:
-                    guarded(lambda: setattr(self.app, "DisplayAlerts", self.alerts_before), "DisplayAlerts",
-                            self.cleanup_deadline_s)
-            else:
+            if self.started:
                 guarded(gc.collect, "quit", self.cleanup_deadline_s)
                 if guarded(lambda: self._documents().Count, "quit", self.cleanup_deadline_s):
                     sys.stderr.write(f"quit: {self.spec['progid']} still holds documents; left running\n")
                 else:
                     guarded(lambda: self.app.Quit(), "quit", self.deadline_s)
+                    left_running = False
+        except (DriverRefusal, *_com_errors()) as e:
+            sys.stderr.write(f"quit: {e}\n")
+        try:
+            if left_running and self.alerts_before is not None:
+                guarded(lambda: setattr(self.app, "DisplayAlerts", self.alerts_before), "DisplayAlerts",
+                        self.cleanup_deadline_s)
         except (DriverRefusal, *_com_errors()) as e:
             sys.stderr.write(f"quit: {e}\n")
         finally:
