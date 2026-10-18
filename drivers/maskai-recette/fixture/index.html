@@ -13,6 +13,9 @@
   [data-role="user"] { margin: 6px 0; padding: 6px; border-radius: 6px; background: #eef; }
   article { margin: 6px 0; padding: 6px; border-radius: 6px; background: #efe; }
   article .head { font-size: 11px; color: #555; display: flex; gap: 6px; flex-wrap: wrap; }
+  article .head svg { width: 10px; height: 10px; }
+  [data-slot="collapsible-content"] { font-size: 11px; background: #f8f8f8; border: 1px dashed #aaa; padding: 4px; margin: 4px 0; }
+  [data-slot="collapsible-content"] pre { white-space: pre-wrap; margin: 2px 0; }
   #composer { border-top: 1px solid #ccc; padding: 8px; display: flex; gap: 6px; align-items: flex-end; flex-wrap: wrap; }
   #chips { width: 100%; display: flex; gap: 6px; }
   #chips > div { display: inline-flex; gap: 4px; padding: 2px 6px; border: 1px solid #999; border-radius: 10px; }
@@ -42,7 +45,16 @@
      the stream, with a pause, and ends about 1.5 s after the server's end. A
      generation left in flight by a new conversation brings the « Votre avis »
      survey (a Radix dialog); a stopped one does not. One known modal of v1 stays:
-     the cookie banner. See serve.py for the server side and its trigger words. -->
+     the cookie banner. See serve.py for the server side and its trigger words.
+     Pilot v2.2, in the shapes of a card stored by recette 2 on 18/10: after the guard
+     panel, every answer card's header carries the « Détails » collapsible trigger
+     (`data-slot="collapsible-trigger"`, `aria-label="Voir le texte anonymisé envoyé au
+     LLM"`) and the PII reveal toggle (`data-slot="pii-reveal-toggle"`, which does
+     nothing here but count its clicks); the trigger opens a `[data-slot="collapsible-
+     content"]` in the card (Radix: always mounted, hidden and empty while closed) that
+     shows the anonymised text the server computed (its `X-Sent-Anonymized` header).
+     `?nodetails=1` draws the cards without the collapsible, `?revealed=1` draws the
+     reveal toggle pressed; both hold for the tab's life. -->
 <aside data-slot="sidebar">
   <nav aria-label="Main navigation">
     <a href="/new" data-slot="button" aria-label="Nouvelle conversation">Nouvelle conversation</a>
@@ -106,6 +118,14 @@ const $ = (id) => document.getElementById(id);
 window.__dialog_answered = false;
 window.__survey_shown = 0;
 window.__survey_answered = false;
+window.__reveal_clicks = 0;
+// ?nodetails=1, ?revealed=1: kept in sessionStorage, the page pushes /conversation/<id> URLs
+// that drop the query.
+for (const k of ["nodetails", "revealed"]) {
+  if (new URLSearchParams(location.search).get(k) === "1") sessionStorage.setItem("bench-" + k, "1");
+}
+const NODETAILS = sessionStorage.getItem("bench-nodetails") === "1";
+const REVEALED = sessionStorage.getItem("bench-revealed") === "1";
 
 if (!localStorage.getItem("cookies-ok")) $("cookies").hidden = false;
 $("accept").onclick = () => { localStorage.setItem("cookies-ok", "1"); $("cookies").hidden = true; };
@@ -114,6 +134,7 @@ $("accept").onclick = () => { localStorage.setItem("cookies-ok", "1"); $("cookie
 const PII = [
   [/\b(?:M\.|Mme|Mr)\s+[A-ZÉ][a-zé]+\s+[A-ZÉ][a-zé]+/g, "PERSON"],
   [/\bFR\d{2}(?:\s?\d{4}){5}\s?\d{3}\b/g, "IBAN"],
+  [/(?:\+33\s?|\b0)[1-9](?:[\s.-]?\d{2}){4}\b/g, "PHONE"],
 ];
 function mask(text) {
   const tokens = [], counts = {};
@@ -279,9 +300,30 @@ function addUser(text) {
   $("messages").appendChild(div);
 }
 
+// The card's « Détails » (v2.2): the trigger and the PII reveal toggle in the markup of the card
+// stored on 18/10; the content, a Radix collapsible's, always mounted, hidden and empty while closed.
+const CHEVRON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 4l3 3 3-3" fill="none" stroke="currentColor"/></svg>';
+const EYE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" aria-hidden="true"><circle cx="5" cy="5" r="2" fill="currentColor"/></svg>';
+let detailsCount = 0;
+function toggleDetails(art, trigger, content) {  // bound to its own content, as Radix's context does
+  const open = trigger.getAttribute("aria-expanded") !== "true";
+  trigger.setAttribute("aria-expanded", String(open));
+  trigger.dataset.state = content.dataset.state = open ? "open" : "closed";
+  content.hidden = !open;
+  content.innerHTML = "";
+  if (open) {
+    const label = document.createElement("p");
+    label.textContent = "Texte anonymisé envoyé au LLM :";
+    const text = document.createElement("pre");
+    text.textContent = art.__sent || "";
+    content.append(label, text);
+  }
+}
+
 function addAnswer(tokens, model) {
   const art = document.createElement("article");
   art.setAttribute("aria-label", "MASKAI response");
+  art.__sent = null;  // the anonymised text, from the stream's X-Sent-Anonymized header
   const guard = document.createElement("div");
   guard.className = "head";
   if (tokens.length) {
@@ -289,15 +331,27 @@ function addAnswer(tokens, model) {
     masked.textContent = "Anonymisé → " + tokens.join(" ");
     const verdicts = document.createElement("span");
     verdicts.textContent = "L'Aiguilleur : PASS·Le Chirurgien : " + tokens.length + " PII détectées";
-    const details = document.createElement("button");
-    details.type = "button";
-    details.setAttribute("aria-haspopup", "dialog");
-    details.dataset.slot = "popover-trigger";
-    details.textContent = "Détails";
-    guard.append(masked, verdicts, details);
+    guard.append(masked, verdicts);
   } else {
     guard.innerHTML = "<span>Aucune donnée personnelle détectée</span><span>L'Aiguilleur : PASS</span>";
   }
+  const parts = [guard];
+  if (!NODETAILS) {
+    guard.insertAdjacentHTML("beforeend", '<button data-slot="collapsible-trigger" data-variant="ghost" data-size="xs" '
+      + 'type="button" aria-expanded="false" aria-label="Voir le texte anonymisé envoyé au LLM" data-state="closed">'
+      + "<span>Détails</span>" + CHEVRON + "</button>");
+    const content = document.createElement("div");
+    content.dataset.slot = "collapsible-content";
+    content.dataset.state = "closed";
+    content.id = "details-" + (++detailsCount);
+    content.hidden = true;
+    parts.push(content);
+    const trigger = guard.querySelector('[data-slot="collapsible-trigger"]');
+    trigger.onclick = () => toggleDetails(art, trigger, content);
+  }
+  guard.insertAdjacentHTML("beforeend", '<button type="button" aria-pressed="' + REVEALED + '" data-state="closed" '
+    + 'data-slot="pii-reveal-toggle" aria-label="Afficher les données personnelles">' + EYE + "</button>");
+  guard.querySelector('[data-slot="pii-reveal-toggle"]').onclick = () => { window.__reveal_clicks += 1; };
   const banner = document.createElement("div");
   banner.className = "head";
   banner.innerHTML = '<span>maskai</span><span class="model"></span><span class="live">· en direct</span>';
@@ -305,7 +359,7 @@ function addAnswer(tokens, model) {
   const body = document.createElement("div");
   body.className = "pl-6";
   body.innerHTML = '<div class="prose-llm"></div>';
-  art.append(guard, banner, body);
+  art.append(...parts, banner, body);
   $("messages").appendChild(art);
   return art;
 }
@@ -366,6 +420,7 @@ async function send() {
   try {
     const res = await fetch("/chat/stream", { method: "POST", headers: { "Content-Type": "application/json" },
                                               body, signal: gen.controller.signal });
+    art.__sent = decodeURIComponent(res.headers.get("X-Sent-Anonymized") || "");
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
@@ -397,8 +452,9 @@ async function send() {
   await typer.end();
   const live = art.querySelector(".live");
   if (live) live.remove();
-  // A dialog well after the answer, once the action that asked is over.
-  if (/LATE_DIALOG/.test(text)) setTimeout(() => { window.__dialog_answered = confirm("late"); }, 3500);
+  // A dialog well after the answer, once the action that asked is over (5 s: v2.2 reads the card's
+  // « Détails » after the 2 s of stillness, the action ends about 2.8 s after the drawing).
+  if (/LATE_DIALOG/.test(text)) setTimeout(() => { window.__dialog_answered = confirm("late"); }, 5000);
 }
 </script>
 </body>

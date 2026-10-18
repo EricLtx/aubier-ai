@@ -6,7 +6,12 @@ stream: the pipeline steps, `{"node": "retrieve"}`, then `{"node": "web_search"}
 when the request's `web_search` is "on", then `{"node": "generate"}`, then the
 answer in three `{"delta": ...}` chunks. The answer echoes the question
 upper-cased and names the attachments the page declared (the chips that were
-ready when the question left). Trigger words in the request body:
+ready when the question left). The response carries, in its `X-Sent-Anonymized`
+header (percent-encoded UTF-8), the anonymised text the bench sends "to the
+model": the message with each name (« M. Prénom Nom »), IBAN and phone number
+replaced by a numbered token (`<PERSON_1>`, `<IBAN_1>`, `<PHONE_1>`); the page
+shows it in the answer card's « Détails » collapsible (pilot v2.2). Trigger
+words in the request body:
 
   SLOW            sleep 8 s before the first event (abandon deadline tests);
   EXTERNAL_IMG    append <img src="http://example.invalid/x"> to the answer
@@ -15,10 +20,12 @@ ready when the question left). Trigger words in the request body:
   NAVIGATE_AWAY   the page then navigates to http://localhost:<port>/away, a
                   host outside a 127.0.0.1-only list (navigation guard);
   UNKNOWN_MODAL   the page shows a [role=dialog] nobody catalogued;
-  LATE_DIALOG     the page opens a confirm() 3.5 s after the answer is drawn,
+  LATE_DIALOG     the page opens a confirm() 5 s after the answer is drawn,
                   once the action is over (the verdict must still see it);
-  LEAK            the « Chiffré » popover shows the text unmasked (a leak);
-  POPOVER_STATUS  the « Chiffré » popover shows a status line, not the text.
+  LEAK            the « Chiffré » popover and the card's « Détails » show the
+                  text unmasked (a leak);
+  POPOVER_STATUS  the « Chiffré » popover shows a status line, not the text;
+  DETAILS_STATUS  the card's « Détails » shows a status line, not the text.
 
 The page side (index.html) draws each answer behind the stream and ends about
 1.5 s after the server; shows the « Votre avis » survey after a generation left
@@ -29,7 +36,10 @@ Other paths: /busy (requests, then a popup after 3 s; /stats says when the popup
 was announced and when its request arrived), /redirect-unreachable (a 302 to an
 unreachable host). Any page asked with `maintenance=1` in its query is MaskAI's
 maintenance card instead (seen at the first live attempt of recette 2: no
-textarea, « MAINTENANCE EN COURS / ON REVIENT TRÈS VITE ! »).
+textarea, « MAINTENANCE EN COURS / ON REVIENT TRÈS VITE ! »). The page itself
+reads `nodetails=1` (answer cards without the « Détails » collapsible, the
+composer popover then being the driver's fallback) and `revealed=1` (the cards'
+PII reveal toggle drawn pressed).
 
 Usage: python -I serve.py [port]     (default 8765; 0 picks a free port)
 The first line on stdout is `listening <port>`.
@@ -37,9 +47,11 @@ The first line on stdout is `listening <port>`.
 import html
 import json
 import os
+import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PORT = 8765
@@ -78,6 +90,29 @@ MAINTENANCE_PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8"
 <body><main><h1>MAINTENANCE EN COURS</h1><p>ON REVIENT TRÈS VITE !</p>
 <p>Mask AI FR fait une petite pause pour s'améliorer. Une question ? contact@maskai.fr</p></main></body></html>
 """.encode("utf-8")
+
+
+# The bench's anonymiser (pilot v2.2): what the card's « Détails » shows as sent to the model. The
+# names and IBANs are those of the page's own mask() (the guard panel's tokens), plus phone numbers.
+MASKS = (
+    (re.compile(r"\b(?:M\.|Mme|Mr)\s+[A-ZÉ][a-zé]+\s+[A-ZÉ][a-zé]+"), "PERSON"),
+    (re.compile(r"\bFR\d{2}(?:\s?\d{4}){5}\s?\d{3}\b"), "IBAN"),
+    (re.compile(r"(?:\+33\s?|\b0)[1-9](?:[\s.-]?\d{2}){4}\b"), "PHONE"),
+)
+DETAILS_STATUS = "Aucune PII détectée — rien à anonymiser pour l'instant"
+
+
+def anonymise(text: str) -> str:
+    """The message with each name, IBAN and phone number replaced by a numbered token; unmasked
+    with LEAK, a status line with DETAILS_STATUS."""
+    if "DETAILS_STATUS" in text:
+        return DETAILS_STATUS
+    if "LEAK" in text:
+        return text
+    for pattern, kind in MASKS:
+        seen = []
+        text = pattern.sub(lambda m: f"<{kind}_{seen.append(m) or len(seen)}>", text)
+    return text
 
 
 def now_ms() -> int:
@@ -144,6 +179,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Sent-Anonymized", quote(anonymise(str(msg.get("message", ""))), safe=""))
         self.end_headers()
         try:
             if "SLOW" in body:

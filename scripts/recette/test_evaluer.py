@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from evaluer import BROKEN_TOKEN, SPAN_LEAK, evaluate, evaluate_case, pii_in  # noqa: E402
+from evaluer import BROKEN_TOKEN, SPAN_LEAK, evaluate, evaluate_case, find, normalise, pii_in  # noqa: E402
 
 CASE = {
     "id": "T1", "size": "léger",
@@ -116,6 +116,45 @@ class EvaluerTests(unittest.TestCase):
         self.assertFalse(pii_in("M. Malzac", "Mr Malzac"))
         self.assertTrue(pii_in("+33 6 12 (34)", "appelez le +336-12 (34)"))
         self.assertFalse(pii_in("a+b", "aab"))
+
+    def test_the_v2_2_sources_of_sent_json_carry_the_sent_text(self):
+        """Pilot v2.2: the answer card's « Détails » panel, the composer popover as its fallback; the
+        recette 2 files still say « popover »."""
+        for source in ("card-details", "composer-popover", "popover", "panel"):
+            path = self.sent_json({"source": source, "text": "Relance pour Marie Dupont, IBAN <IBAN_1>."})
+            r = evaluate_case(CASE, {"answer": "2 820 € sous 15 jours", "sent_json": path})
+            self.assertEqual((r["verdict"], r["leaks"]), ("KO", ["Marie Dupont"]), source)
+        path = self.sent_json({"source": None, "rejected": "pas de bouton Détails sur la carte",
+                               "text": "Relance pour Marie Dupont"})
+        r = evaluate_case(CASE, {"answer": "2 820 € sous 15 jours", "sent_json": path})
+        self.assertEqual(r["leaks"], [])
+        self.assertTrue(any("non observé" in n for n in r["notes"]), r["notes"])
+
+    def test_a_pii_link_left_raw_is_read_as_its_text(self):
+        """18/10 (recette 2): a value MaskAI put back in clear in the answer stayed a raw markdown
+        link around the token it replaced; the oracle reads the value, not the link."""
+        raw = "IBAN : FR55 [3078 8009 0002 8479](pii://%3CCREDIT_CARD_1%3E) 1365 147."
+        self.assertEqual(normalise(raw), "IBAN : FR55 3078 8009 0002 8479 1365 147.")
+        self.assertFalse(find("fr55 ?3078 ?8009 ?0002 ?8479 ?1365 ?147", raw.replace("](pii", "]( pii")),
+                         "a link that is no pii:// link is left as it is")
+        case = dict(CASE, must=["fr55 ?3078 ?8009 ?0002 ?8479 ?1365 ?147"], pii=["FR55 3078 8009 0002 8479 1365 147"])
+        r = evaluate_case(case, {"answer": raw, "sent": "IBAN <CREDIT_CARD_1>"})
+        self.assertEqual((r["verdict"], r["missing"], r["leaks"]), ("OK", [], []))
+        # in the sent text, the same link holds the value in clear: a leak
+        r = evaluate_case(case, {"answer": raw, "sent": "compte " + raw})
+        self.assertEqual(r["leaks"], ["FR55 3078 8009 0002 8479 1365 147"])
+        self.assertEqual(normalise("voir [la doc](https://exemple.fr/a)"), "voir [la doc](https://exemple.fr/a)")
+        self.assertEqual(normalise("[a](pii://x) et [b](pii://%3CPHONE_3%3E)"), "a et b")
+
+    def test_no_break_and_thin_spaces_are_plain_spaces(self):
+        """« 5 minutes » with a no-break, narrow no-break or thin space matches « \\b5 ?min »."""
+        for space in ("\N{NO-BREAK SPACE}", "\N{NARROW NO-BREAK SPACE}", "\N{THIN SPACE}",
+                      "\N{FIGURE SPACE}", "\N{HAIR SPACE}"):
+            self.assertEqual(normalise("5" + space + "minutes"), "5 minutes", repr(space))
+            self.assertTrue(find(r"\b5 ?min", "Il faut 5" + space + "minutes."), repr(space))
+            r = evaluate_case(dict(CASE, must=[r"\b5 ?min"]), {"answer": "Réponse : 5" + space + "min", "sent": "x"})
+            self.assertEqual(r["verdict"], "OK", repr(space))
+        self.assertTrue(pii_in("+33 6 12 34 56 78", "appelez le +33\N{NO-BREAK SPACE}6\N{NARROW NO-BREAK SPACE}12 34 56 78"))
 
 
 if __name__ == "__main__":

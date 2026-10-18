@@ -56,7 +56,7 @@ powershell -ExecutionPolicy Bypass -File drivers\maskai-recette\setup.ps1
 ```
 Attendu, en première ligne, `python de base : ` suivi du chemin du 1.1, puis en dernières lignes :
 ```
-files_sha256 : sha256:df220a2f272f33e4f11ce054ba77c7cb42cdfefb476527077a6ffe23bbbe55b4
+files_sha256 : sha256:09235a3d30ed1291bd94bffeec9ce5105f72a882e09067f27f33a76b92891a77
 manifest.json : à jour
 manifest-fixture.json : à jour
 ```
@@ -323,6 +323,7 @@ Les deux premières changent le compositeur et ne restaurent rien (`reversible: 
 Ce qui change dans les actions existantes :
 - la réponse est le texte du corps `.prose-llm`, jamais la carte entière. L'en-tête (panneau de l'Aiguilleur, bannière du modèle) va dans la preuve `guard.json`. Une réponse est finie quand le flux est fini **et** que son texte n'a plus bougé à l'écran depuis 2 s ;
 - avant d'envoyer, le driver ouvre lui-même le popover « Chiffré » du compositeur, lit ce que MaskAI dit envoyer, puis le referme par Échap (preuve `sent.json`) ;
+- v2.2 : une fois la réponse finie, le driver ouvre le panneau « Détails » de la dernière carte de réponse, lit le texte anonymisé envoyé au modèle, puis le referme d'un second clic (preuve `sent.json`, `source: "card-details"`). Le popover « Chiffré » décrit l'état avant l'envoi : il ne sert plus que pour une carte sans bouton « Détails » (`source: "composer-popover"`). Le bouton de révélation des PII de la carte n'est jamais pressé, son état est noté (`reveal_pressed`) ;
 - `joindre_document` suit la puce (uploading, indexing, puis ready ou failed) au plus 3 × le budget du cas. `poser_question` relit la puce et refuse `precondition` si elle n'est pas prête : la question ne part pas, et `verdict_oracle` journalise « question non envoyée (précondition) » ;
 - à l'abandon, le driver clique sur le bouton d'arrêt : l'enquête « Votre avis » ne suit plus. La ligne de journal dit ce qui était parti (POST, flux, dernier nœud) ;
 - chaque ligne de journal porte `ui_profile_sha256` (§13), et les captures masquent la barre latérale et le bloc du compte.
@@ -396,7 +397,10 @@ Attendu : une ligne par cas joué, par exemple `N1-1     OK       disponibilite,
 | `conversation_items` | Les entrées de l'historique des conversations. | vu (`a[href*="/conversation/"]`) |
 | `attach_remove` | Le bouton « Retirer <fichier> » ; la puce est son ancêtre qui porte du texte. | vu |
 | `attach_pending`, `attach_uploading`, `attach_failed`, `attach_busy`, `attach_ready` | Les états de la puce. | « Indexing in progress » et « Failed » vus les 12–13/10 ; l'état prêt et l'indicateur d'activité à confirmer |
-| `sent_trigger`, `sent_popover`, `sent_text` | La pastille « Chiffré » du compositeur, son popover et son bloc de texte (`sent.json`). | pastille vue (le 18/10 : `aria-label="Data encrypted — no PII detected in this conversation"`) ; contenu à confirmer |
+| `card_details_trigger` | **Le texte envoyé (v2.2).** Le bouton « Détails » de la dernière carte de réponse, cliqué une fois la réponse finie, puis recliqué pour refermer le panneau. Par structure d'abord, `button[data-slot="collapsible-trigger"][aria-label*="anonymis" i]`, puis le libellé « Détails » en secours ; cherché dans cette carte seulement. | relevé le 18/10 dans le DOM d'une carte stockée par la recette 2, après le panneau de garde : `data-slot="collapsible-trigger"`, `aria-label="Voir le texte anonymisé envoyé au LLM"`, `aria-expanded`, `data-state` ; à confirmer au premier passage |
+| `card_details_content` | Le panneau ouvert, `[data-slot="collapsible-content"]` dans la même carte (ou l'élément que nomme `aria-controls`) : tout son texte est le texte envoyé (`sent.json`, `source: "card-details"`), son HTML est gardé (`content_html`). | attendu le 18/10 en collapsible Radix (`data-state="open"`) ; balisage intérieur à relever au premier passage, dans `content_html` |
+| `pii_reveal` | Le bouton qui révèle les PII dans la réponse, `button[data-slot="pii-reveal-toggle"]`, juste après « Détails » : jamais pressé, son état noté (`reveal_pressed`). | relevé le 18/10 (`aria-pressed="false"`) ; à confirmer |
+| `sent_trigger`, `sent_popover`, `sent_text` | Le repli (v2.2) d'une carte sans bouton « Détails » : la pastille « Chiffré » du compositeur, son popover et son bloc de texte (`sent.json`, `source: "composer-popover"`). | pastille vue (le 18/10 : `aria-label="Data encrypted — no PII detected in this conversation"`) ; le 18/10, le popover décrit l'état avant l'envoi (« Aucune PII détectée — rien à anonymiser pour l'instant ») |
 | `stop_button` | Le bouton d'arrêt de la génération, cliqué à l'abandon. | un bouton vu sur la capture N1-3 ; aria-label à confirmer |
 | `send_button` | Le bouton d'envoi, utilisé seulement si Entrée n'a rien envoyé. | vu le 18/10 (`aria-label="Send message"`, `data-action="send"`) |
 | `model_button`, `listbox`, `option` | Le bouton du compositeur qui ouvre la liste des modèles (`choisir_modele`) : par structure d'abord, `button[aria-haspopup="listbox"]` (le compositeur n'est pas un `<form>` le 18/10), puis les libellés « Model: … » / « Modèle … » en secours. | liste vue le 18/10 : quatorze options `role="option"` dans une liste cmdk, `data-value` = identifiant fournisseur/modèle (`google/eu.claude-haiku-5-5`), texte = libellé affiché (« claude haiku 5-5 ») ; tous ouverts |
@@ -410,7 +414,8 @@ Attendu : une ligne par cas joué, par exemple `N1-1     OK       disponibilite,
 Les symptômes d'un sélecteur faux :
 - un KO `réponse vide : échec silencieux` alors que la réponse est visible dans Chrome : `assistant_message` ;
 - `guard.json` avec `body_found: false`, et la note « corps de réponse introuvable » : `answer_body` ;
-- `sent.json` avec `source: null` : `missing: "trigger"` désigne `sent_trigger`, `missing: "popover"` désigne `sent_popover` ou `sent_text` ;
+- `sent.json` avec `source: null` : `card.missing: "trigger"` et `rejected: "pas de bouton Détails sur la carte"` désignent `card_details_trigger` ; `missing: "content"` désigne `card_details_content` ; `rejected: "le panneau « Détails » ne montre pas le texte de la question"` dit que le panneau montre un statut (voir `text` et `content_html`) ; en repli sur le popover, `missing: "trigger"` désigne `sent_trigger`, `missing: "popover"` désigne `sent_popover` ou `sent_text` ;
+- `sent.json` avec `closed: false` : le panneau « Détails » ne s'est pas refermé (`aria-expanded` resté à `true`), voir `card_details_trigger` ; avec `error` : le clic sur « Détails » a échoué (bouton caché ou recouvert) ;
 - un gros document « prêt » avec `ready_by: quiet` en 2 s : la puce ne montre aucun état reconnu, voir `attach_pending` et `attach_busy` ;
 - toutes les réponses notées « affichage encore en mouvement », ou 30 s d'attente après chaque réponse : `stop_button` désigne un bouton qui ne disparaît pas ;
 - `choisir_modele` ou `recherche_web` refusés `precondition` : `model_button`, `listbox`, `option` ou `web_button`.
@@ -429,13 +434,14 @@ Dans tous ces cas :
 Autre point du premier passage : une modale ordinaire de MaskAI (sélecteur de modèle, menu) qui porterait `role=dialog` fait refuser `dialog`. Ajoutez-la à `KNOWN_MODALS`, puis suivez la même procédure. Une modification de `SELECTORS` ou de `KNOWN_MODALS` change `ui_profile_sha256` sur les lignes suivantes (§13) : le delta le montre.
 
 **8.4 Un dialogue.** C'est attendu en N8, où l'injection HTML/JS est le test. Le harnais appelle `verdict_oracle`, qui journalise le cas en KO sécurité, puis `exporter_journal`, puis il s'arrête. Le niveau se ferme en `done`, et ses cas suivants ne sont pas joués dans cette tâche.
-1. Dans Chrome, fermez le dialogue par **Annuler** ou Échap, jamais par OK. Le driver ne répond jamais lui-même à un dialogue. Le popover « Chiffré » du compositeur, ouvert à la main pendant un niveau, fait lui aussi refuser `dialog` : le driver ne referme que ce qu'il a ouvert lui-même. Fermez-le par Échap.
+1. Dans Chrome, fermez le dialogue par **Annuler** ou Échap, jamais par OK. Le driver ne répond jamais lui-même à un dialogue. Le popover « Chiffré » du compositeur, ouvert à la main pendant un niveau, fait lui aussi refuser `dialog` : le driver ne referme que ce qu'il a ouvert lui-même. Fermez-le par Échap. Le panneau « Détails » d'une carte, lui, n'est pas une modale : ouvert à la main, il ne fait rien refuser et reste ouvert.
 2. Continuez avec le niveau suivant (§8.2).
 3. Les cas sautés se rattrapent par la reprise (§12).
 
 **8.5 Durées attendues.** Sur le banc d'essai, un niveau a pris 39 s pour 5 actions, et 44 s pour 12. Sur MaskAI :
 - un cas message prend de 5 à 100 s, la garde AI Act de 3,5 s étant le plancher ;
 - la v2 ajoute environ 3 s par question : 2 s d'affichage immobile avant de lire la réponse, et la lecture du popover « Chiffré » avant l'envoi ;
+- la v2.2 ajoute moins d'une seconde par question : le panneau « Détails » ouvert, lu et refermé (0,4 s sur le banc), 1 s de plus quand il montre un statut plutôt que le texte ;
 - un cas pièce jointe attend sa puce prête jusqu'à 3 × le budget du cas, puis la réponse jusqu'à 3 × le budget encore, soit 180 s au plus chacune pour les gros documents ;
 - comptez de 1 h 30 à 2 h 30 pour les dix niveaux.
 

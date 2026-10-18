@@ -36,3 +36,9 @@ d'erreur du serveur, avec un nom d'hôte interne et une pile logicielle, affich�
 n'est pas corrigée. Décisions ouvertes :
 registre du 18/10 (`docs/strategy/decisions/`, privé). Le fondateur a tranché la mesure en boîte
 noire : la lecture du texte envoyé passera par le panneau « Détails » de la réponse.
+
+v2.2 : texte envoyé lu sur la carte de réponse (le panneau « Détails », ouvert, lu et refermé par le
+pilote après chaque réponse ; le popover « Chiffré » du compositeur, qui décrit l'état avant
+l'envoi, n'est plus qu'un repli) ; l'évaluateur lit un lien `pii://` resté brut comme son texte et
+une espace insécable ou fine comme une espace. L'évaluateur change, donc `inputs_sha256` aussi : la
+recette 3 ne porte pas l'empreinte de la recette 2, c'est attendu, et son delta doit le dire.

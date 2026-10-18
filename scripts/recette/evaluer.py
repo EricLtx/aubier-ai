@@ -12,9 +12,13 @@ OBSERVATIONS.json : { "<id du cas>": { "answer": "...", "sent": "...", "timing_s
     answer : la réponse affichée à l'utilisateur ;
     sent   : le texte réellement envoyé au modèle, s'il est observable (sinon omettre) ;
     sent_json : à défaut de sent, le chemin d'un sent.json du driver maskai-recette (relatif au
-             fichier d'observations) ; son texte compte quand il vient du popover « Chiffré » ou
-             du panneau du 13/10 (`source`) et n'a pas été écarté (`rejected`) ;
+             fichier d'observations) ; son texte compte quand il vient du panneau « Détails » de la
+             carte de réponse (pilote v2.2), du popover « Chiffré » du compositeur ou du panneau du
+             13/10 (`source`) et n'a pas été écarté (`rejected`) ;
     timing_s : optionnel, durée totale.
+
+La réponse et le texte envoyé sont normalisés avant toute recherche (`normalise`) : un lien
+« [x](pii://…) » resté brut devient x, une espace insécable ou fine devient une espace.
 
 Verdict par cas : OK, PARTIEL, KO, NON TESTÉ.
     KO       : une valeur attendue manque, une valeur interdite apparaît, ou une donnée
@@ -39,8 +43,17 @@ SPAN_LEAK = re.compile(r"<[A-Z_]+_\d+>[^\s<,.;:)\]\"']")  # un masque collé à 
 # Jeton dont le '<' a été avalé. Le type peut porter des '_' (<CREDIT_CARD_1>) : le regard arrière
 # exclut '_', pour qu'un jeton bien formé ne se lise pas « CARD_1> », et le type se lit en entier.
 BROKEN_TOKEN = re.compile(r"(?<![<A-Z_])[A-Z]+(?:_[A-Z]+)*_\d+>")
-# Les textes de sent.json qui sont le texte envoyé (le popover « Chiffré », le panneau du 13/10).
-SENT_SOURCES = ("popover", "panel")
+# Les textes de sent.json qui sont le texte envoyé : le panneau « Détails » de la carte de réponse
+# (v2.2), le popover « Chiffré » du compositeur (« composer-popover » en v2.2, « popover » dans les
+# sent.json de la recette 2), le panneau du 13/10.
+SENT_SOURCES = ("card-details", "composer-popover", "popover", "panel")
+# Deux artefacts de rendu relevés le 18/10 (recette 2) : une valeur que MaskAI remet en clair dans la
+# réponse reste un lien markdown brut, « FR55 [3078 8009 0002 8479](pii://%3CCREDIT_CARD_1%3E) 1365
+# 147 », que le motif « fr55 ?3078 … » ne lit pas ; et la typographie française met une espace
+# insécable (U+00A0), insécable fine (U+202F) ou fine (U+2009, U+2007, U+200A) entre un nombre et
+# son unité.
+PII_LINK = re.compile(r"\[([^\[\]\n]*)\]\(pii://[^)\s]*\)")
+ODD_SPACES = re.compile("[\u00a0\u202f\u2007\u2009\u200a]")
 
 
 def fold(s: str) -> str:
@@ -50,8 +63,15 @@ def fold(s: str) -> str:
     return re.sub(r"[\s  ]+", " ", s).lower()
 
 
+def normalise(text: str) -> str:
+    """Le texte d'une page tel qu'un oracle doit le lire : un lien « [x](pii://…) » devient x, une
+    espace insécable ou fine devient une espace. S'applique aux réponses et au texte envoyé, avant
+    `find` et `pii_in`, jamais aux motifs ni aux valeurs de l'inventaire."""
+    return ODD_SPACES.sub(" ", PII_LINK.sub(r"\1", text))
+
+
 def find(pattern: str, text: str) -> bool:
-    return re.search(fold(pattern), fold(text)) is not None
+    return re.search(fold(pattern), fold(normalise(text))) is not None
 
 
 def pii_in(value: str, sent: str) -> bool:
@@ -62,7 +82,7 @@ def pii_in(value: str, sent: str) -> bool:
     parts = [re.escape(p) for p in re.split(r"[\s.\-]+", fold(value)) if p]
     if not parts:
         return False
-    return re.search(r"[\s.\-]*".join(parts), fold(sent)) is not None
+    return re.search(r"[\s.\-]*".join(parts), fold(normalise(sent))) is not None
 
 
 def sent_from_json(path: str) -> str | None:
