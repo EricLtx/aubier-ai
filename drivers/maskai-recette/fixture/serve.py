@@ -62,6 +62,17 @@ AUTH_ERROR_PAGE = b"""<!doctype html><html lang="fr"><head><meta charset="utf-8"
 <a href="/">Sign in again</a></main></body></html>
 """
 
+# 18/10, recette 2 on the live node: the driver's own Chrome profile was not signed in, and the entry
+# page, once loaded, sent the main frame to authentification.maskai.fr (off the host list) — the
+# driver had measured the login page's load as the app's. Here: localhost stands for that host.
+LOGIN_REDIRECT_PAGE = b"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>MaskAI</title></head>
+<body><p>Redirection...</p><script>setTimeout(function () { location.replace('http://localhost:PORT/login'); }, 50);</script>
+</body></html>
+"""
+LOGIN_PAGE = b"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Connexion</title></head>
+<body><main><h1>Bienvenue !</h1><form><label>Identifiant <input name="loginname"></label></form></main></body></html>
+"""
+
 # MaskAI's maintenance card, as the first live attempt of recette 2 met it on app.maskai.fr.
 MAINTENANCE_PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Mask AI</title></head>
 <body><main><h1>MAINTENANCE EN COURS</h1><p>ON REVIENT TRÈS VITE !</p>
@@ -106,6 +117,12 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(200, MAINTENANCE_PAGE)
         elif path == "/api/auth/error":  # 18/10: the session bounced here, no composer
             self.reply(200, AUTH_ERROR_PAGE)
+        elif path == "/login":  # the authentication host's page: no composer, another host
+            self.reply(200, LOGIN_PAGE)
+        elif "login=1" in self.path.partition("?")[2]:  # the entry page of a profile not signed in:
+            # loaded, then sent by script to the authentication host (localhost is not 127.0.0.1)
+            port = self.server.server_address[1]
+            self.reply(200, LOGIN_REDIRECT_PAGE.replace(b"PORT", str(port).encode()))
         else:
             with open(os.path.join(HERE, "index.html"), "rb") as f:
                 self.reply(200, f.read())

@@ -1551,6 +1551,29 @@ class FieldFixesOnFixture(FixtureBench):
         self.assertEqual(refused.exception.reason, "precondition")
         self.assertIn("session perdue", refused.exception.detail)
 
+    def test_a_profile_not_signed_in_is_a_precondition_refusal_not_a_load_measure(self):
+        """18/10, live: the driver's Chrome profile was not signed in; the entry page loaded, then
+        sent the frame to authentification.maskai.fr, and M0-1 measured that login page as the app.
+        Now: « non connecté », within seconds, on mesurer_chargement and on every action that needs
+        the app; signed in again, the measure is the app's."""
+        drv, recette, A = self.make()
+        recette.entry = f"http://127.0.0.1:{self.port}/new?login=1"
+        recette.open()
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "mesurer_chargement")
+        self.assertEqual(refused.exception.reason, "precondition")
+        self.assertIn("non connecté", refused.exception.detail)
+        self.assertIn("localhost", refused.exception.detail)
+        self.assertNotIn("@load", recette.observations)
+        t0 = time.monotonic()
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "nouvelle_conversation")
+        self.assertLess(time.monotonic() - t0, 12, "no 15 s wait for a textarea that will not come")
+        self.assertIn("non connecté", refused.exception.detail)
+        recette.entry = f"http://127.0.0.1:{self.port}/new"  # signed in: the entry page stays
+        res, _ = self.act(A, "mesurer_chargement")
+        self.assertIn("127.0.0.1", res["text"])
+
     def test_a_dictation_the_user_started_is_a_precondition_refusal_and_the_microphone_is_never_touched(self):
         """18/10: the composer has a dictation button (data-status). The driver never presses it; a
         dictation already running when an action starts is refused, the button left as it is."""

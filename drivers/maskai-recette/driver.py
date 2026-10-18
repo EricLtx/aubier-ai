@@ -1473,21 +1473,35 @@ class Recette:
         rechargée (le service a pu revenir depuis)."""
         b = self.browser
 
-        def auth_error() -> dict | None:  # 18/10: the app bounced the session to /api/auth/error
-            if re.search(SELECTORS["auth_error"], page.url or ""):
-                return {"t": now_iso(), "url": short_url(page.url)}
+        def auth_error() -> dict | None:
+            """18/10 : l'application a renvoyé la session sur /api/auth/error (coupure réseau), ou la
+            page d'entrée a redirigé, après son chargement, vers l'hôte d'authentification hors liste
+            (profil non connecté : authentification.maskai.fr). Dans les deux cas, pas de zone de
+            saisie à attendre."""
+            url = page.url or ""
+            if re.search(SELECTORS["auth_error"], url):
+                return {"t": now_iso(), "url": short_url(url), "why": "session perdue (page d'erreur d'authentification) ; "
+                                                                    "reconnecter MaskAI dans Chrome"}
+            if not b.allowed(url):
+                host = urlsplit(url).hostname or ""
+                return {"t": now_iso(), "url": short_url(url), "host": host,
+                        "why": f"non connecté : la page d'entrée renvoie vers {host} ; se connecter à MaskAI dans la "
+                               f"fenêtre Chrome du pilote"}
             return None
 
         seen_auth = auth_error()
         if seen_auth and reload:  # a blip on 18/10 came back on its own: the entry page once more
-            self._goto(page, self.entry)
+            self._goto(page, self.entry, check=False)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)  # a redirect after load lands first
+            except PWTimeout:
+                pass
             seen_auth = auth_error()
         if seen_auth:
             if self._action_case:
                 self.observations.setdefault(self._action_case, {})["auth_error"] = seen_auth
-            log.warning("authentication error page: %s", seen_auth["url"])
-            raise DriverRefusal("precondition", "session perdue (page d'erreur d'authentification) ; "
-                                                "reconnecter MaskAI dans Chrome", extra={"auth_error": seen_auth})
+            log.warning("not on the app: %s", seen_auth["why"])
+            raise DriverRefusal("precondition", seen_auth["why"], extra={"auth_error": seen_auth})
 
         def state() -> dict | None:
             try:
@@ -2064,7 +2078,7 @@ class Recette:
             page.wait_for_load_state("networkidle", timeout=10_000)
         except PWTimeout:
             pass  # un flux tenu ouvert empêche le repos réseau : la mesure reste celle du load
-        self._check_maintenance(page)  # the load of a maintenance page is no measure of the app
+        self._check_maintenance(page)  # a maintenance or a login page is no measure of the app (18/10)
         t = b.call(TIMING_JS)
         nav = t["nav"] or {}
         fcp = next((p["start"] for p in t["paint"] if p["name"] == "first-contentful-paint"), None)
