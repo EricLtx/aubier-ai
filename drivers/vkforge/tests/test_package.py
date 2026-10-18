@@ -2,6 +2,7 @@ import ast
 import contextlib
 import hashlib
 import io
+import os
 import pathlib
 import subprocess
 import sys
@@ -52,6 +53,24 @@ class PackageTest(unittest.TestCase):
             code = entry.main(["fake"])
         self.assertEqual(code, 2)
         self.assertEqual(err.getvalue(), "vkforge fake: corpus has 3 files; remedy: more documents of one kind\n")
+
+    def test_a_refusal_reaches_the_kernel_in_utf8_whatever_the_console_code_page(self):
+        """The kernel reads a stage's stderr as UTF-8 (`run_stage`, `from_utf8_lossy`). Spawned with
+        -I, stderr a pipe, UTF-8 mode off and no PYTHONIOENCODING, Python would write the locale's
+        code page (cp1252 on the node): `main` makes stderr UTF-8 itself (re-review N2)."""
+        from vkforge.tests import debrief_fixtures
+        run = debrief_fixtures.clean_run(pathlib.Path(tempfile.mkdtemp()) / "run")
+        env = {k: v for k, v in os.environ.items() if k not in ("PYTHONIOENCODING", "PYTHONUTF8")}
+        out = str(pathlib.Path(tempfile.mkdtemp()) / "out")
+        cases = [(["--until", "tâche-é"], "until: no task tâche-é in the run; remedy: ")]
+        with (run / "journal.jsonl").open("a", encoding="utf-8") as f:
+            f.write('{"ts": "2026-10-20T11:06+02:00", "ca\n')  # a line cut mid-write: REMEDY names §16
+        cases.append(([], "copy that file again as runbook recette-maskai §16 does"))
+        for extra, said in cases:
+            r = subprocess.run([sys.executable, "-I", "-X", "utf8=0", str(ENTRY), "debrief", "--run", str(run),
+                                "--out", out, *extra], cwd=tempfile.gettempdir(), capture_output=True, env=env)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn(said, r.stderr.decode("utf-8"))  # strict: a cp1252 byte would raise here
 
     def test_canonical_bytes_are_sorted_indented_and_hashed_as_written(self):
         obj = {"b": [1, {"é": "ü"}], "a": None}

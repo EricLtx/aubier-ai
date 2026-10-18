@@ -261,7 +261,8 @@ class Run:
     """The run directory, loaded and checked: every line keeps its place (`at`, the physical line),
     its time and its task. The append-only files — the daemon's console, driver.log, the driver's
     journal, `vk dmesg` — are bounded to the run: from the first task's creation to the last task's
-    end plus a minute, and a harness note must name a task of the run."""
+    end plus a minute (to the newest line read while a task is still running: `open`), and a
+    harness note must name a task of the run."""
 
     def __init__(self, root: Path, until=None):
         if not (root / "journal.jsonl").is_file():
@@ -278,18 +279,25 @@ class Run:
             with _reading(at):
                 t = _task_shape(_json(at, _read(root, at)), at)
                 ends = [x for s in t["steps"] for x in (s.get("started_ms"), s.get("ended_ms")) if x]
-                tasks.append(dict(t, _file=at, _end=max(ends + [t["created_ms"]])))
+                # dumped mid-step: a step `running`, started and not ended, so the task has no end
+                # yet (a step `waiting_human` is a pause at a human gate: the task does nothing)
+                running = any(s["status"] == "running" and s.get("started_ms") and not s.get("ended_ms")
+                              for s in t["steps"])
+                tasks.append(dict(t, _file=at, _end=max(ends + [t["created_ms"]]), _running=running))
         self.tasks = sorted(tasks, key=lambda t: t["created_ms"])
         self.ids = {t["id"] for t in self.tasks}
         self.start = self.tasks[0]["created_ms"]
-        self.stop = max(t["_end"] for t in self.tasks) + 60_000
+        # A task still running keeps the window open: it closes on the newest line read (below).
+        self.open = any(t["_running"] for t in self.tasks)
+        self.stop = None if self.open else max(t["_end"] for t in self.tasks) + 60_000
         self.limit = None
         if until is not None:
             hit = [t for t in self.tasks if t["id"] == until]
             if not hit:
                 raise Refusal(f"until: no task {until} in the run", "name a task of the run's tasks/ directory")
-            self.limit = hit[0]["_end"]
-            self.tasks = [t for t in self.tasks if t["created_ms"] <= self.limit]
+            if not hit[0]["_running"]:  # the end of a running task is the newest line, as without --until
+                self.limit = hit[0]["_end"]
+                self.tasks = [t for t in self.tasks if t["created_ms"] <= self.limit]
         self.cases = {}
         if (root / "cases.json").is_file():
             with _reading("cases.json"):
@@ -324,14 +332,22 @@ class Run:
                     _field(_object(r, f"dmesg.json[{i}]"), "kind", f"dmesg.json[{i}]", ("text",))
                     _field(r, "wall_ms", f"dmesg.json[{i}]", ("integer",))
                 self.ledger = [r for r in rows if self._in_run(r["wall_ms"])]
+        if self.open:  # the window, and a running task, end on the newest line read
+            seen = ([e["_lo"] for e in self.journal + self.set_aside] + [n["ms"] for n in self.notes or []]
+                    + [x["ms"] for x in self.log or []] + [r["wall_ms"] for r in self.ledger or []])
+            self.stop = max(seen + [t["_end"] for t in self.tasks])
+            for t in self.tasks:
+                if t["_running"]:
+                    t["_end"] = self.stop
 
     def _in_run(self, lo: int, hi: int = None) -> bool:
-        """Inside the run's window, and not after `--until`'s task."""
+        """Inside the run's window, and not after `--until`'s task; open-ended while a task runs."""
         hi = lo if hi is None else hi
-        return hi >= self.start and lo <= self.stop and (self.limit is None or lo <= self.limit)
+        return (hi >= self.start and (self.stop is None or lo <= self.stop)
+                and (self.limit is None or lo <= self.limit))
 
     def _task(self, lo: int, hi: int):
-        hit = [t["id"] for t in self.tasks if t["created_ms"] <= hi and t["_end"] >= lo]
+        hit = [t["id"] for t in self.tasks if t["created_ms"] <= hi and (t["_running"] or t["_end"] >= lo)]
         return hit[-1] if hit else None
 
     def _journal(self, name: str, effective: bool) -> list:
@@ -512,7 +528,7 @@ def signals(run: Run) -> dict:
     return {
         "run": {"tasks": [t["id"] for t in run.tasks], "until_ms": run.limit, "learned_driver": run.learned,
                 "inputs": sorted(p.relative_to(run.root).as_posix() for p in run.root.rglob("*") if p.is_file()),
-                "from_ms": run.start, "to_ms": run.stop, "console_from_ms": console_from},
+                "from_ms": run.start, "to_ms": run.stop, "open": run.open, "console_from_ms": console_from},
         "tasks": tasks,
         "acts_total": None if run.ledger is None else sum(1 for r in run.ledger if r["kind"] == "driver.acted"),
         "relaunches": [{"after": a["id"], "next": b["id"]} for a, b in zip(run.tasks, run.tasks[1:]) if a["status"] != "done"],

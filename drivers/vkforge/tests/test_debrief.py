@@ -391,6 +391,30 @@ class DebriefInputTest(unittest.TestCase):
         self.assertEqual((s["run"]["from_ms"], s["run"]["to_ms"]),
                          (debrief_fixtures.ms("11:00:00", "2026-10-20"), debrief_fixtures.ms("11:04:40", "2026-10-20")))
 
+    def test_a_task_still_running_keeps_the_window_open(self):
+        """A task dumped mid-step has no end yet (re-review N1): the window stays open to the newest
+        line read, the run's later lines are kept and still belong to the task, and `to_ms` says
+        where the window stopped."""
+        run = debrief_fixtures.clean_run(Path(tempfile.mkdtemp()) / "run")
+
+        def running(d):
+            d["steps"][2].update(status="running", ended_ms=None)
+            d["status"] = "running"
+        edit_json(task_dump(run), running)
+        s, p, _ = debrief.debrief(run)
+        self.assertEqual([c["case"] for c in s["cases"]], ["N0-1", "N1-1", "N1-2", "N1-3"])
+        self.assertEqual(s["levels"]["N1"][0]["new_lines"], 3)
+        self.assertTrue(s["run"]["open"])
+        self.assertEqual(s["run"]["to_ms"], debrief_fixtures.ms("11:03:40", "2026-10-20"))  # the newest dmesg row
+        self.assertEqual(s["tasks"][0]["window"][1], s["run"]["to_ms"])
+        self.assertEqual(s["acts_total"], 12)
+        self.assertEqual(p, [])
+        self.assertEqual(debrief.debrief(run, until="task-node-1-50")[0]["run"]["to_ms"], s["run"]["to_ms"])
+        closed = debrief.debrief(debrief_fixtures.clean_run(Path(tempfile.mkdtemp()) / "run"))[0]["run"]
+        self.assertFalse(closed["open"])
+        # t25's approval `waiting_human`, never ended, is a pause at a human gate, not a running task
+        self.assertFalse(debrief.debrief(RUN_17_10)[0]["run"]["open"])
+
     def test_line_references_count_blank_lines_and_supersedes_does_not(self):
         """`file:line` is the physical line, as an editor shows it (review M2); journal.py's
         `supersedes` indexes the non-blank lines."""

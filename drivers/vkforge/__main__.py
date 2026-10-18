@@ -22,6 +22,12 @@ STAGES = {"inventory": inventory, "bind": ontology, "mine": mine, "plan": plan, 
 
 
 def main(argv=None) -> int:
+    # The kernel reads what a stage prints as UTF-8 (`run_stage`). Under -I, with stdout and stderr
+    # redirected to files and UTF-8 mode off, Python would write the locale's code page (cp1252 on
+    # a French Windows): `§16` or `…` in a refusal would reach the operator mangled.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):  # a test's StringIO has none, and needs none
+            stream.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(prog="vkforge")
     sub = p.add_subparsers(dest="stage", required=True)
     for name, module in STAGES.items():
