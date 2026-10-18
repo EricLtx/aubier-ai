@@ -303,6 +303,11 @@ class SentTextTest(unittest.TestCase):
         # never a line of the question itself (corpus v3 questions open with « Voici un document : »)
         doc = "Voici un document :\n\nAGENCE RHÔNE GESTION"
         self.assertEqual(drv.details_text(doc, None, doc), (doc, None))
+        # nor a first line that holds a masking token: that is sent text (the question's own line,
+        # masked, is not in the question)
+        greet = "Bonjour <PERSON_1> :\nMerci pour le virement de mars."
+        self.assertEqual(drv.details_text(greet, None, "Bonjour M. Hugo Bernard :\nMerci pour le virement de mars."),
+                         (greet, None))
         # the panel's text block first; a token in <code> is not the message
         self.assertEqual(drv.details_text(label + "\n" + sent, sent, q), (sent, label))
         self.assertEqual(drv.details_text("Libellé : " + sent, "<PERSON_1>", q), ("Libellé : " + sent, None))

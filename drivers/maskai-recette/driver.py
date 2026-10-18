@@ -1009,15 +1009,17 @@ def details_text(raw: str | None, block: str | None, question: str) -> tuple[str
     """Le texte envoyé que montre le panneau « Détails », sans son libellé : le bloc de texte du
     panneau (`sent_text`) s'il porte au moins la moitié du texte (un jeton en <code> n'est pas le
     message), sinon le texte entier privé de son libellé : `details_label`, à défaut une première
-    ligne qui finit par « : » et que la question ne contient pas (« Voici un document : » ouvre des
-    questions du corpus v3 : jamais retiré). Rend (texte, libellé retiré ou None)."""
+    ligne qui finit par « : », que la question ne contient pas (« Voici un document : » ouvre des
+    questions du corpus v3 : jamais retiré) et qui ne porte aucun jeton de masquage (« Bonjour
+    <PERSON_1> : » est du texte envoyé, jamais un libellé). Rend (texte, libellé retiré ou None)."""
     if not raw or not raw.strip():
         return None, None
     raw = raw.strip()
     m = re.match(SELECTORS["details_label"], raw, flags=re.I)
     if m is None:
         m = re.match(r"([^\n]{1,120}?)\s*:[ \t]*\n", raw)
-        if m and evaluer.fold(m.group(1)).strip() in evaluer.fold(question or ""):
+        if m and (evaluer.fold(m.group(1)).strip() in evaluer.fold(question or "")
+                  or re.search(SELECTORS["mask_token"], m.group(1))):
             m = None
     stripped = raw[m.end():].strip() if m else raw
     block = (block or "").strip()
