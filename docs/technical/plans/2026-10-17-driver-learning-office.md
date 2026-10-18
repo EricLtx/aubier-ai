@@ -15,8 +15,9 @@
 - **Parallel chantier:** the packaging plan (`2026-10-17-driver-packaging-and-deployment.md`) adds `DriverSource`, `ExecutionContext`, `needs_input_desktop` to `DriverManifest` and a `DriverLink` seam in `vk-driver`. This plan does NOT touch those fields, `crates/vk-driver/src/link.rs`, or `crates/vk-capital`. Its contract additions are exactly: `DriverKind::Com`; `DriverManifest.applications: Vec<String>` (default empty, `skip_serializing_if = "Vec::is_empty"` so every existing `driver_id` is unchanged); `DriverProgram.runtime = "python-com"` (a string value, no enum); the `DriverPlan` schema in `crates/vk-contracts/src/plan.rs`; the payloads `DriverLearned` and `DriverQualified`; the kinds `driver.learned` (human act, presence proof like `driver.mount`) and `driver.qualified` (kernel-written).
 - Validation: `kind: com` requires non-empty `applications` (each an upper-case executable name ending in `.EXE`, no path) and allows empty `hosts`; `kind: browser` keeps today's rules unchanged (non-empty `hosts`, `applications` must be empty).
 - `drivers/vkforge/` is Python 3.13 with the stdlib, `lxml` and `comtypes` only; `comtypes` is imported lazily and only on Windows. No `python-docx`, no model call inside the package.
+- **How vkforge is run, and how its stages are found.** One invocation everywhere (the kernel's spawn, CI, tests that spawn it, runbooks): `python -I drivers/vkforge/__main__.py <stage> …` — never `python -I -m vkforge`: `-I` implies `-P`, so neither the working directory nor the script's directory is on `sys.path` and `-m` cannot find the package. `__main__.py` puts `drivers/` on `sys.path` itself, `vendor/` first when it exists, then the repository, as `drivers/maskai-recette/driver.py` does for `vkdriver`; `drivers/vkforge/tests/__init__.py` does the same for the suite, whatever discovery top-level is used. `vkforge <stage> …` in this plan is shorthand for that line. The stage table `STAGES` is built in `__main__.py` by explicit imports (`{"inventory": inventory, "bind": ontology, …}`); a stage module defines `add_arguments(parser) -> None` and `run(ns) -> int` and does nothing at import — a stage that registered itself through `from .__main__ import STAGES` would fill a second copy of `__main__` (the running script is `__main__`, not `vkforge.__main__`) and `main` would see an empty table.
 - **L-P1 (fake application):** the generated driver's COM calls go through one adapter module `drivers/vkforge/runtime/com.py` (`Application(name)`, `open(path)`, attribute access by the binding table). A `FakeApplication` driven by the same binding table edits the OOXML of the file directly (with the miner's writer twin), so `qualify` runs against the fake in CI and against the real Word on the node, through the same driver bytes.
-- **L-P2 (how `learn` runs):** the spec's "run as a driver of the kernel" is implemented as a governed one-shot process: `vk-ipc` spawns `python -I -m vkforge <stage> …` under `vk_harness::confine::for_this_platform(1 GiB, None)` with a deadline, from the `drivers/vkforge` root the daemon was started with, never through protocol 1 (a pipeline is not request/response). The Job governor does not block the network; the stages that could reach it (`plan` with an arch) do so only through the kernel's `infer`, so the no-network claim of spec §3.3 rests on the code calling no socket, which a test pins (no `socket`/`urllib`/`http` import in the package).
+- **L-P2 (how `learn` runs):** the spec's "run as a driver of the kernel" is implemented as a governed one-shot process: `vk-ipc` spawns `<python> -I <root>/vkforge/__main__.py <stage> …` under `vk_harness::confine::for_this_platform(1 GiB, None)` with a deadline, `<root>` being the `drivers/` directory the daemon was started with (the script path, never `-m`: see the constraint above), never through protocol 1 (a pipeline is not request/response). The Job governor does not block the network; the stages that could reach it (`plan` with an arch) do so only through the kernel's `infer`, so the no-network claim of spec §3.3 rests on the code calling no socket, which a test pins (no `socket`/`urllib`/`http` import in the package).
 - **L-P3 (fallback, spec §5.3):** `vk driver learn --deliberate VERB` produces a *proposed projection rule* from the catalogue slice and the verb's postcondition through the harness (Claude Code confined, one task), written to `<out>/proposals/<verb>.json` for human review; COM-call tracing of a live deliberate run is deferred to a later chantier and said so in the TCB.
 - Zero model tokens on the nominal path: `plan` calls an arch only for `ambiguities`, only when `--arch NAME` is given, through the kernel's `infer` (`Capability::Draft`) on a register that holds the ambiguity schema and nothing else; with no arch the ambiguity is purged and listed.
 - The miner reads only `word/styles.xml`, `word/settings.xml`, `word/header*.xml`, `word/footer*.xml`, `word/numbering.xml`, `docProps/app.xml`, and in `word/document.xml` only `w:pPr`/`w:rPr` attributes (never `w:t`); for `.pptx` the `ppt/slideMasters/*.xml`, `ppt/slideLayouts/*.xml`, `ppt/presentation.xml`, `docProps/app.xml`, and in `ppt/slides/*.xml` only `a:pPr`/`a:rPr` attributes (never `a:t`). Every free string is replaced by `<redacted:sha256:…>` in `invariants.json`; its clear value goes to `<out>/.vault.json` (private file, deleted after generation).
@@ -44,24 +45,33 @@
 - Modify: `.github/workflows/ci.yml` (`driver-browser` job: install `drivers/vkforge/requirements.txt`, run the vkforge suite), `scripts/check-workflows.py` (no job change yet)
 
 **Interfaces:**
-- Produces: `vkforge.errors.Refusal(what, remedy)` (`str(e)` = `"<what>; remedy: <remedy>"`), the CLI entry `python -I -m vkforge <stage> …` with `argparse` subparsers registered by later tasks through `vkforge.__main__.STAGES: dict[str, Callable[[argparse.Namespace], int]]`.
+- Produces: `vkforge.errors.Refusal(what, remedy)` (`str(e)` = `"<what>; remedy: <remedy>"`); the CLI entry `python -I drivers/vkforge/__main__.py <stage> …`, the only invocation (never `-m`, Global Constraints); the stage table `vkforge.__main__.STAGES: dict[str, ModuleType]`, built by explicit imports, each stage module providing `add_arguments(parser: argparse.ArgumentParser) -> None` and `run(ns: argparse.Namespace) -> int` and registering nothing at import; `drivers/vkforge/tests/__init__.py`, which puts `drivers/` on `sys.path` for every test module.
 
 - [ ] **Step 1: Failing test** (`tests/test_package.py`)
 
 ```python
-import subprocess, sys, unittest, pathlib
+import subprocess, sys, tempfile, unittest, pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]  # drivers/
+ENTRY = ROOT / "vkforge" / "__main__.py"             # the one invocation: python -I <ENTRY> <stage> …
 
 
 class PackageTest(unittest.TestCase):
-    def test_the_cli_lists_its_stages_and_refuses_an_unknown_one(self):
-        out = subprocess.run([sys.executable, "-I", "-m", "vkforge", "--help"], cwd=ROOT, capture_output=True, text=True)
+    def test_the_cli_lists_its_stages_and_refuses_an_unknown_one_from_any_directory(self):
+        # From a foreign working directory, under -I: what the kernel spawns (Task 9).
+        out = subprocess.run([sys.executable, "-I", str(ENTRY), "--help"], cwd=tempfile.gettempdir(), capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stderr)
         for stage in ("inventory", "bind", "mine", "plan", "generate", "qualify"):
             self.assertIn(stage, out.stdout)
-        bad = subprocess.run([sys.executable, "-I", "-m", "vkforge", "nope"], cwd=ROOT, capture_output=True, text=True)
+        bad = subprocess.run([sys.executable, "-I", str(ENTRY), "nope"], cwd=tempfile.gettempdir(), capture_output=True, text=True)
         self.assertNotEqual(bad.returncode, 0)
+
+    def test_the_stage_table_is_built_in_main_and_no_stage_registers_itself(self):
+        from vkforge import __main__ as entry
+        self.assertEqual(sorted(entry.STAGES), ["bind", "generate", "inventory", "mine", "plan", "qualify"])
+        for name, module in entry.STAGES.items():
+            self.assertTrue(callable(module.add_arguments) and callable(module.run), name)
+            self.assertNotIn("STAGES", vars(module), f"{name}: a stage registers nothing at import")
 
     def test_a_refusal_prints_one_line_with_a_remedy(self):
         from vkforge.errors import Refusal
@@ -81,6 +91,16 @@ class PackageTest(unittest.TestCase):
 
 - [ ] **Step 3: Implement**
 
+`tests/__init__.py` (under `-I`, and with CI's `discover -s drivers -p "test_*.py" -t .` importing the tests as `drivers.vkforge.tests.*`, nothing else puts `drivers/` on `sys.path`):
+
+```python
+"""The vkforge suite: `drivers/` on sys.path once, for every test module, whatever the discovery top-level."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+```
+
 `errors.py`:
 
 ```python
@@ -95,28 +115,40 @@ class Refusal(Exception):
 `__main__.py`:
 
 ```python
-"""python -I -m vkforge <stage> …  — the learning pipeline, one stage per call."""
+"""python -I drivers/vkforge/__main__.py <stage> …  — the learning pipeline, one stage per call.
+
+The one way vkforge runs (the kernel's spawn, CI, the runbooks). Not `python -I -m vkforge`: -I
+keeps the working directory and the script's directory off sys.path, so the package would not be
+found. This file puts drivers/ there itself — vendor/ first when it exists, then the repository —
+as drivers/maskai-recette/driver.py does for vkdriver.
+"""
 import argparse
 import sys
+from pathlib import Path
 
-from .errors import Refusal
+HERE = Path(__file__).resolve().parent              # drivers/vkforge
+sys.path.insert(0, str(HERE.parent))                 # drivers/: vkforge and vkdriver from the repository
+if (HERE / "vendor" / "vkdriver").is_dir():
+    sys.path.insert(0, str(HERE / "vendor"))         # installed alone: the vendored vkdriver first
 
-STAGES = {}  # name -> (add_arguments(parser), run(ns) -> int); filled by the stage modules
+from vkforge import generate, inventory, mine, ontology, plan, qualify  # noqa: E402
+from vkforge.errors import Refusal  # noqa: E402
 
-
-def _register():
-    from . import inventory, ontology, mine, plan, generate, qualify  # noqa: F401  (each registers itself)
+# The stage table, built here and nowhere else. A stage module defines add_arguments(parser) and
+# run(ns) -> int and does nothing at import: run as a script this file is `__main__`, so a stage
+# importing `vkforge.__main__` to register itself would fill a second copy of this table.
+STAGES = {"inventory": inventory, "bind": ontology, "mine": mine, "plan": plan, "generate": generate,
+          "qualify": qualify}
 
 
 def main(argv=None) -> int:
-    _register()
     p = argparse.ArgumentParser(prog="vkforge")
     sub = p.add_subparsers(dest="stage", required=True)
-    for name, (add, _run) in STAGES.items():
-        add(sub.add_parser(name))
+    for name, module in STAGES.items():
+        module.add_arguments(sub.add_parser(name))
     ns = p.parse_args(argv)
     try:
-        return STAGES[ns.stage][1](ns)
+        return STAGES[ns.stage].run(ns)
     except Refusal as e:
         sys.stderr.write(f"vkforge {ns.stage}: {e}\n")
         return 2
@@ -126,11 +158,11 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-Each stage module (created empty in this task, filled later) ends with `STAGES["<name>"] = (add_arguments, run)` where both are module functions; in this task `add_arguments` adds nothing and `run` raises `Refusal("not implemented", "wait for the next task")`.
+Each stage module (created in this task, filled by its own task) defines the two module functions `add_arguments(parser)` and `run(ns) -> int`, imports its siblings relatively (`from .errors import Refusal`) and registers nothing at import; in this task `add_arguments` adds nothing and `run` raises `Refusal("not implemented", "wait for the next task")`.
 
 `requirements.txt`: `lxml==6.0.2` (or the current release) and `comtypes==1.4.12; sys_platform == "win32"` (pin the versions available at implementation time).
 
-CI: in `driver-browser`, after the MaskAI requirements, `pip install -r drivers/vkforge/requirements.txt` and a step `python -I -m unittest discover -s drivers/vkforge/tests -t .`.
+CI: in `driver-browser`, after the MaskAI requirements, `pip install -r drivers/vkforge/requirements.txt`, a step `python -I -m unittest discover -s drivers/vkforge/tests -t .`, and a step `python -I drivers/vkforge/__main__.py --help` (the form the kernel spawns).
 
 - [ ] **Step 4: Run green; commit** `feat(vkforge): the learning pipeline's package, CLI and refusal voice`
 
@@ -295,7 +327,7 @@ pub struct DriverQualified { pub driver_id: String, pub passes: u32, pub failure
 
 **Files:**
 - Create: `drivers/vkforge/inventory.py`, `drivers/vkforge/tests/test_inventory.py`, `drivers/vkforge/tests/fixtures/catalogue-word.json`, `drivers/vkforge/tests/fixtures/catalogue-powerpoint.json` (recorded ONCE on the founder's node by this task's step 5, then committed; the CI tests read them)
-- Modify: `drivers/vkforge/__main__.py` (stage registered by the module)
+- Modify: nothing outside the module — `inventory` is already in the `STAGES` table of Task 0's `__main__.py`; this task fills the module's `add_arguments` and `run`
 
 **Interfaces:**
 
@@ -310,7 +342,7 @@ def catalogue_from_typelib(app: str, path: str) -> dict: ...  # comtypes.typeinf
 def catalogue_from_fixture(app: str, fixture: pathlib.Path) -> dict: ...
 def catalogue_sha256(cat: dict) -> str: ...        # sha256 of the canonical JSON (sorted keys, no spaces)
 def write_catalogue(cat: dict, out: pathlib.Path) -> None  # sorted keys, indent 1, "\n"
-# CLI: vkforge inventory --app word --out DIR [--fixture FILE]
+# CLI: vkforge inventory --app word --out DIR [--fixture FILE]   (add_arguments/run of this module, read by __main__.STAGES; nothing registered at import)
 ```
 
 Catalogue shape (spec §4.1): `{"app", "typelib": {"guid","version"}, "types": [{"name", "kind": "dispatch|coclass|enum", "members": [{"name","kind": "method|property_get|property_put","params": [{"name","type"}],"returns"}]}], "enums": {"WdBuiltinStyle": {"wdStyleHeading1": -2, …}}}`, types and members sorted by name.
@@ -356,7 +388,7 @@ class InventoryTest(unittest.TestCase):
 
 - [ ] **Step 4: Run** the fixture tests green (write the two fixture files first from step 5 on the node; until then the implementer commits a minimal hand-written fixture carrying the members and enums the tests name, clearly marked `"recorded": false`, and step 5 replaces it).
 
-- [ ] **Step 5: Record the fixtures on the founder's node** (controller, once): `python -I -m vkforge inventory --app word --out drivers/vkforge/tests/fixtures/` and the same for `powerpoint`; rename to `catalogue-<app>.json`; commit. Size expected 1–3 MB each; if above 4 MB, keep only the types the ontology's patterns name plus every enum (`--only-types` flag added to the stage).
+- [ ] **Step 5: Record the fixtures on the founder's node** (controller, once): `python -I drivers/vkforge/__main__.py inventory --app word --out drivers/vkforge/tests/fixtures/` and the same for `powerpoint`; rename to `catalogue-<app>.json`; commit. Size expected 1–3 MB each; if above 4 MB, keep only the types the ontology's patterns name plus every enum (`--only-types` flag added to the stage).
 
 - [ ] **Step 6: Commit** `feat(vkforge): inventory of a type library into a catalogue; recorded Word and PowerPoint catalogues`
 
@@ -374,7 +406,7 @@ def load(path: pathlib.Path | None = None) -> dict          # default: the packa
 def ontology_sha256(ont: dict) -> str
 def bind(ont: dict, catalogue: dict) -> dict                 # → binding-<app>.json shape below
 def write_binding(binding: dict, out: pathlib.Path) -> None
-# CLI: vkforge bind --catalogue FILE --out DIR [--ontology FILE]
+# CLI: vkforge bind --catalogue FILE --out DIR [--ontology FILE]   (this module's add_arguments/run, the `bind` entry of __main__.STAGES; nothing registered at import)
 ```
 
 Ontology verb shape (spec §4.2) — every verb has `verb`, `args` (name → type among `Path`, `ParagraphSelector`, `BuiltinStyle`, `FontSpec`, `Text`, `Format`), `pre`, `post` (a postcondition id the miner can check: `paragraph_style`, `font_run`, `footer`, `header`, `pdf_exists`, `saved`), and `projection` per app, written as **patterns** over the catalogue:
@@ -466,7 +498,7 @@ PARTS_PPTX = ("ppt/presentation.xml", "docProps/app.xml")                       
 def mine_file(path) -> dict                    # one file's observations: {"kind", "obs": [{"kind": "font_run", "value": {...}}, ...]}
 def mine_corpus(dir, threshold=0.8) -> tuple[dict, dict]   # (invariants.json dict, vault dict {redacted_hash: clear})
 def write_invariants(inv, out: Path) -> None   # out/invariants.json (sorted keys) and out/.vault.json (0o600 where supported)
-# CLI: vkforge mine --corpus DIR --out DIR [--threshold 0.8]
+# CLI: vkforge mine --corpus DIR --out DIR [--threshold 0.8]   (add_arguments/run of this module, read by __main__.STAGES; nothing registered at import)
 ```
 
 Observation kinds and values: `paragraph_style` (`{"builtin": "Heading1"}` mapped from `w:pStyle` through `styles.xml` `w:style/@w:styleId` → built-in alias when `w:name` is one of the English built-in names, else the styleId hashed), `font_run` (`{"name": …, "size": half-points/2}` from the body's majority `w:rFonts/@w:ascii` + `w:sz`), `footer` / `header` (text joined, **hashed**), `page_size`, `margins`, `orientation`, `numbering_present`, `export_format` (from `docProps/app.xml` `Application`? no — from the presence of a sibling `.pdf` with the same stem: `{"format": "pdf"}`), `title_style` (the first paragraph's style). Invariant support = files carrying the observation / files mined; an observation whose value differs across files is grouped by value, each value a candidate.
@@ -567,7 +599,7 @@ RULES = [  # invariant kind → the steps that produce it and the postcondition 
 def build(invariants: dict, binding: dict, ontology: dict, resolve=None) -> dict   # the DriverPlan dict; `resolve(ambiguity: dict) -> dict | None` is the optional arch hook
 def plan_sha256(plan: dict) -> str
 def write_plan(plan: dict, out: Path) -> None
-# CLI: vkforge plan --invariants FILE --binding FILE --out DIR [--resolver FILE]   (resolver: a JSON file of pre-resolved answers, the kernel's seam; see Task 9)
+# CLI: vkforge plan --invariants FILE --binding FILE --out DIR [--resolver FILE]   (resolver: a JSON file of pre-resolved answers, the kernel's seam; see Task 9); add_arguments/run of this module, read by __main__.STAGES; nothing registered at import
 ```
 
 `build`: one action `appliquer_style_maison` (word) / `appliquer_style_presentation` (pptx) with steps `open($arg.document)` + the rule steps for every invariant whose rule's verbs are all `bound` (or `partial`, kept with a `note`) in the binding, then `save`, then `export` when present; `pre: ["document is <kind>", "not open elsewhere"]`, `post` = the invariant ids + `pdf exists` when exported; `qualification: {min_passes: 10, min_rate: 1.0}`. An invariant whose rule needs an `unbound` verb → excluded, listed in `plan["excluded"]` (`{"invariant", "why": "verb X unbound"}`). Each miner ambiguity → `resolve(amb)` if given: an answer `{"invariant": id, "value": …}` is applied as if it were an invariant at threshold, recorded `resolved_by: "arch:<id>"`; `None`/no resolver → `resolved_by: "purged"`.
@@ -593,6 +625,9 @@ class Application:
     def call(self, verb: str, doc, **args): ...                       # dispatches by binding["verbs"][verb]["member"]: a small table of verb → Python function over the COM object graph (apply_paragraph_style, set_font_run, set_footer, set_header, save, export, verify_*, select_paragraph, set_slide_layout, set_placeholder_text, …)
     def close(self, doc, save=False): ...
     def quit(self): ...                                               # only if this driver started the instance
+
+# generate.py — generate(plan: dict, binding: dict, vault: dict, out: Path, name: str) -> None
+# CLI: vkforge generate --plan FILE --binding FILE --vault FILE --out DIR --name NAME   (add_arguments/run of this module, read by __main__.STAGES; nothing registered at import; Task 9 calls it with these flags)
 
 # runtime/fake.py — FakeApplication(binding): the same verbs implemented on OOXML with ooxml.py's writer twin (`ooxml.write_part`): apply_paragraph_style writes w:pStyle, set_font_run rewrites w:rFonts/w:sz on the body runs, set_footer writes footer1.xml, export writes a 1 200-byte "%PDF-1.4 fake" file; verify_* re-read through mine.mine_file.
 ```
@@ -719,7 +754,7 @@ class GenerateTest(unittest.TestCase):
 def qualify(driver_dir: Path, corpus: Path, invariants: dict, work: Path, fake: bool, deadline_s: float = 120.0) -> dict
 # refuses when sha256 of the corpus != invariants["corpus"]["content_sha256"]; copies each file to work/<i>/<name>; runs the driver once per copy (one process for the whole run, protocol 1 over stdio, the same lines the kernel sends); re-mines each output with mine.mine_file and checks every id of plan["post"] holds; records per pass {file_sha256, duration_ms, post: {...}, ok, reason}
 # → {"driver_id", "plan_sha256", "passes", "failures", "rate", "runs": [...]} ; written as qualification.json
-# CLI: vkforge qualify --driver DIR --corpus DIR --invariants FILE --work DIR [--fake]
+# CLI: vkforge qualify --driver DIR --corpus DIR --invariants FILE --work DIR [--fake]   (add_arguments/run of this module, read by __main__.STAGES; nothing registered at import)
 ```
 
 - [ ] **Step 1: Failing tests** — `ten_copies_pass_against_the_fake` (10/10, `rate == 1.0`, every `runs[i].post` all true, durations present), `a_locked_copy_is_a_failed_pass_not_a_hang` (make one copy read-only / `~$` lock marker the fake honours → that pass `ok False, reason "precondition"`, run completes under the deadline, 9/10), `a_changed_corpus_is_refused_before_any_copy` (append a file → `Refusal` "corpus changed", `work` empty), `the_record_is_reproducible_but_for_durations`.
@@ -739,7 +774,9 @@ def qualify(driver_dir: Path, corpus: Path, invariants: dict, work: Path, fake: 
 // vk-ipc/src/forge.rs — L-P2
 pub struct ForgeConfig { pub root: PathBuf /* drivers/ */, pub python: PathBuf /* the interpreter: drivers/vkforge/.venv/Scripts/python.exe or VK_FORGE_PYTHON */ }
 pub struct StageRun { pub stage: &'static str, pub args: Vec<String>, pub stdout_tail: String, pub exit: i32, pub duration_ms: u64 }
-/// Spawns `python -I -m vkforge <stage> <args>` with `current_dir = root`, under
+/// Spawns `<python> -I <root>/vkforge/__main__.py <stage> <args>` with
+/// `current_dir = root` — the script path, never `-m`: under `-I` the package
+/// would not be found, and `__main__.py` puts `root` on `sys.path` itself — under
 /// `vk_harness::confine::for_this_platform(1 << 30, None)`, stdout/stderr to
 /// `<work>/forge-<stage>.log`, killed at `deadline`. A non-zero exit is a
 /// refusal whose text is the stage's last stderr line (vkforge speaks the
@@ -853,6 +890,8 @@ fn an_ambiguity_with_a_mock_arch_is_resolved_and_traced() {
       - run: pip install -r drivers/vkforge/requirements.txt
       - name: vkforge suite (fixtures and the fake application)
         run: python -I -m unittest discover -s drivers/vkforge/tests -t .
+      - name: vkforge runs as the kernel spawns it (the script path under -I, never -m)
+        run: python -I drivers/vkforge/__main__.py --help
       - name: Build
         run: cargo build --locked -p vk-cli -p vkd -p vk-mcp
       - name: learn → qualify → mount through the daemon
@@ -872,11 +911,11 @@ Founder decision 2026-10-17: the post-launch retro-learning loop becomes a stage
 
 **Files:**
 - Create: `drivers/vkforge/debrief.py`, `drivers/vkforge/tests/test_debrief.py`, `drivers/vkforge/tests/debrief_fixtures.py`, `drivers/vkforge/tests/fixtures/debrief-2026-10-17/journal-essai1.jsonl`, `drivers/vkforge/tests/fixtures/debrief-2026-10-17/driver.log`, `drivers/vkforge/tests/fixtures/debrief-2026-10-17/vkd-console.log`
-- Modify: `drivers/vkforge/__main__.py` (`_register` imports `debrief`), `crates/vk-ipc/src/forge.rs` (`debrief`, `DEBRIEF_DEADLINE`), `crates/vk-ipc/src/server.rs` (`dispatch`: `driver.debrief`, **not** added to `takes_presence`), `crates/vk-cli/src/main.rs` (`DriverCmd::Debrief { run, out, until }` and its dispatch arm), `crates/vk-cli/src/render.rs` (`debriefed`), `docs/technical/runbooks/recette-maskai.md` (new §16, French), `docs/technical/technical-readme.md` (the "Learned drivers" section of Task 10: one paragraph), `contracts/tcb.md` §Drivers (one sentence)
+- Modify: `drivers/vkforge/__main__.py` (`debrief` imported and added to the `STAGES` table), `crates/vk-ipc/src/forge.rs` (`debrief`, `DEBRIEF_DEADLINE`), `crates/vk-ipc/src/server.rs` (`dispatch`: `driver.debrief`, **not** added to `takes_presence`), `crates/vk-cli/src/main.rs` (`DriverCmd::Debrief { run, out, until }` and its dispatch arm), `crates/vk-cli/src/render.rs` (`debriefed`), `docs/technical/runbooks/recette-maskai.md` (new §16, French), `docs/technical/technical-readme.md` (the "Learned drivers" section of Task 10: one paragraph), `contracts/tcb.md` §Drivers (one sentence)
 - Test: `crates/vk-ipc/tests/forge.rs` (two tests), `crates/vk-cli/tests/smoke.rs` (one test)
 
 **Interfaces:**
-- Consumes: `vkforge.errors.Refusal` and the stage registry `vkforge.__main__.STAGES` (Task 0); `ForgeConfig`, `run_stage` and the `driver.learn` dispatch site with its state directory (Task 9); `vk_contracts::hash_bytes`; `crate::server::{bad, internal}`.
+- Consumes: `vkforge.errors.Refusal` and the stage table `STAGES` of `drivers/vkforge/__main__.py`, built by explicit imports (Task 0); `ForgeConfig`, `run_stage` and the `driver.learn` dispatch site with its state directory (Task 9); `vk_contracts::hash_bytes`; `crate::server::{bad, internal}`.
 - Reads, in clear on the node (never a ledger payload: those are hashed) — the run directory, fixed names, only `journal.jsonl` and `tasks/` required; a missing optional input turns its signals to `null` or empty:
 
 | File | Where it comes from | What is read |
@@ -890,7 +929,7 @@ Founder decision 2026-10-17: the post-launch retro-learning loop becomes a stage
 | `cases.json` | the driver's | `level`, `kind`, `budget_s` per case |
 | `manifest.json` | the driver's | `kind` (`com` = a learned driver) |
 
-- Produces: `vkforge debrief --run DIR --out DIR [--until TASK]` (a stage like the others); `debrief.debrief(run: Path, until: str | None = None) -> (signals: dict, proposals: list, markdown: str)` and `debrief.write(signals, proposals, markdown, out: Path)` (refuses a non-empty `out`); the files `debrief.json` (signals, sorted keys, no absolute path, no timestamp of its own), `proposals.json`, `debrief.md` (sections 1–3 of a debrief in the register of the 17/10 one; §4 and §5 stay human); IPC `driver.debrief {run, out, until?}` → `{out, proposals: <n>, list: [{kind, target, confidence, proposal}], debrief_sha256, proposals_sha256}`; CLI `vk driver debrief --run DIR --out DIR [--until TASK]`.
+- Produces: the stage `python -I drivers/vkforge/__main__.py debrief --run DIR --out DIR [--until TASK]` (a stage like the others: `add_arguments` and `run`, nothing registered at import); `debrief.debrief(run: Path, until: str | None = None) -> (signals: dict, proposals: list, markdown: str)` and `debrief.write(signals, proposals, markdown, out: Path)` (refuses a non-empty `out`); the files `debrief.json` (signals, sorted keys, no absolute path, no timestamp of its own), `proposals.json`, `debrief.md` (sections 1–3 of a debrief in the register of the 17/10 one; §4 and §5 stay human); IPC `driver.debrief {run, out, until?}` → `{out, proposals: <n>, list: [{kind, target, confidence, proposal}], debrief_sha256, proposals_sha256}`; CLI `vk driver debrief --run DIR --out DIR [--until TASK]`.
 - Proposal shape — the list form of the deliberate-run proposal (Task 10, spec §5.3: one object, `proposed_by`), here with `proposed_by: "debrief"` and the evidence lines:
 
 ```json
@@ -1156,7 +1195,7 @@ if __name__ == "__main__":
     (run_2026_10_17 if which == "17-10" else clean_run)(target)
 ```
 
-- [ ] **Step 2: Failing tests** (`tests/test_debrief.py`; the stage is called in-process, through `vkforge.__main__.main` for the CLI entry, so the suite does not depend on how Task 9 spawns the interpreter)
+- [ ] **Step 2: Failing tests** (`tests/test_debrief.py`; the stage is called in-process, the CLI entry through `vkforge.__main__.main`; Task 0's test covers the script form the kernel spawns)
 
 ```python
 import contextlib
@@ -1836,19 +1875,18 @@ def run(ns: argparse.Namespace) -> int:
     write(s, proposals, md, Path(ns.out))
     print(f"debrief: {len(proposals)} proposals -> {ns.out}")
     return 0
-
-
-from .__main__ import STAGES  # noqa: E402  (Task 0's registry)
-
-STAGES["debrief"] = (add_arguments, run)
 ```
 
-and in `__main__.py`:
+and in `__main__.py`, the import and the table (the module registers nothing itself):
 
 ```python
-def _register():
-    from . import inventory, ontology, mine, plan, generate, qualify, debrief  # noqa: F401  (each registers itself)
+from vkforge import debrief, generate, inventory, mine, ontology, plan, qualify  # noqa: E402
+
+STAGES = {"inventory": inventory, "bind": ontology, "mine": mine, "plan": plan, "generate": generate,
+          "qualify": qualify, "debrief": debrief}
 ```
+
+with `"debrief"` added to the stage list of Task 0's `test_the_stage_table_is_built_in_main_and_no_stage_registers_itself`.
 
 - [ ] **Step 5: Run** the vkforge suite green.
 
@@ -2094,5 +2132,6 @@ Attendu : `debrief: N proposals -> …`, une ligne par proposition (genre, cible
 - Founder decision 2026-10-17, not in the spec (the debrief stage) → Task 11, from the 17/10 debrief §4 and the defects of its §2/§3: D1, D2, D5, D8, D11 and the maintenance page become proposals; D4, D6, D7, D9, D10, D12, D13 and S15–S17 signals; S14 (the judge's claims against the journal, D3) is out — the judge's text is in the register, not in clear on the node. Open founder decision: the optional `driver.debriefed` ledger row (default: none, L-P5). Fixture outcome: three of the four manual loops of 17/10 answered before their relaunch, one left.
 - Open items of spec §10 settled: verb list v1 (Task 4, 32 verbs); `comtypes` pinned in `requirements.txt`, type library located through the registry (Task 3); threshold default 0.8, one value for every kind, `--threshold` on the CLI (Task 5); no COM server in CI — the fake adapter (L-P1, Task 7); `vk driver plan show` format (Task 9).
 - Plan rulings: **L-P1** fake application behind the one adapter; **L-P2** `learn` is a governed one-shot process, not a protocol-1 driver; **L-P3** the deliberate fallback is a proposal from the catalogue through a Draft step, no live application driving in this chantier; **L-P4** a `kind: com` driver mounts only with a `driver.qualified` record meeting the plan's thresholds; **L-P5** the debrief is a machine act, writes no ledger row and applies nothing.
+- Invocation and stage table, corrected while writing Task 11 (both defects reproduced on CPython 3.13): `python -I -m vkforge` does not find the package (`-I` implies `-P`), so every invocation is `python -I drivers/vkforge/__main__.py <stage>` with `drivers/` put on `sys.path` by `__main__.py` and, for the suite, by `tests/__init__.py` (Tasks 0, 3, 9, 10, 11); stages registering through `from .__main__ import STAGES` filled a second copy of `__main__`, so `STAGES` is now built in `__main__.py` by explicit imports and a stage module only defines `add_arguments` and `run` (Tasks 0, 3–8, 11).
 - Type consistency: `Refusal` (0) used everywhere; `catalogue_from_fixture`/`catalogue_sha256` (3) in 4, 9; `bind` output shape (4) consumed by 6, 7 (`binding.json` copied), 9; `mine_file`/`mine_corpus`/vault (5) in 6, 7, 8; `build`/`write_plan` (6) in 7, 9; `generate` (7) in 8, 9; `qualify` (8) in 9; `DriverPlan`/`DriverLearned`/`DriverQualified` (2) in 9; `DriverKind::Com`/`applications` (1) in 7's manifest and 9's gate; `Refusal` and `STAGES` (0), `ForgeConfig`/`run_stage` (9) in 11.
 - Spec statements that differ from the code, left for the founder (not changed here): (a) "the pipeline is itself run as a driver of the kernel (protocol 1, Job Object)" — protocol 1 is request/response with evidence directories; the plan runs the stages as a governed one-shot process (L-P2); (b) "no network" for governed processes — a Job Object does not block sockets on Windows; the plan pins "no socket in the package" by a test instead; (c) §5.3 "the COM calls are traced" in the deliberate run — deferred (L-P3); (d) §4.6 says `kind: com` driver's `hosts: []` — today's validator refuses empty hosts, hence Task 1's per-kind rule; (e) §3.2 names `vk driver learn --deliberate <verb>` as a human act producing "a proposed projection rule reviewed by a human before it is versioned" — the plan writes the proposal file only; versioning into the ontology stays a manual edit + commit; (f) the spec has no debrief stage — it comes from the founder's decision of 2026-10-17 (`docs/technical/debriefs/2026-10-17-maskai-driver.md` §4), and §3.2's components and §4.10's CLI table should name `debrief` and `vk driver debrief` at the spec's next revision.
