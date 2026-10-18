@@ -65,6 +65,17 @@ def drop(key):
     return change
 
 
+def running_run() -> Path:
+    """The clean run dumped while its N1 step still runs: started 11:01:30, no end."""
+    run = debrief_fixtures.clean_run(Path(tempfile.mkdtemp()) / "run")
+
+    def running(d):
+        d["steps"][2].update(status="running", ended_ms=None)
+        d["status"] = "running"
+    edit_json(task_dump(run), running)
+    return run
+
+
 def with_cases(run: Path, budget) -> None:
     (run / "cases.json").write_text(json.dumps({"cases": {"N1-1": {"level": "N1", "kind": "message",
                                                                     "budget_s": budget}}}), encoding="utf-8")
@@ -392,28 +403,60 @@ class DebriefInputTest(unittest.TestCase):
                          (debrief_fixtures.ms("11:00:00", "2026-10-20"), debrief_fixtures.ms("11:04:40", "2026-10-20")))
 
     def test_a_task_still_running_keeps_the_window_open(self):
-        """A task dumped mid-step has no end yet (re-review N1): the window stays open to the newest
-        line read, the run's later lines are kept and still belong to the task, and `to_ms` says
-        where the window stopped."""
-        run = debrief_fixtures.clean_run(Path(tempfile.mkdtemp()) / "run")
-
-        def running(d):
-            d["steps"][2].update(status="running", ended_ms=None)
-            d["status"] = "running"
-        edit_json(task_dump(run), running)
-        s, p, _ = debrief.debrief(run)
+        """A task dumped mid-step has no end yet (re-review N1): the window stays open to the call
+        time, the run's later lines are kept and still belong to the task, its end is the newest
+        line read, and `to_ms`/`to_by` say which bound closed the window."""
+        run = running_run()
+        now = debrief_fixtures.ms("12:00:00", "2026-10-20")
+        s, p, _ = debrief.debrief(run, now_ms=now)
         self.assertEqual([c["case"] for c in s["cases"]], ["N0-1", "N1-1", "N1-2", "N1-3"])
         self.assertEqual(s["levels"]["N1"][0]["new_lines"], 3)
         self.assertTrue(s["run"]["open"])
-        self.assertEqual(s["run"]["to_ms"], debrief_fixtures.ms("11:03:40", "2026-10-20"))  # the newest dmesg row
-        self.assertEqual(s["tasks"][0]["window"][1], s["run"]["to_ms"])
+        self.assertEqual((s["run"]["to_ms"], s["run"]["to_by"]), (now, "now"))
+        self.assertEqual(s["tasks"][0]["window"][1], debrief_fixtures.ms("11:03:40", "2026-10-20"))  # newest row
         self.assertEqual(s["acts_total"], 12)
         self.assertEqual(p, [])
-        self.assertEqual(debrief.debrief(run, until="task-node-1-50")[0]["run"]["to_ms"], s["run"]["to_ms"])
+        self.assertEqual(debrief.debrief(run, until="task-node-1-50", now_ms=now)[0]["run"]["to_ms"], now)
         closed = debrief.debrief(debrief_fixtures.clean_run(Path(tempfile.mkdtemp()) / "run"))[0]["run"]
         self.assertFalse(closed["open"])
+        self.assertEqual(closed["to_by"], "the last end + 60 s")
         # t25's approval `waiting_human`, never ended, is a pause at a human gate, not a running task
         self.assertFalse(debrief.debrief(RUN_17_10)[0]["run"]["open"])
+
+    def test_an_open_window_still_ends_at_the_call_time_and_24_h_after_the_last_start(self):
+        """The open-run twin of the closed-run test (re-review 2, N1): the console and driver.log are
+        appended across mounts, so a line written after the debrief's call, or more than 24 h after
+        the run's last step started, is another run's and is not read."""
+        run = running_run()
+        console, log = run / "vkd-console.log", run / "driver.log"
+        console.write_text(console.read_text(encoding="utf-8")
+                           + "2026-10-21T10:30:00.000001Z  INFO vk_ipc::server: harness log task=task-node-1-50 "
+                             "harness=N1 : nouvelle_conversation refusée (dialog) : modale inconnue : Votre avis\n",
+                           encoding="utf-8")
+        log.write_text(log.read_text(encoding="utf-8") + "2026-10-21 10:29:14,207 WARNING maskai-recette service "
+                       "in maintenance: MAINTENANCE EN COURS\n2026-10-22 09:00:00,000 WARNING maskai-recette service "
+                       "in maintenance: MAINTENANCE EN COURS\n", encoding="utf-8")
+        with (run / "journal.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": "2026-10-22T09:01+02:00", "step": "exec", "case": "N1-1", "verdict": "KO",
+                                "evidence": "réponse vide : échec silencieux", "pipeline_ms": {"call_llm": 2444}},
+                               ensure_ascii=False) + "\n")
+        edit_json(run / "dmesg.json", lambda rows: rows + [
+            {"seq": 99, "kind": "driver.acted", "wall_ms": debrief_fixtures.ms("09:00:00", "2026-10-22")}])
+        same_day = debrief_fixtures.ms("12:00:00", "2026-10-20")  # the debrief called during the run
+        three_days = debrief_fixtures.ms("12:00:00", "2026-10-23")  # a stale `running` dump debriefed later
+        cap = debrief_fixtures.ms("11:01:30", "2026-10-21")  # the last step started 11:01:30, plus 24 h
+        for now, to_ms, to_by in ((same_day, same_day, "now"), (three_days, cap, "the last start + 24 h")):
+            s, p, _ = debrief.debrief(run, now_ms=now)
+            self.assertEqual((s["run"]["to_ms"], s["run"]["to_by"]), (to_ms, to_by))
+            self.assertEqual(len(s["cases"]), 4)
+            self.assertEqual(s["acts_total"], 12)
+            self.assertEqual((s["selector_suspects"], s["modal_refusals"]), ([], []))
+            if to_by == "now":
+                self.assertEqual((s["maintenance"], p), ([], []))
+        # with the 24 h cap, the next morning's maintenance line (10:29, before 11:01:30) is the run's
+        # window still: only what lies past the cap — 22/10 — is dropped
+        s = debrief.debrief(run, now_ms=three_days)[0]
+        self.assertEqual([m["at"] for m in s["maintenance"]], ["driver.log:2"])
 
     def test_line_references_count_blank_lines_and_supersedes_does_not(self):
         """`file:line` is the physical line, as an editor shows it (review M2); journal.py's

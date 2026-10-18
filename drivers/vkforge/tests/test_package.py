@@ -72,6 +72,20 @@ class PackageTest(unittest.TestCase):
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn(said, r.stderr.decode("utf-8"))  # strict: a cp1252 byte would raise here
 
+    def test_the_utf8_streams_keep_backslashreplace(self):
+        """A lone surrogate in a refusal (a task id from a mangled argv) is escaped, never raised:
+        `reconfigure(encoding=...)` alone would reset the error mode to strict (re-review 2)."""
+        from vkforge.tests import debrief_fixtures
+        run = debrief_fixtures.clean_run(pathlib.Path(tempfile.mkdtemp()) / "run")
+        out = pathlib.Path(tempfile.mkdtemp()) / "out"
+        raw = io.BytesIO()
+        err = io.TextIOWrapper(raw, encoding="utf-8", errors="strict")
+        with contextlib.redirect_stderr(err):
+            code = entry.main(["debrief", "--run", str(run), "--out", str(out), "--until", "t\udcff"])
+        err.flush()
+        self.assertEqual(code, 2)
+        self.assertIn(b"until: no task t\\udcff in the run; remedy: ", raw.getvalue())
+
     def test_canonical_bytes_are_sorted_indented_and_hashed_as_written(self):
         obj = {"b": [1, {"é": "ü"}], "a": None}
         data = canon.dumps(obj)

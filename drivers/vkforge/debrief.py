@@ -29,6 +29,7 @@ import json
 import math
 import re
 import statistics
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -261,10 +262,10 @@ class Run:
     """The run directory, loaded and checked: every line keeps its place (`at`, the physical line),
     its time and its task. The append-only files — the daemon's console, driver.log, the driver's
     journal, `vk dmesg` — are bounded to the run: from the first task's creation to the last task's
-    end plus a minute (to the newest line read while a task is still running: `open`), and a
-    harness note must name a task of the run."""
+    end plus a minute — while a task is still running (`open`), to the debrief's call, at most 24 h
+    after the last step started — and a harness note must name a task of the run."""
 
-    def __init__(self, root: Path, until=None):
+    def __init__(self, root: Path, until=None, now_ms=None):
         if not (root / "journal.jsonl").is_file():
             raise Refusal(f"no journal.jsonl under {root}",
                           "copy the driver's journal (its work directory) into the run directory")
@@ -287,17 +288,28 @@ class Run:
         self.tasks = sorted(tasks, key=lambda t: t["created_ms"])
         self.ids = {t["id"] for t in self.tasks}
         self.start = self.tasks[0]["created_ms"]
-        # A task still running keeps the window open: it closes on the newest line read (below).
+        # The window's end, and what set it (`to_by`). A task still running has no end yet: the
+        # window then ends at the debrief's call, and never more than 24 h after the run's last step
+        # started — the console and driver.log are appended across mounts, a later line is another
+        # run's. `--until` a task that ended closes it earlier.
         self.open = any(t["_running"] for t in self.tasks)
-        self.stop = None if self.open else max(t["_end"] for t in self.tasks) + 60_000
+        if not self.open:
+            self.stop, self.stop_by = max(t["_end"] for t in self.tasks) + 60_000, "the last end + 60 s"
+        else:
+            cap = max([s["started_ms"] for t in self.tasks for s in t["steps"] if s.get("started_ms")]
+                      + [self.start]) + 86_400_000
+            now = int(time.time() * 1000) if now_ms is None else now_ms
+            self.stop, self.stop_by = (now, "now") if now <= cap else (cap, "the last start + 24 h")
         self.limit = None
         if until is not None:
             hit = [t for t in self.tasks if t["id"] == until]
             if not hit:
                 raise Refusal(f"until: no task {until} in the run", "name a task of the run's tasks/ directory")
-            if not hit[0]["_running"]:  # the end of a running task is the newest line, as without --until
+            if not hit[0]["_running"]:  # a running task has no end: its window is the open run's
                 self.limit = hit[0]["_end"]
                 self.tasks = [t for t in self.tasks if t["created_ms"] <= self.limit]
+                if self.limit < self.stop:
+                    self.stop, self.stop_by = self.limit, "--until"
         self.cases = {}
         if (root / "cases.json").is_file():
             with _reading("cases.json"):
@@ -332,19 +344,18 @@ class Run:
                     _field(_object(r, f"dmesg.json[{i}]"), "kind", f"dmesg.json[{i}]", ("text",))
                     _field(r, "wall_ms", f"dmesg.json[{i}]", ("integer",))
                 self.ledger = [r for r in rows if self._in_run(r["wall_ms"])]
-        if self.open:  # the window, and a running task, end on the newest line read
+        if self.open:  # a running task ends, for its table row and its acts, on the newest line read
             seen = ([e["_lo"] for e in self.journal + self.set_aside] + [n["ms"] for n in self.notes or []]
                     + [x["ms"] for x in self.log or []] + [r["wall_ms"] for r in self.ledger or []])
-            self.stop = max(seen + [t["_end"] for t in self.tasks])
+            newest = max(seen + [t["_end"] for t in self.tasks])
             for t in self.tasks:
                 if t["_running"]:
-                    t["_end"] = self.stop
+                    t["_end"] = newest
 
     def _in_run(self, lo: int, hi: int = None) -> bool:
-        """Inside the run's window, and not after `--until`'s task; open-ended while a task runs."""
+        """Inside the run's window, and not after `--until`'s task."""
         hi = lo if hi is None else hi
-        return (hi >= self.start and (self.stop is None or lo <= self.stop)
-                and (self.limit is None or lo <= self.limit))
+        return hi >= self.start and lo <= self.stop and (self.limit is None or lo <= self.limit)
 
     def _task(self, lo: int, hi: int):
         hit = [t["id"] for t in self.tasks if t["created_ms"] <= hi and (t["_running"] or t["_end"] >= lo)]
@@ -528,7 +539,8 @@ def signals(run: Run) -> dict:
     return {
         "run": {"tasks": [t["id"] for t in run.tasks], "until_ms": run.limit, "learned_driver": run.learned,
                 "inputs": sorted(p.relative_to(run.root).as_posix() for p in run.root.rglob("*") if p.is_file()),
-                "from_ms": run.start, "to_ms": run.stop, "open": run.open, "console_from_ms": console_from},
+                "from_ms": run.start, "to_ms": run.stop, "to_by": run.stop_by, "open": run.open,
+                "console_from_ms": console_from},
         "tasks": tasks,
         "acts_total": None if run.ledger is None else sum(1 for r in run.ledger if r["kind"] == "driver.acted"),
         "relaunches": [{"after": a["id"], "next": b["id"]} for a, b in zip(run.tasks, run.tasks[1:]) if a["status"] != "done"],
@@ -707,8 +719,10 @@ def render(run: Run, s: dict, proposals: list) -> str:
     return "\n".join(out)
 
 
-def debrief(root: Path, until=None) -> tuple:
-    run = Run(root, until)
+def debrief(root: Path, until=None, now_ms=None) -> tuple:
+    """`now_ms`: the call's time, which ends the window of a run whose task is still running
+    (default: now). A run whose tasks all ended does not read it: its bytes are the same at any time."""
+    run = Run(root, until, now_ms)
     s = signals(run)
     proposals = propose(run, s)
     return s, proposals, render(run, s, proposals)
@@ -733,12 +747,13 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
 
 
 def run(ns: argparse.Namespace) -> int:
+    now_ms = int(time.time() * 1000)  # the stage's start: an open run's window ends here
     root, out = Path(ns.run), Path(ns.out)
     if out.resolve().is_relative_to(root.resolve()):
         raise Refusal(f"out {out} is inside the run directory",
                       "a new directory outside it: the run directory is read, never written")
     try:
-        s, proposals, md = debrief(root, ns.until)
+        s, proposals, md = debrief(root, ns.until, now_ms)
     except Refusal:
         raise
     except Exception as e:  # noqa: BLE001 — the last resort (L-P15): one line, never a traceback
