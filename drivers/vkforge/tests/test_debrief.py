@@ -416,7 +416,11 @@ class DebriefInputTest(unittest.TestCase):
         self.assertEqual(s["tasks"][0]["window"][1], debrief_fixtures.ms("11:03:40", "2026-10-20"))  # newest row
         self.assertEqual(s["acts_total"], 12)
         self.assertEqual(p, [])
-        self.assertEqual(debrief.debrief(run, until="task-node-1-50", now_ms=now)[0]["run"]["to_ms"], now)
+        with self.assertRaises(Refusal) as refused:  # round 4: a running task has no end to stop at
+            debrief.debrief(run, until="task-node-1-50", now_ms=now)
+        self.assertEqual(str(refused.exception),
+                         "until: task task-node-1-50 is still running; remedy: name a task that ended, "
+                         "or omit --until to debrief up to the call time")
         closed = debrief.debrief(debrief_fixtures.clean_run(Path(tempfile.mkdtemp()) / "run"))[0]["run"]
         self.assertFalse(closed["open"])
         self.assertEqual(closed["to_by"], "the last end + 60 s")

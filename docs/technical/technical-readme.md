@@ -772,7 +772,8 @@ lines (`file:line`) that support it, cut before any answer, sent text or documen
 (ruling L-P57); a suspect that needs a screen to be confirmed stays a signal, without a
 proposal. The console, `driver.log`, the journal and `vk dmesg` are read only inside the
 run's window (first task created to last task ended, plus a minute; while a task still
-runs, to the call, at most 24 h after the last step started), and a malformed input is one
+runs, to the call, at most 24 h after the last step started — a next-morning line inside
+that cap is still read; `--until` refuses a task still running), and a malformed input is one
 refusal line naming the file and the field. It is a machine act: no presence proof, no
 ledger row — the answer carries `debrief_sha256` and `proposals_sha256`, so whoever
 applies a proposal can name the evidence — and nothing is applied: selectors and modals

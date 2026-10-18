@@ -305,7 +305,10 @@ class Run:
             hit = [t for t in self.tasks if t["id"] == until]
             if not hit:
                 raise Refusal(f"until: no task {until} in the run", "name a task of the run's tasks/ directory")
-            if not hit[0]["_running"]:  # a running task has no end: its window is the open run's
+            if hit[0]["_running"]:  # a running task has no end: nothing to stop at
+                raise Refusal(f"until: task {until} is still running",
+                              "name a task that ended, or omit --until to debrief up to the call time")
+            else:
                 self.limit = hit[0]["_end"]
                 self.tasks = [t for t in self.tasks if t["created_ms"] <= self.limit]
                 if self.limit < self.stop:
