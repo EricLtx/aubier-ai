@@ -1,0 +1,626 @@
+{
+ "applications": {
+  "powerpoint": {
+   "alerts_off": 1,
+   "close": {},
+   "collection": "Presentations",
+   "open": {
+    "WithWindow": false
+   },
+   "progid": "PowerPoint.Application"
+  },
+  "word": {
+   "alerts_off": 0,
+   "close": {
+    "SaveChanges": false
+   },
+   "collection": "Documents",
+   "open": {
+    "AddToRecentFiles": false,
+    "ReadOnly": false,
+    "Visible": false
+   },
+   "progid": "Word.Application"
+  }
+ },
+ "family": "office-document",
+ "verbs": [
+  {
+   "args": {
+    "path": "Path"
+   },
+   "post": "document_open",
+   "pre": "none",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Presentations.Open"
+    },
+    "word": {
+     "constants": null,
+     "member": "Documents.Open"
+    }
+   },
+   "reversible": true,
+   "verb": "open"
+  },
+  {
+   "args": {},
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Presentation.Close"
+    },
+    "word": {
+     "constants": null,
+     "member": "Document.Close"
+    }
+   },
+   "reversible": true,
+   "verb": "close"
+  },
+  {
+   "args": {},
+   "post": "saved",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Presentation.Save"
+    },
+    "word": {
+     "constants": null,
+     "member": "Document.Save"
+    }
+   },
+   "reversible": false,
+   "verb": "save"
+  },
+  {
+   "args": {
+    "format": "Format",
+    "path": "Path"
+   },
+   "post": "saved",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": "PpSaveAsFileType",
+     "member": "Presentation.SaveAs"
+    },
+    "word": {
+     "constants": "WdSaveFormat",
+     "member": "Document.SaveAs2"
+    }
+   },
+   "reversible": false,
+   "verb": "save_as"
+  },
+  {
+   "args": {
+    "format": "Format",
+    "path": "Path"
+   },
+   "post": "pdf_exists",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": "PpFixedFormatType",
+     "member": "Presentation.ExportAsFixedFormat"
+    },
+    "word": {
+     "constants": "WdExportFormat",
+     "member": "Document.ExportAsFixedFormat"
+    }
+   },
+   "reversible": false,
+   "verb": "export"
+  },
+  {
+   "args": {
+    "selector": "ParagraphSelector"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Shape.TextFrame.TextRange.Paragraphs",
+     "status": "partial"
+    },
+    "word": {
+     "constants": null,
+     "member": "Document.Paragraphs"
+    }
+   },
+   "reversible": true,
+   "verb": "select_paragraph"
+  },
+  {
+   "args": {
+    "selector": "ParagraphSelector",
+    "style": "BuiltinStyle"
+   },
+   "post": "paragraph_style",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": "PpPlaceholderType",
+     "member": "Shape.PlaceholderFormat.Type",
+     "status": "partial"
+    },
+    "word": {
+     "constants": "WdBuiltinStyle",
+     "member": "Paragraph.Style"
+    }
+   },
+   "reversible": false,
+   "verb": "apply_paragraph_style"
+  },
+  {
+   "args": {
+    "font": "FontSpec",
+    "selector": "ParagraphSelector"
+   },
+   "post": "font_run",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Shape.TextFrame.TextRange.Font"
+    },
+    "word": {
+     "constants": null,
+     "member": "Paragraph.Range.Font"
+    }
+   },
+   "reversible": false,
+   "verb": "set_font_run"
+  },
+  {
+   "args": {
+    "selector": "ParagraphSelector"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Shape.TextFrame.TextRange.Font.Bold"
+    },
+    "word": {
+     "constants": null,
+     "member": "Paragraph.Range.Font.Bold"
+    }
+   },
+   "reversible": false,
+   "verb": "set_font_bold"
+  },
+  {
+   "args": {
+    "selector": "ParagraphSelector"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Shape.TextFrame.TextRange.Font.Italic"
+    },
+    "word": {
+     "constants": null,
+     "member": "Paragraph.Range.Font.Italic"
+    }
+   },
+   "reversible": false,
+   "verb": "set_font_italic"
+  },
+  {
+   "args": {
+    "alignment": "Format",
+    "selector": "ParagraphSelector"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": "PpParagraphAlignment",
+     "member": "Shape.TextFrame.TextRange.ParagraphFormat.Alignment"
+    },
+    "word": {
+     "constants": "WdParagraphAlignment",
+     "member": "Paragraph.Alignment"
+    }
+   },
+   "reversible": false,
+   "verb": "set_paragraph_alignment"
+  },
+  {
+   "args": {
+    "selector": "ParagraphSelector",
+    "spacing": "Format"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Shape.TextFrame.TextRange.ParagraphFormat"
+    },
+    "word": {
+     "constants": null,
+     "member": "Paragraph.Format"
+    }
+   },
+   "reversible": false,
+   "verb": "set_paragraph_spacing"
+  },
+  {
+   "args": {
+    "selector": "ParagraphSelector",
+    "spacing": "Format"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Shape.TextFrame.TextRange.ParagraphFormat.SpaceWithin"
+    },
+    "word": {
+     "constants": "WdLineSpacing",
+     "member": "Paragraph.LineSpacingRule"
+    }
+   },
+   "reversible": false,
+   "verb": "set_line_spacing"
+  },
+  {
+   "args": {
+    "text": "Text"
+   },
+   "post": "header",
+   "pre": "document_open",
+   "projection": {
+    "word": {
+     "constants": "WdHeaderFooterIndex",
+     "member": "Section.Headers"
+    }
+   },
+   "reversible": false,
+   "verb": "set_header"
+  },
+  {
+   "args": {
+    "text": "Text"
+   },
+   "post": "footer",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Slide.HeadersFooters.Footer"
+    },
+    "word": {
+     "constants": "WdHeaderFooterIndex",
+     "member": "Section.Footers"
+    }
+   },
+   "reversible": false,
+   "verb": "set_footer"
+  },
+  {
+   "args": {
+    "margins": "Format"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "word": {
+     "constants": null,
+     "member": "Document.PageSetup"
+    }
+   },
+   "reversible": false,
+   "verb": "set_page_margins"
+  },
+  {
+   "args": {
+    "orientation": "Format"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Presentation.PageSetup.SlideOrientation"
+    },
+    "word": {
+     "constants": "WdOrientation",
+     "member": "Document.PageSetup.Orientation"
+    }
+   },
+   "reversible": false,
+   "verb": "set_page_orientation"
+  },
+  {
+   "args": {
+    "property": "Text",
+    "value": "Text"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Presentation.BuiltInDocumentProperties"
+    },
+    "word": {
+     "constants": "WdBuiltInProperty",
+     "member": "Document.BuiltInDocumentProperties"
+    }
+   },
+   "reversible": false,
+   "verb": "set_document_property"
+  },
+  {
+   "args": {},
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Slide.HeadersFooters.SlideNumber"
+    },
+    "word": {
+     "constants": null,
+     "member": "HeaderFooter.PageNumbers.Add"
+    }
+   },
+   "reversible": false,
+   "verb": "insert_page_number"
+  },
+  {
+   "args": {
+    "selector": "ParagraphSelector"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "word": {
+     "constants": null,
+     "member": "Paragraph.Range.ListFormat.ApplyNumberDefault"
+    }
+   },
+   "reversible": false,
+   "verb": "apply_numbering"
+  },
+  {
+   "args": {
+    "style": "BuiltinStyle"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Table.ApplyStyle",
+     "status": "partial"
+    },
+    "word": {
+     "constants": "WdBuiltinStyle",
+     "member": "Table.Style"
+    }
+   },
+   "reversible": false,
+   "verb": "set_table_style"
+  },
+  {
+   "args": {},
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Table.Cell.Borders",
+     "status": "partial"
+    },
+    "word": {
+     "constants": null,
+     "member": "Table.Borders"
+    }
+   },
+   "reversible": false,
+   "verb": "set_table_borders"
+  },
+  {
+   "args": {
+    "selector": "ParagraphSelector",
+    "style": "BuiltinStyle"
+   },
+   "post": "paragraph_style",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": "PpPlaceholderType",
+     "member": "Shape.PlaceholderFormat.Type",
+     "status": "partial"
+    },
+    "word": {
+     "constants": "WdBuiltinStyle",
+     "member": "Paragraph.Style"
+    }
+   },
+   "reversible": true,
+   "verb": "verify_paragraph_style"
+  },
+  {
+   "args": {
+    "font": "FontSpec",
+    "selector": "ParagraphSelector"
+   },
+   "post": "font_run",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Shape.TextFrame.TextRange.Font"
+    },
+    "word": {
+     "constants": null,
+     "member": "Paragraph.Range.Font"
+    }
+   },
+   "reversible": true,
+   "verb": "verify_font_run"
+  },
+  {
+   "args": {
+    "text": "Text"
+   },
+   "post": "footer",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Slide.HeadersFooters.Footer"
+    },
+    "word": {
+     "constants": "WdHeaderFooterIndex",
+     "member": "Section.Footers"
+    }
+   },
+   "reversible": true,
+   "verb": "verify_footer"
+  },
+  {
+   "args": {
+    "text": "Text"
+   },
+   "post": "header",
+   "pre": "document_open",
+   "projection": {
+    "word": {
+     "constants": "WdHeaderFooterIndex",
+     "member": "Section.Headers"
+    }
+   },
+   "reversible": true,
+   "verb": "verify_header"
+  },
+  {
+   "args": {
+    "path": "Path"
+   },
+   "post": "pdf_exists",
+   "pre": "none",
+   "projection": {
+    "powerpoint": {
+     "constants": "PpFixedFormatType",
+     "member": "Presentation.ExportAsFixedFormat"
+    },
+    "word": {
+     "constants": "WdExportFormat",
+     "member": "Document.ExportAsFixedFormat"
+    }
+   },
+   "reversible": true,
+   "verb": "verify_pdf"
+  },
+  {
+   "args": {},
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Shape.TextFrame.TextRange.Paragraphs",
+     "status": "partial"
+    },
+    "word": {
+     "constants": null,
+     "member": "Document.Paragraphs.Count"
+    }
+   },
+   "reversible": true,
+   "verb": "count_paragraphs"
+  },
+  {
+   "args": {
+    "property": "Text"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Presentation.BuiltInDocumentProperties"
+    },
+    "word": {
+     "constants": "WdBuiltInProperty",
+     "member": "Document.BuiltInDocumentProperties"
+    }
+   },
+   "reversible": true,
+   "verb": "read_document_property"
+  },
+  {
+   "args": {
+    "layout": "BuiltinStyle"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": "PpSlideLayout",
+     "member": "Slide.Layout"
+    }
+   },
+   "reversible": false,
+   "verb": "set_slide_layout"
+  },
+  {
+   "args": {
+    "selector": "ParagraphSelector",
+    "text": "Text"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Shape.TextFrame.TextRange.Text"
+    },
+    "word": {
+     "constants": null,
+     "member": "Paragraph.Range.Text",
+     "status": "partial"
+    }
+   },
+   "reversible": false,
+   "verb": "set_placeholder_text"
+  },
+  {
+   "args": {
+    "path": "Path"
+   },
+   "post": "none",
+   "pre": "document_open",
+   "projection": {
+    "powerpoint": {
+     "constants": null,
+     "member": "Presentation.ApplyTheme"
+    },
+    "word": {
+     "constants": null,
+     "member": "Document.ApplyTheme"
+    }
+   },
+   "reversible": false,
+   "verb": "apply_theme"
+  }
+ ],
+ "version": 1
+}
