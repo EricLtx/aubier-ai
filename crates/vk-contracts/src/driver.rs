@@ -493,12 +493,14 @@ mod tests {
 
     #[test]
     fn unknown_words_are_refused_at_parse() {
-        let text = include_str!("../../../contracts/examples/driver_manifest/valid/identity-frozen-2026-10-17.json")
-            .replacen(
-                "\"kind\": \"browser\"",
-                "\"kind\": \"browser\", \"source\": \"packaged\"",
-                1,
-            );
+        let text = include_str!(
+            "../../../contracts/examples/driver_manifest/valid/identity-frozen-2026-10-17.json"
+        )
+        .replacen(
+            "\"kind\": \"browser\"",
+            "\"kind\": \"browser\", \"source\": \"packaged\"",
+            1,
+        );
         let msg = serde_json::from_str::<DriverManifest>(&text)
             .unwrap_err()
             .to_string();
