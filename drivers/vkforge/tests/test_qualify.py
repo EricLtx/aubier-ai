@@ -1,13 +1,17 @@
+import contextlib
 import copy
+import io
 import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
+from vkdriver.hash_dir import hash_dir
 from vkforge import __main__ as entry
 from vkforge import canon, generate, mine, ontology, plan, qualify
 from vkforge.errors import Refusal
@@ -15,6 +19,41 @@ from vkforge.tests import ooxml_fixtures
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 HOUSE_POST = {"title_style": True, "body_font": True, "footer_text": True, "pdf_exists": True}
+NOTHING_REPAIRED = {"title_style": False, "body_font": False, "footer_text": False, "pdf_exists": True}
+
+# A stand-in for the generated driver.py (L-P51): protocol 1 by hand, stdlib only. Per document name it
+# sleeps past the deadline or exits without answering; otherwise it writes the PDF and answers ok
+# without repairing anything — "pdf" leaves the document as it found it, "resave" rewrites it unrepaired.
+STAND_IN = r'''import json
+import os
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+VERSION, ACTION, DEFAULT, BEHAVIOUR = @CONFIG@
+
+with open(Path(os.environ["VK_DRIVER_WORK_DIR"]) / "pids.log", "a", encoding="utf-8") as f:
+    f.write(str(os.getpid()) + "\n")
+print(json.dumps({"hello": {"protocol": 1, "driver": "stand-in", "version": VERSION, "actions": [ACTION]}}),
+      flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    doc = Path(request["args"]["document"])
+    what = BEHAVIOUR.get(doc.name, DEFAULT)
+    if what == "sleep":
+        time.sleep(60)
+    if what == "exit":
+        os._exit(3)
+    Path(request["args"]["pdf"]).write_bytes(b"%PDF-1.4 stand-in\n")
+    if what == "resave":
+        with zipfile.ZipFile(doc) as zf:
+            members = [(info.filename, zf.read(info)) for info in zf.infolist()]
+        with zipfile.ZipFile(doc, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, data in members:
+                zf.writestr(name, data)
+    print(json.dumps({"id": request["id"], "ok": True, "result": {"text": "stand-in"}, "evidence": []}), flush=True)
+'''
 
 
 def learned(corpus: Path):
@@ -26,6 +65,42 @@ def learned(corpus: Path):
     driver = Path(tempfile.mkdtemp()) / "word-maison" / "driver"
     generate.generate(p, binding, inv, vault, driver, name="word-maison")
     return driver, p, inv
+
+
+def stand_in(driver: Path, p: dict, default: str, behaviour: dict | None = None) -> Path:
+    """The generated driver with STAND_IN as its driver.py and its manifest hashed again: vendor, hash and
+    hello still hold, only the action differs."""
+    config = repr((canon.sha256(p), p["actions"][0]["name"], default, behaviour or {}))
+    (driver / "driver.py").write_text(STAND_IN.replace("@CONFIG@", config), encoding="utf-8")
+    manifest = json.loads((driver / "manifest.json").read_text(encoding="utf-8"))
+    manifest["program"]["files_sha256"] = hash_dir(str(driver))
+    canon.write(manifest, driver / "manifest.json")
+    return driver
+
+
+def alive(pid: int) -> bool:
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)     # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == 0x102        # WAIT_TIMEOUT: still running
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 class QualifyTest(unittest.TestCase):
@@ -108,8 +183,74 @@ class QualifyTest(unittest.TestCase):
         out = self.driver.parent
         plan.write_plan(self.plan, [], out)
         canon.write(self.inv, out / "invariants.json")
-        code = entry.main(["qualify", "--driver", str(self.driver), "--corpus", str(self.corpus),
-                           "--plan", str(out / "plan.json"), "--invariants", str(out / "invariants.json"),
-                           "--work", str(self.work), "--fake"])
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            code = entry.main(["qualify", "--driver", str(self.driver), "--corpus", str(self.corpus),
+                               "--plan", str(out / "plan.json"), "--invariants", str(out / "invariants.json"),
+                               "--work", str(self.work), "--fake"])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads((self.work / "qualification.json").read_text(encoding="utf-8"))["passes"], 10)
+        self.assertEqual(printed.getvalue(),
+                         f"qualify: 10/10 passes (0 failures), fake true -> {self.work / 'qualification.json'}\n")
+
+    # --- L-P52: perturb then repair; L-P50/L-P51: the stage's own reasons, the timeout and the crash ---
+
+    def test_the_perturbation_breaks_every_post_and_keeps_the_file_mode(self):
+        post, expected = self.plan["actions"][0]["post"], qualify._expected(self.plan, self.inv)
+        doc = Path(tempfile.mkdtemp()) / "c0.docx"
+        shutil.copy2(self.corpus / "c0.docx", doc)
+        doc.with_suffix(".pdf").write_bytes(b"%PDF-1.4 corpus\n")
+        self.assertEqual(qualify._post(post, doc, expected), HOUSE_POST, "the corpus already conforms")
+        os.chmod(doc, stat.S_IREAD)
+        try:
+            qualify._perturb(doc, post, expected)
+            self.assertFalse(os.access(doc, os.W_OK), "a read-only document stays read-only")
+        finally:
+            os.chmod(doc, stat.S_IREAD | stat.S_IWRITE)
+        self.assertEqual(qualify._post(post, doc, expected), {k: False for k in HOUSE_POST})
+
+    def test_a_driver_that_repairs_nothing_never_passes(self):
+        # Review Important 1: the corpus already conforms, so only the perturbation makes a no-op fail.
+        stand_in(self.driver, self.plan, "pdf")
+        rec = self.run_qualify(deadline_s=30)
+        self.assertEqual((rec["passes"], rec["failures"]), (0, 10))
+        for r in rec["runs"]:
+            self.assertEqual((r["ok"], r["reason"], r["post"]), (False, "unsaved", NOTHING_REPAIRED))
+
+    def test_a_driver_that_saves_without_repairing_fails_its_postconditions(self):
+        # Review Important 2, L-P50: an ok answer the re-mined copy contradicts is `postcondition`.
+        stand_in(self.driver, self.plan, "resave")
+        rec = self.run_qualify(deadline_s=30)
+        self.assertEqual((rec["passes"], rec["failures"]), (0, 10))
+        for r in rec["runs"]:
+            self.assertEqual((r["ok"], r["reason"], r["post"]), (False, "postcondition", NOTHING_REPAIRED))
+
+    def test_the_strays_of_a_corpus_are_repaired_too(self):
+        corpus = ooxml_fixtures.corpus(Path(tempfile.mkdtemp()) / "corpus", 10, 2)     # c10, c11: Calibri 12
+        driver, p, inv = learned(corpus)
+        rec = qualify.qualify(driver, corpus, p, inv, Path(tempfile.mkdtemp()) / "w", fake=True)
+        self.assertEqual((rec["passes"], rec["failures"]), (12, 0))
+        self.assertEqual([r["post"] for r in rec["runs"]], [HOUSE_POST] * 12)
+        rec = qualify.qualify(stand_in(driver, p, "resave"), corpus, p, inv, Path(tempfile.mkdtemp()) / "w", fake=True)
+        self.assertEqual((rec["passes"], rec["failures"]), (0, 12))
+        self.assertEqual({r["reason"] for r in rec["runs"]}, {"postcondition"})
+
+    def test_a_pass_past_its_deadline_or_a_dead_driver_fails_and_a_new_process_takes_the_next(self):
+        stand_in(self.driver, self.plan, "pdf", {"c3.docx": "sleep", "c5.docx": "exit"})
+        started = time.monotonic()
+        rec = self.run_qualify(deadline_s=2)
+        self.assertLess(time.monotonic() - started, 60, "the deadline, then END_WAIT_S, then the kill")
+        reasons = [r["reason"] for r in rec["runs"]]
+        self.assertEqual(reasons, ["unsaved"] * 3 + ["timeout", "unsaved", "internal"] + ["unsaved"] * 4)
+        self.assertEqual(rec["runs"][3]["post"], {k: False for k in HOUSE_POST})
+        pids = [int(x) for x in (self.work / "pids.log").read_text(encoding="utf-8").split()]
+        self.assertEqual(len(pids), 3, "one process, then one after the timeout, then one after the crash")
+        self.assertEqual([pid for pid in pids if alive(pid)], [], "no driver process outlives the stage")
+
+    def test_a_post_id_qualify_cannot_perturb_is_refused_before_any_pass(self):
+        other = copy.deepcopy(self.plan)
+        other["actions"][0]["post"][0] = "page_size"
+        with self.assertRaises(Refusal) as cm:
+            qualify.qualify(self.driver, self.corpus, other, self.inv, self.work, fake=True)
+        self.assertIn("cannot perturb page_size for qualification", str(cm.exception))
+        self.assertFalse(self.work.exists())

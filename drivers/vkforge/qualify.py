@@ -3,16 +3,22 @@
 The qualification is the learned driver's bench test. The driver runs as the kernel runs a driver —
 from its own directory, with no repository around it, one protocol-1 process for the run, `cwd` the
 work directory — on a copy of every document the miner mined; the originals are never handed to it.
-After each `ok` answer the miner reads the copy again: a postcondition holds when the observation of
-its (kind, where) has the invariant's value (spec §5.2: checked in code, never taken from the driver's
-word), `pdf_exists` when the PDF beside the copy starts with `%PDF`. `qualification.json` records, per
-pass, the document's hash, the duration, each postcondition and the refusal word, and no file name
-(spec §5.5: a name is content); the kernel hashes its bytes into `qualification_sha256`, which the
-mount gate checks (Task 9).
+The corpus documents already carry the invariants (that is how they were mined), so each copy is first
+PERTURBED on every post id of the plan (L-P52: the title's style removed, the fonts changed, the footer
+and header text replaced, no PDF beside it), with lxml and ooxml.write_parts, never Office: only a real
+repair can then pass. After each `ok` answer the miner reads the copy again: a postcondition holds when
+the observation of its (kind, where) has the invariant's value (spec §5.2: checked in code, never taken
+from the driver's word), `pdf_exists` when the PDF beside the copy starts with `%PDF`; a copy whose
+bytes are still the perturbed ones was not saved. `qualification.json` records, per pass, the
+document's hash, the duration, each postcondition and the reason, and no file name (spec §5.5: a name
+is content); the kernel hashes its bytes into `qualification_sha256`, which the mount gate checks.
 
-With `fake`, `<work>/fake.json` makes the driver load the repository's fake application (L-P19). The
-driver is this stage's child, inside the stage's Job (the governor), not a job step under the
-harness: the deviation from spec §5.2's "under the harness, supervised" that L-P32 declares.
+A pass's reason is protocol 1's refusal word, or this stage's own: `postcondition` (the driver said ok,
+the re-mined copy disagrees, L-P50) and `unsaved` (the driver said ok, the copy is byte for byte the
+perturbed one). With `fake`, `<work>/fake.json` makes the driver load the repository's fake application
+(L-P19). The driver is this stage's child, inside the stage's Job (the governor), not a job step under
+the harness: the deviation from spec §5.2's "under the harness, supervised" that L-P32 declares. A pass
+killed at its deadline never runs the driver's `_quit`: the Office instance it started stays running.
 """
 import argparse
 import json
@@ -20,27 +26,45 @@ import os
 import queue
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
+from lxml import etree
 from vkdriver.hash_dir import hash_dir
 from vkdriver.protocol import PROTOCOL
 
-from . import canon, mine, ontology
+from . import canon, mine, ontology, ooxml
 from .errors import Refusal
+from .ooxml import NS, q
 
-PASS_DEADLINE_S = 120.0
-HELLO_TIMEOUT_S = 30.0
+# L-P53: the worst case of one document, 90 s + END_WAIT_S + a new process's hello, stays under the
+# 130 s per document the kernel gives the stage (Task 9).
+PASS_DEADLINE_S = 90.0
+HELLO_TIMEOUT_S = 10.0
 END_WAIT_S = 5.0        # stdin closed, the driver's own end (it quits the Office it started, L-P46) before a kill
 VKFORGE_ROOT = Path(__file__).resolve().parent.parent       # drivers/: what fake.json names (L-P19)
 REASONS = ("dialog", "timeout", "host", "precondition", "internal")    # protocol 1's refusal words
+PERTURBABLE = frozenset({"title_style", "body_font", "title_font", "header_text", "footer_text", "pdf_exists"})
+PERTURBED_FONT = "Courier New"
+PERTURBED_TEXT = "vkforge qualification: not the firm's text"
+_UNDECLARED_STYLE = "VkQualifyPerturbed"    # a styleId no styles.xml declares: the miner sees no style
 _WHERE = {ident: key for key, ident in mine.INVARIANT_IDS.items()}     # post id → the (kind, where) it observes
 _NOT_THIS_PLAN = "pass the plan.json the driver was generated from, or generate it again"
+_CORPUS_CHANGED = ("corpus changed since vkforge mine",
+                   "qualify on the corpus the driver was learned from, or learn again")
+_PERTURB_REMEDY = "teach drivers/vkforge/qualify.py to perturb it, so that only a real repair passes (L-P52)"
+# CT_RPr's sequence up to w:sz: a child the perturbation adds goes after its predecessors (Word's schema)
+_RPR_ORDER = ("rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline",
+              "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing",
+              "w", "kern", "position", "sz")
 _LATE = object()
 
+
+# --- the driver process ---------------------------------------------------------------------------
 
 def _kill_tree(proc: subprocess.Popen) -> None:
     """The driver and every process it started: taskkill /T on Windows, its session elsewhere. An
@@ -136,7 +160,11 @@ def _start(command: list, work: Path, env: dict, log, driver_dir: Path, plan_sha
     """A driver process whose hello came within HELLO_TIMEOUT_S, speaks protocol 1 and names this plan
     (the generator's VERSION is canon.sha256(plan)); else it is ended and the stage refuses."""
     driver = _Driver(command, work, env, log)
-    hello = driver.hello()
+    try:
+        hello = driver.hello()
+    except BaseException:                           # an interrupt while waiting: the process is ended too
+        driver.end()
+        raise
     refusal = None
     if hello is None:
         refusal = Refusal(f"driver {driver_dir} sent no hello within {HELLO_TIMEOUT_S:g} s",
@@ -152,9 +180,11 @@ def _start(command: list, work: Path, env: dict, log, driver_dir: Path, plan_sha
     return driver
 
 
-def _check(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: Path) -> tuple[dict, dict, dict]:
+# --- the checks before any copy ---------------------------------------------------------------------
+
+def _check(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: Path) -> tuple:
     """Every refusal before any copy, in this order; (the manifest, the plan's action, the manifest's
-    entry for it)."""
+    entry for it, the corpus files sorted by name — the one survey of the corpus)."""
     if work.exists() and (not work.is_dir() or any(work.iterdir())):
         raise Refusal(f"work {work} is not empty", "a new directory: a qualification never reuses one")
     if not (driver_dir / "vendor" / "vkdriver" / "protocol.py").is_file():
@@ -169,15 +199,28 @@ def _check(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: P
                       "generate it again: a learned driver's files are never edited")
     if canon.sha256(invariants) != plan.get("invariants_sha256"):
         raise Refusal("plan and invariants do not belong together", "pass the invariants.json the plan was built from")
-    if mine.content_sha256(corpus) != (invariants.get("corpus") or {}).get("content_sha256"):
-        raise Refusal("corpus changed since vkforge mine",
-                      "qualify on the corpus the driver was learned from, or learn again")
+    mined, _ = mine.survey(corpus)
+    files = sorted((p for p, _ in mined), key=lambda p: p.name)
+    if _content_sha256(canon.sha256_file(p) for p in files) != _learned_content(invariants):
+        raise Refusal(*_CORPUS_CHANGED)
     action = plan["actions"][0]                     # v1: one action per plan (plan.build)
     entry = next((a for a in manifest.get("actions") or [] if isinstance(a, dict) and a.get("name") == action["name"]),
                  None)
     if entry is None:
         raise Refusal(f"driver {driver_dir} was not generated from this plan", _NOT_THIS_PLAN)
-    return manifest, action, entry
+    unknown = next((ident for ident in action["post"] if ident not in PERTURBABLE), None)
+    if unknown is not None:
+        raise Refusal(f"cannot perturb {unknown} for qualification", _PERTURB_REMEDY)
+    return manifest, action, entry, files
+
+
+def _content_sha256(hashes) -> str:
+    """mine.content_sha256's formula, over file hashes already taken."""
+    return canon.sha256(sorted(hashes))
+
+
+def _learned_content(invariants: dict):
+    return (invariants.get("corpus") or {}).get("content_sha256")
 
 
 def _expected(plan: dict, invariants: dict) -> dict:
@@ -187,12 +230,195 @@ def _expected(plan: dict, invariants: dict) -> dict:
     return {**resolved, **{i["id"]: i["value"] for i in invariants.get("invariants") or [] if isinstance(i, dict)}}
 
 
+# --- the perturbation (L-P52) -----------------------------------------------------------------------
+
+def _xml(root) -> bytes:
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def _first_child(parent, local: str):
+    """`parent`'s w:<local>, created as its first child when absent (w:pPr in w:p, w:pStyle in w:pPr,
+    w:rPr in w:r: each is first in its schema sequence)."""
+    found = parent.find(f"w:{local}", NS)
+    if found is None:
+        found = etree.Element(q("w", local))
+        parent.insert(0, found)
+    return found
+
+
+def _rpr_child(rpr, local: str):
+    """`rpr`'s w:<local>, created after the children CT_RPr puts before it when absent."""
+    found = rpr.find(f"w:{local}", NS)
+    if found is not None:
+        return found
+    before = {q("w", n) for n in _RPR_ORDER[:_RPR_ORDER.index(local)]}
+    at = 0
+    for i, child in enumerate(rpr):
+        if child.tag in before:
+            at = i + 1
+    element = etree.Element(q("w", local))
+    rpr.insert(at, element)
+    return element
+
+
+def _other_size(value) -> float:
+    """A size the invariant does not have: its own plus 2 (12 when it names none)."""
+    size = value.get("size") if isinstance(value, dict) else None
+    return size + 2 if isinstance(size, (int, float)) and not isinstance(size, bool) else 12
+
+
+def _perturb_runs(paragraphs: list, value) -> bool:
+    """Every run of `paragraphs` in PERTURBED_FONT at another size than the invariant's."""
+    half_points = str(int(round(_other_size(value) * 2)))
+    touched = False
+    for p in paragraphs:
+        for run in p.iter(q("w", "r")):
+            rpr = _first_child(run, "rPr")
+            fonts = _rpr_child(rpr, "rFonts")
+            for theme in ("asciiTheme", "hAnsiTheme"):          # a theme font overrides the named one
+                fonts.attrib.pop(q("w", theme), None)
+            fonts.set(q("w", "ascii"), PERTURBED_FONT)
+            fonts.set(q("w", "hAnsi"), PERTURBED_FONT)
+            _rpr_child(rpr, "sz").set(q("w", "val"), half_points)
+            touched = True
+    return touched
+
+
+def _replace_text(roots: list, t_tag: str) -> bool:
+    """Each part's text replaced by PERTURBED_TEXT (its first text node), the part itself kept."""
+    touched = False
+    for root in roots:
+        texts = list(root.iter(t_tag))
+        if texts:
+            texts[0].text = PERTURBED_TEXT
+            for t in texts[1:]:
+                t.text = ""
+            touched = True
+    return touched
+
+
+def _default_builtin(styles):
+    """The value the miner gives a paragraph without w:pStyle: its default paragraph style's built-in."""
+    if styles is None:
+        return None
+    for s in styles.findall("w:style", NS):
+        if s.get(q("w", "type")) == "paragraph" and s.get(q("w", "default")) in ("1", "true"):
+            name = s.find("w:name", NS)
+            builtin = mine.BUILTIN_STYLES.get(((name.get(q("w", "val")) if name is not None else None) or "").lower())
+            return None if builtin is None else {"builtin": builtin}
+    return None
+
+
+def _perturb_docx(zf, post: set, expected: dict) -> dict:
+    edits = {}
+    doc = ooxml.part(zf, "word/document.xml")
+    paragraphs = [] if doc is None else list(doc.iter(q("w", "p")))
+    touched = False
+    if "title_style" in post and paragraphs:
+        first = paragraphs[0]
+        ppr = first.find("w:pPr", NS)
+        ps = None if ppr is None else ppr.find("w:pStyle", NS)
+        if canon.dumps(_default_builtin(ooxml.part(zf, "word/styles.xml"))) == canon.dumps(expected.get("title_style")):
+            # Without w:pStyle the title would be in the invariant's style itself: an undeclared one instead.
+            _first_child(_first_child(first, "pPr"), "pStyle").set(q("w", "val"), _UNDECLARED_STYLE)
+            touched = True
+        elif ps is not None:
+            ppr.remove(ps)
+            touched = True
+    if "title_font" in post and paragraphs:
+        touched = _perturb_runs(paragraphs[:1], expected.get("title_font")) or touched
+    if "body_font" in post:
+        touched = _perturb_runs(paragraphs[1:], expected.get("body_font")) or touched
+    if touched:
+        edits["word/document.xml"] = doc
+    for ident, pattern in (("footer_text", "word/footer*.xml"), ("header_text", "word/header*.xml")):
+        if ident in post:
+            for name in ooxml.parts(zf, pattern):
+                root = ooxml.part(zf, name)
+                if root is not None and _replace_text([root], q("w", "t")):
+                    edits[name] = root
+    return edits
+
+
+def _perturb_pptx(zf, post: set, expected: dict) -> dict:
+    """The first slide master, where the miner reads a presentation's title font and footer."""
+    masters = ooxml.parts(zf, "ppt/slideMasters/slideMaster*.xml")
+    master = ooxml.part(zf, masters[0]) if masters else None
+    if master is None:
+        return {}
+
+    def placeholder(kind):
+        return master.xpath(f'.//p:sp[p:nvSpPr/p:nvPr/p:ph[@type="{kind}"]]', namespaces=NS)
+
+    touched = False
+    if "title_font" in post:
+        size = str(int(round(_other_size(expected.get("title_font")) * 100)))
+        for root in placeholder("title") + master.xpath("p:txStyles/p:titleStyle/a:lvl1pPr", namespaces=NS):
+            for latin in root.iter(q("a", "latin")):
+                latin.set("typeface", PERTURBED_FONT)
+                touched = True
+            for rpr in root.iter(q("a", "rPr"), q("a", "defRPr")):
+                if rpr.get("sz") is not None:
+                    rpr.set("sz", size)
+                    touched = True
+    if "footer_text" in post:
+        touched = _replace_text(placeholder("ftr")[:1], q("a", "t")) or touched
+    return {masters[0]: master} if touched else {}
+
+
+def _perturb(copy: Path, post: list, expected: dict) -> None:
+    """The copy made non-conforming on every post id (no PDF beside it for `pdf_exists`), its file mode
+    kept: a read-only document stays read-only, as Word holds it."""
+    copy.with_suffix(".pdf").unlink(missing_ok=True)
+    with ooxml.open_package(copy) as zf:
+        edits = (_perturb_docx if ooxml.kind_of(zf) == "docx" else _perturb_pptx)(zf, set(post), expected)
+    if not edits:
+        return
+    mode = stat.S_IMODE(os.stat(copy).st_mode)
+    os.chmod(copy, mode | stat.S_IWRITE)
+    try:
+        ooxml.write_parts(copy, {name: _xml(root) for name, root in sorted(edits.items())})
+    finally:
+        os.chmod(copy, mode)
+
+
+def _prepare(files: list, work: Path, post: list, expected: dict, learned_content: str) -> list:
+    """Before the first pass: every document copied to work/<i>/ with its attributes, the copies'
+    bytes checked against the corpus the driver was learned from, then each copy perturbed and read
+    again — a post id still held is refused (L-P52)."""
+    copies = []
+    for index, source in enumerate(files):
+        folder = work / str(index)
+        (folder / "evidence").mkdir(parents=True)
+        copy = folder / source.name
+        shutil.copy2(source, copy)
+        copies.append({"copy": copy, "file_sha256": canon.sha256_file(copy)})
+    if _content_sha256(c["file_sha256"] for c in copies) != learned_content:
+        raise Refusal(*_CORPUS_CHANGED)             # a document edited after the check, before its copy
+    for c in copies:
+        _perturb(c["copy"], post, expected)
+        held = next((ident for ident, v in _post(post, c["copy"], expected).items() if v), None)
+        if held is not None:
+            raise Refusal(f"cannot perturb {held} for qualification", _PERTURB_REMEDY)
+        c["perturbed_sha256"] = canon.sha256_file(c["copy"])
+    return copies
+
+
+# --- one pass ----------------------------------------------------------------------------------------
+
 def _is_pdf(path: Path) -> bool:
     try:
         with open(path, "rb") as f:
             return f.read(4) == b"%PDF"
     except OSError:
         return False
+
+
+def _sha_or_none(path: Path):
+    try:
+        return canon.sha256_file(path)
+    except OSError:
+        return None
 
 
 def _post(post: list, copy: Path, expected: dict) -> dict:
@@ -216,21 +442,16 @@ def _post(post: list, copy: Path, expected: dict) -> dict:
     return held
 
 
-def _pass(driver: _Driver, index: int, source: Path, work: Path, action: dict, entry: dict, expected: dict,
+def _pass(driver: _Driver, index: int, c: dict, action: dict, entry: dict, expected: dict,
           deadline_s: float) -> tuple[dict, bool]:
-    """(the run of corpus file `index`, whether the driver process must be ended): the document copied
-    to work/<index>/ with its attributes (a read-only document stays read-only), the action asked once."""
-    folder = work / str(index)
-    evidence = folder / "evidence"
-    evidence.mkdir(parents=True)
-    copy = folder / source.name
-    shutil.copy2(source, copy)
-    file_sha256 = canon.sha256_file(copy)
+    """(the run of corpus file `index`, whether the driver process must be ended): the action asked
+    once on the perturbed copy, then the copy read again."""
+    copy = c["copy"]
     args = {"document": str(copy)}
     if "pdf" in ((entry.get("args") or {}).get("required") or []):
         args["pdf"] = str(copy.with_suffix(".pdf"))
     request = {"id": index + 1, "action": action["name"], "args": args, "deadline_ms": int(deadline_s * 1000),
-               "evidence_dir": str(evidence)}
+               "evidence_dir": str(copy.parent / "evidence")}
     started = time.monotonic()
     answer, fault = driver.ask(request, deadline_s)
     duration_ms = int((time.monotonic() - started) * 1000)
@@ -239,14 +460,13 @@ def _pass(driver: _Driver, index: int, source: Path, work: Path, action: dict, e
         post, ok, reason = none, False, fault
     elif answer.get("ok") is True:
         post = _post(action["post"], copy, expected)
-        ok = all(post.values())
-        # The word the generated driver itself answers when its own checks fail (Task 7): the same
-        # condition carries the same word whoever saw it.
-        reason = None if ok else "precondition"
+        unsaved = c["perturbed_sha256"] != c["file_sha256"] and _sha_or_none(copy) == c["perturbed_sha256"]
+        ok = not unsaved and bool(post) and all(post.values())
+        reason = "unsaved" if unsaved else None if ok else "postcondition"     # L-P52, L-P50
     else:
         post, ok = none, False
         reason = answer.get("reason") if answer.get("reason") in REASONS else "internal"
-    run = {"index": index, "file_sha256": file_sha256, "duration_ms": duration_ms, "post": post, "ok": ok,
+    run = {"index": index, "file_sha256": c["file_sha256"], "duration_ms": duration_ms, "post": post, "ok": ok,
            "reason": reason}
     return run, fault is not None
 
@@ -255,26 +475,24 @@ def qualify(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: 
             deadline_s: float = PASS_DEADLINE_S) -> dict:
     """The record, also written as <work>/qualification.json (canon.write)."""
     driver_dir, corpus, work = Path(os.path.abspath(driver_dir)), Path(corpus), Path(os.path.abspath(work))
-    manifest, action, entry = _check(driver_dir, corpus, plan, invariants, work)
-    mined, _ = mine._survey(corpus)
-    files = sorted((p for p, _ in mined), key=lambda p: p.name)
+    manifest, action, entry, files = _check(driver_dir, corpus, plan, invariants, work)
+    plan_sha256, expected = canon.sha256(plan), _expected(plan, invariants)
     work.mkdir(parents=True, exist_ok=True)
     if fake:
         canon.write({"vkforge_root": str(VKFORGE_ROOT)}, work / "fake.json")
     (work / "profile").mkdir()
+    copies = _prepare(files, work, action["post"], expected, _learned_content(invariants))
     env = {**os.environ, "VK_DRIVER_WORK_DIR": str(work), "VK_DRIVER_PROFILE_DIR": str(work / "profile"),
            "VK_DRIVER_APPLICATIONS": ",".join(manifest.get("applications") or [])}
     # The vkforge interpreter: the virtualenv the manifest's .venv links to (L-P12).
     command = [sys.executable, "-I", str(driver_dir / "driver.py")]
-    plan_sha256, expected = canon.sha256(plan), _expected(plan, invariants)
-    runs = []
+    runs, driver = [], None
     with open(work / "driver.log", "ab") as log:
-        driver = _start(command, work, env, log, driver_dir, plan_sha256)
         try:
-            for index, source in enumerate(files):
-                if driver is None:                  # the last one was killed: a new process for this pass
+            for index, c in enumerate(copies):
+                if driver is None:                  # the first pass, or the last process was ended
                     driver = _start(command, work, env, log, driver_dir, plan_sha256)
-                run, ended = _pass(driver, index, source, work, action, entry, expected, deadline_s)
+                run, ended = _pass(driver, index, c, action, entry, expected, deadline_s)
                 runs.append(run)
                 if ended:
                     driver.end()

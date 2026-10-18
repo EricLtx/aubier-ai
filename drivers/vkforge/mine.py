@@ -246,7 +246,7 @@ def mine_file(path: Path) -> dict:
     return {"kind": kind, "obs": obs, "vault": vault}
 
 
-def _survey(corpus: Path) -> tuple[list, int]:
+def survey(corpus: Path) -> tuple[list, int]:
     """(the mined files with their observations, the number of files skipped). A .pdf beside a mined
     document is that document's export_format, not a skipped file."""
     corpus = Path(corpus)
@@ -266,7 +266,7 @@ def _survey(corpus: Path) -> tuple[list, int]:
 
 
 def content_sha256(corpus: Path) -> str:
-    mined, _ = _survey(corpus)
+    mined, _ = survey(corpus)
     return canon.sha256(sorted(canon.sha256_file(p) for p, _ in mined))
 
 
@@ -283,7 +283,7 @@ def _tokens(value):
 
 
 def mine_corpus(corpus: Path, threshold: float = 0.8) -> tuple[dict, dict]:
-    mined, skipped = _survey(corpus)
+    mined, skipped = survey(corpus)
     kinds = sorted({result["kind"] for _, result in mined})
     if len(kinds) > 1:
         raise Refusal("corpus mixes .docx and .pptx files", REMEDY)
