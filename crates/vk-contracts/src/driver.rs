@@ -443,9 +443,12 @@ pub struct DriverUnmounted {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // A frozen copy of the pilot manifest as it was when PILOT_ID was recorded: the live
+    // maskai.json changes its files_sha256 with every driver fix, and this test pins the
+    // identity rule, not the driver.
     fn manifest() -> DriverManifest {
         serde_json::from_str(include_str!(
-            "../../../contracts/examples/driver_manifest/valid/maskai.json"
+            "../../../contracts/examples/driver_manifest/valid/identity-frozen-2026-10-17.json"
         ))
         .unwrap()
     }
@@ -490,7 +493,7 @@ mod tests {
 
     #[test]
     fn unknown_words_are_refused_at_parse() {
-        let text = include_str!("../../../contracts/examples/driver_manifest/valid/maskai.json")
+        let text = include_str!("../../../contracts/examples/driver_manifest/valid/identity-frozen-2026-10-17.json")
             .replacen(
                 "\"kind\": \"browser\"",
                 "\"kind\": \"browser\", \"source\": \"packaged\"",
