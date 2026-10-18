@@ -736,6 +736,17 @@ async fn debrief_is_a_machine_act_that_writes_three_files_and_no_ledger_row() {
         before,
         "a debrief writes no ledger row (L-P5)"
     );
+    // The stage's logs, per run name, where no driver's `learn` can clear them.
+    let forge = node.dir().join("forge");
+    assert!(forge
+        .join(".debrief")
+        .join("run")
+        .join("forge-debrief.out")
+        .is_file());
+    assert!(
+        !forge.join("debrief").exists(),
+        "not forge/debrief, a learn's"
+    );
     // --until reaches the stage: at the end of t2, the selector is the one proposal (debrief §4).
     let early = node.dir().join("debrief-t2");
     let r = node
@@ -857,7 +868,7 @@ async fn debrief_refuses_a_run_without_journal_and_a_used_out_before_spawning() 
         "a driver's directory is never written"
     );
     assert!(
-        !node.dir().join("forge").join("debrief").exists(),
+        !node.dir().join("forge").join(".debrief").exists(),
         "all refused before a process was spawned"
     );
     node.shutdown().await;

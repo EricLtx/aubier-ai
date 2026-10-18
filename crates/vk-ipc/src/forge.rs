@@ -1030,7 +1030,7 @@ struct DebriefParams {
 
 /// `driver.debrief {run, out, until?}` (founder decision 2026-10-17): vkforge's `debrief` stage
 /// on a run directory the operator assembled, under the same governor as `learn`'s stages, its
-/// logs under `<state_dir>/forge/debrief/<run name>/`. A machine act: no presence proof and no
+/// logs under `<state_dir>/forge/.debrief/<run name>/`. A machine act: no presence proof and no
 /// ledger row (ruling L-P5) — the answer carries the hashes of `debrief.json` and
 /// `proposals.json`, so whoever applies a proposal can name the evidence that motivated it.
 /// Nothing is applied.
@@ -1101,7 +1101,9 @@ pub fn debrief(cfg: &ForgeConfig, state_dir: &Path, p: Value) -> Result<Value, R
         // One argument, so a value that starts with `-` is still the value.
         args.push(format!("--until={task}"));
     }
-    let logs = state_dir.join("forge").join("debrief").join(&run_name);
+    // `.debrief`, a name no driver can take (`is_driver_name`: a-z, 0-9 and `-`): a `learn` clears
+    // `<state>/forge/<its name>` before it starts, and must never reach a debrief's logs.
+    let logs = state_dir.join("forge").join(".debrief").join(&run_name);
     run_stage(cfg, "debrief", &args, &logs, DEBRIEF_DEADLINE)?;
     let signals = read_output(&out.join("debrief.json"), "debrief", "debrief.json")?;
     let proposals = read_output(&out.join("proposals.json"), "debrief", "proposals.json")?;
