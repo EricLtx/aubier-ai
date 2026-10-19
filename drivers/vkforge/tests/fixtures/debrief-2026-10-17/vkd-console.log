@@ -1,0 +1,14 @@
+2026-10-17T13:42:00.004113Z  INFO vk_ipc::server: listening (a daemon line that is not a harness note: ignored)
+2026-10-17T13:42:31.207114Z  INFO vk_ipc::server: harness log task=task-node-1-16 harness=N0 : rejeu, N0-1 et N0-2 déjà journalisés
+2026-10-17T13:45:02.551930Z  INFO vk_ipc::server: harness log task=task-node-1-16 harness=N4 : V2-V1 joint, question posée
+2026-10-17T13:49:04.880512Z  INFO vk_ipc::server: harness log task=task-node-1-16 harness=V2-V1 KO : abandon à 180 s (3 × budget 60 s)
+2026-10-17T13:49:14.302877Z  INFO vk_ipc::server: harness log task=task-node-1-16 harness=N5 : nouvelle_conversation refusée (dialog) : modale inconnue : Votre avis — Aidez-nous à améliorer Mask AI
+2026-10-17T13:49:22.640019Z  INFO vk_ipc::server: harness log task=task-node-1-16 harness=N5 : capture_ecran refusée (dialog) : modale inconnue : Votre avis — Aidez-nous à améliorer Mask AI
+2026-10-17T13:49:31.118250Z  INFO vk_ipc::server: harness log task=task-node-1-16 harness=N5-1 : verdict_oracle refusé (precondition) : aucune observation pour N5-1
+2026-10-17T13:49:38.774391Z  INFO vk_ipc::server: harness log task=task-node-1-16 harness=N5-2 : verdict_oracle refusé (precondition) : aucune observation pour N5-2
+2026-10-17T13:49:45.020611Z  INFO vk_ipc::server: harness log task=task-node-1-16 harness=N5 : niveau terminé sans preuve, la modale bloque toute action
+2026-10-17T14:06:09.413377Z  INFO vk_ipc::server: harness log task=task-node-1-25 harness=V2-V3 KO : abandon à 180 s (3 × budget 60 s)
+2026-10-17T14:09:12.902114Z  INFO vk_ipc::server: harness log task=task-node-1-25 harness=V2-V4 KO : abandon à 180 s (3 × budget 60 s)
+2026-10-17T14:10:13.551006Z  INFO vk_ipc::server: harness log task=task-node-1-25 harness=V2-V5 KO : abandon à 60 s (3 × budget 20 s)
+2026-10-17T14:22:40.118734Z  INFO vk_ipc::server: harness log task=task-node-1-25 harness=N9-2 KO : réponse vide, aucune étape call_llm dans le flux
+2026-10-17T14:31:52.330918Z  INFO vk_ipc::server: harness log task=task-node-1-39 harness=N0–N9 : 34 verdicts rejoués, aucune ligne ajoutée

@@ -1,0 +1,9 @@
+2026-10-17 15:22:31,118 INFO maskai-recette browser up: channel=chrome headless=False hosts=['app.maskai.fr']
+2026-10-17 15:31:02,540 INFO maskai-recette browser up: channel=chrome headless=False hosts=['app.maskai.fr']
+2026-10-17 15:42:24,906 INFO maskai-recette browser up: channel=chrome headless=False hosts=['app.maskai.fr']
+2026-10-17 15:59:23,377 INFO maskai-recette browser up: channel=chrome headless=False hosts=['app.maskai.fr']
+2026-10-17 16:06:15,602 INFO maskai-recette known modal avis dismissed ([role="dialog"][data-slot="dialog-content"] button[data-slot="dialog-close"])
+2026-10-17 16:09:19,233 INFO maskai-recette known modal avis dismissed ([role="dialog"][data-slot="dialog-content"] button[data-slot="dialog-close"])
+2026-10-17 16:10:19,871 INFO maskai-recette known modal avis dismissed ([role="dialog"][data-slot="dialog-content"] button[data-slot="dialog-close"])
+2026-10-17 16:26:24,050 INFO maskai-recette browser up: channel=chrome headless=False hosts=['app.maskai.fr']
+2026-10-17 16:29:14,207 WARNING maskai-recette service in maintenance: MAINTENANCE EN COURS ON REVIENT TRÈS VITE ! Mask AI FR fait une petite pause

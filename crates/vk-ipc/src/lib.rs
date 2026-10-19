@@ -20,6 +20,7 @@
 mod capital;
 pub mod client;
 pub mod drivers;
+pub mod forge;
 pub mod server;
 pub mod transport;
 

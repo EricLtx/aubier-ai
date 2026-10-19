@@ -563,6 +563,11 @@ impl RealKernel {
     /// package: another package of a `Ready` driver is refused like another
     /// manifest, so a mount never answers with the row of a version it did
     /// not mount.
+    ///
+    /// A learned driver (`kind: com`) is held to the qualification gate next
+    /// ([`RealKernel::check_qualified`], ruling L-P4): no record, a record
+    /// edited since `vk driver qualify`, or one under the plan's thresholds is
+    /// refused here, whatever the daemon checked before the spawn.
     pub fn mount_driver(
         &mut self,
         ctx: &Ctx,
@@ -588,6 +593,9 @@ impl RealKernel {
         // link retargeted after this call cannot move the tree it names.
         let root = resolved(&root);
         self.check_context(&manifest, &root)?;
+        // A learned (`kind: com`) driver mounts only qualified (ruling L-P4),
+        // held here under the lock as the daemon held it before the spawn.
+        self.check_qualified(&manifest)?;
         let source = manifest.source;
         if (source == DriverSource::Installed) != package_digest.is_some() {
             return Err(KernelError::Gate(

@@ -91,6 +91,13 @@ pub struct ServerConfig {
     /// still held to the pinned release's, so it can never be another
     /// interpreter. `None` in every ordinary run.
     pub python_archive: Option<PathBuf>,
+    /// The vkforge this daemon learns drivers with (driver-learning plan
+    /// Task 9): `vkd --vkforge-root`, the `drivers/` directory of a checkout.
+    /// Daemon configuration, never a request field — a client that could name
+    /// it would choose the code the daemon runs. `None` on a daemon started
+    /// without one: `driver.learn`, `driver.qualify` and `driver.debrief`
+    /// then refuse.
+    pub forge: Option<crate::forge::ForgeConfig>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -104,6 +111,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("api_arches", &self.api_arches)
             .field("claude_bin", &self.claude_bin)
             .field("python_archive", &self.python_archive)
+            .field("forge", &self.forge)
             .finish()
     }
 }
@@ -122,6 +130,7 @@ impl ServerConfig {
             claude_bin: PathBuf::from(DEFAULT_CLAUDE_BIN),
             drivers: crate::drivers::DriverPool::new(),
             python_archive: None,
+            forge: None,
         }
     }
 }
@@ -438,6 +447,14 @@ pub async fn serve_on(
     mut listener: transport::os::Listener,
     config: ServerConfig,
 ) -> Result<()> {
+    // The kernel's half of the vkforge fixtures seam (final review I-1): this
+    // daemon's configuration, handed over once, before the first request. A
+    // daemon without vkforge, or without the seam, refuses at mount a learned
+    // driver whose last replay ran on the fake application.
+    kernel
+        .lock()
+        .map_err(|_| anyhow::anyhow!("kernel lock poisoned"))?
+        .set_forge_fixtures(config.forge.as_ref().is_some_and(|f| f.fixtures));
     let challenges = Arc::new(Mutex::new(Challenges::default()));
     // The endpoint the harness's `vk-mcp` must dial back on and the daemon's
     // harness settings, threaded to every connection for `harness.run`.
@@ -703,7 +720,7 @@ fn to_value<T: serde::Serialize>(v: T) -> Result<Value, RpcError> {
 /// A proof as `ctx_for` receives it: its nonce already taken from the map by
 /// `dispatch`, along with the verdict of that taking. The taking happens for
 /// every request that carries a proof, before the method is even looked at.
-struct Presented {
+pub(crate) struct Presented {
     proof: PresenceProof,
     nonce: Result<(), RpcError>,
 }
@@ -740,6 +757,9 @@ fn takes_presence(method: &str) -> bool {
             // signing one, are human acts (packaging spec §4.4–4.5).
             | "capital.key_init"
             | "driver.pack"
+            // Learning a driver writes code this node will run (driver-
+            // learning plan Task 9): see the refusal in `dispatch`.
+            | "driver.learn"
             // Plaintext out of the encrypted store, to a terminal (R22).
             | "artefact.read"
     )
@@ -749,8 +769,14 @@ fn takes_presence(method: &str) -> bool {
 /// already proved the peer is this user's process — and human only for the
 /// one request that carries a presence proof the enrolled device key made
 /// over a nonce this server issued, still unexpired, that no earlier request
-/// had spent.
-fn ctx_for(k: &RealKernel, presence: Option<Presented>, now: u64) -> Result<Ctx, RpcError> {
+/// had spent. `pub(crate)` for the arms that build their `Ctx` before the
+/// general lock and hand it to another module (ruling L-P25); still the only
+/// place a `Ctx` is built.
+pub(crate) fn ctx_for(
+    k: &RealKernel,
+    presence: Option<Presented>,
+    now: u64,
+) -> Result<Ctx, RpcError> {
     let principal = match presence {
         None => Principal::Machine {
             node_id: k.node_id.clone(),
@@ -779,6 +805,22 @@ fn ctx_for(k: &RealKernel, presence: Option<Presented>, now: u64) -> Result<Ctx,
         partition: "local".into(),
         now_ms: now,
     })
+}
+
+/// The daemon's vkforge and its state directory (read in one short lock phase), or the refusal
+/// "vkforge is not configured on this daemon; remedy: start vkd with --vkforge-root <repository>\drivers".
+pub(crate) fn forge_context<'a>(
+    kernel: &Shared,
+    config: &'a ServerConfig,
+) -> Result<(&'a crate::forge::ForgeConfig, PathBuf), RpcError> {
+    let cfg = config.forge.as_ref().ok_or_else(|| {
+        bad(
+            "vkforge is not configured on this daemon; remedy: start vkd with --vkforge-root \
+             <repository>\\drivers",
+        )
+    })?;
+    let state_dir = lock(kernel)?.store().state_dir.clone();
+    Ok((cfg, state_dir))
 }
 
 fn dispatch(
@@ -891,6 +933,45 @@ fn dispatch(
             ));
         }
         return crate::capital::pack(kernel, config, ctx, req.params);
+    }
+    // vkforge (driver learning, plan Task 9; ruling L-P17): dispatched here,
+    // before the general lock, as driver.pack is. Each stage is a process
+    // that runs for seconds to minutes on this connection's blocking thread;
+    // the kernel lock is taken only in short phases inside.
+    if req.method == "driver.learn" {
+        let ctx = {
+            let k = lock(kernel)?;
+            ctx_for(&k, presence.take(), now)?
+        };
+        if !ctx.principal.is_human() {
+            return Err(invariant(
+                "I1: learning a driver writes code this node will run, which is a human act; \
+                 re-run it with a presence proof",
+            ));
+        }
+        let (cfg, state_dir) = forge_context(kernel, config)?;
+        return crate::forge::learn(kernel, cfg, &state_dir, &ctx, req.params);
+    }
+    if req.method == "driver.qualify" {
+        // Kernel-written (`driver.qualified`), no presence required; the `Ctx` is built here as
+        // for driver.pack, in one short lock phase (ruling L-P25).
+        let ctx = {
+            let k = lock(kernel)?;
+            ctx_for(&k, presence.take(), now)?
+        };
+        let (cfg, state_dir) = forge_context(kernel, config)?;
+        return crate::forge::qualify(kernel, cfg, &state_dir, &ctx, req.params);
+    }
+    if req.method == "driver.plan_show" {
+        return crate::forge::plan_show(req.params);
+    }
+    // A machine act: it reads evidence the node holds in clear and writes
+    // three files. No presence proof (not in `takes_presence`), no ledger row
+    // (ruling L-P5); before the general lock, like the other vkforge methods
+    // (L-P17).
+    if req.method == "driver.debrief" {
+        let (cfg, state_dir) = forge_context(kernel, config)?;
+        return crate::forge::debrief(cfg, &state_dir, req.params);
     }
     // Mounting a Claude Code arch means running the binary to ask its version,
     // because the version is in the arch identity. That happens here, *before*
@@ -1005,6 +1086,9 @@ fn dispatch(
             // `source: installed` tree must be under, and where
             // `vk driver install` writes.
             "install_root": k.install_root().display().to_string(),
+            // The vkforge this daemon learns drivers with (`vkd
+            // --vkforge-root`), `null` on a daemon started without one.
+            "vkforge_root": config.forge.as_ref().map(|f| f.root.display().to_string()),
             // Where a `release` step's `to_dir` is resolved: the client names a
             // subpath and prints the resolved path, so "where did my artefact
             // go?" is answerable without the client guessing the layout.

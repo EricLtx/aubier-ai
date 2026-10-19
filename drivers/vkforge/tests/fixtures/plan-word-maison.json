@@ -1,0 +1,99 @@
+{
+ "actions": [
+  {
+   "name": "appliquer_style_maison",
+   "post": [
+    "title_style",
+    "body_font",
+    "footer_text",
+    "pdf_exists"
+   ],
+   "pre": [
+    "document is .docx",
+    "not open elsewhere"
+   ],
+   "reversible": false,
+   "steps": [
+    {
+     "args": {
+      "path": "$arg.document"
+     },
+     "verb": "open"
+    },
+    {
+     "args": {
+      "selector": "first",
+      "style": "Heading1"
+     },
+     "verb": "apply_paragraph_style"
+    },
+    {
+     "args": {
+      "font": {
+       "name": "Garamond",
+       "size": 11
+      },
+      "selector": "body"
+     },
+     "verb": "set_font_run"
+    },
+    {
+     "args": {
+      "text": "$secret.footer_text"
+     },
+     "verb": "set_footer"
+    },
+    {
+     "args": {},
+     "verb": "save"
+    },
+    {
+     "args": {
+      "format": "pdf",
+      "path": "$arg.pdf"
+     },
+     "verb": "export"
+    },
+    {
+     "args": {
+      "selector": "first",
+      "style": "Heading1"
+     },
+     "verb": "verify_paragraph_style"
+    },
+    {
+     "args": {
+      "font": {
+       "name": "Garamond",
+       "size": 11
+      },
+      "selector": "body"
+     },
+     "verb": "verify_font_run"
+    },
+    {
+     "args": {
+      "text": "$secret.footer_text"
+     },
+     "verb": "verify_footer"
+    },
+    {
+     "args": {
+      "path": "$arg.pdf"
+     },
+     "verb": "verify_pdf"
+    }
+   ]
+  }
+ ],
+ "ambiguities": [],
+ "app": "word",
+ "catalogue_sha256": "sha256:35b989fbc6c37cb5c67900e47a8d89fd99c723ad9d5c6b77564da2aedb83a9bd",
+ "family": "office-document",
+ "invariants_sha256": "sha256:243d9a6e9c2905a7ef1e2d167b06facaa786dacde61545e50a1121a3b885ccb8",
+ "ontology_sha256": "sha256:117706338c6b1e091d1a60002135147bf01891b89415f03056d10d21b96d24df",
+ "qualification": {
+  "min_passes": 10,
+  "min_rate": 1.0
+ }
+}

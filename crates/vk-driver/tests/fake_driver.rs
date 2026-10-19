@@ -54,7 +54,7 @@ for line in sys.stdin:
 const ENV_DRIVER: &str = r#"import json, os, sys
 def say(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
 say({"hello": {"protocol": 1, "driver": "env", "version": "0", "actions": ["env"]}})
-names = ["VK_DRIVER_PROFILE_DIR", "VK_DRIVER_WORK_DIR", "VK_DRIVER_HEADLESS", "VK_DRIVER_CHANNEL", "VK_DRIVER_HOSTS"]
+names = ["VK_DRIVER_PROFILE_DIR", "VK_DRIVER_WORK_DIR", "VK_DRIVER_HEADLESS", "VK_DRIVER_CHANNEL", "VK_DRIVER_HOSTS", "VK_DRIVER_APPLICATIONS"]
 for line in sys.stdin:
     r = json.loads(line)
     env = {k: os.environ.get(k) for k in names}
@@ -750,6 +750,92 @@ fn kill_pid_tree_ends_an_act_from_outside() {
     );
 }
 
+/// A driver that answers `echo` and, once its stdin closes — the protocol's
+/// end — writes `eof.txt` into its work directory and exits; with `stubborn`
+/// on its command line it sleeps a minute instead of exiting.
+const EOF_DRIVER: &str = r#"import json, os, sys, time
+def say(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+say({"hello": {"protocol": 1, "driver": "eof", "version": "0", "actions": ["echo"]}})
+for line in sys.stdin:
+    r = json.loads(line)
+    say({"id": r["id"], "ok": True, "result": {"echo": r["args"]}})
+open(os.path.join(os.environ["VK_DRIVER_WORK_DIR"], "eof.txt"), "w").write("eof")
+if "stubborn" in sys.argv: time.sleep(60)
+"#;
+
+/// Ruling L-P49: the host stops a running driver the way the protocol ends —
+/// its stdin closed — and gives it five seconds to exit on its own (a learned
+/// driver quits the Office instance it started on its way out, L-P46) before
+/// the tree is killed. The driver that exits at EOF wrote its marker, which a
+/// process killed first could not have; the one that stays on is killed once
+/// the grace is over, and not before.
+#[test]
+fn a_driver_is_stopped_by_closing_its_stdin_before_any_kill() {
+    if !python_available() {
+        return;
+    }
+    let rig = Rig::new(EOF_DRIVER);
+    let echo =
+        json!([{"name": "echo", "reversible": true, "args": {"type": "object"}, "evidence": []}]);
+    let marker = rig.work.join("eof.txt");
+
+    let m = rig.manifest(rig.command(), echo.clone());
+    let mut host = rig.spawn(&m);
+    host.act(
+        action(&m, "echo"),
+        &json!({}),
+        Duration::from_secs(10),
+        WIDE,
+        &never,
+    )
+    .expect("a live driver answers");
+    assert!(
+        !marker.exists(),
+        "a running driver has not seen its input end"
+    );
+    drop(host);
+    assert!(
+        marker.is_file(),
+        "the driver read EOF on its stdin and ran its own end before any kill"
+    );
+
+    std::fs::remove_file(&marker).expect("remove the marker");
+    let mut command = rig.command();
+    command.push("stubborn".into());
+    let m = rig.manifest(command, echo);
+    let mut host = rig.spawn(&m);
+    host.act(
+        action(&m, "echo"),
+        &json!({}),
+        Duration::from_secs(10),
+        WIDE,
+        &never,
+    )
+    .expect("a live driver answers");
+    let pid = host.pid();
+    let started = Instant::now();
+    drop(host);
+    let waited = started.elapsed();
+    assert!(
+        marker.is_file(),
+        "the stubborn driver saw its input end too"
+    );
+    assert!(
+        waited >= Duration::from_millis(4500),
+        "a driver still running after EOF is given its grace before the kill: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(5) + kill_bound(),
+        "and then killed: the drop came back after {waited:?}"
+    );
+    if cfg!(windows) {
+        assert!(
+            !windows_process_alive(pid),
+            "the stubborn driver {pid} is gone"
+        );
+    }
+}
+
 #[test]
 fn the_environment_names_the_dirs_the_mode_and_the_hosts() {
     if !python_available() {
@@ -798,7 +884,7 @@ fn the_environment_names_the_dirs_the_mode_and_the_hosts() {
 
     // Headless and no channel: `1` and the empty string.
     let rig = Rig::new(ENV_DRIVER);
-    let m = rig.manifest(rig.command(), env_action);
+    let m = rig.manifest(rig.command(), env_action.clone());
     let mut host = rig.spawn(&m);
     let out = host
         .act(
@@ -812,6 +898,31 @@ fn the_environment_names_the_dirs_the_mode_and_the_hosts() {
     assert_eq!(out.result["VK_DRIVER_HEADLESS"], "1");
     assert_eq!(out.result["VK_DRIVER_CHANNEL"], "");
     assert_eq!(out.result["VK_DRIVER_HOSTS"], "example.invalid");
+    assert_eq!(out.result["VK_DRIVER_APPLICATIONS"], "");
+
+    // A com driver: no host, its applications comma-joined.
+    let rig = Rig::new(ENV_DRIVER);
+    let mut m = rig.manifest(rig.command(), env_action.clone());
+    m.kind = vk_contracts::driver::DriverKind::Com;
+    m.hosts.clear();
+    m.applications = vec!["WINWORD.EXE".into(), "POWERPNT.EXE".into()];
+    m.validate().unwrap();
+    let mut host = rig.spawn(&m);
+    let out = host
+        .act(
+            action(&m, "env"),
+            &json!({}),
+            Duration::from_secs(10),
+            WIDE,
+            &never,
+        )
+        .expect("env answers");
+    assert_eq!(
+        out.result["VK_DRIVER_APPLICATIONS"],
+        "WINWORD.EXE,POWERPNT.EXE"
+    );
+    assert_eq!(out.result["VK_DRIVER_HOSTS"], "");
+    host.shutdown();
 }
 
 /// Re-review of the final fix wave: the driver's own `ok: false` reason is
@@ -1079,7 +1190,25 @@ fn tree_is_contained_on_windows() {
     }
 
     // And gone with the tree, well inside its thirty seconds.
+    let packaged = interpreter_is_packaged();
     host.shutdown();
+    if packaged {
+        // Ruling L-P49: the host now closes the driver's stdin first, and this
+        // driver exits on its own at EOF, so no parent-chain kill can walk to
+        // its child any more — and the Job, under a packaged interpreter, does
+        // not hold it. The gap above, which R27 keeps out of every driver
+        // virtualenv; the child is ended here so the test leaves nothing.
+        std::thread::sleep(Duration::from_millis(500));
+        if windows_process_alive(child) {
+            eprintln!(
+                "KNOWN GAP: under a Microsoft Store {PYTHON}, the child {child} of a driver that \
+                 exits on its own at EOF outlives it (no Job holds it, no parent to walk from); \
+                 ending it by hand"
+            );
+            vk_driver::kill_pid_tree(child);
+        }
+        return;
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     while windows_process_alive(child) {
         assert!(

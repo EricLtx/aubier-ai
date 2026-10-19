@@ -1,0 +1,30 @@
+{
+  "name": "word-maison",
+  "kind": "com",
+  "program": {
+    "runtime": "python-com",
+    "command": [".venv/Scripts/python.exe", "-I", "driver.py"],
+    "files_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "browser_channel": null,
+    "headless": true
+  },
+  "hosts": [],
+  "actions": [
+    {
+      "name": "appliquer_style_maison",
+      "reversible": false,
+      "args": {
+        "type": "object",
+        "properties": { "document": { "type": "string" }, "pdf": { "type": "string" } },
+        "required": ["document", "pdf"],
+        "additionalProperties": false
+      },
+      "evidence": ["post.json"],
+      "to_register": false
+    }
+  ],
+  "min_interval_ms": 0,
+  "max_action_ms": 120000,
+  "clearance": { "max_scope": "business", "third_party_allowed": false },
+  "governed": false
+}

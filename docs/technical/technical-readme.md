@@ -419,7 +419,7 @@ under `WindowsApps`, refuses an existing `.venv` whose `pyvenv.cfg` names
 one, and without `-Python` takes the standalone CPython 3.13 that `uv`
 manages (pilot ruling R27).
 
-Four ledger kinds record a driver, each with its own schema:
+Six ledger kinds record a driver, each with its own schema:
 
 | kind | what it carries |
 |---|---|
@@ -427,6 +427,8 @@ Four ledger kinds record a driver, each with its own schema:
 | `driver.acted` | `task_id`, `step_index`, `driver_id`, `action`, `args_hash`, `result_hash`, `ok`, `reason` when it failed — a host or daemon failure's word from a closed vocabulary (`timeout`, `dead`, `protocol: malformed response`, `would not start`, …), a driver refusal's word from the protocol's five (`dialog`, `timeout`, `host`, `precondition`, `internal`; anything else is pinned to `internal`), or a kernel refusal composed of plain tokens and byte counts — `duration_ms`, `evidence` (the blob hashes), `evidence_bytes`, `hosts_seen` |
 | `driver.packed` | `driver_id`, `name`, `version`, `package_digest` (the OCI image manifest's digest), `files_sha256`, `publisher_key_id`, and `by`, the node that packed — a human act |
 | `driver.unmounted` | `driver_id` and the reason: the operator, what degraded it (a word of the same vocabulary), or `row unreadable at boot` |
+| `driver.learned` | `family`, `app`, `catalogue_sha256`, `ontology_sha256`, `corpus_schema_sha256`, `invariants_sha256`, `plan_sha256` (the hash of the approved `plan.json`'s bytes), `driver_id` and `by`, the node that learned — a human act |
+| `driver.qualified` | `driver_id`, `passes`, `failures` and `qualification_sha256` (the hash of the qualification record) — written by the kernel |
 
 `driver.acted` carries hashes and sizes, never text (Ruling 28): what the
 harness asked, what the driver answered and what it captured are in the
@@ -678,6 +680,113 @@ materialise test, the daemon's pack, mount and `tampered` tests, and the
 act → ls → uninstall`. GitHub's Windows runner is an administrator, so that job
 is where the elevated half of the install (the read-only ACL, the root check,
 the interpreter spawned from the protected tree) runs for the first time.
+
+What the kernel enforces and what it trusts is in
+[`contracts/tcb.md`](../../contracts/tcb.md), §Drivers.
+
+### Learned drivers: an Office driver written from the firm's own documents
+
+A driver for Word or PowerPoint is not written by hand. `vk driver learn` reads a
+folder of the firm's documents of one kind (contracts, quotes, decks), works out what
+they all have in common (the body font, the footer, the margins, the page numbering),
+and generates a driver whose one action brings any document to that house style. The
+firm's documents are the datasheet; the driver is the register map generated from it.
+Spec: [`docs/technical/specs/2026-10-17-driver-learning-office-design.md`](specs/2026-10-17-driver-learning-office-design.md);
+the operator's procedure is [`runbooks/learn-office-driver.md`](runbooks/learn-office-driver.md).
+
+The pipeline is `drivers/vkforge`, six stages, each a **governed one-shot process** the
+daemon spawns (`<python> -I <root>/vkforge/__main__.py <stage> ...`, in the vkforge root,
+under the platform's governor, killed with its tree at its deadline, stdout and stderr
+kept under `<state_dir>/forge/<name>/`). It is never protocol 1: a pipeline is not
+request and response. `vkd --vkforge-root <repository>\drivers` turns it on; without it
+`vk driver learn`, `vk driver qualify` and `vk driver debrief` refuse and say so. A stage
+that refuses speaks the kernel's voice in one line, `vkforge <stage>: ...; remedy: ...`,
+and that line is the refusal, verbatim.
+
+| Stage | Reads | Writes (under `--out`) |
+|---|---|---|
+| `inventory` | the application's type library (Office's COM registration), or a recorded catalogue under the test seam | `catalogue.json`: types, members, enums, the type library's hash |
+| `bind` | the ontology (`drivers/vkforge/ontology/office-document.json`) and the catalogue | `binding-<app>.json`: each verb bound or `unbound`, with its projection |
+| `mine` | the corpus, as zip files, formatting parts only | `invariants.json` (values with their support, no text of the documents); the clear values a footer needs go to the vault, `<state_dir>/forge/<name>/.vault.json` (`mine --vault`), under the daemon's private forge directory and the state directory's ACL, never under `--out` |
+| `plan` | invariants, binding, and the arch's answers if any | `plan.json` (the `DriverPlan`: one action, its steps, `pre`, `post`, `qualification` thresholds: `min_passes` ten, or the number of documents mined when fewer, `min_rate` 1), `plan-excluded.json` |
+| `generate` | the plan, the binding, the vault | `driver/`: `driver.py`, `manifest.json` (`kind: com`), `vendor/` (the protocol and the COM adapter, vendored), `.venv` (a junction to the vkforge virtualenv) |
+| `qualify` | the driver, the corpus, the plan | `<state_dir>/drivers/<name>/work/qualify/qualification.json` |
+
+`learn` runs the first five. The kernel does only what a kernel does: a short lock phase
+for the human act `driver.learned` and its row in the `learned` table, and, when `--arch`
+names one, one model call per ambiguity (two values of a font near in support) whose
+answer is read by a strict rule: only a candidate the miner listed can be chosen, never
+applied in part. Without an arch every ambiguity is purged and listed, and a plan with
+none calls no model: zero tokens on the nominal path. The vault is deleted the moment
+`generate` returns, on every way out. One `learn` or `qualify` per driver name at a time:
+a second is refused with `... of <name> already in progress`.
+
+`vk driver plan show DIR` prints `plan.json` for review: each step, its pre- and
+postconditions, the qualification thresholds the gate will hold the replay to, how each
+ambiguity was settled, and what the plan left out and why.
+`vk driver qualify --driver DIR\driver --corpus DIR` replays the driver on **copies** of
+the corpus, perturbs each copy first so that only a real repair counts, re-mines the
+result and checks every postcondition of the plan in code. The kernel records the replay
+as `driver.qualified` (the hash of `qualification.json`, passes, failures) on the
+`learned` row.
+
+**The mount gate.** `vk mount driver --manifest DIR\driver\manifest.json` is refused for
+a `kind: com` driver the kernel did not learn on this node, or whose last replay does not
+meet the plan's thresholds (`min_passes`, `min_rate`), or whose `qualification.json` no
+longer hashes to what the kernel stored, or whose last replay ran on the fake application
+while this daemon runs without `VK_FORGE_FIXTURES=1` (`... was qualified on the fake
+application; remedy: vk driver qualify on the real one`). There is no override. Every
+other driver kind passes the gate untouched. `vk driver pack` refuses a learned driver in
+this version (`a learned driver is not packaged in this version; remedy: mount it from
+its learn directory`): it is mounted from its learn directory.
+
+**Seams, for development and CI only.**
+
+| Seam | Effect |
+|---|---|
+| `vkd --vkforge-root DIR` | the `drivers/` directory of a checkout; no default |
+| `VK_FORGE_PYTHON` | the interpreter; default `%LOCALAPPDATA%\vk\venvs\vkforge\Scripts\python.exe`, made by `drivers\vkforge\setup.ps1` |
+| `VK_FORGE_FIXTURES=1` | `inventory` reads the recorded catalogues (`drivers/vkforge/tests/fixtures/`) and `qualify` replays on the fake application instead of Office; `vkd` warns when it is set; the replay is recorded `fake: true`, and only a daemon under this seam mounts a driver so qualified |
+| `<work>/fake.json` | written by `vkforge qualify --fake` into its own work directory, and nowhere else; it is what points the generated driver's adapter at the fake |
+
+**The deliberate fallback.** A verb the application's catalogue could not bind (for
+example `set_slide_layout` on Word) can be put to an arch:
+`vk driver learn --deliberate VERB --app A --out DIR --arch NAME`, with `DIR` an earlier
+learning's output. One `Draft` step, no harness, no application driving: the arch reads
+the verb's ontology entry and a slice of the catalogue (at most 20 kB) and answers with a
+projection rule `{"member": "Type.Member", "constants": "<Enum>" | null}`. The kernel
+writes `DIR\proposals\VERB.json` (the verb, the app, `proposed_by: arch:<id>`, the task,
+the `rule` if the answer carries one, else `null`, and the answer verbatim). Nothing is
+applied: not the ontology, not `driver.py`, not the ledger beyond the task's own rows.
+A human reads the proposal and versions a rule into `office-document.json`.
+
+**The debrief stage.** After a governed run, `vk driver debrief --run DIR --out DIR
+[--until TASK]` runs vkforge's seventh stage (founder decision 2026-10-17; requirements in
+[`debriefs/2026-10-17-maskai-driver.md`](debriefs/2026-10-17-maskai-driver.md) §4) on a
+run directory the operator assembles from what the node holds in clear: `journal.jsonl`
+and `tasks/<id>.json` (`vk task show --json`) are required; journals set aside
+(`journal-*.jsonl`), `driver.log`, the daemon's console (`vkd-console.log`, its harness
+notes), `vk dmesg --json`, `cases.json` and `manifest.json` are read when present. It
+writes three files into a new directory outside the run and outside any driver:
+`debrief.json` (the signals: per case, per task and per harness pass, refusals by reason,
+the defects of the 17/10 debrief), `proposals.json` and `debrief.md` (sections 1 to 3 of a
+debrief; 4 and 5 stay human). A proposal is the list form of the deliberate run's: `{kind,
+target, evidence, evidence_total, proposal, confidence, tasks, proposed_by: "debrief",
+human}`, `kind` one of `selector`, `modal`, `budget`, `oracle`, `recipe`, each with the
+lines (`file:line`) that support it, cut before any answer, sent text or document content
+(ruling L-P57); a suspect that needs a screen to be confirmed stays a signal, without a
+proposal. The console, `driver.log`, the journal and `vk dmesg` are read only inside the
+run's window (first task created to last task ended, plus a minute; while a task still
+runs, to the call, at most 24 h after the last step started — a next-morning line inside
+that cap is still read; `--until` refuses a task still running), and a malformed input is one
+refusal line naming the file and the field. It is a machine act: no presence proof, no
+ledger row — the answer carries `debrief_sha256` and `proposals_sha256`, so whoever
+applies a proposal can name the evidence — and nothing is applied: selectors and modals
+mean a new `driver_id` and a signed remount, budgets and oracles a new `inputs_sha256`, a
+recipe change a reviewed commit. For a learned driver (`manifest.json` with `kind: com`)
+the selector and modal proposals name `vk driver learn --deliberate VERB` instead: a
+learned driver's code is never edited by hand. The operator's procedure is
+[`runbooks/recette-maskai.md`](runbooks/recette-maskai.md) §16.
 
 What the kernel enforces and what it trusts is in
 [`contracts/tcb.md`](../../contracts/tcb.md), §Drivers.

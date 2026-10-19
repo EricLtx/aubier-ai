@@ -363,12 +363,14 @@ pub fn drivers(v: &Value) -> String {
 }
 
 /// One driver, as `vk driver show` and `vk ls /drivers/<name>` print it:
-/// what it is, whether it would act and why not, where it may go, what it may
+/// what it is — its name and kind, a browser or a learned `com` driver
+/// (ruling L-P27) — whether it would act and why not, where it may go, what it may
 /// be asked, whether the kernel governs it, and where its command resolves.
 pub fn driver(v: &Value) -> String {
     let m = &v["manifest"];
     let mut rows = vec![
         ("name", text(&m["name"])),
+        ("kind", text(&m["kind"])),
         ("driver_id", text(&v["driver_id"])),
         ("state", text(&v["state"]["state"])),
     ];
@@ -1180,6 +1182,179 @@ pub fn mounted_driver(v: &Value) -> String {
     out
 }
 
+/// A list of names as one line: comma-separated, or `none`.
+fn listed_or_none(items: impl IntoIterator<Item = String>) -> String {
+    let items: Vec<String> = items.into_iter().collect();
+    if items.is_empty() {
+        "none".into()
+    } else {
+        items.join(", ")
+    }
+}
+
+/// `vk driver learn`: the driver learned and its id, the plan it was
+/// generated from and where to read it, the verbs the application could not
+/// bind, each ambiguity and how it was settled (`purged`, `arch:<id>`), and
+/// each invariant the plan left out and why.
+pub fn learned(v: &Value) -> String {
+    let out = text(&v["out"]);
+    let plan_file = Path::new(&out).join("plan.json");
+    let ambiguities = array(v, "ambiguities")
+        .iter()
+        .map(|a| format!("{} {}", text(&a["invariant"]), text(&a["resolved_by"])));
+    let excluded = array(v, "excluded")
+        .iter()
+        .map(|e| format!("{} ({})", text(&e["invariant"]), text(&e["why"])));
+    [
+        format!("learned {}  {}", text(&v["name"]), text(&v["driver_id"])),
+        format!(
+            "plan {} -> {} (read it: vk driver plan show {out})",
+            text(&v["plan_sha256"]),
+            plan_file.display()
+        ),
+        format!(
+            "unbound: {}",
+            listed_or_none(array(v, "unbound").iter().map(text))
+        ),
+        format!("ambiguities: {}", listed_or_none(ambiguities)),
+        format!("excluded: {}", listed_or_none(excluded)),
+    ]
+    .join("\n")
+}
+
+/// `vk driver learn --deliberate`: where the proposal was written, the rule the arch's answer
+/// carried if it carried one, and the reminder that nothing was applied.
+pub fn proposed(v: &Value) -> String {
+    let proposal = &v["proposal"];
+    let rule = match proposal["rule"].as_object() {
+        Some(rule) => format!(
+            "rule: {} / {}",
+            text(&rule["member"]),
+            rule["constants"].as_str().unwrap_or("null")
+        ),
+        None => "rule: none (read the answer in the file)".to_string(),
+    };
+    [
+        format!(
+            "proposal for {} on {} by {} -> {}",
+            text(&proposal["verb"]),
+            text(&proposal["app"]),
+            text(&proposal["proposed_by"]),
+            text(&v["path"])
+        ),
+        rule,
+        "nothing applied: a human versions a rule into the ontology".to_string(),
+    ]
+    .join("\n")
+}
+
+/// `vk driver qualify`: the replay's count, whether it ran on the fake
+/// application, and the record the mount gate holds the driver to.
+pub fn qualified(v: &Value) -> String {
+    let passes = v["passes"].as_u64().unwrap_or(0);
+    let failures = v["failures"].as_u64().unwrap_or(0);
+    format!(
+        "qualified {}: {passes}/{} passes ({failures} failures), fake {} -> {}",
+        text(&v["name"]),
+        passes + failures,
+        text(&v["fake"]),
+        text(&v["record"])
+    )
+}
+
+/// `vk driver plan show`: each action, its numbered steps — an ontology verb
+/// and its arguments, each value as compact JSON — its pre- and
+/// post-conditions and its note; then the qualification thresholds the mount
+/// gate holds a replay to; then the ambiguities and how each was settled,
+/// with the chosen value; then the invariants left out and why.
+pub fn plan_shown(v: &Value) -> String {
+    let plan = &v["plan"];
+    let mut lines = Vec::new();
+    for action in array(plan, "actions") {
+        lines.push(format!(
+            "{} (reversible: {})",
+            text(&action["name"]),
+            yes_no(&action["reversible"])
+        ));
+        for (n, step) in array(action, "steps").iter().enumerate() {
+            let args: Vec<String> = step["args"]
+                .as_object()
+                .map(|args| args.iter().map(|(k, v)| format!("{k}={v}")).collect())
+                .unwrap_or_default();
+            lines.push(format!(
+                "  {}. {}({})",
+                n + 1,
+                text(&step["verb"]),
+                args.join(", ")
+            ));
+        }
+        lines.push(format!(
+            "  pre: {}",
+            listed_or_none(array(action, "pre").iter().map(text))
+        ));
+        lines.push(format!(
+            "  post: {}",
+            listed_or_none(array(action, "post").iter().map(text))
+        ));
+        if let Some(note) = action["note"].as_str() {
+            lines.push(format!("  note: {note}"));
+        }
+    }
+    let q = &plan["qualification"];
+    lines.push(format!(
+        "qualification: min_passes {}, min_rate {}",
+        q["min_passes"], q["min_rate"]
+    ));
+    let ambiguities = array(plan, "ambiguities");
+    if ambiguities.is_empty() {
+        lines.push("ambiguities: none".into());
+    } else {
+        lines.push("ambiguities:".into());
+        for a in ambiguities {
+            let mut line = format!("  {}  {}", text(&a["invariant"]), text(&a["resolved_by"]));
+            if let Some(value) = a.get("value") {
+                line.push_str(&format!("  {value}"));
+            }
+            lines.push(line);
+        }
+    }
+    let excluded = array(v, "excluded");
+    if excluded.is_empty() {
+        lines.push("excluded: none".into());
+    } else {
+        lines.push("excluded:".into());
+        for e in excluded {
+            lines.push(format!("  {}  {}", text(&e["invariant"]), text(&e["why"])));
+        }
+    }
+    lines.join("\n")
+}
+
+/// `vk driver debrief`: one line per proposal (kind, target, confidence, what
+/// to change), then the files, and that nothing was applied.
+pub fn debriefed(v: &Value) -> String {
+    let mut lines = vec![format!(
+        "debrief: {} proposals -> {}",
+        v["proposals"],
+        text(&v["out"])
+    )];
+    for p in array(v, "list") {
+        lines.push(format!(
+            "  {:<8} {:<24} {:<6}  {}",
+            text(&p["kind"]),
+            text(&p["target"]),
+            text(&p["confidence"]),
+            text(&p["proposal"])
+        ));
+    }
+    lines.push(
+        "files: debrief.md, debrief.json, proposals.json; nothing applied: each proposal is the \
+         operator's to apply"
+            .into(),
+    );
+    lines.join("\n")
+}
+
 /// `vk driver umount`: what was taken away, named back.
 pub fn unmounted_driver(v: &Value) -> String {
     format!("unmounted driver {}", text(&v["name"]))
@@ -1316,6 +1491,123 @@ pub fn harness_run(v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn vk_driver_show_says_the_kind() {
+        let shown = driver(
+            &json!({"driver_id": "sha256:1", "state": {"state": "ready"}, "root": "C:\\d",
+                                   "manifest": {"name": "word-maison", "kind": "com", "governed": false, "actions": []}}),
+        );
+        assert!(
+            shown
+                .lines()
+                .any(|l| l.split_whitespace().eq(["kind", "com"])),
+            "{shown}"
+        );
+    }
+
+    /// `vk driver learn`, `vk driver qualify` and `vk driver plan show`, as a
+    /// person reads them: one line each for what was learned and replayed,
+    /// and the plan step by step, values as compact JSON.
+    #[test]
+    fn the_learning_verbs_render_their_rows() {
+        let learned_v = json!({"driver_id": "sha256:1", "name": "word-maison", "plan_sha256": "sha256:2",
+            "out": "C:\\l\\word-maison", "unbound": ["set_slide_layout"],
+            "ambiguities": [{"invariant": "body_font", "resolved_by": "purged"}],
+            "excluded": [{"invariant": "title_style", "why": "a custom style has no built-in anchor (v1)"}]});
+        let shown = learned(&learned_v);
+        assert!(
+            shown.starts_with("learned word-maison  sha256:1\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("(read it: vk driver plan show C:\\l\\word-maison)"),
+            "{shown}"
+        );
+        assert!(shown.contains("unbound: set_slide_layout\n"), "{shown}");
+        assert!(shown.contains("ambiguities: body_font purged\n"), "{shown}");
+        assert!(
+            shown.ends_with("excluded: title_style (a custom style has no built-in anchor (v1))"),
+            "{shown}"
+        );
+        let none = learned(&json!({"unbound": [], "ambiguities": [], "excluded": []}));
+        assert!(
+            none.contains("unbound: none\nambiguities: none\nexcluded: none"),
+            "{none}"
+        );
+
+        let ruled = proposed(
+            &json!({"path": r"C:\l\proposals\set_slide_layout.json", "proposal": {
+            "verb": "set_slide_layout", "app": "word", "proposed_by": "arch:sha256:9",
+            "rule": {"member": "Slide.Layout", "constants": "PpSlideLayout"}}}),
+        );
+        assert_eq!(
+            ruled,
+            "proposal for set_slide_layout on word by arch:sha256:9 -> C:\\l\\proposals\\set_slide_layout.json\n\
+             rule: Slide.Layout / PpSlideLayout\n\
+             nothing applied: a human versions a rule into the ontology"
+        );
+        let unruled = proposed(
+            &json!({"path": "p.json", "proposal": {"verb": "v", "app": "word",
+            "proposed_by": "arch:x", "rule": null}}),
+        );
+        assert!(
+            unruled.contains("\nrule: none (read the answer in the file)\n"),
+            "{unruled}"
+        );
+
+        let q = qualified(
+            &json!({"name": "word-maison", "passes": 9, "failures": 1, "fake": true,
+                                  "record": "C:\\s\\qualification.json"}),
+        );
+        assert_eq!(q, "qualified word-maison: 9/10 passes (1 failures), fake true -> C:\\s\\qualification.json");
+
+        let plan = json!({"plan": {"actions": [{"name": "appliquer_style_maison", "reversible": false,
+            "steps": [{"verb": "open", "args": {"path": "$arg.document"}},
+                      {"verb": "set_font_run", "args": {"selector": "body", "font": {"name": "Garamond", "size": 11}}}],
+            "pre": ["document is .docx"], "post": ["body_font", "pdf_exists"], "note": "partial: x"}],
+            "ambiguities": [{"invariant": "body_font", "resolved_by": "arch:sha256:9", "value": {"name": "Garamond", "size": 11}}],
+            "qualification": {"min_passes": 6, "min_rate": 1.0}},
+            "plan_sha256": "sha256:2", "excluded": []});
+        let shown = plan_shown(&plan);
+        assert_eq!(
+            shown,
+            "appliquer_style_maison (reversible: no)\n\
+             \x20 1. open(path=\"$arg.document\")\n\
+             \x20 2. set_font_run(font={\"name\":\"Garamond\",\"size\":11}, selector=\"body\")\n\
+             \x20 pre: document is .docx\n\
+             \x20 post: body_font, pdf_exists\n\
+             \x20 note: partial: x\n\
+             qualification: min_passes 6, min_rate 1.0\n\
+             ambiguities:\n\
+             \x20 body_font  arch:sha256:9  {\"name\":\"Garamond\",\"size\":11}\n\
+             excluded: none"
+        );
+    }
+
+    /// `vk driver debrief`: the count and where the files went, one line per
+    /// proposal, and the reminder that nothing was applied — with none, the
+    /// reminder still.
+    #[test]
+    fn the_debrief_renders_one_line_per_proposal_and_applies_nothing() {
+        let v = json!({"out": "C:\\d\\out", "proposals": 2, "list": [
+            {"kind": "selector", "target": "assistant_message", "confidence": "high", "proposal": "N1-1 : réponse vide"},
+            {"kind": "budget", "target": "N4", "confidence": "medium", "proposal": "N4 : 5/5 cas abandonnés"}]});
+        assert_eq!(
+            debriefed(&v),
+            "debrief: 2 proposals -> C:\\d\\out\n\
+             \x20 selector assistant_message        high    N1-1 : réponse vide\n\
+             \x20 budget   N4                       medium  N4 : 5/5 cas abandonnés\n\
+             files: debrief.md, debrief.json, proposals.json; nothing applied: each proposal is \
+             the operator's to apply"
+        );
+        let none = debriefed(&json!({"out": "o", "proposals": 0, "list": []}));
+        assert!(
+            none.starts_with("debrief: 0 proposals -> o\nfiles: ")
+                && none.contains("nothing applied"),
+            "{none}"
+        );
+    }
 
     /// The three states of an arch's price, and the three glyphs that must
     /// stay distinct (Ruling 30). A `?` printed as `0` would tell an operator

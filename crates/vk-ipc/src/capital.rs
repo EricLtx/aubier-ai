@@ -27,7 +27,7 @@ use vk_capital::layout::{self, Annotations, Layers};
 use vk_capital::python::{self, PINNED};
 use vk_capital::signature::{self, Pins, PublisherKey};
 use vk_capital::{materialise, wheels, CapitalError};
-use vk_contracts::driver::{is_driver_name, DriverManifest, DriverSource};
+use vk_contracts::driver::{is_driver_name, DriverKind, DriverManifest, DriverSource};
 use vk_contracts::package::{DriverPackage, Signature};
 use vk_contracts::syscalls::Ctx;
 use vk_kernel::capital::is_version;
@@ -92,10 +92,11 @@ struct Built {
 ///
 /// Everything that can be refused is refused before anything is written or
 /// downloaded: the version (it becomes a path component), the paths, an
-/// `--out` that holds anything, the manifest (it parses, validates and its
-/// driver's files hash to its `files_sha256`), the context rules on the
-/// installed copy at `<install_root>/<name>/<version>`, and a missing
-/// publisher key. Then, in a short stage directory ([`Stage`]): the files
+/// `--out` that holds anything, the manifest (it parses, validates, is not a
+/// learned driver's — [`packable`] — and its driver's files hash to its
+/// `files_sha256`), the context rules on the installed copy at
+/// `<install_root>/<name>/<version>`, and a missing publisher key. Then, in
+/// a short stage directory ([`Stage`]): the files
 /// layer (the driver's files as `hash_dir` sees them, plus the shared
 /// `vkdriver` library beside them, [`stage_files`]), the pinned CPython
 /// release (`config.python_archive`, else fetched into `python_cache`, else
@@ -149,6 +150,7 @@ pub(crate) fn pack(
         )));
     }
     let mut manifest = read_manifest(&manifest_file)?;
+    packable(&manifest)?;
     let driver_dir = manifest_file.parent().ok_or_else(|| {
         bad("--manifest names no directory; remedy: name the manifest.json beside the driver's files")
     })?;
@@ -318,6 +320,22 @@ fn packed_command(command: &[String], script: &str) -> Vec<String> {
         .collect()
 }
 
+/// A learned driver (`kind: com`) is not packed in this version (final
+/// review I-4): its package would carry `secrets.json` — the firm's footer in
+/// clear — in a layer meant to travel, no wheels (`comtypes` missing once
+/// installed), and a `driver_id` this node never learned, which the
+/// qualification gate refuses to mount. It is mounted from its learn
+/// directory until the packaging of learned drivers is designed.
+fn packable(manifest: &DriverManifest) -> Result<(), RpcError> {
+    if manifest.kind == DriverKind::Com {
+        return Err(bad(
+            "a learned driver is not packaged in this version; remedy: mount it from its learn \
+             directory",
+        ));
+    }
+    Ok(())
+}
+
 /// The manifest `driver.pack` was pointed at, parsed and validated. Read
 /// bounded; a refusal names where it failed to parse, never what it read.
 fn read_manifest(file: &Path) -> Result<DriverManifest, RpcError> {
@@ -390,6 +408,11 @@ fn stage_files(driver_dir: &Path, dest: &Path) -> Result<(), RpcError> {
     .map_err(failed)?;
     if let Some(plan) = plan {
         return vendor(&plan, dest);
+    }
+    // A learned driver vendors its own vkdriver and has no pack.json (ruling
+    // L-P9): nothing to copy beside it, and no repository is asked for.
+    if dest.join("vendor").join("vkdriver").is_dir() {
+        return Ok(());
     }
     let shared = driver_dir.parent().map(|p| p.join("vkdriver"));
     let Some(shared) = shared.filter(|s| std::fs::symlink_metadata(s).is_ok_and(|m| m.is_dir()))
@@ -1165,6 +1188,59 @@ mod tests {
             "{}",
             e.message
         );
+    }
+
+    /// A learned driver vendors its own `vkdriver` and carries no `pack.json`
+    /// (ruling L-P9): it packs with its own copy alone, the shared library
+    /// beside it is not copied, and no repository (`Cargo.toml`) is needed.
+    #[test]
+    fn a_driver_that_vendors_its_own_vkdriver_packs_it_alone_without_a_repository() {
+        let t = tempfile::tempdir().unwrap();
+        let drv = t.path().join("drivers").join("word-maison");
+        write(&drv.join("driver.py"), "");
+        write(
+            &drv.join("vendor").join("vkdriver").join("protocol.py"),
+            "vendored",
+        );
+        write(
+            &t.path()
+                .join("drivers")
+                .join("vkdriver")
+                .join("protocol.py"),
+            "repository",
+        );
+        let dest = t.path().join("files");
+        stage_files(&drv, &dest).unwrap();
+        assert_eq!(
+            files_under(&dest),
+            ["driver.py", "vendor/vkdriver/protocol.py"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("vendor/vkdriver/protocol.py")).unwrap(),
+            "vendored"
+        );
+    }
+
+    /// Final review I-4: `vk driver pack` refuses a learned (`kind: com`)
+    /// driver before anything is hashed, written or downloaded, naming the
+    /// remedy; a written (browser) driver is packable as before.
+    #[test]
+    fn a_learned_driver_is_not_packed_in_this_version() {
+        let learned: DriverManifest = serde_json::from_str(include_str!(
+            "../../../contracts/examples/driver_manifest/valid/word_com.json"
+        ))
+        .unwrap();
+        let e = packable(&learned).unwrap_err();
+        assert_eq!(
+            e.message,
+            "a learned driver is not packaged in this version; remedy: mount it from its learn \
+             directory"
+        );
+        let written: DriverManifest = serde_json::from_str(include_str!(
+            "../../../contracts/examples/driver_manifest/valid/identity-frozen-2026-10-17.json"
+        ))
+        .unwrap();
+        packable(&written).unwrap();
     }
 
     /// A repository laid out the way `pack.json` names it (ruling R-T8a):

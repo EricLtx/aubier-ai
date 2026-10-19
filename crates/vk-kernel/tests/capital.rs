@@ -84,6 +84,7 @@ mod common {
                 max_memory_bytes: None,
             },
             hosts: vec!["app.maskai.fr".into()],
+            applications: vec![],
             actions: vec![DriverAction {
                 name: "look".into(),
                 reversible: true,

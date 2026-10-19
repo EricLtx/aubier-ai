@@ -1,0 +1,46 @@
+{
+ "ambiguities": [],
+ "corpus": {
+  "content_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "files": 10,
+  "kind": "docx",
+  "schema_sha256": "sha256:e344d6d51fb66258f6120dab98fae838da3dd9153509ed402c5d40336e249b13",
+  "skipped": 0
+ },
+ "invariants": [
+  {
+   "id": "body_font",
+   "kind": "font_run",
+   "support": 1.0,
+   "value": {
+    "name": "Garamond",
+    "size": 11
+   },
+   "where": "body"
+  },
+  {
+   "id": "export_format",
+   "kind": "export_format",
+   "support": 1.0,
+   "value": {
+    "format": "pdf"
+   }
+  },
+  {
+   "id": "footer_text",
+   "kind": "footer",
+   "support": 1.0,
+   "value": "<redacted:sha256:47ea47515b0a877309964c3aa4978b2812aaf5ac46c64361d65ae9371933ae43>"
+  },
+  {
+   "id": "title_style",
+   "kind": "paragraph_style",
+   "support": 1.0,
+   "value": {
+    "builtin": "Heading1"
+   },
+   "where": "first"
+  }
+ ],
+ "threshold": 0.8
+}

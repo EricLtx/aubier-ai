@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DriverLearned",
+  "description": "Ledger payload of `driver.learned`: a human learned a driver from the\nfirm's documents. It names every input by hash (the catalogue, the\nontology, the corpus schema, the invariants, the approved plan) and the\ngenerated driver by its `driver_id`; no document text is on the ledger.",
+  "type": "object",
+  "properties": {
+    "app": {
+      "type": "string"
+    },
+    "by": {
+      "description": "The node that recorded the act.",
+      "type": "string"
+    },
+    "catalogue_sha256": {
+      "type": "string"
+    },
+    "corpus_schema_sha256": {
+      "type": "string"
+    },
+    "driver_id": {
+      "type": "string"
+    },
+    "family": {
+      "type": "string"
+    },
+    "invariants_sha256": {
+      "type": "string"
+    },
+    "ontology_sha256": {
+      "type": "string"
+    },
+    "plan_sha256": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "family",
+    "app",
+    "catalogue_sha256",
+    "ontology_sha256",
+    "corpus_schema_sha256",
+    "invariants_sha256",
+    "plan_sha256",
+    "driver_id",
+    "by"
+  ]
+}

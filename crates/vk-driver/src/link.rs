@@ -27,6 +27,11 @@ use vk_harness::launch::kill_tree;
 /// before what is left of its tree is killed and the exit read.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a running driver whose stdin the host closed — the protocol's end
+/// — gets to exit on its own before its tree is killed (ruling L-P49): a
+/// learned driver quits the Office instance it started on its way out (L-P46).
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
 /// What a link needs to start a driver: the command line, where it runs, the
 /// environment it is given on top of the daemon's, and the file its stderr is
 /// appended to.
@@ -108,7 +113,8 @@ pub trait DriverLink: Send {
 
 struct Proc {
     child: Child,
-    stdin: ChildStdin,
+    /// `None` once [`LocalLink::terminate`] has closed it to stop the driver.
+    stdin: Option<ChildStdin>,
     /// Every line the driver prints on stdout, from the reader thread, which
     /// ends on its own when the pipe closes.
     lines: Receiver<String>,
@@ -151,11 +157,25 @@ impl LocalLink {
     /// ([`sweep`]), a leader still running (or whose exit cannot be observed)
     /// has its tree killed, and only then is it reaped. Under the Job Object
     /// the drop of the governor, right after the link's, ends what is left.
+    ///
+    /// A leader still running is first stopped the way the protocol ends
+    /// (ruling L-P49): its stdin is closed and it gets [`STOP_GRACE`] to exit
+    /// on its own — a learned driver quits the Office instance it started on
+    /// its way out (L-P46), which a kill would leave running. Its exit is
+    /// observed as above, without reaping it; one that is still running when
+    /// the grace is over is killed as before.
     fn terminate(&mut self) {
         let Some(proc) = self.proc.as_mut() else {
             return;
         };
         if !self.swept {
+            if matches!(exited(&mut proc.child), Ok(false)) {
+                drop(proc.stdin.take());
+                let until = Instant::now() + STOP_GRACE;
+                while matches!(exited(&mut proc.child), Ok(false)) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
             match exited(&mut proc.child) {
                 Ok(true) => sweep(&mut proc.child, self.governed, &self.signals),
                 Ok(false) | Err(_) => {
@@ -209,7 +229,7 @@ impl DriverLink for LocalLink {
         let pid = child.id();
         self.proc = Some(Proc {
             child,
-            stdin,
+            stdin: Some(stdin),
             lines: read_lines(stdout),
         });
         Ok(Spawned { pid })
@@ -217,12 +237,11 @@ impl DriverLink for LocalLink {
 
     fn send_line(&mut self, line: &str) -> Result<(), LinkError> {
         let proc = self.proc.as_mut().ok_or(LinkError::Closed)?;
+        let stdin = proc.stdin.as_mut().ok_or(LinkError::Closed)?;
         let mut bytes = Vec::with_capacity(line.len() + 1);
         bytes.extend_from_slice(line.as_bytes());
         bytes.push(b'\n');
-        proc.stdin
-            .write_all(&bytes)
-            .and_then(|()| proc.stdin.flush())?;
+        stdin.write_all(&bytes).and_then(|()| stdin.flush())?;
         Ok(())
     }
 

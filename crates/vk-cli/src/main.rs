@@ -102,8 +102,9 @@ enum Cmd {
         #[command(subcommand)]
         what: ArchCmd,
     },
-    /// The drivers this node has mounted: the browsers a harness step may act
-    /// through (`vk mount driver` mounts one).
+    /// The drivers a harness step may act through: written ones that drive a
+    /// browser, and learned ones that drive Word or PowerPoint (`vk driver
+    /// learn` learns one, `vk mount driver` mounts either).
     Driver {
         #[command(subcommand)]
         what: DriverCmd,
@@ -559,6 +560,79 @@ enum DriverCmd {
     /// Remove an installed version, from an elevated shell. Refused while
     /// the daemon reports it mounted: `vk driver umount NAME` first.
     Uninstall(install::UninstallArgs),
+    /// Learn a driver from a corpus of the firm's documents (spec §4.10): the
+    /// type library's catalogue, the binding, the mined invariants, a plan, a
+    /// generated driver under `--out/driver`. A human act: signed with this
+    /// node's device key; `driver.learned` goes on the ledger.
+    Learn {
+        #[arg(long)]
+        family: String,
+        #[arg(long)]
+        app: String,
+        #[arg(
+            long,
+            value_name = "DIR",
+            required_unless_present = "deliberate",
+            conflicts_with = "deliberate"
+        )]
+        corpus: Option<PathBuf>,
+        /// A new directory; its name is the driver's (word-maison). With
+        /// `--deliberate`, an earlier learning's output instead.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        #[arg(long, default_value_t = 0.8, conflicts_with = "deliberate")]
+        threshold: f64,
+        /// The arch that may choose among an ambiguous invariant's candidates, by
+        /// name or id; without it every ambiguity is purged, and no model is called.
+        #[arg(long, value_name = "ARCH")]
+        arch: Option<String>,
+        /// The fallback for a verb the application could not bind: the arch drafts a
+        /// projection rule for VERB into `--out/proposals/VERB.json`. It proposes and
+        /// applies nothing; a human versions a rule into the ontology. Needs `--arch`.
+        #[arg(long, value_name = "VERB", requires = "arch")]
+        deliberate: Option<String>,
+    },
+    /// Replay a learned driver on copies of its corpus; `driver.qualified`
+    /// records the result, and a `com` driver mounts only when it meets its
+    /// plan's thresholds.
+    Qualify {
+        #[arg(long, value_name = "DIR")]
+        driver: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        corpus: PathBuf,
+    },
+    /// A learned driver's plan, for review before `vk driver qualify`.
+    Plan {
+        #[command(subcommand)]
+        what: PlanCmd,
+    },
+    /// Debrief a governed run from its evidence: signals, proposals with the
+    /// lines that support them, and sections 1-3 of a debrief. Not a human
+    /// act: it reads files the node holds in clear and writes three files; it
+    /// applies nothing and writes no ledger row.
+    Debrief {
+        /// The run directory: journal.jsonl and tasks/<id>.json, optionally
+        /// journal-*.jsonl, driver.log, vkd-console.log, dmesg.json, cases.json.
+        #[arg(long, value_name = "DIR")]
+        run: PathBuf,
+        /// A new or empty directory for debrief.json, proposals.json, debrief.md.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// Debrief only the evidence up to the end of this task.
+        #[arg(long, value_name = "TASK")]
+        until: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanCmd {
+    /// The actions of the plan `vk driver learn` wrote into DIR (its
+    /// `--out`), step by step, its ambiguities and how each was settled, and
+    /// the invariants it left out.
+    Show {
+        /// The directory `vk driver learn --out` wrote.
+        dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1206,6 +1280,107 @@ async fn call(cli: &Cli) -> Result<()> {
                 render::unmounted_driver,
             )
         }
+        // Learning a driver writes code this node will run: a human act,
+        // signed with this node's device key. The paths are made absolute
+        // here, where they mean what the person typed — the daemon's working
+        // directory is its own — and an arch named is resolved to its id.
+        Cmd::Driver {
+            what:
+                DriverCmd::Learn {
+                    family,
+                    app,
+                    corpus,
+                    out,
+                    threshold,
+                    arch,
+                    deliberate,
+                },
+        } => {
+            let arch = match arch {
+                Some(arch) => Some(
+                    resolve_arch(arch, &c.call("arch.ls", json!({}), None).await?)
+                        .map_err(|e| anyhow!("--arch {arch}: {e}"))?,
+                ),
+                None => None,
+            };
+            let mut params = json!({
+                "family": family,
+                "app": app,
+                "out": plain_path(&absolute(out)?),
+            });
+            if deliberate.is_none() {
+                // A fallback takes no threshold: the daemon refuses one it is sent.
+                params["threshold"] = json!(threshold);
+            }
+            if let Some(corpus) = corpus {
+                params["corpus"] = json!(plain_path(&absolute(corpus)?));
+            }
+            if let Some(arch) = arch {
+                params["arch"] = json!(arch);
+            }
+            let proof = presence(&c).await?;
+            if let Some(verb) = deliberate {
+                params["deliberate"] = json!(verb);
+                return show(
+                    cli,
+                    c.call("driver.learn", params, Some(proof)).await?,
+                    render::proposed,
+                );
+            }
+            show(
+                cli,
+                c.call("driver.learn", params, Some(proof)).await?,
+                render::learned,
+            )
+        }
+        Cmd::Driver {
+            what: DriverCmd::Qualify { driver, corpus },
+        } => show(
+            cli,
+            c.call(
+                "driver.qualify",
+                json!({
+                    "driver": plain_path(&absolute(driver)?),
+                    "corpus": plain_path(&absolute(corpus)?),
+                }),
+                None,
+            )
+            .await?,
+            render::qualified,
+        ),
+        Cmd::Driver {
+            what: DriverCmd::Plan {
+                what: PlanCmd::Show { dir },
+            },
+        } => show(
+            cli,
+            c.call(
+                "driver.plan_show",
+                json!({ "dir": plain_path(&absolute(dir)?) }),
+                None,
+            )
+            .await?,
+            render::plan_shown,
+        ),
+        // A machine act, no presence proof. The paths are made absolute here,
+        // where they mean what the person typed: the daemon's working
+        // directory is its own.
+        Cmd::Driver {
+            what: DriverCmd::Debrief { run, out, until },
+        } => show(
+            cli,
+            c.call(
+                "driver.debrief",
+                json!({
+                    "run": plain_path(&absolute(run)?),
+                    "out": plain_path(&absolute(out)?),
+                    "until": until,
+                }),
+                None,
+            )
+            .await?,
+            render::debriefed,
+        ),
         Cmd::Task { what } => task(cli, &c, what).await,
         Cmd::Harness { what } => harness(cli, &c, what).await,
         Cmd::Stop { scope } => {
@@ -1577,57 +1752,65 @@ fn names_an_arch(step: &RecipeStep) -> bool {
 /// pointing at `vk ls /arches`, where the names and ids are. An id is left as
 /// written: whether it is mounted is the kernel's to say when the step runs.
 fn resolve_arch_names(steps: &mut [RecipeStep], arches: &Value) -> Result<()> {
-    let rows = arches
-        .as_array()
-        .ok_or_else(|| anyhow!("arch.ls answered something other than a list: {arches}"))?;
     for (i, step) in steps.iter_mut().enumerate() {
         let Some((role, arch)) = step_arch(step) else {
             continue;
         };
-        if arch.starts_with("sha256:") {
-            continue;
-        }
-        let carrying: Vec<&Value> = rows
-            .iter()
-            .filter(|a| a["manifest"]["name"].as_str() == Some(arch.as_str()))
-            .collect();
-        match carrying.as_slice() {
-            [one] => {
-                *arch = one["arch_id"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("arch.ls listed `{arch}` without an id: {one}"))?
-                    .to_string();
-            }
-            [] => {
-                return Err(anyhow!(
-                    "step {} ({role}): no mounted arch is named `{arch}`; mount it, or write \
-                     its id instead (`vk ls /arches` lists the names and ids this node has)",
-                    i + 1
-                ))
-            }
-            many => {
-                let ids = many
-                    .iter()
-                    .map(|a| {
-                        format!(
-                            "{} ({})",
-                            a["arch_id"].as_str().unwrap_or("?"),
-                            a["state"].as_str().unwrap_or("?")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(anyhow!(
-                    "step {} ({role}): {} mounted arches are named `{arch}`: {ids}; unmount the \
-                     one you do not mean (`vk umount <ID>`) or write its id instead \
-                     (`vk ls /arches` lists them)",
-                    i + 1,
-                    many.len()
-                ));
-            }
-        }
+        *arch = resolve_arch(arch, arches).map_err(|e| anyhow!("step {} ({role}): {e}", i + 1))?;
     }
     Ok(())
+}
+
+/// One arch named as a recipe step or `vk driver learn --arch` names it,
+/// against `arch.ls`: an id (`sha256:…`) is kept as it is, a name becomes the
+/// id of the one mounted arch carrying it, and none or several is refused —
+/// several with each one's id and state, so the person can tell which to
+/// unmount. The one place this matching is written.
+fn resolve_arch(arch: &str, arches: &Value) -> Result<String> {
+    if arch.starts_with("sha256:") {
+        return Ok(arch.to_string());
+    }
+    let rows = arches
+        .as_array()
+        .ok_or_else(|| anyhow!("arch.ls answered something other than a list: {arches}"))?;
+    let carrying: Vec<&Value> = rows
+        .iter()
+        .filter(|a| a["manifest"]["name"].as_str() == Some(arch))
+        .collect();
+    match carrying.as_slice() {
+        [one] => one["arch_id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("arch.ls listed `{arch}` without an id: {one}")),
+        [] => Err(anyhow!(
+            "no mounted arch is named `{arch}`; mount it, or write its id instead \
+             (`vk ls /arches` lists the names and ids this node has)"
+        )),
+        many => {
+            let ids = many
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{} ({})",
+                        a["arch_id"].as_str().unwrap_or("?"),
+                        a["state"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow!(
+                "{} mounted arches are named `{arch}`: {ids}; unmount the one you do not mean \
+                 (`vk umount <ID>`) or write its id instead (`vk ls /arches` lists them)",
+                many.len()
+            ))
+        }
+    }
+}
+
+/// A path as the person typed it, made absolute against this shell's working
+/// directory: the daemon's is its own.
+fn absolute(path: &Path) -> Result<PathBuf> {
+    std::path::absolute(path).with_context(|| format!("make {} absolute", path.display()))
 }
 
 /// `vk mount driver --manifest FILE`'s request: the manifest as written, and
@@ -2252,8 +2435,29 @@ mod detach_tests {
 
 #[cfg(test)]
 mod recipe_tests {
-    use super::{names_an_arch, resolve_arch_names, RecipeStep};
+    use super::{names_an_arch, resolve_arch, resolve_arch_names, RecipeStep};
     use serde_json::json;
+
+    /// `vk driver learn --arch` reads a name as a recipe's arch is read.
+    #[test]
+    fn learn_arch_resolves_a_name_and_keeps_an_id() {
+        assert_eq!(
+            resolve_arch("claude-code/claude-opus-5", &listing()).unwrap(),
+            "sha256:bbb"
+        );
+        assert_eq!(
+            resolve_arch("sha256:not-mounted", &listing()).unwrap(),
+            "sha256:not-mounted"
+        );
+        let e = resolve_arch("nobody", &listing()).unwrap_err().to_string();
+        assert!(e.contains("no mounted arch is named `nobody`"), "{e}");
+        let e = resolve_arch("twice", &listing()).unwrap_err().to_string();
+        assert!(e.contains("2 mounted arches are named `twice`"), "{e}");
+        assert!(
+            e.contains("sha256:c01 (ready)") && e.contains("sha256:c02 (unavailable)"),
+            "the one function keeps each arch's state: {e}"
+        );
+    }
 
     fn listing() -> serde_json::Value {
         json!([

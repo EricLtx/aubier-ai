@@ -226,10 +226,12 @@ impl DriverHost {
     /// `VK_DRIVER_HEADLESS` (`0`|`1`), `VK_DRIVER_CHANNEL` (empty when the
     /// manifest names no channel) and `VK_DRIVER_HOSTS` (the manifest's hosts
     /// joined with commas, ruling R1 — the driver enforces the allow-list from
-    /// it); contain it under `governor` immediately, failing closed on Windows
-    /// as the harness does; read the hello within [`HELLO_TIMEOUT`]; refuse a
-    /// protocol other than [`PROTOCOL`] and an action set that does not cover
-    /// `manifest.actions`. The driver's stderr goes to `<work_dir>/driver.log`
+    /// it) and `VK_DRIVER_APPLICATIONS` (the executables a com driver drives,
+    /// comma-joined; empty for a browser driver); contain it under `governor`
+    /// immediately, failing closed on Windows as the harness does; read the
+    /// hello within [`HELLO_TIMEOUT`]; refuse a protocol other than
+    /// [`PROTOCOL`] and an action set that does not cover `manifest.actions`.
+    /// The driver's stderr goes to `<work_dir>/driver.log`
     /// (append). A driver refused after it started is killed before this
     /// returns; nothing is left running on an `Err`.
     pub fn spawn(
@@ -307,6 +309,10 @@ impl DriverHost {
                         .into(),
                 ),
                 ("VK_DRIVER_HOSTS".into(), manifest.hosts.join(",")),
+                (
+                    "VK_DRIVER_APPLICATIONS".into(),
+                    manifest.applications.join(","),
+                ),
             ],
             log_file: log_path.clone(),
         };

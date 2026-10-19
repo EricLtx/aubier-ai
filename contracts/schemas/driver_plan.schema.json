@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DriverPlan",
+  "description": "The plan a human approves (spec §4.5).",
+  "type": "object",
+  "properties": {
+    "actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PlanAction"
+      }
+    },
+    "ambiguities": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Ambiguity"
+      }
+    },
+    "app": {
+      "description": "The application: `word` or `powerpoint`.",
+      "type": "string"
+    },
+    "catalogue_sha256": {
+      "type": "string"
+    },
+    "family": {
+      "description": "The family of applications the driver belongs to: `office-document`.",
+      "type": "string"
+    },
+    "invariants_sha256": {
+      "type": "string"
+    },
+    "ontology_sha256": {
+      "type": "string"
+    },
+    "qualification": {
+      "$ref": "#/$defs/Qualification"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "family",
+    "app",
+    "ontology_sha256",
+    "catalogue_sha256",
+    "invariants_sha256",
+    "actions",
+    "qualification"
+  ],
+  "$defs": {
+    "Ambiguity": {
+      "description": "An invariant the corpus left open, and how it was settled.",
+      "type": "object",
+      "properties": {
+        "invariant": {
+          "type": "string"
+        },
+        "resolved_by": {
+          "description": "`arch:<arch_id>` | `human` | `purged`.",
+          "type": "string"
+        },
+        "value": {
+          "description": "The chosen candidate: present exactly when `resolved_by` is not `purged`."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "invariant",
+        "resolved_by"
+      ]
+    },
+    "PlanAction": {
+      "description": "One action the generated driver offers: ordered steps, its pre-conditions\nand the invariants that must hold after it.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "note": {
+          "description": "The `partial` bindings the steps use, for the human reading the plan.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "post": {
+          "description": "Invariant ids, and `pdf_exists`: one per `verify_*` step, in their order.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pre": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reversible": {
+          "description": "True only when every step's ontology verb is reversible (L-P13).",
+          "type": "boolean"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlanStep"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "reversible",
+        "steps",
+        "pre",
+        "post"
+      ]
+    },
+    "PlanStep": {
+      "description": "One step: an ontology verb and its arguments. An argument that is a string\nstarting with `$` is a reference: `$arg.<key>` or `$secret.<id>`.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        },
+        "verb": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "verb"
+      ]
+    },
+    "Qualification": {
+      "description": "What the qualification replay must reach before the driver is trusted.",
+      "type": "object",
+      "properties": {
+        "min_passes": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "min_rate": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "min_passes",
+        "min_rate"
+      ]
+    }
+  }
+}

@@ -293,6 +293,11 @@ pub const ALLOWED_KINDS: &[&str] = &[
     // the package's digest and the tree it holds. The payload is
     // `package::DriverPacked`.
     "driver.packed",
+    // A human learned a driver from the firm's documents, and the kernel
+    // recorded its qualification replay (driver-learning chantier, spec
+    // §4.8): payloads `driver::DriverLearned`, `driver::DriverQualified`.
+    "driver.learned",
+    "driver.qualified",
     "shred",
 ];
 
@@ -448,5 +453,12 @@ mod tests {
     fn driver_packed_is_an_allowed_kind() {
         assert!(is_allowed_kind("driver.packed"));
         assert!(!is_allowed_kind("driver.pack"));
+    }
+
+    #[test]
+    fn driver_learned_and_driver_qualified_are_allowed_kinds() {
+        assert!(is_allowed_kind("driver.learned"));
+        assert!(is_allowed_kind("driver.qualified"));
+        assert!(!is_allowed_kind("driver.learn"));
     }
 }
