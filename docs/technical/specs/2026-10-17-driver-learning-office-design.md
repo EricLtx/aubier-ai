@@ -145,7 +145,7 @@ Per pass: document hash, duration, each postcondition held or not, refusal reaso
 |---|---|---|
 | `vk driver learn --family F --app A --corpus DIR --out DIR [--threshold 0.8]` | yes: `driver.learned` | stages 1–5, prints the unbound verbs and the purged ambiguities |
 | `vk driver qualify --driver DIR --corpus DIR` | no (kernel writes `driver.qualified`) | stage 6 |
-| `vk driver learn --deliberate VERB --app A` | yes | the fallback (§5.3); output is a proposed projection rule, not code |
+| `vk driver learn --deliberate VERB --app A --out DIR --arch NAME` | yes | the fallback (§5.3); `--out` is a learn's output (its catalogue), `--arch` the arch that drafts the proposal (founder decision L-P23, 2026-10-18); output is a proposed projection rule, not code |
 | `vk driver plan show DIR` | no | prints `plan.json` in the operator's register for review |
 | `vk mount driver --manifest DIR/manifest.json` | yes (as today) | unchanged |
 
@@ -226,3 +226,16 @@ The exact verb list of `office-document.json` v1; the `comtypes` pin and how the
 ## 11. TCB statement additions
 
 `contracts/tcb.md` §Drivers: a learned driver is identified like a written one and trusted no more; the kernel trusts the miner's schema because the miner calls no model and reads no text run; the only data that may reach an arch during learning is the ambiguity list of §4.5, and the ledger records which arch answered; the deliberate-run fallback produces a rule for human review, never code; qualification is a replay on copies under the Job, and its record is what the mount checks.
+
+## 12. Rulings taken at implementation (merged 2026-10-19)
+
+The SDD ledger (private, `docs/archive/technical/reviews/2026-10-19-driver-learning-sdd-ledger.md`) holds rulings L-P1 to L-P58; the ones that change what this document says:
+
+- **§4.10 `--deliberate`** takes `--out` and `--arch` (L-P23, founder).
+- **§5 learn** runs the stages as a governed one-shot process, not through protocol 1 (L-P2); the vault `.vault.json` lives under the daemon's private `forge/<name>/` directory and is deleted on every way out (final review I-2).
+- **§5.2 qualify** perturbs each copy before the pass so that only a real repair counts (L-P52), runs the driver as its stage's child (L-P32), and writes `min_passes = min(10, corpus files)` (final review I-3); a record qualified on the fake application opens the gate only on a daemon started with `VK_FORGE_FIXTURES` (final review I-1).
+- **§6 Office version change**: the generated driver's `probe` refuses `precondition` "office version changed; remedy: vk driver learn again" (L-P22); the binding is inside `driver_id`.
+- **The generated driver** quits only the Office instance it started and restores `DisplayAlerts` (L-P46/L-P47); the host closes a driver's stdin and waits before killing it (L-P49); a dialog box is closed, never answered, and the action refuses `dialog` (L-P33); the fake application is reached only through `<work>/fake.json` (L-P19).
+- **Debrief** (founder decision of 2026-10-17): a seventh stage, no ledger kind (L-P5); its proposals never carry answer text, sent text or document content (L-P57); logs are read inside the run's window (L-P58).
+- **Packaging of a learned driver is refused in this version** (final review I-4): a learned driver mounts from its learn directory; packaging it is a follow-up chantier.
+- **Potential value of information**: see `2026-10-18-information-value-in-learning-design.md` (founder decisions D-26, V1–V4), to implement on top of this pipeline.

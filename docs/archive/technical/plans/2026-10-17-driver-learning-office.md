@@ -1,5 +1,7 @@
 # Driver Learning from the Firm's Documents (Office COM) Implementation Plan
 
+> **Archived at the merge (2026-10-19).** Superseded by the implementation on these points: the generated `driver.py` text gains the `atexit` quit of the Office instance it started (L-P46); `min_passes = min(10, n)` (final review I-3); the vault lives under the daemon's `forge/<name>/` (I-2); `vk driver pack` refuses a learned driver (I-4). The rulings are in the SDD ledger (archived with this plan).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** `vk driver learn` turns a corpus of the firm's Word documents into a qualified, mountable driver — inventory of the application's type library, deterministic OOXML mining, a typed plan, a deterministic generator, a qualification replay — and the same engine, fed presentations, produces the PowerPoint driver with no application-specific code.
