@@ -56,7 +56,7 @@ powershell -ExecutionPolicy Bypass -File drivers\maskai-recette\setup.ps1
 ```
 Attendu, en première ligne, `python de base : ` suivi du chemin du 1.1, puis en dernières lignes :
 ```
-files_sha256 : sha256:d26703f9befeb5dc90b554253372eb09effb773e9e327670a08e2dc94eb19e83
+files_sha256 : sha256:e3574d5012ec07dc4498086696d6b03113d7fbf58ce1871b5246914a32507722
 manifest.json : à jour
 manifest-fixture.json : à jour
 ```
@@ -297,7 +297,7 @@ maskai-1  ready  yes       development  -        mesurer_chargement,…,exporter
 ```
 Monté depuis un paquet (§6.0), la ligne dit `installed` et `1.0.0` à la place de `development` et `-`. Un driver installé et non monté est listé aussi, à l'état `installed`, avec ses versions.
 
-Les quinze actions, dans l'ordre du manifeste : `mesurer_chargement`, `nouvelle_conversation`, `joindre_document`, `poser_question`, `envoyer_message`, `lire_reponse`, `capturer_flux`, `choisir_modele`, `recherche_web`, `conversation_longue`, `verdict_oracle`, `lister_conversations`, `charge_concurrente`, `capture_ecran`, `exporter_journal`. Les trois du milieu sont nouvelles en v2 (§6.4).
+Les dix-neuf actions, dans l'ordre du manifeste : `mesurer_chargement`, `nouvelle_conversation`, `joindre_document`, `poser_question`, `envoyer_message`, `lire_reponse`, `capturer_flux`, `choisir_modele`, `recherche_web`, `conversation_longue`, `verdict_oracle`, `lister_conversations`, `charge_concurrente`, `capture_ecran`, `exporter_journal`, `renommer_conversation`, `supprimer_conversation`, `ouvrir_avis`, `sonder_interface`. `choisir_modele`, `recherche_web` et `conversation_longue` sont nouvelles en v2 (§6.4), les quatre dernières en v2.3 (§6.5).
 
 `governed: yes` veut dire que le Job Object a confirmé le confinement du processus du driver : le plafond mémoire du manifeste (`program.max_memory_bytes`, 6 Gio), et l'arbre est tué avec le démon. Avec un Python du Store, Chrome est hors du Job (§1.2).
 
@@ -327,6 +327,30 @@ Ce qui change dans les actions existantes :
 - `joindre_document` suit la puce (uploading, indexing, puis ready ou failed) au plus 3 × le budget du cas. `poser_question` relit la puce et refuse `precondition` si elle n'est pas prête : la question ne part pas, et `verdict_oracle` journalise « question non envoyée (précondition) » ;
 - à l'abandon, le driver clique sur le bouton d'arrêt : l'enquête « Votre avis » ne suit plus. La ligne de journal dit ce qui était parti (POST, flux, dernier nœud) ;
 - chaque ligne de journal porte `ui_profile_sha256` (§13), et les captures masquent la barre latérale et le bloc du compte.
+
+**6.5 Ce que la v2.3 ajoute (2026-10-19, PROCEDURE-3 §6).** Quatre actions, et `lister_conversations` qui prend un cas :
+
+| Action | Ce qu'elle fait | Preuve |
+|---|---|---|
+| `lister_conversations {case}` | Pour un cas qui porte une question (M8-4) : ouvre la recherche ⌘K (`ControlOrMeta+K`, à défaut l'entrée « Search conversations » de la barre latérale), y tape la question, et là seulement, lit les titres trouvés, puis la referme par Échap. `@list` : « recherche « q » : n résultats : t1 \| t2 … ». Sans question, ou sans `case`, la liste de la barre latérale comme avant. | `search.json`, `screen.png` |
+| `renommer_conversation {case}` | **Irréversible.** Renomme la seule conversation que le cas nomme par `same_conversation_as` (M8-5 : celle de M8-1) : la conversation que ce cas a créée, au registre du pilote, retrouvée dans la barre latérale par son adresse exacte, jamais par son rang ni par son titre. Son menu (déclencheur au plus près du lien, révélé au survol) doit porter exactement une entrée « Renommer » et une « Supprimer » ; le nouveau titre est la question du cas, validé par Entrée, puis relu. | `conversation.json`, `screen.png` |
+| `supprimer_conversation {case}` | **Irréversible.** Supprime cette même conversation (M8-6), par l'entrée « Supprimer » du même menu, puis la confirmation de l'application, validée par son seul bouton de suppression. Le registre la note « supprimée » ; rejouée, l'action ne clique plus rien. | `conversation.json`, `screen.png` |
+| `ouvrir_avis {case}` | Ouvre l'enquête « Votre avis » depuis son entrée (`button[aria-label="Send feedback"]`) et la ferme par sa croix, jamais par « Envoyer » ; rien n'y est choisi ni écrit (M8-8). | `avis.json`, `avis.png` |
+| `sonder_interface` | Lecture seule, jouée en M0 : résout chaque sélecteur, relève l'entrée et la palette ⌘K (rien n'y est tapé), l'entrée de « Votre avis » (jamais cliquée), le bouton de dictée (jamais pressé), la liste `accept`, et le menu de la première conversation de la barre latérale (ouvert, lu, refermé par Échap ; aucune entrée cliquée ; ni son titre ni son adresse gardés). Ne refuse rien. | `probe.json` |
+
+Avant tout clic, `renommer_conversation` et `supprimer_conversation` refusent `precondition` un cas qui ne les nomme pas (champ `action` de `cases.json`), une conversation absente du registre, déjà supprimée (pour le renommage) ou absente de la barre latérale. Le registre est `conversations.json`, dans le dossier de travail du driver, à côté du journal : il dit chaque conversation que le pilote a créée, avec le cas qui l'a créée et ses états (créée, renommée, supprimée).
+
+Ce qui change dans les actions existantes :
+- `choisir_modele` relit l'état du bouton de dictée, sans jamais le presser : son résultat finit par « ; micro : idle » (ou « absent ») ; la `config` de chaque ligne porte `mic` ;
+- `joindre_document` rend la liste `accept` du champ de fichier (et chaque ligne de pièce jointe la porte, `attach.accept`). Une puce en échec ne donne plus que sa classe (`error_class` : « service documentaire injoignable », « format refusé », « fichier trop volumineux », « échec de la pièce jointe ») et `internal_error_shown` ; son libellé brut (nom d'hôte, pile) ne va qu'à la preuve `chip.json` ;
+- une question restée sans carte de réponse : la ligne porte `error_class` (statut HTTP du flux, erreur du flux, erreur affichée, flux terminé sans réponse) et `error_excerpt`, 80 caractères expurgés ; ce que la page et le flux ont dit, brut, va à la preuve `failure.json` ;
+- chaque ligne d'une question porte `sent_source` (nul avec `sent_rejected`), `sent_tokens` et `pii_declared` ; la note d'un passage b compare les ensembles masqués (« ensemble masqué identique » ou « différent : +X −Y ») ; chaque ligne porte `modals_closed`, et `conversation` quand la question a créé ou rouvert une conversation du registre ;
+- une observation partagée (`@load`, `@list`, `@model`, `@web`) ne juge qu'un cas : `verdict_oracle` refuse `precondition` un cas dont l'observation a déjà jugé un autre cas, sauf un cas sondé avant qu'elle soit faite.
+
+**Lignes de correction (E8).** `scripts/recette/correct.py` rejoue hors ligne le jugement du driver sur l'observation gardée d'un cas, et écrit une ligne `step: correction` qui remplace la ligne en vigueur (`supersedes`), avec sa raison (`reason`) et les empreintes des règles qui jugent maintenant. Un cas inchangé n'a pas de ligne ; un cas jugé sur une observation partagée sans instantané (pilote antérieur à la v2.3) n'est pas rejoué, et le script le dit. `--reread-header` relit d'abord l'en-tête gardé de chaque carte avec les règles du driver d'aujourd'hui (la correction de M3 du 18/10, bannière sans fournisseur). À blanc par défaut ; `--write` pour écrire, le driver démonté :
+```powershell
+drivers\maskai-recette\.venv\Scripts\python.exe -I scripts\recette\correct.py "$S\drivers\maskai-1\work" --cases M1-J1a,M3-B2 --reason "oracle corrigé le 19/10"
+```
 
 ---
 
@@ -386,7 +410,7 @@ Get-Content "$S\drivers\maskai-1\work\journal.jsonl" -Encoding UTF8 | ForEach-Ob
 ```
 Attendu : une ligne par cas joué, par exemple `N1-1     OK       disponibilite,performance`.
 
-**Premier passage : confirmer les SELECTORS.** C'est à faire après N0, N1 et N5. Le banc d'essai imite l'interface des 17 et 18/10, mais une partie des `SELECTORS` de `drivers/maskai-recette/driver.py` reste une hypothèse :
+**Premier passage : confirmer les SELECTORS.** C'est à faire après N0, N1 et N5. En recette 3, lisez d'abord la preuve `probe.json` de `sonder_interface` (M0) : elle dit, sélecteur par sélecteur, ce que la page trouve, et le balisage réel de la recherche ⌘K et du menu d'une conversation, avant que M8 en ait besoin. Le banc d'essai imite l'interface des 17, 18 et 19/10, mais une partie des `SELECTORS` de `drivers/maskai-recette/driver.py` reste une hypothèse :
 
 | Sélecteur | Rôle | Le 17/10 |
 |---|---|---|
@@ -411,6 +435,14 @@ Attendu : une ligne par cas joué, par exemple `N1-1     OK       disponibilite,
 | `maintenance` | La page de maintenance (« MAINTENANCE EN COURS / ON REVIENT TRÈS VITE ! »), lue sur le texte quand aucune zone de saisie n'est visible (§11). | vue au premier essai réel de la recette 2 |
 | `mask` | Les zones masquées des captures : la barre latérale et le bloc du compte. | `nav[aria-label="Main navigation"]` et `aside` vus ; `data-slot` à confirmer |
 | `sent_label` | Le panneau « SENT TO THE LLM » du 13/10, en secours du popover. | disparu |
+| `sidebar`, `conversation_path` | La barre latérale (`aside`, `nav[aria-label="Main navigation"]`) et le chemin d'une conversation (`/conversation/<id>`) : le registre (v2.3) n'y cherche une conversation que par son adresse exacte. | vus le 17/10 |
+| `search_entry` | L'entrée de la recherche ⌘K en tête de la barre latérale, `button:has-text("Search conversations")` : le secours quand `ControlOrMeta+K` n'ouvre rien. | texte et indice ⌘K vus le 18/10 ; balisage à confirmer |
+| `search_input`, `search_result`, `search_empty` | La palette de recherche (attendue en cmdk : `[cmdk-input]`, `[cmdk-item]`, `[cmdk-empty]`), ses résultats cherchés dans la palette seule. Modale `own` « recherche » de `KNOWN_MODALS`. | à confirmer (`probe.json`, `search.json`) |
+| `conversation_menu_trigger`, `menu`, `menu_item`, `menu_rename`, `menu_delete` | Le menu d'une conversation : un `button[aria-haspopup="menu"]` dans l'élément de cette conversation, révélé au survol ; ses entrées `[role="menuitem"]` « Renommer » et « Supprimer », par leur texte. | jamais lu ; à confirmer (`probe.json`, puis `conversation.json`) |
+| `rename_field`, `rename_submit` | Le champ du nouveau titre (le focus, sinon un champ texte de la barre latérale ou d'une fenêtre), et le bouton qui valide une fenêtre de renommage. Modale `own` « renommer ». | à confirmer (`conversation.json`, `field`) |
+| `KNOWN_MODALS` « suppression » | La confirmation de suppression, `[role="alertdialog"]`, validée par son seul bouton dont le texte suit `supprimer\|delete\|confirmer\|confirm`, jamais annulée par erreur ni validée par la garde (Échap). | à confirmer (`conversation.json`, `confirmation`) |
+| `feedback_entry` | L'entrée de « Votre avis », `button[aria-label="Send feedback"]`, fixée en bas à gauche ; l'enquête qu'elle ouvre doit être reconnue par `KNOWN_MODALS` « avis » (vue le 17/10 après les abandons). | entrée vue le 18/10 ; l'enquête qu'elle ouvre à confirmer (`avis.json`) |
+| `input_status`, `notices` | Ce que dit la page d'une question restée sans réponse : `#chat-input-status` (`role="status"`, `aria-live="polite"`) sous le compositeur, les alertes et les toasts. | `#chat-input-status` vu le 18/10 ; son texte d'erreur et les toasts à confirmer (`failure.json`) |
 
 Les symptômes d'un sélecteur faux :
 - un KO `réponse vide : échec silencieux` alors que la réponse est visible dans Chrome : `assistant_message` ;
@@ -421,7 +453,8 @@ Les symptômes d'un sélecteur faux :
 - `sent.json` avec un `label` vide alors que `content_text` commence par un libellé : `details_label` ;
 - un gros document « prêt » avec `ready_by: quiet` en 2 s : la puce ne montre aucun état reconnu, voir `attach_pending` et `attach_busy` ;
 - toutes les réponses notées « affichage encore en mouvement », ou 30 s d'attente après chaque réponse : `stop_button` désigne un bouton qui ne disparaît pas ;
-- `choisir_modele` ou `recherche_web` refusés `precondition` : `model_button`, `listbox`, `option` ou `web_button`.
+- `choisir_modele` ou `recherche_web` refusés `precondition` : `model_button`, `listbox`, `option` ou `web_button` ;
+- v2.3 : `lister_conversations M8-4` refusé « la recherche ne s'ouvre pas » : `search_entry` et `search_input` ; « pas le menu d'une conversation » ou « pas de bouton de menu sur la conversation » sur `renommer_conversation` : `conversation_menu_trigger`, `menu`, `menu_item` (lisez `probe.json` de M0, puis `conversation.json`) ; « pas de champ pour le nouveau titre » : `rename_field` ; « pas de confirmation de suppression » : `KNOWN_MODALS` « suppression » ; `ouvrir_avis` refusé `dialog` « modale inconnue après l'entrée « Votre avis » » : l'enquête que l'entrée ouvre n'est pas celle de `KNOWN_MODALS` « avis ».
 
 Après N5, relisez aussi le `model.json` de `choisir_modele` : sa liste `options` dit les modèles réellement proposés, et `gemini`, le modèle de N5-3, doit y figurer.
 
@@ -584,7 +617,7 @@ Le journal du driver est append-only et survit à tout : à la tâche, au démon
 - `replayed: true` : le cas est déjà journalisé, le harnais passe au suivant sans toucher MaskAI ;
 - refus `precondition` : le cas reste à faire, le harnais le joue.
 
-Le verdict rejoué est réinscrit au registre de la nouvelle tâche, ce qui permet au juge de voir tous les cas. **Pour reprendre, on soumet de nouveau la même recette.** Cela vaut après un dialogue, une tâche échouée, un démon tué, ou un verdict ou un rapport qu'on refuse de signer. Avant de soumettre, deux choses sont à mettre de côté.
+Le verdict rejoué est réinscrit au registre de la nouvelle tâche, ce qui permet au juge de voir tous les cas. **Pour reprendre, on soumet de nouveau la même recette.** Le registre des conversations (`conversations.json`, v2.3) ne se met jamais de côté : c'est lui qui dit à M8-5 et M8-6 quelle conversation la recette a créée. Cela vaut après un dialogue, une tâche échouée, un démon tué, ou un verdict ou un rapport qu'on refuse de signer. Avant de soumettre, deux choses sont à mettre de côté.
 
 - **Les observations du driver.** `observations.json` garde la dernière mesure non jugée. N0-1 et N0-2 se jugent sur la même mesure de chargement (`@load`). Si N0-1 est journalisé et N0-2 ne l'est pas, une ancienne mesure resterait là pour juger N0-2. L'instruction N0 mesure déjà avant le verdict de N0-2 ; on retire en plus le fichier. Il se trouve dans `<dossier d'état>\drivers\maskai-1\work\observations.json`. Le driver le garde en mémoire, donc il faut l'arrêter avant de le déplacer.
 - **Le dossier publié.** La publication écrit dans le dossier existant sans le vider. Une tâche déjà publiée y laisse son `report.md` et son `verdict.md` à côté des nouveaux. On le renomme : il devient la trace de l'essai précédent.

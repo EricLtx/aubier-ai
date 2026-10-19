@@ -1,6 +1,7 @@
 # Procédure Aubier — troisième recette de MaskAI, « de bout en bout »
 
-Version 1, 2026-10-18. Ce document est un **delta** de `PROCEDURE-2.md` (version 1, 2026-10-17),
+Version 2, 2026-10-19 (la version 1 est du 18/10 ; la version 2 suit le pilote v2.3, qui joue M8-4 à
+M8-8 et livre le §6). Ce document est un **delta** de `PROCEDURE-2.md` (version 1, 2026-10-17),
 lui-même delta de `PROCEDURE.md` (version 2, 2026-10-13), et il ne les recopie pas. Tout ce qu'il
 ne dit pas reste valable : les six ENF, les règles de conduite, les sept étapes, le barème, les
 leçons et les annexes de `PROCEDURE.md` ; la grille M0–M7, ses budgets, ses réglages remis et ses
@@ -18,9 +19,9 @@ latence par couche (§5).
 | Fichier | Rôle |
 |---|---|
 | `PROCEDURE-3.md` | ce document : pourquoi, ce qui change, grille M0–M9, budgets, lecture par couche, exigences pour le pilote v2.3, contrat de masquage, rapport |
-| `cases-3-proposal.json` | les cas M8 et M9 proposés, au format des entrées de `cases.json` : sous `cases`, les neuf que le pilote v2.2 sait jouer ; sous `a_implementer`, les cinq qui attendent le pilote v2.3 |
+| `cases-3-proposal.json` | les quatorze cas M8 et M9, au format des entrées de `cases.json`, tous entrés dans `cases.json` : neuf avec le pilote v2.2, cinq avec le pilote v2.3 |
 | `recipes/recette-maskai-3.json` | la recette gouvernée : plan, dix niveaux de harnais M0–M9, juge, signature, rédaction, signature, publication |
-| `drivers/maskai-recette/cases.json` | les 94 cas M0–M7 ; les neuf cas exécutables de M8 et M9 y entrent à la fusion du pilote v2.2 (§6) |
+| `drivers/maskai-recette/cases.json` | les 108 cas M0–M9 (94 + 8 + 6) ; M8-4 à M8-8 y sont entrés avec le pilote v2.3 (§6) |
 | `corpus/`, `corpus-v3/` | corpus v1 (M2, M8-3) et v3 (M1) ; aucun document nouveau |
 | `docs/technical/debriefs/2026-10-17-maskai-driver.md` | le débriefing du pilote, dont les mesures par nœud servent de repère à §5 |
 | `2026-10-17-maskai-benchmark.md` | la base signée du delta (§9) |
@@ -60,7 +61,8 @@ sur le corps de la réponse (M7).
     haiku 5-5, recherche web off.
   - M8 et M9 se jouent après M7. La remise de la recherche web dans l'état trouvé passe de M7 à
     M9, le dernier niveau.
-  - Une conversation neuve par cas, sauf pour M8-2, qui lit la barre latérale juste après M8-1.
+  - Une conversation neuve par cas qui pose une question. M8-2 et M8-4 à M8-8 n'en ouvrent pas : ils
+    lisent ou modifient la barre latérale, le compositeur ou l'enquête, autour de la conversation de M8-1.
   - Les niveaux à pièce jointe (M1-J, M2) sont rejoués, et M8-3 s'y ajoute.
 - **Étape 5, jugement.** Quatre ajouts, tous recopiés dans le but de la recette, car le juge ne
   lit aucun fichier :
@@ -96,46 +98,51 @@ M0 à M7 sont inchangés : mêmes 94 cas, mêmes questions, mêmes oracles, mêm
 | M5 Conversation longue | Le contexte tient-il sur huit tours ? | M5-1, inchangé | 10 s par tour | véracité, disponibilité |
 | M6 Charge concurrente | Deux traitements courts passent-ils ensemble ? | M6-1, M6-2, inchangés | 15 s | disponibilité, scalabilité |
 | M7 Conformité et identité | L'assistant dit-il qui il est et où vont les données ? | M7-1 … M7-3, inchangés | 10 s | conformité |
-| **M8 Fonctionnalités** | Les fonctions autour du message marchent-elles ? | M8-1 … M8-3 joués ; M8-4 … M8-8 à implémenter | 10 s ; 20 s pour M8-3 | disponibilité, conformité ; véracité (M8-3) |
+| **M8 Fonctionnalités** | Les fonctions autour du message marchent-elles ? | M8-1 … M8-8 (M8-4 … M8-8 avec le pilote v2.3) | 10 s ; 20 s pour M8-3 | disponibilité, conformité ; véracité (M8-3) |
 | **M9 Pertinence** | Les réponses servent-elles un gestionnaire de biens ? | M9-1 … M9-6 | 10 s | véracité, performance |
 
-Au total, 103 cas sont joués (94 + 3 + 6) et 100 conversations créées (les 92 de la recette 2,
-plus M8-1, M8-3 et les six de M9). Cinq cas sont proposés en attente du pilote v2.3.
+Au total, 108 cas sont joués (94 + 8 + 6) et 100 conversations créées (les 92 de la recette 2,
+plus M8-1, M8-3 et les six de M9). M8-6 en supprime une, celle de M8-1 : la seule conversation que
+la recette supprime.
 
 ### M8 — Fonctionnalités
 
-Ce que l'utilisateur fait autour du message. Un cas par fonction. Une fonction qui demande une
-action que le pilote v2.2 n'a pas devient une exigence pour le pilote v2.3 (§6), et son cas reste
-« à implémenter » : il est proposé dans `cases-3-proposal.json` (sous `a_implementer`), avec une
-sorte qui existe déjà, mais la recette ne le nomme pas.
+Ce que l'utilisateur fait autour du message. Un cas par fonction. Les fonctions que le pilote v2.2
+ne savait pas jouer ont fait les exigences du pilote v2.3 (§6), livré le 19/10 : leurs cinq cas,
+M8-4 à M8-8, gardent une sorte qui existe déjà, nomment l'action qui les joue (champ `action`, la
+seule qui le peut) et sont joués.
 
 | Cas | Sorte | État | Ce qui est joué | Jugé sur | ENF |
 |---|---|---|---|---|---|
 | M8-1 | `model` | joué | un message sans donnée identifiante sur claude haiku 5-5, dont le début sert de titre connu (« Recette trois, fiche pratique : … ») | la bannière nomme le modèle choisi (verdict du pilote) ; le corps répond ; aucun jeton ; la source du texte envoyé | conformité, disponibilité |
 | M8-2 | `list` | joué | `lister_conversations` juste après M8-1 | le titre de M8-1 figure dans la barre latérale | disponibilité |
 | M8-3 | `attach_question` | joué | la facture scannée en JPEG (`corpus/03b_facture_berthod_scan.jpg`), oracle DOC-03 | l'état de la puce ; les valeurs de DOC-03, comme M2-3 | disponibilité, véracité |
-| M8-4 | `list` | à implémenter (E2) | recherche ⌘K (Ctrl+K) du titre connu | le titre de M8-1 dans les résultats | disponibilité |
-| M8-5 | `list` | à implémenter (E1, E3) | renommer la conversation de M8-1, créée par la recette | le nouveau titre est listé | disponibilité |
-| M8-6 | `list` | à implémenter (E1, E3) | supprimer cette même conversation, créée par la recette, et aucune autre | le titre renommé n'est plus listé | disponibilité |
-| M8-7 | `model` | à implémenter (E4) | relire le bouton de dictée avec le sélecteur de modèle, sans jamais le presser | « micro : idle » | disponibilité |
-| M8-8 | `message` | à implémenter (E5) | ouvrir « Votre avis » depuis son entrée, puis le fermer par sa croix | « fermé par : croix ; envoyé : non » | disponibilité |
+| M8-4 | `list` | joué (v2.3, E2) | recherche ⌘K (Ctrl+K) du titre connu, `lister_conversations` M8-4 | le titre de M8-1 parmi les résultats (l'oracle ne lit que les titres trouvés, après « résultats : ») | disponibilité |
+| M8-5 | `list` | joué (v2.3, E1, E3) | renommer la conversation de M8-1, créée par la recette, `renommer_conversation` M8-5 | le nouveau titre est relu et listé | disponibilité |
+| M8-6 | `list` | joué (v2.3, E1, E3) | supprimer cette même conversation, créée par la recette, et aucune autre, `supprimer_conversation` M8-6 | le titre renommé n'est plus listé | disponibilité |
+| M8-7 | `model` | joué (v2.3, E4) | relire le bouton de dictée avec le sélecteur de modèle, sans jamais le presser | « micro : idle » | disponibilité |
+| M8-8 | `message` | joué (v2.3, E5) | ouvrir « Votre avis » depuis son entrée, puis le fermer par sa croix, `ouvrir_avis` M8-8 | « fermé par : croix ; envoyé : non » | disponibilité |
 
 - **Titre connu.** Le 17/10, la barre latérale titrait chaque conversation par son premier message,
-  coupé vers 45 caractères. Le début de M8-1 sert donc de titre à M8-2, puis à M8-4 à M8-6 quand
-  ils seront joués. Ce titre ne porte aucune donnée identifiante, et ces cas ne lisent ni ne citent
-  les titres des conversations antérieures à la recette.
+  coupé vers 45 caractères. Le début de M8-1 sert donc de titre à M8-2, puis à M8-4 à M8-6. Ce
+  titre ne porte aucune donnée identifiante, et ces cas ne citent aucun titre d'une conversation
+  antérieure à la recette, hors ce que la barre latérale et la recherche listent. M8-5 et M8-6
+  n'agissent que sur la conversation que M8-1 a créée : le pilote la tient dans son registre (E1)
+  et la retrouve par son adresse, jamais par son rang ni par son titre, qu'une conversation de la
+  première exécution du 18/10 partage.
 - **Bannière et « Détails ».** M8-1 vérifie la bannière par le mécanisme des cas `model` (KO
   conformité si elle ne nomme pas le modèle choisi). Pour « Détails », c'est le cas témoin : une
   carte sans donnée identifiante peut ne pas en porter, et le juge note ce qu'il a vu (§7, point 4).
 - **Dictée.** Le pilote ne presse jamais ce bouton. Depuis la v2.1, une dictée en cours au début
-  d'une action est un refus `precondition`. Ce qui manque, c'est la preuve que le bouton est
-  présent (E4).
+  d'une action est un refus `precondition`. Depuis la v2.3, son état est relu avec le sélecteur de
+  modèle (E4) : c'est M8-7.
 - **« Votre avis ».** Le pilote ferme cette enquête par sa croix quand elle apparaît (le 17/10,
-  après chaque abandon ; débriefing D2). M8-8 l'ouvrira exprès quand son entrée aura été relevée
-  (E5).
+  après chaque abandon ; débriefing D2), et chaque ligne compte ces apparitions (`modals_closed`).
+  M8-8 l'ouvre exprès depuis son entrée, le bouton « Send feedback » de la barre latérale (E5).
 - **Types de fichiers.** Une pièce jointe par famille, comptée sur toute la recette. La liste
-  `accept` du champ de fichier n'a jamais été relevée : E6 la fait lire, et une famille acceptée
-  sans document au corpus deviendra un cas à la révision suivante. Tant que le service
+  `accept` du champ de fichier n'était pas relevée avant le pilote v2.3 : E6 la fait lire. Chaque
+  ligne de pièce jointe la porte (`attach.accept`), et la sonde de M0 la relève ; une famille
+  acceptée sans document au corpus deviendra un cas à la révision suivante. Tant que le service
   documentaire est hors service, la règle des pièces jointes (§2) s'applique.
 
 | Famille | Cas qui la joint |
@@ -194,7 +201,7 @@ pas.
 
 | Pas | Actes sur le chemin complet | `max_actions` (3 × actes + 10) | `timeout_s` |
 |---|---|---|---|
-| M0 | 13 | 49 | 1800 |
+| M0 | 14 | 52 | 1800 |
 | M1 | 112 | 346 | 2700 |
 | M2 | 54 | 172 | 2700 |
 | M3 | 215 | 655 | 3600 |
@@ -202,12 +209,15 @@ pas.
 | M5 | 8 | 34 | 2700 |
 | M6 | 10 | 40 | 1800 |
 | M7 | 16 | 58 | 1800 |
-| M8 | 17 | 61 | 1800 |
+| M8 | 32 | 106 | 1800 |
 | M9 | 29 | 97 | 1800 |
 
 - M7 perd un acte, la remise de la recherche web, qui passe à M9.
+- M0 : un acte de plus que la recette 2, la sonde d'interface (`sonder_interface`, v2.3, E11),
+  après les deux chargements.
 - M8 : 2 de configuration ; M8-1, 5 (verdict, conversation neuve, choix du modèle, question,
-  verdict) ; M8-2, 3 (verdict, liste, verdict) ; M8-3, 5 ; capture et export, 2.
+  verdict) ; M8-2, 3 (verdict, liste, verdict) ; M8-3, 5 ; M8-4 à M8-8, 3 chacun (verdict, l'action
+  du cas, verdict) ; capture et export, 2.
 - M9 : 2 de configuration ; 6 × 4 ; la remise de la recherche web, 1 ; capture et export, 2.
 - La lecture de « Détails » allonge chaque question de moins d'une seconde au banc d'essai. Les
   `timeout_s` de la recette 2 gardent leur marge.
@@ -250,13 +260,13 @@ Le juge rend deux choses.
 La latence est mesurée. L'imputation d'un bruit à une couche est déduite, et le rapport le dit
 (« déduit », `PROCEDURE.md` §6, étape 5).
 
-## 6. Ce que le pilote v2.3 doit fournir
+## 6. Ce que le pilote v2.3 fournit
 
-Le pilote v2.2 suffit pour tous les cas que nomme la recette 3. Les exigences ci-dessous débloquent
-les cinq cas « à implémenter » (E1 à E5) ou rendent le jugement plus sûr (E6 à E9). Chaque cas à
-implémenter garde une sorte existante : la nouvelle action écrit l'observation que lit déjà le
-verdict de cette sorte (`@list` pour `list`, `@model` pour `model`, l'observation du cas pour
-`message`).
+Livré en v2.3 le 19/10. Les exigences E1 à E5 ont débloqué les cinq cas qui étaient « à
+implémenter » ; E6 à E9 rendent le jugement plus sûr ; E10 et E11 s'y sont ajoutées après la
+première exécution de la recette 3 (18 et 19/10). Chaque cas débloqué garde une sorte existante : la
+nouvelle action écrit l'observation que lit déjà le verdict de cette sorte (`@list` pour `list`,
+`@model` pour `model`, l'observation du cas pour `message`).
 
 | # | Exigence | Débloque |
 |---|---|---|
@@ -268,21 +278,33 @@ verdict de cette sorte (`@list` pour `list`, `@model` pour `model`, l'observatio
 | E6 | **Liste `accept`.** `joindre_document` lit l'attribut `accept` du champ de fichier caché, le rend dans son résultat et le met dans l'`attach` de la ligne. Le juge compare familles acceptées et familles jointes (§3, M8). | les cas de familles à écrire |
 | E7 | **Ligne de journal au service du contrat.** Chaque ligne porte `sent_source` (`card-details`, `composer-popover` ou nul, avec la raison du rejet), `sent_tokens` (les types des jetons du texte envoyé, numérotation repliée, par exemple `{"PERSON": 2, "IBAN": 1}`) et le nombre de données identifiantes que déclare le panneau de garde. Le juge compare ainsi les ensembles masqués des passages a et b (§7, point 5) sans lire `sent.json`. Avec la v2.2, il s'en tient à `sent_sha256` (texte envoyé à la numérotation des jetons près) et à la note de passage a. | jugement de M1 |
 | E8 | **Lignes de correction.** Une ligne `supersedes` porte `inputs_sha256` et `ui_profile_sha256` comme une ligne d'exécution (le 18/10, celles de 18:43 n'en portaient aucun). | traçabilité |
-| E9 | **Classe d'erreur de la puce.** Une puce en échec donne à la ligne une `error_class` sans nom d'hôte ni pile, par exemple « service documentaire injoignable ». Le libellé brut reste dans les preuves, privées. Aujourd'hui, il passe dans la note de la ligne, et donc dans ce que lisent le juge et la rédaction. | règle des pièces jointes, confidentialité |
+| E9 | **Classe d'erreur de la puce.** Une puce en échec donne à la ligne une `error_class` sans nom d'hôte ni pile, par exemple « service documentaire injoignable ». Le libellé brut reste dans les preuves, privées. Avant la v2.3, il passait dans la note de la ligne, et donc dans ce que lisent le juge et la rédaction. | règle des pièces jointes, confidentialité |
+| E10 | **Diagnostic de l'échec silencieux.** Une question sans nouvelle carte de réponse, ou avec une carte vide : le pilote relève la ligne d'état du compositeur (`#chat-input-status`), les alertes et les toasts, le statut HTTP du flux et ses derniers événements, avec la charge utile d'une erreur. La ligne porte une `error_class` et un extrait expurgé de 80 caractères au plus (`error_excerpt`), sans nom d'hôte, chemin ni pile ; la capture brute ne va qu'à la preuve `failure.json`. | disponibilité (la nuit du 18 au 19/10, 12 modèles sur 14 sans réponse après `detect_pii`, « échec silencieux » sans autre indice) |
+| E11 | **Sonde d'interface.** `sonder_interface`, en lecture seule, jouée en M0 : chaque sélecteur résolu, l'entrée de la recherche ⌘K et sa palette, l'entrée de « Votre avis », le bouton de dictée, la liste `accept`, et le menu de la première conversation de la barre latérale (ouvert, lu, refermé par Échap, aucune entrée cliquée, ni son titre ni son adresse gardés) ; preuve `probe.json`. Elle ne refuse rien. | confirmer le balisage réel avant que M8 en ait besoin |
 
-**À la fusion des cas** (avec le pilote v2.2, hors de cette branche documentaire) :
+**Livraison.** Les neuf cas de M8 et M9 jouables avec le pilote v2.2 sont entrés dans `cases.json`
+à sa fusion, les cinq autres avec le pilote v2.3. `drivers/maskai-recette/tests/test_recipe_cases.py`
+lit les trois recettes, compte trente blocs de règles, borne chaque grille à ses niveaux (M0–M7 pour
+la recette 2, M0–M9 pour la recette 3) et vérifie la forme v2.3 de la recette 3 (la sonde en M0, les
+huit cas de M8 dans l'ordre, le renommage et la suppression par M8-5 et M8-6 seuls). `cases.json` est
+dans le dossier haché du driver : `files_sha256` est régénéré, et `inputs_sha256` change.
+`scripts/recette/correct.py` écrit les lignes de correction (E8) : il rejoue hors ligne le jugement
+du driver sur l'observation gardée, à blanc par défaut.
 
-1. Les neuf entrées de `cases` de `cases-3-proposal.json` s'ajoutent à
-   `drivers/maskai-recette/cases.json`. Il faut aussi y ajouter la clé `procedure_3` et une note
-   M8 et M9. Les entrées de `a_implementer` n'y entrent qu'avec le pilote v2.3, sinon la recette 3
-   ne couvrirait plus sa grille.
-2. `drivers/maskai-recette/tests/test_recipe_cases.py` doit apprendre trois choses :
-   - lire `recette-maskai-3.json` ;
-   - compter 30 blocs de règles au lieu de 20 ;
-   - borner la grille de chaque recette à ses niveaux : M0–M7 pour la recette 2, M0–M9 pour la
-     recette 3. Sans cette borne, la recette 2 échoue dès que M8 et M9 entrent dans `cases.json`.
-3. `cases.json` est dans le dossier haché du driver : `files_sha256` se régénère, et
-   `inputs_sha256` change.
+**Choix du pilote v2.3, à relire au premier passage réel :**
+- l'oracle de M8-4 ne lit les titres qu'après « résultats : » (`resultats? : .*recette trois`) : la
+  ligne recopie la requête en tête, et l'oracle proposé le 18/10 (`recette trois`) passait même sans
+  aucun résultat ;
+- un menu n'est celui d'une conversation que s'il porte exactement une entrée de renommage et une de
+  suppression, et aucune qui viserait plus d'une conversation (« tout », « all », « historique ») :
+  sinon rien n'est cliqué ;
+- une observation partagée (`@load`, `@list`, `@model`, `@web`) ne juge qu'un cas, celui qui la lit
+  le premier, sauf un cas sondé avant qu'elle soit faite (N7-1 et N7-2 sur une même liste) : la sonde
+  de M8-4 ne se juge pas sur la liste de M8-2, ni celle de M8-7 sur le choix de modèle de M8-1 ;
+- la palette ⌘K, la fenêtre de renommage et la confirmation de suppression sont des modales `own` :
+  laissées ouvertes par une action coupée, la garde suivante les ferme par Échap, sans jamais valider ;
+- `sent_tokens` compte chaque occurrence d'un type de jeton, à la numérotation près, comme
+  `sent_sha256` ; nul quand le texte envoyé n'est pas observé.
 
 ## 7. Contrat de masquage, opposable au juge
 
@@ -345,7 +367,8 @@ place ainsi :
 - Disponibilité : le tableau des fonctionnalités (M8) et l'état du canal pièce jointe.
 - Sécurité : le contrat appliqué document par document (P1 à P6), canal par canal, passage a puis
   b. Pour chacun : texte envoyé observé ou non, fuite ou non, entités masquées, écart a/b.
-- Traçabilité : M8-4 à M8-8, NON TESTÉ (à implémenter).
+- Traçabilité : la conversation de M8-1, créée, renommée (M8-5) puis supprimée (M8-6) par la
+  recette, et aucune autre (le registre du pilote ; le champ `conversation` des lignes).
 
 **Confidentialité.**
 - Le rapport reste privé, sous `docs/functional/use-cases/recettage-chat-ia/private/`, tant que
@@ -361,5 +384,5 @@ place ainsi :
   main, et le rapport le note.
 - Une recette arrêtée avant M9 laisse la recherche web off : le rapport le dit dans
   « Traçabilité ».
-- Les 100 conversations créées ne sont pas supprimées (M8-6 n'est pas joué). Le rapport les liste
-  par niveau.
+- Des 100 conversations créées, la recette n'en supprime qu'une, celle de M8-1 (M8-6) ; les 99
+  autres restent, et le rapport les liste par niveau.
