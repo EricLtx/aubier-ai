@@ -1,8 +1,9 @@
 # The potential value of information in the learning pipeline — design
 
 Date: 2026-10-18. Status: design validated section by section with the founder (decisions D-26 of
-the open-decisions register); implementation after Task 12 of the learning chantier (the contracts
-are frozen until then). Extends `2026-10-17-driver-learning-office-design.md` (vkforge: inventory,
+the open-decisions register); Task 12 of the learning chantier held on 2026-10-19 and the chantier
+merged (`22962c7`, tag `driver-learning`); the implementation is scheduled by the founder (register,
+D-34), and its plan brings the optional contract fields of §3.2 to the founder's review. Extends `2026-10-17-driver-learning-office-design.md` (vkforge: inventory,
 bind, mine, plan, generate, qualify, debrief), which stays binding; this document adds one quantity
 and the places where it acts. Thesis it serves (research note of 2026-10-18, private): the relevance
 of information and the reduction of its entropy as it crosses compliant layers.
@@ -57,3 +58,10 @@ Fewer model calls (VOI-gated), a plan legible in value and in missing bits, a ga
 ## 6. Plan rulings expected at implementation
 
 `VOI_MIN = 0.25`, `min_value_rate = 0.9`, `critical_value = 0.9` are defaults to confirm on the first real corpus; the optional contract fields follow the frozen-contract rule (a founder decision at the implementation plan's review); `ontology_sha256` changes with the new `value` fields, so every binding fixture is regenerated.
+
+Notes from the learning chantier's final review (2026-10-19), for that plan:
+
+- `LearnedRow.qualification` gains `min_value_rate` with `#[serde(default)]`, so a `learned` row written before the field still reads; `DriverQualified.value_rate` is optional for the same reason.
+- The ontology's `VERB_FIELDS` must accept `value`; every binding fixture is regenerated with the new `ontology_sha256`.
+- `min_passes = min(10, corpus files)` (final review I-3) and `min_rate` 1.0 for Word and PowerPoint (founder decision D-30) stay; `value_rate ≥ min_value_rate` is checked beside them, not instead of them.
+- The gate runs before every spawn of a learned driver once the follow-ups chantier lands (founder decision D-31, plan `2026-10-19-learning-follow-ups.md`, ruling LF-9), so the value threshold will too, not only at mount.

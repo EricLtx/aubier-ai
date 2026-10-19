@@ -214,3 +214,12 @@ The python-build-standalone release to pin (3.13.x, `install_only`, the SHA-256 
 ## 11. TCB statement additions
 
 `contracts/tcb.md` §Drivers: a packed driver's identity covers its interpreter and libraries (R15 closed for `source: installed`); the development root keeps R5's exclusions and is allowed only under the interactive daemon; the publisher key signs packages and nothing else; the install step trusts the administrator's TOFU confirmation and the read-only ACL of `%ProgramFiles%`, and the fingerprint before every spawn is the control that catches a rewrite; `tampered` is a degradation, not a refusal of a human act.
+
+## 12. Rulings taken at implementation (merged 2026-10-18) and after
+
+The SDD ledger (private, `docs/archive/technical/reviews/2026-10-18-driver-packaging-sdd-ledger.md`) holds the rulings; the ones that change what this document says:
+
+- **R-F1, a name binds its publisher.** A driver name already installed on a node binds its publisher: a package for that name signed by another key is refused with `remedy: vk driver uninstall every version of <name> first`, and the trust-on-first-use prompt prints how many publishers the node already pins. No payload or schema moves.
+- **R-F2, the installed command.** For `source: installed`, the kernel's `check_context` requires `command` to be `["python/python.exe", …, "-B", …, "<script>.py"]` with `root/python/python.exe` a regular file (`remedy: repack the driver with vk driver pack`); `vk driver pack` refuses the same at pack time.
+- **R-F3, parked.** The rule requires `-B` only. Requiring `-E -s` (or `-I`) is a one-line policy change left to the session-agent chantier's manifest work (open decision D-11 of the founder's register).
+- **A learned driver is not packed in this version** (learning chantier, final review I-4; founder decision D-27 of 2026-10-19): `vk driver pack` refuses a manifest of `kind: com`, and a learned driver mounts from its learn directory. Packing one (the `comtypes` wheels, `secrets.json` outside the file layer) is a separate chantier.
