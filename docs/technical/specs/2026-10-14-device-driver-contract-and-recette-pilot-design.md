@@ -194,3 +194,14 @@ Which arches plan, judge and draft (subscription or API); Chrome or Edge channel
 ## 11. TCB statement additions
 
 `contracts/tcb.md` gains a "Devices (pilot)" section: the driver is trusted for the host allow-list and runs with the interactive user's rights inside the governor's Job Object; the kernel's enforcement is the list of §4.3; `hosts_seen` and the driver hash in the manifest are the detection and identity controls; the browser profile holds a live session to a third-party service and is protected by the state directory's ACL only.
+
+## 12. The pilot after this spec: v2 and v2.1 (merged 2026-10-18), v2.2 and v2.3 (branch `maskai-recette-3`)
+
+The contract above did not move: no new syscall, ledger kind or manifest field. The MaskAI driver grew inside it, from the debrief of its first live run (`docs/technical/debriefs/2026-10-17-maskai-driver.md`) and from the platform's return on 2026-10-18.
+
+- **v2** adds the composer actions `choisir_modele`, `recherche_web` and `conversation_longue`, an attachment state machine (an attachment's chip is read before sending), the text sent to the model read from the composer's popover, and `ui_profile_sha256` on every journal line.
+- **v2.1** reads the platform of 2026-10-18 by structure: fourteen models in a listbox, a three-state web search button, the dictation button. A step refuses to measure a page it cannot trust: a maintenance page, a sign-in page or an entry navigation aborted by a sign-in redirect (« non connecté »: the browser profile is not signed in), the platform's authentication error page, a dictation in progress. Recette 2 ran on every model of the selector (94 cases, 2026-10-18); its journal was corrected by appended `supersedes` lines and rejudged, never rewritten.
+- **v2.2** (branch `maskai-recette-3`) reads the text sent to the model from the answer card's « Détails » panel, opened, read and closed after each answer, and never presses the reveal toggle; the evaluator folds `pii://` links. The evaluator's change moves `inputs_sha256`, so a line judged by the new rules says so (ruling R18).
+- **v2.3** (in progress on the same branch, founder decision D-32 of 2026-10-19) plays the last five feature cases of recette 3, captures the error a page shows on a silent failure, and inventories the masked entities so that the judge can weigh the gap between what was sent and what was promised.
+
+The procedures live under `docs/functional/use-cases/recettage-chat-ia/`: `PROCEDURE-2.md` (recette 2), and `PROCEDURE-3.md` on branch `maskai-recette-3` until it merges (recette 3, black box, end to end, grid M0–M9, with the masking contract the judge applies).

@@ -1,5 +1,10 @@
 # Procédure Aubier — seconde recette de MaskAI, « MaskAI en profondeur »
 
+> **Statut au 2026-10-20.** Jouée le 18/10 sur le nœud (tâche `task-node-1-75`, pilote v2.1,
+> quatorze modèles), journal corrigé puis rejugée, non signée : la grille a été jugée injuste et
+> incomplète pour servir une refonte. La recette 3, de bout en bout, la remplace (`PROCEDURE-3.md`,
+> branche `maskai-recette-3` jusqu'à son merge).
+
 Version 1, 2026-10-17. Ce document est un **delta** de `PROCEDURE.md` (version 2, 2026-10-13) et
 ne la recopie pas. Tout ce qu'il ne dit pas reste valable : les six ENF (§2), les règles de
 conduite (§5), les sept étapes (§6), le barème (§7), les leçons (§8) et les annexes. Il remplace,

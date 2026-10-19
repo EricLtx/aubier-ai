@@ -508,7 +508,18 @@ the flag-built task (`--goal`, `--artefact`, `--plan`, `--draft`, `--harness`,
 `--judge`, `--approve`, `--release`); a harness step is then run with
 `vk harness run TASK`, as before.
 
-The first use is the MaskAI recette, sixteen steps. The procedure for the
+The first use is the MaskAI recette. `recipes/recette-maskai.json` (sixteen
+steps) ran on 2026-10-17 and its report was signed; `recipes/recette-maskai-2.json`
+(grid M0–M7, 94 cases over the fourteen models of the platform's selector)
+ran on 2026-10-18 with the driver's v2.1 and was not signed. The v2.1 driver
+refuses to measure a page it cannot trust — a maintenance page, a sign-in page
+(« non connecté »: the browser profile is not signed in), the platform's
+authentication error page, a dictation in progress — and reads the model
+listbox, the three-state web search button and the dictation button by
+structure. The third recette (grid M0–M9, black box, end to end) and the
+driver's v2.2 and v2.3 (the text sent to the model read from the answer's
+« Détails » panel) are on branch `maskai-recette-3` until it merges; the
+driver-contract spec, §12, says what changed. The procedure for the
 founder, in French, from the first boot to the release, is
 [`docs/technical/runbooks/recette-maskai.md`](runbooks/recette-maskai.md). The driver's
 tests run in CI (`driver-browser`) against a local fixture page in headless
