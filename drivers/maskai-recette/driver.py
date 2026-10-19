@@ -81,6 +81,32 @@ noire : le texte transmis au modèle est observé à chaque cas) :
   « lien pii:// rendu à l'utilisateur » quand la réponse en montre un ; `inputs_sha256` change
   avec lui.
 
+Ce que la v2.3 ajoute (décision du fondateur du 19/10 : la recette 3 rejouée avec sa grille entière ;
+PROCEDURE-3.md §6, E1 à E11) :
+- un registre des conversations que le driver crée (`conversations.json` du dossier de travail, avec
+  le cas qui a créé chacune) ; `same_conversation_as` s'y résout ;
+- la recherche ⌘K (`lister_conversations {case}` d'un cas qui porte une question), le renommage et la
+  suppression (`renommer_conversation`, `supprimer_conversation`, irréversibles) de la seule
+  conversation du registre que nomme `same_conversation_as`, retrouvée dans la barre latérale par son
+  adresse exacte, jamais par son rang ni par son titre seul, et refusée `precondition` avant tout clic
+  si le registre ne la connaît pas ; la suppression passe par la confirmation de l'application, une
+  modale `own` ;
+- l'état du bouton de dictée relu par choisir_modele (« ; micro : idle ») et sur chaque ligne, jamais
+  pressé ; l'enquête « Votre avis » ouverte depuis son entrée et fermée par sa croix (`ouvrir_avis`),
+  jamais envoyée ; `modals_closed` sur chaque ligne (les modales connues que la garde a fermées) ;
+- la liste `accept` du champ de fichier ; la classe d'erreur d'une puce en échec, sans nom d'hôte ni
+  pile (le libellé brut ne va qu'à la preuve `chip.json`) ; le diagnostic d'un échec silencieux (ligne
+  d'état du compositeur, alertes, statut HTTP et derniers événements du flux, preuve `failure.json`),
+  classé et expurgé sur la ligne ;
+- sur la ligne d'une question : `sent_source`, `sent_tokens` (les types des jetons envoyés) et
+  `pii_declared` (le compte du panneau de garde) ; la note `replay_of` compare les ensembles masqués des
+  passages a et b ;
+- une observation partagée (@load, @list, @model, @web) ne juge qu'un cas : celui qui la lit le
+  premier, ou un cas sondé avant qu'elle soit faite (N7-1 et N7-2 sur une même liste) ;
+- la sonde d'interface `sonder_interface`, en lecture seule (`probe.json`) ; `_judge`, le jugement de
+  verdict_oracle, que `scripts/recette/correct.py` rejoue hors ligne pour écrire les lignes de
+  correction.
+
 Environnement (posé par l'hôte) : VK_DRIVER_PROFILE_DIR, VK_DRIVER_WORK_DIR,
 VK_DRIVER_HEADLESS, VK_DRIVER_CHANNEL, VK_DRIVER_HOSTS ; MASKAI_ENTRY_URL
 remplace `ENTRY_URL` (le banc d'essai sur un autre port).
@@ -294,7 +320,55 @@ SELECTORS = {
     "auth_error": r"/api/auth/error",
     # Fenêtres modales (CSS).
     "modal": '[role="dialog"], [role="alertdialog"], [aria-modal="true"], .modal',
+    # -- v2.3 (relevés des 18 et 19/10 ; « à confirmer » : balisage jamais lu sur la plateforme) --------
+    # La barre latérale (vue le 17/10 : nav[aria-label="Main navigation"] dans un aside) : le driver n'y
+    # cherche une conversation du registre que par son adresse exacte (CSS).
+    "sidebar": 'aside, [data-slot="sidebar"], nav[aria-label="Main navigation"]',
+    # Le chemin d'une conversation, motif sur location.pathname (vu le 17/10 : /conversation/<id>).
+    "conversation_path": r"^/conversation/[^/?#]+$",
+    # L'entrée de la recherche ⌘K en tête de la barre latérale (vue le 18/10 : « Search conversations »
+    # et l'indice ⌘K ; balisage à confirmer). La recherche s'ouvre d'abord au clavier (ControlOrMeta+K),
+    # par cette entrée en secours (Playwright).
+    "search_entry": ['button:has-text("Search conversations")', '[role="button"]:has-text("Search conversations")',
+                     'button:has-text("Rechercher")', '[aria-keyshortcuts*="k" i]', 'button:has(kbd)'],
+    # La palette de recherche, attendue en cmdk comme la liste des modèles (à confirmer) : son champ, ses
+    # résultats et son état vide, cherchés dans la palette seule (CSS).
+    "search_input": ['[cmdk-input]', '[role="dialog"] input[role="combobox"]', '[role="dialog"] input[type="search"]',
+                     '[role="dialog"] input'],
+    "search_result": ['[cmdk-item]', '[role="option"]', 'a[href*="/conversation/"]'],
+    "search_empty": '[cmdk-empty]',
+    # Le menu d'une conversation de la barre latérale (jamais lu ; à confirmer par sonder_interface) : son
+    # déclencheur, cherché dans l'élément de cette conversation seule et révélé au survol ; le menu et ses
+    # entrées (CSS), retenues par leur texte (motifs, sur le texte replié).
+    "conversation_menu_trigger": ['button[aria-haspopup="menu"]', '[data-slot*="menu-trigger"]',
+                                  'button[aria-label*="option" i]', 'button[aria-label*="menu" i]',
+                                  'button[aria-label*="action" i]'],
+    "menu": '[role="menu"]',
+    "menu_item": '[role="menuitem"]',
+    "menu_rename": r"renommer|rename",
+    "menu_delete": r"supprimer|delete",
+    # Le champ du nouveau titre après « Renommer » (à confirmer) : l'élément qui a pris le focus, sinon un
+    # champ texte de la barre latérale ou d'une fenêtre (CSS) ; jamais la zone de saisie du compositeur ni
+    # un champ de recherche. Le bouton qui valide une fenêtre de renommage, par son texte (motif).
+    "rename_field": ['aside input[type="text"]', 'aside input:not([type])', '[role="dialog"] input[type="text"]',
+                     '[role="dialog"] input:not([type])', 'aside [contenteditable="true"]'],
+    "rename_submit": r"enregistrer|save|renommer|rename|valider|confirmer|confirm",
+    # L'entrée de « Votre avis » (vue le 18/10 : button[aria-label="Send feedback"], fixé en bas à gauche) ;
+    # les suivantes à confirmer (Playwright).
+    "feedback_entry": ['button[aria-label="Send feedback"]', 'button[aria-label*="feedback" i]',
+                       'button[aria-label*="avis" i]', 'button:has-text("Votre avis")', 'button:has-text("Feedback")'],
+    # Ce que dit la page quand une question reste sans réponse (E10) : la ligne d'état sous le compositeur
+    # (vue le 18/10 : #chat-input-status, role="status", aria-live="polite"), les alertes et les toasts
+    # (à confirmer) (CSS).
+    "input_status": '#chat-input-status',
+    "notices": '[role="alert"], [role="status"], [data-sonner-toast], [data-slot*="toast"]',
 }
+# Les entrées de SELECTORS qui sont des motifs de texte ou d'URL, pas des adresses dans la page :
+# sonder_interface ne les résout pas.
+SELECTOR_PATTERNS = ("stop_text", "model_banner", "brand_model", "brand", "live_marker", "guard_pii", "guard_clean",
+                     "mask_token", "attach_failed", "attach_uploading", "attach_pending", "attach_ready",
+                     "details_label", "sent_label", "model_prefix", "web_words", "maintenance", "auth_error",
+                     "conversation_path", "menu_rename", "menu_delete", "rename_submit")
 # Modales connues : reconnues par leur sélecteur et fermées par leur bouton documenté (ou une touche,
 # « key:<touche> »), jamais par « OK » ni « Envoyer ». Une modale `own` est une fenêtre que le
 # driver ouvre lui-même : connue seulement quand c'est lui qui l'a ouverte ; ouverte par quelqu'un
@@ -313,6 +387,21 @@ KNOWN_MODALS = [
     # suivante le referme.
     {"name": "envoi", "selector": '[role="dialog"][data-slot="popover-content"]', "dismiss": "key:Escape",
      "own": True},
+    # v2.3, à confirmer. La palette de recherche ⌘K, ouverte par le driver (lister_conversations {case},
+    # sonder_interface), refermée par Échap dans la même action.
+    {"name": "recherche",
+     "selector": ('[role="dialog"]:has([cmdk-input]), [role="dialog"]:has(input[role="combobox"]), '
+                  '[role="dialog"]:has(input[type="search"])'),
+     "dismiss": "key:Escape", "own": True},
+    # Une fenêtre de renommage, si l'application en ouvre une (renommer_conversation) : abandonnée par
+    # Échap, jamais validée par la garde.
+    {"name": "renommer", "selector": '[role="dialog"]:has(input[type="text"]), [role="dialog"]:has(input:not([type]))',
+     "dismiss": "key:Escape", "own": True},
+    # La confirmation de suppression de l'application (supprimer_conversation) : validée par le seul bouton
+    # dont le texte suit `confirm`, dans cette fenêtre, par l'action qui l'a ouverte ; laissée ouverte par
+    # une action coupée, la garde suivante l'annule par Échap, jamais ne la valide.
+    {"name": "suppression", "selector": '[role="alertdialog"]', "dismiss": "key:Escape",
+     "confirm": r"supprimer|delete|confirmer|confirm", "own": True},
 ]
 # Motif de l'URL du flux de réponse (annexe A) : /api/chat/stream chez MaskAI.
 STREAM_PATTERN = r"chat/stream"
@@ -335,7 +424,8 @@ MAINTENANCE_FRESH_S = 600
 # elles) ; une capture d'écran, la lecture du flux ou de la dernière réponse n'en ont pas besoin.
 NEEDS_APP = ("mesurer_chargement", "nouvelle_conversation", "joindre_document", "poser_question",
              "envoyer_message", "lister_conversations", "charge_concurrente", "choisir_modele",
-             "recherche_web", "conversation_longue")
+             "recherche_web", "conversation_longue", "renommer_conversation", "supprimer_conversation",
+             "ouvrir_avis")
 # La couleur des zones masquées sur les captures.
 MASK_COLOR = "#FF00FF"
 # Fin de réponse (D6) : après la fin du flux, le corps de la nouvelle réponse immobile
@@ -366,6 +456,15 @@ DETAILS_MIN_S = 3.0
 # Recherche web coupée : une étape web_search plus longue que cela est une recherche faite.
 WEB_OFF_MAX_MS = 1000
 WEB_MODES = ("off", "auto", "on")
+# v2.3 : la palette ⌘K ouverte au plus SEARCH_OPEN_S après la touche ; ses résultats retenus immobiles
+# SEARCH_STABLE_S, au plus tôt SEARCH_MIN_S après la frappe, au plus SEARCH_CAP_S. Un menu, un champ, une
+# confirmation : au plus UI_WAIT_S. Un extrait d'erreur sur une ligne : EXCERPT_MAX caractères.
+SEARCH_OPEN_S = 2.5
+SEARCH_STABLE_S = 0.8
+SEARCH_MIN_S = 1.2
+SEARCH_CAP_S = 5.0
+UI_WAIT_S = 3.0
+EXCERPT_MAX = 80
 MARGIN_S = 8                      # laissé sous l'échéance de l'hôte pour écrire les preuves
 NFR_ORDER = ["performance", "veracite", "disponibilite", "securite", "conformite", "scalabilite"]
 
@@ -446,7 +545,23 @@ MODALS_JS = "(a) => {" + _VISIBLE + """
   return { known, unknown };
 }"""
 
-POLL_JS = "(a) => {" + _VISIBLE + _PICK + """
+# Ce que dit la page hors des cartes (v2.3, E10) : le texte de la ligne d'état du compositeur (a.status,
+# lue même cachée : elle est aria-live) et des alertes et toasts visibles (a.notices), en paires
+# [genre, texte].
+_NOTICES = """const notices = (a) => {
+    const out = [];
+    const st = a.status ? document.querySelector(a.status) : null;
+    const stText = st ? (st.innerText || st.textContent || '').trim().replace(/\\s+/g, ' ') : '';
+    if (stText) out.push(['status', stText.slice(0, 500)]);
+    if (a.notices) for (const el of document.querySelectorAll(a.notices)) {
+      if ((st && (el === st || st.contains(el) || el.contains(st))) || !visible(el)) continue;
+      const t = (el.innerText || '').trim().replace(/\\s+/g, ' ');
+      if (t) out.push([el.hasAttribute('data-sonner-toast') ? 'toast' : (el.getAttribute('role') || 'toast'), t.slice(0, 500)]);
+    }
+    return out.slice(0, 20);
+  };"""
+
+POLL_JS = "(a) => {" + _VISIBLE + _PICK + _NOTICES + """
   const ev = window.__ev || [];
   const msgs = pick(a.assistant);
   const last = msgs.length ? msgs[msgs.length - 1] : null;
@@ -455,8 +570,10 @@ POLL_JS = "(a) => {" + _VISIBLE + _PICK + """
   let stop = a.stop.some((s) => [...document.querySelectorAll(s)].some(visible));
   if (!stop) stop = [...document.querySelectorAll('button')].some((b) => visible(b) && re.test(b.textContent || ''));
   return { n: ev.length, ev: ev.length < a.from ? ev : ev.slice(a.from), count: msgs.length,
-           text: body ? body.innerText : (last ? last.innerText : ''), body: !!body, stop };
+           text: body ? body.innerText : (last ? last.innerText : ''), body: !!body, stop, notices: notices(a) };
 }"""
+
+NOTICES_JS = "(a) => {" + _VISIBLE + _NOTICES + " return notices(a); }"
 
 # La dernière carte : le texte de son corps (a.body), le texte de la carte entière (l'en-tête s'en
 # déduit) et son HTML. Sans corps trouvé, le texte est celui de la carte (body: false, noté).
@@ -683,6 +800,257 @@ TIMING_JS = """() => {
            resources: res.length, resources_bytes: res.reduce((s, r) => s + (r.transferSize || 0), 0) };
 }"""
 
+# v2.3, E4 : le bouton de dictée, lu (data-status, aria-pressed, libellé), jamais pressé.
+MIC_JS = """(a) => { const el = document.querySelector(a.sel);
+  return el ? { status: el.getAttribute('data-status'), pressed: el.getAttribute('aria-pressed'),
+                label: (el.getAttribute('aria-label') || '').slice(0, 200) } : null; }"""
+
+# v2.3, E2 et E11 : la palette de recherche ouverte. Son premier champ visible (a.inputs), la palette qui
+# le porte (la fenêtre, à défaut la racine cmdk), ses résultats visibles (a.results, cherchés dans la
+# palette seule) et son état vide. `redact` (la sonde, qui ne tape rien et peut voir des titres de
+# conversations antérieures à la recette) : le HTML gardé ne porte ni le texte ni les valeurs des
+# résultats.
+_SEARCH_FIND = """const findSearch = (a) => {
+    for (const s of a.inputs) {
+      let els = [];
+      try { els = [...document.querySelectorAll(s)]; } catch (e) { continue; }
+      const el = els.find(visible);
+      if (el) return { input: el, sel: s, root: el.closest('[role="dialog"]') || el.closest('[cmdk-root]') || el.parentElement };
+    }
+    return null;
+  };"""
+
+SEARCH_JS = "(a) => {" + _VISIBLE + _SEARCH_FIND + """
+  const f = findSearch(a);
+  if (!f) return null;
+  let results = [], resultSel = null;
+  for (const s of a.results) {
+    const els = [...f.root.querySelectorAll(s)].filter(visible);
+    if (els.length) {
+      resultSel = s;
+      results = els.map((el) => (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 120)).filter(Boolean);
+      break;
+    }
+  }
+  const empty = a.empty ? [...f.root.querySelectorAll(a.empty)].some(visible) : false;
+  const keep = /^(role|class|id|cmdk-item|cmdk-group|data-slot|aria-selected|data-selected|hidden)$/;
+  const copy = f.root.cloneNode(true);
+  if (a.redact) for (const s of a.results) for (const x of copy.querySelectorAll(s)) {
+    x.textContent = '…';
+    for (const at of [...x.attributes]) if (!keep.test(at.name)) x.setAttribute(at.name, '…');
+  }
+  return { input: f.sel, root: f.root.getAttribute('role') || f.root.tagName.toLowerCase(), value: f.input.value || '',
+           focused: document.activeElement === f.input, results: a.redact ? [] : results.slice(0, 50),
+           result: resultSel, count: results.length, empty, html: (copy.outerHTML || '').slice(0, 5000) };
+}"""
+
+SEARCH_INPUT_EL_JS = "(a) => {" + _VISIBLE + _SEARCH_FIND + " const f = findSearch(a); return [f ? f.input : null]; }"
+
+# v2.3, E1, E3 et E11 : une conversation de la barre latérale, trouvée par son adresse exacte (a.href, le
+# chemin enregistré au registre), jamais par son rang ni par son titre : un lien de la barre latérale
+# (a.sidebar), hors fenêtre, menu et liste, dont le chemin est a.href. Son élément (`scope`) est le plus
+# grand ancêtre du lien qui ne porte le lien d'aucune autre conversation, sans monter jusqu'à la barre.
+# Son déclencheur de menu (a.triggers) est cherché au plus près du lien d'abord : dans le lien, puis dans
+# chaque ancêtre jusqu'à `scope`, jamais au-delà (un menu de groupe, plus haut, n'est jamais pris pour
+# le sien).
+_ITEM_FIND = r"""
+  const pathOf = (el) => { try { return new URL(el.getAttribute('href') || '', location.href).pathname.replace(/\/+$/, ''); }
+                           catch (e) { return null; } };
+  const convRe = new RegExp(a.convPath);
+  const textOf = (el) => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+  const conversations = () => [...document.querySelectorAll('a[href]')].filter((el) => !!el.closest(a.sidebar)
+      && !el.closest('[role="dialog"], [role="menu"], [role="listbox"]') && convRe.test(pathOf(el) || ''));
+  const findItem = (href) => {
+    const all = conversations();
+    const mine = all.filter((el) => pathOf(el) === href);
+    if (!mine.length) return null;
+    const anchor = mine.find(visible) || mine[0];
+    const top = anchor.closest(a.sidebar);
+    let scope = anchor;
+    while (scope.parentElement && scope.parentElement !== top
+           && !all.some((x) => pathOf(x) !== href && scope.parentElement.contains(x))) scope = scope.parentElement;
+    return { anchor, scope, count: mine.length, all };
+  };
+  const triggerNear = (anchor, scope) => {
+    let level = 0;
+    for (let node = anchor; node; node = node.parentElement, level++) {
+      for (const s of a.triggers || []) {
+        let els = [];
+        try { els = [...node.querySelectorAll(s)]; } catch (e) { continue; }
+        const el = els.find(visible);
+        if (el) return { el, sel: s, level };
+      }
+      if (node === scope) break;
+    }
+    return null;
+  };"""
+
+# Où est la page, et quelles conversations la barre latérale liste (E1) : le chemin de la page, et le
+# chemin et le titre de chaque lien de conversation.
+CONV_STATE_JS = "(a) => {" + _VISIBLE + _ITEM_FIND + """
+  return { path: location.pathname.replace(/\\/+$/, ''), items: conversations().map((el) => [pathOf(el), textOf(el).slice(0, 120)]) };
+}"""
+
+# Ce que le driver relève d'une conversation (E3, E11) : trouvée ou non, son élément, son déclencheur de
+# menu, son titre. Sans a.href, la première conversation visible (la sonde) ; `redact` : le HTML gardé ne
+# porte ni son titre ni son adresse (une conversation antérieure à la recette).
+ITEM_JS = "(a) => {" + _VISIBLE + _ITEM_FIND + r"""
+  const all = conversations();
+  let href = a.href;
+  if (!href) { const first = all.find(visible); href = first ? pathOf(first) : null; }
+  if (!href) return { found: false, total: all.length };
+  const f = findItem(href);
+  if (!f) return { found: false, total: all.length };
+  const t = triggerNear(f.anchor, f.scope);
+  const title = textOf(f.anchor).slice(0, 120);
+  const key = title.slice(0, 12).toLowerCase();
+  const id = href.split('/').pop();
+  const copy = f.scope.cloneNode(true);
+  if (a.redact) {
+    const walker = document.createTreeWalker(copy, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const v = n.nodeValue.trim();
+      if (v.length >= 2 && (title.includes(v) || (key && v.toLowerCase().includes(key)))) n.nodeValue = '…';
+    }
+    for (const x of [copy, ...copy.querySelectorAll('*')]) for (const at of [...x.attributes])
+      if (at.name === 'href' || (id && at.value.includes(id)) || (key && at.value.toLowerCase().includes(key)))
+        x.setAttribute(at.name, '…');
+  }
+  let label = t ? (t.el.getAttribute('aria-label') || '').slice(0, 120) : null;
+  if (a.redact && label && key && label.toLowerCase().includes(key)) label = '…';
+  return { found: true, href, count: f.count, total: all.length, visible: visible(f.anchor),
+           title: a.redact ? null : title, scope: f.scope.tagName.toLowerCase(), scope_is_link: f.scope === f.anchor,
+           trigger: t ? t.sel : null, trigger_level: t ? t.level : null, trigger_label: label,
+           expanded: t ? t.el.getAttribute('aria-expanded') : null, controls: t ? t.el.getAttribute('aria-controls') : null,
+           html: (copy.outerHTML || '').slice(0, 5000) };
+}"""
+
+ITEM_EL_JS = "(a) => {" + _VISIBLE + _ITEM_FIND + " const f = findItem(a.href); return [f ? f.anchor : null]; }"
+
+TRIGGER_EL_JS = "(a) => {" + _VISIBLE + _ITEM_FIND + """
+  const f = findItem(a.href);
+  const t = f ? triggerNear(f.anchor, f.scope) : null;
+  return [t ? t.el : null];
+}"""
+
+# Le menu ouvert : celui que nomme le déclencheur (a.controls, aria-controls), à défaut le dernier menu
+# visible ; ses entrées (a.item), leur texte replié (minuscules, sans accents) pour les motifs.
+_MENU_FIND = r"""
+  const fold = (s) => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const findMenu = (a) => {
+    let menu = a.controls ? document.getElementById(a.controls) : null, how = 'aria-controls';
+    if (!menu || !visible(menu) || !menu.matches(a.menu)) {
+      const menus = [...document.querySelectorAll(a.menu)].filter(visible);
+      menu = menus.length ? menus[menus.length - 1] : null;
+      how = 'last';
+    }
+    return menu ? { menu, how } : null;
+  };"""
+
+MENU_JS = "(a) => {" + _VISIBLE + _MENU_FIND + r"""
+  const f = findMenu(a);
+  if (!f) return null;
+  const items = [...f.menu.querySelectorAll(a.item)].map((el, i) => ({ index: i, text: fold(el.innerText || el.textContent).slice(0, 80),
+      label: (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80),
+      disabled: el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('data-disabled') }));
+  return { how: f.how, id: f.menu.id || null, items, html: (f.menu.outerHTML || '').slice(0, 5000) };
+}"""
+
+# L'entrée du menu à cliquer : la seule, active, dont le texte replié suit a.pattern ; aucune sinon.
+MENU_ITEM_EL_JS = "(a) => {" + _VISIBLE + _MENU_FIND + r"""
+  const f = findMenu(a);
+  if (!f) return [null];
+  const re = new RegExp(a.pattern, 'i');
+  const hits = [...f.menu.querySelectorAll(a.item)].filter((el) => re.test(fold(el.innerText || el.textContent))
+      && el.getAttribute('aria-disabled') !== 'true' && !el.hasAttribute('data-disabled'));
+  return [hits.length === 1 ? hits[0] : null];
+}"""
+
+MENU_OPEN_JS = "(a) => {" + _VISIBLE + " return [...document.querySelectorAll(a.menu)].some(visible); }"
+
+# Le champ du nouveau titre (E3) : l'élément qui a le focus s'il est un champ texte de la barre latérale
+# ou d'une fenêtre, sinon le premier de a.fields ; jamais la zone de saisie du compositeur (a.composer),
+# jamais un champ de recherche.
+_FIELD_FIND = r"""
+  const editable = (el) => !!el && el.matches && visible(el)
+      && el.matches('input:not([type]), input[type="text"], textarea, [contenteditable="true"]')
+      && !el.matches(a.composer) && !el.matches('[cmdk-input], input[type="search"], input[role="combobox"]')
+      && !/search|recherch/i.test((el.getAttribute('placeholder') || '') + ' ' + (el.getAttribute('aria-label') || ''))
+      && (!!el.closest(a.sidebar) || !!el.closest('[role="dialog"]'));
+  const findField = (a) => {
+    const ae = document.activeElement;
+    if (editable(ae)) return { el: ae, how: 'focus' };
+    for (const s of a.fields) {
+      let els = [];
+      try { els = [...document.querySelectorAll(s)]; } catch (e) { continue; }
+      const el = els.find(editable);
+      if (el) return { el, how: s };
+    }
+    return null;
+  };"""
+
+RENAME_FIELD_JS = "(a) => {" + _VISIBLE + _FIELD_FIND + """
+  const f = findField(a);
+  if (!f) return null;
+  return { how: f.how, tag: f.el.tagName.toLowerCase(), type: f.el.getAttribute('type'),
+           in_dialog: !!f.el.closest('[role="dialog"]'),
+           value: (f.el.value !== undefined ? f.el.value : f.el.textContent || '').slice(0, 200) };
+}"""
+
+RENAME_FIELD_EL_JS = "(a) => {" + _VISIBLE + _FIELD_FIND + " const f = findField(a); return [f ? f.el : null]; }"
+
+# Le bouton qui valide une fenêtre de renommage : dans la fenêtre du champ, le seul dont le texte suit
+# a.submit.
+RENAME_SUBMIT_EL_JS = "(a) => {" + _VISIBLE + _FIELD_FIND + r"""
+  const f = findField(a);
+  const d = f ? f.el.closest('[role="dialog"]') : null;
+  if (!d) return [null];
+  const re = new RegExp(a.submit, 'i');
+  const fold = (s) => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+  const hits = [...d.querySelectorAll('button')].filter((b) => visible(b) && re.test(fold(b.innerText || b.getAttribute('aria-label'))));
+  return [hits.length === 1 ? hits[0] : null];
+}"""
+
+# La confirmation de suppression (E3) : la dernière fenêtre d'alerte visible, à défaut la dernière
+# fenêtre ; ses boutons, et ceux dont le texte replié suit a.confirm sans être une annulation.
+_CONFIRM_FIND = r"""
+  const fold = (s) => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
+  const findConfirm = (a) => {
+    const alerts = [...document.querySelectorAll('[role="alertdialog"]')].filter(visible);
+    const boxes = alerts.length ? alerts : [...document.querySelectorAll('[role="dialog"]')].filter(visible);
+    if (!boxes.length) return null;
+    const d = boxes[boxes.length - 1];
+    const re = new RegExp(a.confirm, 'i'), cancel = /annuler|cancel|^non|^no/i;
+    const buttons = [...d.querySelectorAll('button')].filter(visible);
+    const texts = buttons.map((b) => fold(b.innerText || b.getAttribute('aria-label')).slice(0, 60));
+    const hits = buttons.filter((b, i) => re.test(texts[i]) && !cancel.test(texts[i]));
+    return { d, texts, hits };
+  };"""
+
+CONFIRM_JS = "(a) => {" + _VISIBLE + _CONFIRM_FIND + """
+  const f = findConfirm(a);
+  if (!f) return null;
+  return { role: f.d.getAttribute('role'), buttons: f.texts, hits: f.hits.length,
+           text: fold(f.d.innerText).slice(0, 300), html: (f.d.outerHTML || '').slice(0, 5000) };
+}"""
+
+CONFIRM_EL_JS = "(a) => {" + _VISIBLE + _CONFIRM_FIND + """
+  const f = findConfirm(a);
+  return [f && f.hits.length === 1 ? f.hits[0] : null];
+}"""
+
+# L'enquête « Votre avis » ouverte (E5) : ses choix et ses boutons, pour la preuve ; rien n'y est cliqué
+# que sa croix.
+AVIS_JS = "(a) => {" + _VISIBLE + r"""
+  const d = [...document.querySelectorAll(a.sel)].find(visible);
+  if (!d) return null;
+  return { radios: [...d.querySelectorAll('[role="radio"], [data-slot="radio-group-item"]')]
+             .map((r) => r.getAttribute('value') || (r.innerText || '').trim()).slice(0, 10),
+           buttons: [...d.querySelectorAll('button')].filter(visible)
+             .map((b) => (b.innerText || b.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').slice(0, 60)).slice(0, 20),
+           html: (d.outerHTML || '').slice(0, 5000) };
+}"""
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -769,7 +1137,11 @@ def parse_guard(card: str, body: str, body_found: bool) -> dict:
         pii = False
     else:
         pii = None
-    return {"model": model, "guard_text": guard_text[:600] or None, "pii_detected": pii,
+    # v2.3, E7 : le nombre de données identifiantes que le panneau déclare (« Le Chirurgien : 2 PII
+    # détectées ») ; 0 pour « aucune donnée personnelle détectée » ; None sans compte lisible.
+    count = re.search(r"\b(\d+)\s*PII\b", guard_text, re.I)
+    pii_count = int(count.group(1)) if count else (0 if pii is False else None)
+    return {"model": model, "guard_text": guard_text[:600] or None, "pii_detected": pii, "pii_count": pii_count,
             "tokens": re.findall(SELECTORS["mask_token"], guard_text)[:50],
             "live": bool(re.search(SELECTORS["live_marker"], after, re.I)), "header": header[:600]}
 
@@ -962,7 +1334,8 @@ def turn_summary(i: int, question: str, obs: dict) -> dict:
             "ttft_s": obs.get("ttft_s"), "total_s": obs.get("total_s"), "display_s": obs.get("display_s"),
             "display_stable": obs.get("display_stable"), "end": obs.get("end"), "model": guard.get("model"),
             "pii_detected": guard.get("pii_detected"), "sent_source": (obs.get("sent_info") or {}).get("source"),
-            "sent_to_model": (obs.get("sent_to_model") or "")[:4000] or None, "pipeline_ms": obs.get("pipeline_ms")}
+            "sent_to_model": (obs.get("sent_to_model") or "")[:4000] or None, "pipeline_ms": obs.get("pipeline_ms"),
+            "error_class": (obs.get("failure") or {}).get("error_class")}
 
 
 def looks_like_sent(shown: str | None, question: str, pii=()) -> bool:
@@ -1027,6 +1400,210 @@ def details_text(raw: str | None, block: str | None, question: str) -> tuple[str
     at = raw.find(text)
     label = raw[:at].strip() if at > 0 else (raw[:m.end()].strip() if m and text == stripped else None)
     return text or None, label or None
+
+
+# v2.3, E7 : un jeton de masquage et son type.
+TOKEN_TYPE = r"<([A-Z][A-Z_]*)_\d+>"
+
+
+def token_inventory(text: str | None) -> dict | None:
+    """Les types des jetons de masquage d'un texte envoyé, numérotation repliée comme pour sent_sha256
+    (<PERSON_2> compte pour un PERSON), chaque occurrence comptée : {"PERSON": 2, "PHONE": 1} ; {} sans
+    jeton ; None quand le texte envoyé n'a pas été observé (E7)."""
+    if text is None:
+        return None
+    counts = {}
+    for kind in re.findall(TOKEN_TYPE, text):
+        counts[kind] = counts.get(kind, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def inventory_note(first: dict | None, mine: dict | None) -> str:
+    """Les ensembles masqués des passages a (`first`) et b (`mine`) comparés, pour le point 5 du contrat
+    (non-déterminisme : un ensemble différent d'entités masquées, à la numérotation près) : « ensemble
+    masqué identique », ou « ensemble masqué différent : +X −Y » (les types en plus, puis en moins, au
+    passage b, avec leur nombre au-delà de un)."""
+    if first is None or mine is None:
+        which = "a" if first is None else "b"
+        return f"ensemble masqué non comparable (texte envoyé non observé au passage {which})"
+    if first == mine:
+        return "ensemble masqué identique"
+    plus, minus = [], []
+    for kind in sorted(set(first) | set(mine)):
+        d = mine.get(kind, 0) - first.get(kind, 0)
+        if d:
+            (plus if d > 0 else minus).append(("+" if d > 0 else "−") + kind + (f" ×{abs(d)}" if abs(d) > 1 else ""))
+    return "ensemble masqué différent : " + " ".join(plus + minus)
+
+
+# v2.3, E9 et E10 : ce qu'une erreur montrée par la page ne porte jamais jusqu'au journal ni jusqu'au
+# harnais : pile logicielle, adresse, chemin, nom d'hôte. Le texte brut ne va qu'aux preuves de l'action.
+STACK_RE = re.compile(r"Traceback \(most recent call last\):?|File \"[^\"]*\", line \d+(?:, in [\w.<>]+)?"
+                      r"|\bat [\w.$<>\[\]]+ \([^)]*\)|\bat \S+:\d+:\d+")
+URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.I)
+IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b")
+PATH_RE = re.compile(r"(?:\b[A-Za-z]:)?(?:[\\/][\w.@~-]+){2,}[\\/]?")
+QUOTED_HOST_RE = re.compile(r"\b(host(?:\s*name)?|hostname|server(?:\s+at)?|h[ôo]te)\s*(?:[=:]\s*[^\s,;]+|\"[^\"]*\"|'[^']*')",
+                            re.I)
+HOST_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?\.)+[a-z][a-z0-9_-]*\b(?::\d+)?", re.I)
+
+
+def sanitise(text: str | None, n: int = EXCERPT_MAX, keep=()) -> str:
+    """Un texte d'erreur sans pile, adresse, chemin ni nom d'hôte, sur une ligne de `n` caractères au
+    plus : chaque élément retiré devient <adresse>, <chemin> ou <hôte>. `keep` : les noms à garder tels
+    quels (le nom du fichier joint, qui a la forme d'un nom d'hôte). Au mieux : un nom d'hôte sans point
+    ni mot-clé (« host », « server ») passe."""
+    s = STACK_RE.sub(" ", text or "")
+    s = URL_RE.sub("<adresse>", s)
+    s = QUOTED_HOST_RE.sub(lambda m: m.group(1) + " <hôte>", s)
+    s = IP_RE.sub("<hôte>", s)
+    s = PATH_RE.sub("<chemin>", s)
+    kept = {k.lower() for k in keep if k}
+    s = HOST_RE.sub(lambda m: m.group(0) if m.group(0).lower() in kept else "<hôte>", s)
+    return one_line(s, n)
+
+
+def exposes_internals(text: str | None, keep=()) -> bool:
+    """Le texte montre-t-il un détail interne (pile, adresse, chemin, nom d'hôte) ? Ce que le harnais
+    apprend d'une puce en échec (`internal_error_shown`), sans en recevoir le texte."""
+    whole = 10 ** 6
+    return bool(text) and sanitise(text, whole, keep) != one_line(text, whole)
+
+
+# E9 : la classe d'une puce en échec, lue sur son libellé brut replié (casse, accents), le nom du fichier
+# retiré ; la première qui convient.
+ATTACH_ERRORS = (
+    ("service documentaire injoignable",
+     r"could not translate host|name or service not known|nodename nor servname|name resolution|getaddrinfo"
+     r"|enotfound|econnrefused|connection refused|could not connect|operationalerror|psycopg|postgres"
+     r"|database|base de donnees|injoignable|unreachable"),
+    ("fichier trop volumineux", r"too large|trop (?:volumineux|gros|lourd)|size limit|file size|exceeds|depasse|\b413\b|taille"),
+    ("format refusé", r"format|unsupported|not supported|non (?:pris en charge|supporte)|file type|type de fichier|mime|extension"),
+)
+
+
+def attach_error_class(label: str | None, name: str = "") -> str:
+    """La classe d'erreur d'une puce en échec (E9) : « service documentaire injoignable » (une base ou un
+    hôte injoignable), « fichier trop volumineux », « format refusé », sinon « échec de la pièce
+    jointe ». Sans nom d'hôte ni pile, par construction."""
+    text = label or ""
+    stem = Path(name).stem if name else ""
+    for part in (name, stem if len(stem) >= 4 else ""):  # whole tokens only: « x.pdf » never eats an « x »
+        if part:
+            text = re.sub(rf"(?<!\w){re.escape(part)}(?!\w)", " ", text)
+    folded = evaluer.fold(text)
+    for cls, pattern in ATTACH_ERRORS:
+        if re.search(pattern, folded):
+            return cls
+    return "échec de la pièce jointe"
+
+
+def stream_digest(events: list) -> dict:
+    """Les derniers événements du flux d'un tour (window.__ev, chaque ligne coupée à 160 caractères) :
+    leurs noms (<START>, node:detect_pii, event:error, error, data, <END>…), le dernier nœud, et le texte
+    brut de la dernière charge utile d'erreur (un `event: error`, ou un objet qui porte error, detail ou
+    exception, ou message sous un type error)."""
+    names, last_node, error, event = [], None, None, None
+    for _, line in events or []:
+        line = (line or "").strip()
+        if line.startswith("<"):
+            names.append(line.split(">")[0] + ">")
+            continue
+        if line.startswith("event:"):
+            event = line[6:].strip()
+            names.append("event:" + event)
+            continue
+        payload = line[5:].strip() if line.startswith("data:") else line
+        try:
+            obj = json.loads(payload)
+        except ValueError:
+            obj = None
+        text = None
+        if isinstance(obj, dict):
+            if obj.get("node"):
+                last_node = str(obj["node"])
+            for key in ("error", "detail", "exception", "message"):
+                if obj.get(key) and (key != "message" or event == "error" or obj.get("type") == "error"):
+                    text = obj[key] if isinstance(obj[key], str) else json.dumps(obj[key], ensure_ascii=False)
+                    break
+            if text is None and (event == "error" or obj.get("type") == "error"):
+                text = payload
+        else:
+            m = re.search(r'"(?:error|detail|exception)"\s*:\s*"([^"]*)', payload)
+            text = m.group(1) if m else (payload if event == "error" else None)
+        if text:
+            error = text
+            names.append("error")
+        elif isinstance(obj, dict) and obj.get("node"):
+            names.append("node:" + str(obj["node"]))
+        else:
+            names.append("data")
+        event = None
+    compact = []
+    for name in names:  # a run of answer chunks is one « data ×n »
+        if compact and compact[-1][0] == name:
+            compact[-1][1] += 1
+        else:
+            compact.append([name, 1])
+    return {"names": [n if k == 1 else f"{n} ×{k}" for n, k in compact][-12:], "last_node": last_node, "error": error}
+
+
+def failure_class(http: int | None, error: str | None, notices: list, names: list, seen: bool) -> str:
+    """La classe d'un échec silencieux (E10), sans nom d'hôte ni pile par construction : le statut HTTP du
+    flux d'abord, puis une base ou un hôte injoignable dans ce que disent le flux ou la page, puis
+    l'erreur du flux, l'erreur affichée, le flux coupé, le flux fini sans rien."""
+    if http is None and not seen:
+        return "aucun flux"
+    if http is not None and http >= 400:
+        if http >= 500:
+            return f"erreur serveur (HTTP {http})"
+        if http == 429:
+            return "limite de débit (HTTP 429)"
+        if http in (401, 403):
+            return f"session refusée (HTTP {http})"
+        return f"requête refusée (HTTP {http})"
+    said = evaluer.fold(" ".join([error or ""] + [t for _, t in notices]))
+    if re.search(ATTACH_ERRORS[0][1], said):
+        return "service interne injoignable"
+    if error:
+        return "erreur signalée par le flux"
+    if notices:
+        return "erreur affichée par l'application"
+    if any(n.startswith("<ABORT>") for n in names):
+        return "flux coupé"
+    return "flux terminé sans réponse"
+
+
+# v2.3, E3 : une entrée de menu qui viserait plus d'une conversation (texte replié).
+MENU_TOO_WIDE = r"\btout(?:es)?\b|\ball\b|historique|history|everything|\bvider\b|\bclear\b"
+
+
+def menu_entry(items: list, want: str) -> tuple[dict | None, str | None]:
+    """L'entrée du menu d'une conversation à cliquer pour `want` (« renommer » ou « supprimer »). Un menu
+    n'est celui d'une conversation que s'il porte exactement une entrée de renommage et une de
+    suppression, actives, et aucune qui viserait plus d'une conversation (« tout », « all »,
+    « historique ») : sinon rien n'est cliqué. Rend (l'entrée, None) ou (None, la raison)."""
+    usable = [i for i in items if not i.get("disabled")]
+    rename = [i for i in usable if re.search(SELECTORS["menu_rename"], i["text"])]
+    delete = [i for i in usable if re.search(SELECTORS["menu_delete"], i["text"])]
+    listed = " | ".join(i.get("label") or i["text"] for i in items) or "aucune entrée"
+    if any(re.search(MENU_TOO_WIDE, i["text"]) for i in items):
+        return None, f"menu refusé, une entrée viserait plus d'une conversation : {listed}"
+    if len(rename) != 1 or len(delete) != 1:
+        return None, f"pas le menu d'une conversation (une entrée renommer et une supprimer) : {listed}"
+    return (rename if want == "renommer" else delete)[0], None
+
+
+def same_title(read: str | None, want: str) -> bool:
+    """Le titre relu sur la barre latérale est-il celui demandé ? Au repli près (casse, accents, blancs),
+    ou coupé par la barre (« … » final ; vers 45 caractères le 17/10) sur au moins vingt caractères."""
+    if not read:
+        return False
+    r, w = evaluer.fold(read).strip(), evaluer.fold(want).strip()
+    if r == w:
+        return True
+    cut = r.rstrip("…. ").strip()
+    return len(cut) >= 20 and w.startswith(cut)
 
 
 def chip_label(reading: dict | None) -> str:
@@ -1480,7 +2057,8 @@ class Browser:
             self._push(self.third_party, {"host": urlsplit(request.url).hostname or "", "url": e["url"],
                                           "type": request.resource_type, "page": e["page"]})
         if request.method == "POST" and re.search(STREAM_PATTERN, request.url):
-            self.posts.append({"seq": e["seq"], "page": e["page"], "body": (request.post_data or "")[:20_000]})
+            # `net`: the request's own summary, which the response completes with its status (E10)
+            self.posts.append({"seq": e["seq"], "page": e["page"], "body": (request.post_data or "")[:20_000], "net": e})
 
     def _on_response(self, response) -> None:
         e, t0 = self._open.pop(response.request, ({}, time.monotonic()))
@@ -1552,6 +2130,11 @@ class Recette:
         self.obs_path = self.work / "observations.json"
         self.observations = (json.loads(self.obs_path.read_text(encoding="utf-8"))
                              if self.obs_path.exists() else {})
+        # v2.3, E1 : the conversations the driver created, with the case that created each; kept apart
+        # from the observations (a resumption sets observations.json aside, never this registry).
+        self.registry_path = self.work / "conversations.json"
+        self.registry = (json.loads(self.registry_path.read_text(encoding="utf-8")).get("conversations", [])
+                         if self.registry_path.exists() else [])
         self.conv = self._fresh_conversation()
         self.flux = {"ev": 0, "mark": 0}
         self._case_in_hand = None
@@ -1573,7 +2156,8 @@ class Recette:
         browser = ["mesurer_chargement", "nouvelle_conversation", "joindre_document", "poser_question",
                    "envoyer_message", "lire_reponse", "capturer_flux", "lister_conversations",
                    "charge_concurrente", "capture_ecran", "choisir_modele", "recherche_web",
-                   "conversation_longue"]
+                   "conversation_longue", "renommer_conversation", "supprimer_conversation", "ouvrir_avis",
+                   "sonder_interface"]
         local = ["verdict_oracle", "exporter_journal"]
         return {**{n: self._wrap(getattr(self, n), browser=True) for n in browser},
                 **{n: self._wrap(getattr(self, n), browser=False) for n in local}}
@@ -1653,6 +2237,8 @@ class Recette:
             log.info("known modal %s dismissed (%s)", name, k["dismiss"])
             if k.get("own"):
                 b.own_modal = None
+            else:
+                self._note_closed(name)
         if b.own_modal and b.own_modal not in modals["known"]:
             b.own_modal = None  # closed since, by the page or by hand
         if modals["unknown"]:
@@ -1741,6 +2327,14 @@ class Recette:
                 if time.monotonic() >= deadline:
                     raise
 
+    def _note_closed(self, name: str) -> None:
+        """Une modale connue que la garde a fermée (v2.3, E5) : comptée pour le cas en main (celui que
+        l'action nomme, à défaut le dernier que verdict_oracle a dit à faire), dont chaque ligne de journal
+        porte la liste (`modals_closed`), pour que le juge compte les apparitions spontanées. Une modale
+        `own` (le driver l'avait ouverte lui-même) n'en est pas une."""
+        if self._action_case:
+            self.observations.setdefault("@modals", {}).setdefault(self._action_case, []).append(name)
+
     @staticmethod
     def _dismiss(page, k: dict) -> None:
         """Fermer une modale connue par son moyen documenté : une touche (« key:Escape ») ou un
@@ -1800,6 +2394,86 @@ class Recette:
             self.observations.setdefault(self._case_in_hand, {})["dialog"] = {
                 "type": d["type"] if d else "", "message": d["message"] if d else "", "t": now_iso()}
         return DriverRefusal("dialog", detail, evidence=ev.items if ev else None)
+
+    # -- le registre des conversations (v2.3, E1) ------------------------------------------------
+    def _save_registry(self) -> None:
+        tmp = self.registry_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"version": 1, "conversations": self.registry}, ensure_ascii=False, indent=1),
+                       encoding="utf-8", errors="replace")
+        os.replace(tmp, self.registry_path)
+
+    def _registered(self, cid: str) -> dict | None:
+        """La conversation que le cas `cid` a créée, au registre (la dernière, si le cas a été rejoué)."""
+        found = [e for e in self.registry if e["case"] == cid]
+        return found[-1] if found else None
+
+    @staticmethod
+    def _conv_arg(href: str | None = None, redact: bool = False) -> dict:
+        return {"href": href, "sidebar": SELECTORS["sidebar"], "convPath": SELECTORS["conversation_path"],
+                "triggers": SELECTORS["conversation_menu_trigger"], "redact": redact}
+
+    def _conversation_state(self, page) -> dict | None:
+        """Le chemin de la page et les conversations de la barre latérale (chemin, titre) ; None si la page
+        ne répond pas à temps."""
+        try:
+            return self.browser.call(CONV_STATE_JS, self._conv_arg(), page=page, timeout_ms=3000)
+        except PWTimeout:
+            if self.browser.pending():
+                raise
+            return None
+
+    def _note_conversation(self, cid: str, before: dict | None, page, via: str) -> dict | None:
+        """Après une question : la conversation où elle a été posée, et ce que la ligne du cas en porte
+        (`conversation` : adresse, cas qui l'a créée, état), ou None. Elle entre au registre, avec le cas
+        `cid`, quand la question l'a créée : la page était, avant l'envoi, sur une page qui n'est pas une
+        conversation (une page neuve), et elle est maintenant sur /conversation/<id> ou, à défaut, une seule
+        conversation est apparue dans la barre latérale. Sans relevé d'avant l'envoi, rien n'entre au
+        registre : le driver ne s'attribue jamais une conversation qu'il n'a pas vue naître."""
+        after = self._conversation_state(page)
+        if not after:
+            return None
+        here = after.get("path") or ""
+        if before is None or re.match(SELECTORS["conversation_path"], before.get("path") or ""):
+            href = (before or {}).get("path") or here  # asked in a conversation already open
+            entry = next((e for e in self.registry if e["href"] == href), None)
+            if not re.match(SELECTORS["conversation_path"], href):
+                return None
+            return {"href": href, "created_by": entry["case"] if entry else None,
+                    "state": entry["state"] if entry else "hors registre"}
+        if re.match(SELECTORS["conversation_path"], here):
+            href = here
+        else:
+            known = {p for p, _ in before.get("items") or []}
+            fresh = [p for p, _ in after.get("items") or [] if p not in known]
+            if len(fresh) != 1:
+                return None
+            href = fresh[0]
+        entry = next((e for e in self.registry if e["href"] == href), None)
+        if entry is None:
+            title = next((t for p, t in after.get("items") or [] if p == href), None)
+            entry = {"href": href, "case": cid, "via": via, "created": now_iso(), "state": "créée", "title": title,
+                     "history": [{"t": now_iso(), "state": "créée", "case": cid}]}
+            self.registry.append(entry)
+            self._save_registry()
+            log.info("conversation %s created by %s", href, cid)
+        return {"href": entry["href"], "created_by": entry["case"], "state": entry["state"]}
+
+    def _note_conversation_quietly(self, cid: str, before: dict | None, page, via: str) -> dict | None:
+        """_note_conversation après un abandon : au mieux, sans jamais masquer le refus qui suit."""
+        try:
+            return self._note_conversation(cid, before, page, via)
+        except PWError as e:
+            log.warning("conversation of %s not noted: %s", cid, one_line(str(e), 160))
+            return None
+
+    def _in_conversation_of(self, cid: str) -> bool:
+        """La page est-elle sur la conversation que `cid` a créée ? (E1 : same_conversation_as se résout par
+        le registre, par exemple après une relance du driver, quand sa mémoire de la conversation est
+        perdue.)"""
+        entry = self._registered(cid)
+        if entry is None or entry["state"] == "supprimée":
+            return False
+        return urlsplit(self.browser.page().url).path.rstrip("/") == entry["href"]
 
     # -- outils -----------------------------------------------------------------------------
     @staticmethod
@@ -1878,15 +2552,18 @@ class Recette:
         return lines[-1] if lines else None
 
     def _journal_add(self, cid: str, verdict: str, timing_s, evidence: str, nfr: list,
-                     pipeline_ms: dict | None = None, extra: dict | None = None) -> str:
+                     pipeline_ms: dict | None = None, extra: dict | None = None, step: str = "exec",
+                     supersedes: int | None = None) -> str:
+        """Une ligne au journal, avec inputs_sha256 et ui_profile_sha256 ; `step` « correction » et
+        `supersedes` pour une ligne de correction (scripts/recette/correct.py, E8)."""
         event = journal.add(str(self.journal_path), argparse.Namespace(
-            step="exec", case=clean(cid), verdict=verdict,
+            step=step, case=clean(cid), verdict=verdict,
             timing=round(timing_s, 1) if isinstance(timing_s, (int, float)) else None,
             evidence=clean(evidence)[:600],
             pipeline=[f"{k}={int(v)}" for k, v in (pipeline_ms or {}).items()] or None,
-            nfr=",".join(nfr) or None, supersedes=None),
+            nfr=",".join(nfr) or None, supersedes=supersedes),
             extra={"inputs_sha256": self.inputs_sha256, "ui_profile_sha256": self.ui_profile_sha256,
-                   **(extra or {})})
+                   **clean(extra or {})})
         return json.dumps(event, ensure_ascii=False)
 
     # -- envoyer un message et attendre la réponse -------------------------------------------
@@ -1901,7 +2578,7 @@ class Recette:
         # no generation indicator (a guessed selector on a permanent button): ignored, never clicked.
         turn = {"page": page, "n0": st["n"], "count0": st["count"], "posts0": len(b.posts),
                 "page_no": b.context.pages.index(page), "stop_before": st["stop"], "text": text, "pii": list(pii or []),
-                "read_sent": read_sent}
+                "read_sent": read_sent, "notices0": st.get("notices") or []}
         if not b.call(FILL_JS, {"sel": SELECTORS["textarea"], "text": text}, page=page):
             self._check_maintenance(page)  # the app went into maintenance since the guard
             raise DriverRefusal("precondition", "pas de zone de saisie dans la page")
@@ -2152,7 +2829,8 @@ class Recette:
     @staticmethod
     def _poll_arg(start: int) -> dict:
         return {"from": start, "assistant": SELECTORS["assistant_message"], "body": SELECTORS["answer_body"],
-                "stop": SELECTORS["stop_button"], "stopText": SELECTORS["stop_text"]}
+                "stop": SELECTORS["stop_button"], "stopText": SELECTORS["stop_text"],
+                "status": SELECTORS["input_status"], "notices": SELECTORS["notices"]}
 
     def _wait(self, turns: list, wait_s: float, check_host: bool = True) -> None:
         """Attendre chaque tour, en deux temps.
@@ -2168,7 +2846,7 @@ class Recette:
         b = self.browser
         for t in turns:
             t.update(done=False, events=[], saw_stop=False, stop_gone=None, last_text=None, changed_at=None,
-                     end_at=None, display_stable=None, display_s=None)
+                     end_at=None, display_stable=None, display_s=None, notices=[])
         start = min(t["t_send"] for t in turns)
         while not all(t["done"] for t in turns):
             if check_host:
@@ -2195,6 +2873,9 @@ class Recette:
                     t["n0"] = 0
                     continue
                 t["events"] = st["ev"]
+                for notice in st.get("notices") or []:  # what the page says meanwhile (E10), toasts that go
+                    if notice not in t["notices"] and len(t["notices"]) < 20:
+                        t["notices"].append(notice)
                 lines = [line for _, line in st["ev"]]
                 now = time.monotonic()
                 fresh = st["count"] > t["count0"]  # a new answer card is on screen
@@ -2294,12 +2975,52 @@ class Recette:
                     sent_info["popover_rejected"] = popover["rejected"]
                 sent_info["rejected"] = card["rejected"]
         sent_info["panel_text"] = panel
+        failure = failure_raw = None
+        if not fresh or not (got["text"] or "").strip():  # a silent failure: what the page and the stream said
+            failure, failure_raw = self._diagnose(turn, page, fresh)
         return {"answer": got["text"].strip(), "html": got["html"], "guard": guard, "body_found": got["body"],
                 "new_answer": fresh, "sent": posts[-1]["body"] if posts else None,
                 "sent_to_model": sent_to_model, "sent_info": sent_info,
                 "ttft_s": ttft, "total_s": turn.get("total_s"), "timing_s": turn.get("total_s"),
                 "display_s": turn.get("display_s"), "display_stable": turn.get("display_stable"),
-                "server_steps": steps, "pipeline_ms": pipeline, "end": turn.get("end"), "t": now_iso()}
+                "server_steps": steps, "pipeline_ms": pipeline, "end": turn.get("end"), "t": now_iso(),
+                "failure": failure, "failure_raw": failure_raw}
+
+    def _diagnose(self, turn: dict, page, fresh: bool) -> tuple[dict, dict]:
+        """v2.3, E10 — une question restée sans réponse (pas de carte nouvelle, ou une carte vide) : ce que
+        la page et le flux en ont dit. La ligne d'état du compositeur, les alertes et les toasts (vus pendant
+        l'attente et maintenant, ceux d'avant l'envoi mis à part), le statut HTTP du flux, ses derniers
+        événements et sa dernière charge utile d'erreur. Rend le résumé que porte la ligne (`error_class`, et
+        un extrait de EXCERPT_MAX caractères au plus, sans nom d'hôte, chemin ni pile) et la capture brute,
+        qui ne va qu'à la preuve `failure.json`."""
+        b = self.browser
+        try:
+            now = b.call(NOTICES_JS, {"status": SELECTORS["input_status"], "notices": SELECTORS["notices"]},
+                         page=page, timeout_ms=2000) or []
+        except PWTimeout:
+            if b.pending():
+                raise
+            now = []
+        seen = list(turn.get("notices") or [])
+        for notice in now:
+            if notice not in seen:
+                seen.append(notice)
+        before = turn.get("notices0") or []
+        said = [n for n in seen if n not in before]
+        posts = [p for p in b.posts[turn["posts0"]:] if p["page"] in (turn["page_no"], -1)]
+        net = (posts[-1].get("net") or {}) if posts else {}
+        http = net.get("status")
+        digest = stream_digest(turn.get("events"))
+        cls = failure_class(http, digest["error"], said, digest["names"], bool(posts) or bool(digest["names"]))
+        source = (digest["error"] or next((text for kind, text in said if kind == "status"), None)
+                  or (said[0][1] if said else ""))
+        summary = {"error_class": cls, "excerpt": sanitise(source) or None, "http_status": http,
+                   "last_node": digest["last_node"], "events": digest["names"], "new_card": fresh}
+        raw = {"error_class": cls, "http_status": http, "request_failure": net.get("failure"),
+               "events": (turn.get("events") or [])[-40:], "stream": digest, "notices": seen,
+               "notices_before": before}
+        log.warning("silent failure: %s", cls)
+        return summary, raw
 
     def _stop_generation(self, page) -> dict:
         """Cliquer sur le bouton d'arrêt s'il est visible, puis attendre sa disparition (au plus
@@ -2380,18 +3101,21 @@ class Recette:
         self._check_host()  # a page that left after <END> is not the answer
         return obs
 
-    def _timeout_line(self, cid: str, nfr: list, t: AskTimeout, why: str) -> str:
+    def _timeout_line(self, cid: str, nfr: list, t: AskTimeout, why: str, extra: dict | None = None) -> str:
         """La ligne d'un abandon. À 3 × le budget : KO disponibilité. Coupé avant par l'échéance de
-        l'action (le produit n'a pas eu son temps) : NON TESTÉ, sans ENF, « échéance de l'action »."""
+        l'action (le produit n'a pas eu son temps) : NON TESTÉ, sans ENF, « échéance de l'action ». `extra` :
+        les champs de la ligne (config, modals_closed)."""
         if getattr(t, "capped", False):
             return self._journal_add(cid, "NON TESTÉ", t.seconds,
                                      f"{why} : échéance de l'action avant 3 × le budget, pas de verdict sur le "
-                                     f"produit ; {abort_text(t.profile)}", [])
+                                     f"produit ; {abort_text(t.profile)}", [], extra=extra)
         return self._journal_add(cid, "KO", t.seconds, f"{why} : pas de fin de réponse ; {abort_text(t.profile)}",
-                                 nfr_union(nfr, ["disponibilite"]))
+                                 nfr_union(nfr, ["disponibilite"]), extra=extra)
 
-    def _answer_evidence(self, ev: Evidence, obs: dict, mark: int) -> None:
+    def _answer_evidence(self, ev: Evidence, obs: dict, mark: int, failure: dict | None = None) -> None:
         page = self.browser.page()
+        if failure:  # E10: the raw capture of a silent failure, in the evidence only
+            ev.json("failure.json", failure)
         if obs.get("html"):
             ev.html("dom.html", obs["html"])
         ev.json("guard.json", {**(obs.get("guard") or {}), "body_found": obs.get("body_found"),
@@ -2419,6 +3143,9 @@ class Recette:
         if obs.get("sent_to_model") is not None:
             result["sent_to_model"] = obs["sent_to_model"][:2000]
         result["text"] = f"{label} : réponse en {obs.get('total_s')} s — {one_line(obs.get('answer') or '', 160)}"
+        if obs.get("failure"):  # E10: the class only, never the raw text
+            result["error_class"] = obs["failure"]["error_class"]
+            result["text"] += f" ; échec silencieux : {obs['failure']['error_class']}"
         return result
 
     # =========================================================================================
@@ -2448,8 +3175,8 @@ class Recette:
                           f"({t['resources']} ressources)")
         ev.json("timing.json", {**t, "url": short_url(t["url"])})
         ev.screenshot(page, "screen.png")
-        self.observations["@load"] = {"answer": result["text"], "timing_s": result["load_ms"] / 1000,
-                                      "t": now_iso()}
+        self._shared("@load", {"answer": result["text"], "timing_s": result["load_ms"] / 1000, "t": now_iso(),
+                               "composer": self._composer_now(page)})
         return result
 
     def nouvelle_conversation(self, args: dict, ev: Evidence) -> dict:
@@ -2521,20 +3248,29 @@ class Recette:
         self._ensure_on_app(page)
         mark = b.mark()
         att = self._attach(page, path, budget_of(case))
+        # v2.3, E9 : the raw label (a host name and a stack, on 18/10) goes to chip.json only; the line, the
+        # observation and the harness get its class, a sanitised label and whether it shows internals.
+        raw_label = att["label"]
+        record = {"state": att["state"], "ready_by": att["ready_by"], "seconds": att["seconds"],
+                  "label": sanitise(raw_label, 120, keep=(path.name,)), "trace": att["trace"],
+                  "accept": att["accept"],
+                  "error_class": attach_error_class(raw_label, path.name) if att["state"] == "failed" else None,
+                  "internal_error_shown": exposes_internals(raw_label, keep=(path.name,))}
         self.conv["attached"][cid] = {k: att[k] for k in ("state", "ready_by", "pending_seen")} | {"file": path.name}
-        self.observations[cid] = {"attach": {k: att[k] for k in ("state", "ready_by", "seconds", "label", "trace")}
-                                  | {"t": now_iso()}}
+        self.observations[cid] = {"attach": {**record, "t": now_iso()}}
         ev.screenshot(page, "attach.png")
         ev.json("network.json", b.capture(mark), cap=NETWORK_CAP)
-        extra = {k: att[k] for k in ("state", "ready_by", "seconds", "label", "trace", "uploads")}
+        ev.json("chip.json", {**record, "label": raw_label, "reading": att["reading"], "uploads": att["uploads"]})
+        extra = {**record, "uploads": att["uploads"]}
         if att["state"] == "failed":
             raise DriverRefusal("precondition", "attachment failed", extra=extra)
         if att["state"] != "ready":
-            raise DriverRefusal("precondition", f"pièce jointe « {att['label'] or 'sans puce'} » ({att['state']}) "
+            raise DriverRefusal("precondition", f"pièce jointe « {record['label'] or 'sans puce'} » ({att['state']}) "
                                                 f"après {att['seconds']} s", extra=extra)
         how = {"marker": "marquée prête", "after_pending": "indexée", "quiet": "sans marqueur, présumée prête"}
         return {**extra, "text": f"{path.name} prêt en {att['seconds']} s ({how.get(att['ready_by'], '')}, "
-                                 f"{' → '.join(x['state'] for x in att['trace'])})"}
+                                 f"{' → '.join(x['state'] for x in att['trace'])})"
+                                 + (f" ; accept : {att['accept']}" if att["accept"] else " ; accept : aucun")}
 
     def _read_chip(self, page, name: str):
         return self.browser.call(CHIP_JS, {"remove": SELECTORS["attach_remove"], "chips": SELECTORS["attach_chip"],
@@ -2545,7 +3281,9 @@ class Recette:
         (ready, failed), au plus 3 × budget_s, borné par l'échéance de l'action."""
         b = self.browser
         mark = b.mark()
-        page.locator(SELECTORS["file_input"]).first.set_input_files(str(path), timeout=10_000)
+        field = page.locator(SELECTORS["file_input"]).first
+        accept = field.get_attribute("accept", timeout=10_000)  # E6: the families the page says it takes
+        field.set_input_files(str(path), timeout=10_000)
         t0 = time.monotonic()
         limit, _ = self._deadline(3 * budget_s)
         watch, reading = ChipWatch(), None
@@ -2559,7 +3297,7 @@ class Recette:
                    for e in b.since(b.network, mark) if e["method"] in ("POST", "PUT")]
         return {"state": watch.state, "ready_by": watch.ready_by, "pending_seen": watch.pending_seen,
                 "seconds": round(time.monotonic() - t0, 1), "label": chip_label(reading), "trace": watch.trace,
-                "reading": reading, "uploads": uploads[-20:]}
+                "reading": reading, "uploads": uploads[-20:], "accept": accept}
 
     def _chip_ready(self, cid: str) -> tuple[bool, str, str]:
         """La puce du cas relue au moment d'envoyer : prête, ou non (son état brut, son libellé)."""
@@ -2583,7 +3321,8 @@ class Recette:
                 raise DriverRefusal("precondition", f"cas de configuration {cid} : {action} d'abord, puis verdict_oracle")
             return {"case": cid, "configuration": True, "answer": seen["answer"], "text": f"{cid} : {seen['answer']}"}
         if case["kind"] not in ("message", "attach_question", "model", "web") or "question" not in case:
-            hint = " : conversation_longue" if case["kind"] == "long" else ""
+            hint = (f" : {case['action']}" if case.get("action")
+                    else " : conversation_longue" if case["kind"] == "long" else "")
             raise DriverRefusal("precondition", f"le cas {cid} ({case['kind']}) n'a pas de question{hint}")
         # The composer as it is now, read on screen: every line carries the model and web mode read.
         composer = self._composer_now(self.browser.page())
@@ -2600,11 +3339,15 @@ class Recette:
                 raise DriverRefusal("precondition", f"joindre_document {cid} d'abord (pièce jointe : aucune)")
             ready, raw, label = self._chip_ready(cid)
             if not ready:  # the real chip, read now: a question on a chip not ready never leaves
-                self.observations.setdefault(cid, {})["not_sent"] = {"chip": raw, "label": label, "t": now_iso()}
+                name = self.conv["attached"][cid]["file"]
+                shown = {"chip": raw, "label": sanitise(label, 120, keep=(name,))}
+                if raw == "failed":  # E9: its class, never its raw label
+                    shown["error_class"] = attach_error_class(label, name)
+                self.observations.setdefault(cid, {})["not_sent"] = {**shown, "t": now_iso()}
                 raise DriverRefusal("precondition", f"pièce jointe pas prête ({raw}) : question non envoyée",
-                                    extra={"chip": raw, "label": label})
+                                    extra=shown)
         before = case.get("same_conversation_as")
-        if before and before not in self.conv["asked"]:
+        if before and before not in self.conv["asked"] and not self._in_conversation_of(before):
             raise DriverRefusal("precondition", f"{cid} se pose dans la conversation de {before}, pas encore posé")
         self._case_in_hand = cid
         # A new attempt: only the attachment survives from the previous observation, so a
@@ -2614,13 +3357,21 @@ class Recette:
         mark = self.browser.mark()
         self._last_asked = {"case": cid, "mark": mark}  # what happens from here on is this case's
         budget = budget_of(case)
+        page = self.browser.page()
+        self._ensure_on_app(page)
+        conv_before = self._conversation_state(page)  # E1: where the question leaves from
         try:
             obs = self._ask(case["question"], budget, pii=case.get("pii"))
         except AskTimeout as t:
-            line = self._timeout_line(cid, case["nfr"], t, t.why)
+            line = self._timeout_line(cid, case["nfr"], t, t.why, extra=self._line_extra(cid, {"composer": composer}))
             self.observations.setdefault(cid, {})["timeout"] = {"seconds": round(t.seconds, 1), "t": now_iso(),
                                                                 **t.profile}
+            conversation = self._note_conversation_quietly(cid, conv_before, page, "poser_question")
+            if conversation:
+                self.observations[cid]["conversation"] = conversation
             raise DriverRefusal("timeout", t.why, extra={"journal": line, "abort": t.profile}) from None
+        failure = obs.pop("failure_raw", None)
+        conversation = self._note_conversation(cid, conv_before, page, "poser_question")
         self.conv["asked"].append(cid)
         if case["kind"] == "attach_question" and obs.get("sent_info") is not None:
             # In an attachment, the sent text may not hold the document: then a leak cannot be
@@ -2628,8 +3379,8 @@ class Recette:
             obs["sent_info"]["document_in_sent"] = document_in_sent(self._resolve(case["file"]),
                                                                     obs.get("sent_to_model"))
         self.observations[cid] = {**obs, "html": None, **({"attach": attach} if attach else {}),
-                                  "composer": composer}
-        self._answer_evidence(ev, obs, mark)
+                                  "composer": composer, **({"conversation": conversation} if conversation else {})}
+        self._answer_evidence(ev, obs, mark, failure)
         return self._answer_result(obs, cid)
 
     def envoyer_message(self, args: dict, ev: Evidence) -> dict:
@@ -2637,13 +3388,20 @@ class Recette:
         sous « @message », hors cas."""
         text = args["text"]
         mark = self.browser.mark()
+        page = self.browser.page()
+        self._ensure_on_app(page)
+        conv_before = self._conversation_state(page)
         try:
             obs = self._ask(text, DEFAULT_BUDGET_S)
         except AskTimeout as t:
             line = self._timeout_line(f"message : {one_line(text, 60)}", [], t, t.why)
+            self._note_conversation_quietly("@message", conv_before, page, "envoyer_message")
             raise DriverRefusal("timeout", t.why, extra={"journal": line, "abort": t.profile}) from None
-        self.observations["@message"] = {**obs, "html": None, "text": text}
-        self._answer_evidence(ev, obs, mark)
+        failure = obs.pop("failure_raw", None)
+        conversation = self._note_conversation("@message", conv_before, page, "envoyer_message")
+        self.observations["@message"] = {**obs, "html": None, "text": text,
+                                         **({"conversation": conversation} if conversation else {})}
+        self._answer_evidence(ev, obs, mark, failure)
         return self._answer_result(obs, "message")
 
     def lire_reponse(self, args: dict, ev: Evidence) -> dict:
@@ -2712,7 +3470,8 @@ class Recette:
 
     def verdict_oracle(self, args: dict, ev: Evidence) -> dict:
         """evaluer.py sur la dernière observation du cas, puis une ligne au journal (annexe C).
-        Un cas déjà journalisé rend son verdict (replayed) et n'ajoute rien."""
+        Un cas déjà journalisé rend son verdict (replayed) et n'ajoute rien. Le jugement lui-même est
+        `_judge`, que scripts/recette/correct.py rejoue hors ligne."""
         cid = args["case"]
         case = self._case(cid)
         self._late_events()
@@ -2723,18 +3482,68 @@ class Recette:
                     "forbidden": r.get("forbidden", []), "leaks": r.get("leaks", []),
                     "span_issues": r.get("span_issues", []), "replayed": True,
                     "text": json.dumps(done, ensure_ascii=False)}
+        j = self._judge(case)
+        line = self._journal_add(cid, j["verdict"], j["timing_s"], j["evidence"], j["nfr"], j["pipeline_ms"],
+                                 j["extra"])
+        self._record_verdict(case, j)
+        ev.add("journal.jsonl", (line + "\n").encode("utf-8", "replace"))
+        r = j["r"]
+        return {"case": cid, "verdict": r["verdict"], "missing": r["missing"], "forbidden": r["forbidden"],
+                "leaks": r["leaks"], "span_issues": r["span_issues"], "replayed": False, "text": line}
+
+    # -- le jugement (v2.3 : séparé de verdict_oracle, rejouable hors ligne) -------------------------
+    def _next_seq(self) -> int:
+        """Le numéro suivant de la séquence des observations, gardé avec elles (v2.3)."""
+        self.observations["@seq"] = int(self.observations.get("@seq") or 0) + 1
+        return self.observations["@seq"]
+
+    def _shared(self, key: str, obs: dict) -> dict:
+        """Une observation partagée (@load, @list, @model, @web), numérotée : `_fresh_for` la compare aux
+        cas sondés."""
+        obs["seq"] = self._next_seq()
+        self.observations[key] = obs
+        return obs
+
+    def _fresh_for(self, cid: str, obs: dict) -> bool:
+        """Une observation partagée juge-t-elle encore `cid` ? Oui tant qu'elle n'a jugé aucun cas ; une
+        fois épuisée (`judged`), seulement un cas sondé (verdict_oracle refusé faute d'observation) avant
+        qu'elle soit faite : N7-1 et N7-2 se jugent sur une même liste, M8-4 jamais sur celle de M8-2, M8-7
+        jamais sur le choix de modèle de M8-1."""
+        if not obs.get("judged"):
+            return True
+        probe = (self.observations.get("@probes") or {}).get(cid)
+        return probe is not None and probe < (obs.get("seq") or 0)
+
+    def _judge(self, case: dict, offline: bool = False) -> dict:
+        """Le jugement de verdict_oracle, sans rien écrire : evaluer.py sur l'observation du cas et les
+        contrôles de sa sorte. Rend le verdict, la preuve, les ENF, pipeline_ms et les champs de la ligne
+        (`extra`), avec l'observation jugée et sa clé. Une observation partagée ne juge qu'un cas
+        (`_fresh_for`). Sans observation : refus `precondition`, le cas reste à faire, et il est noté sondé.
+        `offline` (scripts/recette/correct.py) : rejouer un cas journalisé sur l'observation gardée (pour
+        une observation partagée, l'instantané gardé sous le cas à son verdict, `observed`), sans fraîcheur
+        ni âge de page de maintenance ; ValueError quand il n'y a rien à rejouer."""
+        cid = case["id"]
         key = {"load": "@load", "list": "@list"}.get(case["kind"], cid)
         if case["kind"] in ("model", "web") and "question" not in case:  # a configuration case
             key = "@model" if case["kind"] == "model" else "@web"
-        obs = self.observations.get(key) or {}
+        own = self.observations.get(cid) or {}
+        if offline and key != cid:
+            obs = own.get("observed")
+            if obs is None:
+                raise ValueError(f"{cid} : jugé sur {key} sans instantané gardé sous le cas (pilote antérieur à la "
+                                 "v2.3) : non rejouable hors ligne")
+        else:
+            obs = self.observations.get(key) or {}
+            if key != cid and obs and not self._fresh_for(cid, obs):
+                obs = {}  # it judged another case already: never a second time
         asked = "answer" in obs
         attach = obs.get("attach") or {}
         dialog = obs.get("dialog")
         offlist = obs.get("offlist")
         nfr = case["nfr"]
         not_sent = obs.get("not_sent")
-        maint = (self.observations.get(cid) or {}).get("maintenance")
-        if maint and time.time() - maint.get("epoch", 0) > MAINTENANCE_FRESH_S:
+        maint = own.get("maintenance")
+        if maint and not offline and time.time() - maint.get("epoch", 0) > MAINTENANCE_FRESH_S:
             maint = None  # an old maintenance never stands for a case tried again later
         if maint and not dialog and not offlist:
             # The app showed its maintenance page when this case was tried: KO disponibilité.
@@ -2743,21 +3552,34 @@ class Recette:
             obs = {k: v for k, v in obs.items() if k in ("verdict",)}  # judged on the maintenance alone
         elif (not asked and not dialog and not offlist
                 and (not_sent or (attach and attach.get("state") not in ("ready", "attached")))):
-            label = (not_sent or {}).get("label") or attach.get("label") or "sans puce"
+            # E9: a failed chip is named by its class, never by its raw label (an observation of pilot v2.2
+            # kept the raw label: its class is read from it here, and the label never reaches the line)
+            name = Path(case.get("file") or "").name
+            label = sanitise((not_sent or {}).get("label") or attach.get("label") or "", 120, keep=(name,)) or "sans puce"
+            if attach.get("state") == "failed" and not attach.get("error_class"):
+                attach = {**attach, "error_class": attach_error_class(attach.get("label"), name), "label": label}
+                obs = {**obs, "attach": attach}
+            if not_sent and not_sent.get("chip") == "failed" and not not_sent.get("error_class"):
+                not_sent = {**not_sent, "error_class": attach_error_class(not_sent.get("label"), name), "label": label}
+                obs = {**obs, "not_sent": not_sent}
             if not_sent:
-                note = (f"question non envoyée (précondition) : pièce jointe {not_sent['chip']} ({label})"
+                what = not_sent.get("error_class") or label
+                note = (f"question non envoyée (précondition) : pièce jointe {not_sent['chip']} ({what})"
                         + (f" après {attach['seconds']} s" if attach.get("seconds") is not None else ""))
             elif attach.get("state") == "failed":
-                note = f"pièce jointe en échec ({label})"
+                note = f"pièce jointe en échec ({attach['error_class']})"
             else:
                 note = f"pièce jointe pas prête : {attach.get('state')} ({label}) après {attach.get('seconds')} s"
             r = {"verdict": "KO", "notes": [note]}
             nfr = nfr_union(nfr, ["disponibilite"])
         elif not asked and not dialog and not offlist:
+            if offline:
+                raise ValueError(f"{cid} : aucune observation jugeable sous {key}")
             hint = {"load": "mesurer_chargement", "list": "lister_conversations",
                     "concurrent": "charge_concurrente", "long": "conversation_longue"}.get(case["kind"], "poser_question")
-            hint = {"@model": "choisir_modele", "@web": "recherche_web"}.get(key, hint)
+            hint = case.get("action") or {"@model": "choisir_modele", "@web": "recherche_web"}.get(key, hint)
             self._last_verdict_probe = cid  # still to do: a maintenance page next is this case's
+            self.observations.setdefault("@probes", {})[cid] = self._next_seq()
             raise DriverRefusal("precondition", f"aucune observation pour {cid} : {hint} d'abord")
         elif asked:
             oracle = {"id": cid, "must": case["must"], "must_not": case["must_not"], "pii": case["pii"]}
@@ -2769,8 +3591,11 @@ class Recette:
             nfr = nfr_union(nfr, r.get("nfr") or [])  # a leak to the model is KO sécurité
             if r["verdict"] == "NON TESTÉ" and not dialog and not offlist:  # échec silencieux
                 r["verdict"] = "KO"
-                r["notes"].append("réponse vide : échec silencieux"
-                                  + (" (aucune nouvelle carte de réponse)" if obs.get("new_answer") is False else ""))
+                failure = obs.get("failure") or {}
+                why = [w for w in ("aucune nouvelle carte de réponse" if obs.get("new_answer") is False else None,
+                                   f"dernier nœud {failure['last_node']}" if failure.get("last_node") else None) if w]
+                r["notes"].append("réponse vide : échec silencieux" + (f" ({' ; '.join(why)})" if why else "")
+                                  + (f" : {failure['error_class']}" if failure.get("error_class") else ""))
                 nfr = nfr_union(nfr, ["disponibilite"])
             if obs.get("body_found") is False and obs.get("answer"):
                 r["notes"].append("corps de réponse introuvable : texte de la carte entière, en-tête compris")
@@ -2799,33 +3624,73 @@ class Recette:
         if obs.get("offlist_after"):  # après la fin de l'action : une note, pas un KO (R20)
             o = obs["offlist_after"]
             r["notes"].append(f"navigation hors périmètre après la réponse : {o['host']} (+{o['after_s']:g} s)")
-        line = self._journal_add(cid, r["verdict"], obs.get("timing_s"), self._summary(r, obs), nfr,
-                                 obs.get("pipeline_ms"), self._line_extra(obs))
-        self.observations.setdefault(key, obs)["verdict"] = {k: r[k] for k in ("verdict", "missing", "forbidden", "leaks", "span_issues", "notes")}
-        if key != cid:
-            self.observations[cid] = {"verdict": self.observations[key]["verdict"], "from": key}
-        ev.add("journal.jsonl", (line + "\n").encode("utf-8", "replace"))
-        return {"case": cid, "verdict": r["verdict"], "missing": r["missing"], "forbidden": r["forbidden"],
-                "leaks": r["leaks"], "span_issues": r["span_issues"], "replayed": False, "text": line}
+        return {"key": key, "obs": obs, "r": r, "verdict": r["verdict"], "timing_s": obs.get("timing_s"),
+                "evidence": self._summary(r, obs), "nfr": nfr, "pipeline_ms": obs.get("pipeline_ms"),
+                "extra": self._line_extra(cid, obs)}
 
-    @staticmethod
-    def _line_extra(obs: dict) -> dict:
-        """Ce que porte une ligne en plus du format : la fin d'affichage, le modèle et le mode web lus
-        (PROCEDURE-2 §8.4), l'empreinte du texte envoyé (replay_of)."""
+    def _record_verdict(self, case: dict, j: dict) -> None:
+        """Après la ligne : le verdict noté sur l'observation qui l'a fait. Une observation partagée est
+        alors épuisée (`judged`), et son instantané gardé sous le cas (`observed`, pour un rejeu hors
+        ligne) ; le choix du modèle ou du mode web fait pour un cas `model` ou `web` à question est épuisé
+        aussi : un cas de configuration ne se juge jamais sur lui."""
+        cid, key, obs, r = case["id"], j["key"], j["obs"], j["r"]
+        record = {k: r[k] for k in ("verdict", "missing", "forbidden", "leaks", "span_issues", "notes")}
+        self.observations.setdefault(key, obs)["verdict"] = record
+        if key != cid:
+            self.observations[key]["judged"] = cid
+            self.observations[cid] = {"verdict": record, "from": key,
+                                      "observed": {k: v for k, v in obs.items() if k not in ("verdict", "judged")}}
+        elif case["kind"] in ("model", "web"):
+            shared = self.observations.get("@model" if case["kind"] == "model" else "@web")
+            if isinstance(shared, dict) and shared.get("answer") and not shared.get("judged"):
+                shared["judged"] = cid
+
+    def _line_extra(self, cid: str, obs: dict) -> dict:
+        """Ce que porte une ligne en plus du format : la fin d'affichage, le modèle et le mode web lus et,
+        depuis la v2.3, l'état du micro (`config`, PROCEDURE-2 §8.4 ; E4), l'empreinte du texte envoyé
+        (replay_of). Depuis la v2.3 : sur la ligne d'une question, `sent_source` (nul, avec la raison en
+        `sent_rejected`), `sent_tokens` et `pii_declared` (E7) ; la pièce jointe (`attach`, avec sa liste
+        `accept`, E6, jamais son libellé brut) ; `error_class`, d'une puce en échec (E9) ou d'un échec
+        silencieux, avec son extrait expurgé `error_excerpt` (E10) ; la conversation du registre (E1) ; et
+        toujours `modals_closed`, les modales connues que la garde a fermées pendant les actions du cas (E5)."""
         extra = {}
         if obs.get("display_s") is not None:
             extra["display_s"] = obs["display_s"]
         composer, guard = obs.get("composer"), obs.get("guard") or {}
         if composer or guard.get("model"):
             extra["config"] = {"model": (composer or {}).get("model"), "web": (composer or {}).get("web"),
-                               "banner": guard.get("model")}
+                               "banner": guard.get("model"), "mic": (composer or {}).get("mic")}
         if obs.get("sent_to_model") is not None:
             extra["sent_sha256"] = sent_digest(obs["sent_to_model"])
+        if "sent_info" in obs or "guard" in obs:  # a question was asked (E7)
+            info = obs.get("sent_info") or {}
+            seen = obs.get("sent_to_model") is not None
+            extra["sent_source"] = info.get("source") if seen else None
+            if not seen:
+                extra["sent_rejected"] = (info.get("rejected") or info.get("popover_rejected")
+                                          or ("pas de carte de réponse" if obs.get("new_answer") is False
+                                              else "texte envoyé non observé"))
+            extra["sent_tokens"] = token_inventory(obs.get("sent_to_model"))
+            extra["pii_declared"] = guard.get("pii_count")
+        attach = obs.get("attach")
+        if attach:
+            extra["attach"] = {k: attach.get(k) for k in ("state", "ready_by", "seconds", "accept", "error_class")}
+        failure = obs.get("failure") or {}
+        error = ((obs.get("not_sent") or {}).get("error_class") or (attach or {}).get("error_class")
+                 or failure.get("error_class"))
+        if error:
+            extra["error_class"] = error
+        if failure.get("excerpt"):
+            extra["error_excerpt"] = failure["excerpt"]
+        if obs.get("conversation"):
+            extra["conversation"] = obs["conversation"]
+        extra["modals_closed"] = list((self.observations.get("@modals") or {}).get(cid) or [])
         return extra
 
     def _replay_note(self, case: dict, obs: dict, r: dict) -> None:
-        """Le second passage d'un cas (replay_of) : le verdict du premier, et si le texte envoyé est
-        le même à la numérotation des jetons près (un écart signe un masquage non déterministe)."""
+        """Le second passage d'un cas (replay_of) : le verdict du premier, le texte envoyé comparé à la
+        numérotation des jetons près, et (v2.3, E7) les ensembles masqués comparés (`sent_tokens` des deux
+        lignes) : c'est sur eux que le juge applique le point 5 du contrat (non-déterminisme)."""
         first = self._journaled(case["replay_of"])
         if first is None:
             r["notes"].append(f"passage a ({case['replay_of']}) pas encore journalisé")
@@ -2833,8 +3698,11 @@ class Recette:
         note = f"passage a ({case['replay_of']}) : {first['verdict']}"
         mine = sent_digest(obs.get("sent_to_model"))
         if mine and first.get("sent_sha256"):
-            note += (" ; texte envoyé identique" if mine == first["sent_sha256"]
-                     else " ; texte envoyé différent (masquage non déterministe ?)")
+            note += " ; texte envoyé identique" if mine == first["sent_sha256"] else " ; texte envoyé différent"
+        if "sent_tokens" in first:
+            note += " ; " + inventory_note(first["sent_tokens"], token_inventory(obs.get("sent_to_model")))
+        else:
+            note += " ; ensemble masqué non comparable (passage a journalisé sans ses jetons)"
         r["notes"].append(note)
 
     @staticmethod
@@ -2902,14 +3770,663 @@ class Recette:
         return " ; ".join(parts)
 
     def lister_conversations(self, args: dict, ev: Evidence) -> dict:
-        """N7 : les titres de la barre latérale."""
+        """N7 : les titres de la barre latérale. Avec `case` (v2.3, E2) : un cas qui porte une question est
+        une recherche ⌘K (_search) ; sans question, la liste, comme sans `case` (N7, M8-2). Un cas `list` qui
+        se joue par une autre action (renommer, supprimer) est refusé, avant tout clic."""
         page = self.browser.page()
         self._ensure_on_app(page)
+        cid = args.get("case")
+        case = self._case(cid) if cid else None
+        if case is not None:
+            if case["kind"] != "list":
+                raise DriverRefusal("precondition", f"le cas {cid} ({case['kind']}) n'est pas un cas de liste")
+            self._played_by(case, "lister_conversations")
+        composer = self._composer_now(page)
+        if case is not None and (case.get("question") or "").strip():
+            return self._search(page, case, composer, ev)
         titles = self.browser.call(TITLES_JS, {"items": SELECTORS["conversation_items"]})
         text = f"{len(titles)} conversation{'s' if len(titles) != 1 else ''} : " + " | ".join(titles[:30])
         ev.screenshot(page, "screen.png")
-        self.observations["@list"] = {"answer": text, "timing_s": None, "t": now_iso()}
+        self._shared("@list", {"answer": text, "timing_s": None, "t": now_iso(), "composer": composer,
+                               **({"case": cid} if cid else {})})
         return {"titles": titles, "count": len(titles), "text": one_line(text, 300)}
+
+    # -- les fonctions autour du message (v2.3, E2 à E5, E11) -------------------------------------
+    @staticmethod
+    def _played_by(case: dict, action: str) -> None:
+        """Un cas qui nomme son action (`action`, v2.3) ne se joue que par elle : supprimer_conversation sur
+        le cas du renommage est refusé, avant tout clic. renommer_conversation, supprimer_conversation et
+        ouvrir_avis exigent un cas qui les nomme."""
+        named = case.get("action")
+        if named == action:
+            return
+        if named:
+            raise DriverRefusal("precondition", f"le cas {case['id']} se joue par {named}, pas par {action}")
+        if action in ("renommer_conversation", "supprimer_conversation", "ouvrir_avis"):
+            raise DriverRefusal("precondition", f"le cas {case['id']} ne nomme pas l'action {action} : rien n'est touché")
+
+    def _wait_for(self, page, probe, limit_s: float):
+        """La première valeur vraie de `probe()`, essayée toutes les 100 ms, au plus `limit_s` ; None sinon.
+        Un délai de la page compte pour une valeur fausse, sauf avec un dialogue en attente."""
+        deadline = time.monotonic() + limit_s
+        while True:
+            try:
+                got = probe()
+            except PWTimeout:
+                if self.browser.pending():
+                    raise
+                got = None
+            if got:
+                return got
+            if time.monotonic() >= deadline:
+                return None
+            page.wait_for_timeout(100)
+
+    def _first_visible(self, page, sels: list) -> dict | None:
+        """Le premier élément visible d'une liste de sélecteurs Playwright : son sélecteur, son rang parmi
+        ses correspondances, son aria-label et son texte ; None. Un sélecteur refusé est passé."""
+        for sel in sels:
+            try:
+                loc = page.locator(sel)
+                for i in range(min(loc.count(), 10)):
+                    item = loc.nth(i)
+                    if item.is_visible():
+                        return {"selector": sel, "index": i, "label": item.get_attribute("aria-label", timeout=2000),
+                                "text": one_line(item.inner_text(timeout=2000), 120)}
+            except PWTimeout:
+                if self.browser.pending():
+                    raise
+            except PWError:
+                continue
+        return None
+
+    def _restore_page(self, page, url: str, record: dict) -> None:
+        """Remettre la page où l'action l'a trouvée, si un clic l'a menée ailleurs (une entrée de recherche
+        ou d'avis qui serait un lien) : le cas suivant attend le compositeur."""
+        if urlsplit(page.url).path != urlsplit(url).path:
+            record["moved_to"] = short_url(page.url)
+            self._goto(page, url)
+
+    def _open_search(self, page, arg: dict, record: dict) -> bool:
+        """La palette ⌘K ouverte par le driver : au clavier (ControlOrMeta+K), à défaut par l'entrée de la
+        barre latérale (search_entry). Modale `own` « recherche » dès avant la touche : laissée ouverte par
+        une action coupée, la garde suivante la referme. Rend True si son champ est visible."""
+        b = self.browser
+        b.own_modal = "recherche"
+        page.keyboard.press("ControlOrMeta+K")
+        if self._wait_for(page, lambda: b.call(SEARCH_JS, arg, page=page, timeout_ms=2000), SEARCH_OPEN_S):
+            record["opened_by"] = "ControlOrMeta+K"
+            return True
+        entry = self._first_visible(page, SELECTORS["search_entry"])
+        record["entry"] = entry
+        if entry is not None:
+            page.locator(entry["selector"]).nth(entry["index"]).click(timeout=5000)
+            if self._wait_for(page, lambda: b.call(SEARCH_JS, arg, page=page, timeout_ms=2000), SEARCH_OPEN_S):
+                record["opened_by"] = entry["selector"]
+                return True
+        b.own_modal = None
+        return False
+
+    def _close_search(self, page, arg: dict) -> bool:
+        """Échap, deux fois au plus, jusqu'à ce que la palette n'ait plus de champ visible."""
+        b = self.browser
+        for _ in range(2):
+            page.keyboard.press("Escape")
+            if self._wait_for(page, lambda: not b.call(SEARCH_JS, arg, page=page, timeout_ms=2000), 1.5):
+                if b.own_modal == "recherche":
+                    b.own_modal = None
+                return True
+        return False
+
+    def _search_results(self, page, arg: dict) -> tuple[dict | None, bool]:
+        """Les résultats de la palette, lus quand ils ne bougent plus : SEARCH_STABLE_S immobiles, au plus
+        tôt SEARCH_MIN_S après la frappe, au plus SEARCH_CAP_S (`settled` faux). None : la palette s'est
+        refermée."""
+        b = self.browser
+        t1 = time.monotonic()
+        last, since = None, t1
+        while True:
+            got = b.call(SEARCH_JS, arg, page=page, timeout_ms=2000)
+            now = time.monotonic()
+            if got is None:
+                return None, False
+            key = (tuple(got["results"]), got["empty"], got["value"])
+            if key != last:
+                last, since = key, now
+            elif now - t1 >= SEARCH_MIN_S and now - since >= SEARCH_STABLE_S:
+                return got, True
+            if now - t1 >= SEARCH_CAP_S:
+                return got, False
+            page.wait_for_timeout(150)
+
+    def _search(self, page, case: dict, composer: dict, ev: Evidence) -> dict:
+        """v2.3, E2 — la recherche ⌘K d'un cas `list` qui porte une question : la palette ouverte
+        (_open_search), la question tapée dans son champ et là seulement, les titres des résultats lus quand
+        ils ne bougent plus (_search_results), la palette refermée par Échap. @list : « recherche « q » : n
+        résultats : t1 | t2 … ». Une palette qui ne s'ouvre pas, un champ qui ne prend pas la question :
+        l'observation le dit, et l'action refuse `precondition`."""
+        b = self.browser
+        cid, q = case["id"], case["question"]
+        t0 = time.monotonic()
+        start = page.url
+        arg = {"inputs": SELECTORS["search_input"], "results": SELECTORS["search_result"],
+               "empty": SELECTORS["search_empty"], "redact": False}
+        record = {"case": cid, "query": q, "opened_by": None, "input": None, "results": [], "result": None,
+                  "empty": None, "settled": None, "closed": None, "seconds": None}
+        error, shot = None, False
+        try:
+            if not self._open_search(page, arg, record):
+                error = "la recherche ne s'ouvre pas (ni ControlOrMeta+K, ni l'entrée de la barre latérale)"
+            else:
+                field = b.element(SEARCH_INPUT_EL_JS, arg, page=page, timeout_ms=3000)
+                if field is None:
+                    error = "pas de champ dans la recherche"
+                else:
+                    try:
+                        field.fill(q, timeout=5000)
+                    finally:
+                        field.dispose()
+                    got, record["settled"] = self._search_results(page, arg)
+                    if got is None:
+                        error = "la recherche s'est refermée avant ses résultats"
+                    else:
+                        record.update({k: got[k] for k in ("input", "results", "result", "empty", "focused", "value",
+                                                           "html")})
+                        if evaluer.fold(got["value"]).strip() != evaluer.fold(q).strip():
+                            error = "le champ de recherche ne porte pas la question"
+                        ev.screenshot(page, "screen.png")  # the palette and its results, before it closes
+                        shot = True
+        except PWTimeout:
+            if b.pending():
+                raise
+            error = "délai d'une lecture de la recherche dépassé"
+        finally:
+            if record["opened_by"] and not b.pending():
+                record["closed"] = self._close_search(page, arg)
+            record["seconds"] = round(time.monotonic() - t0, 1)
+        self._restore_page(page, start, record)
+        n = len(record["results"])
+        text = (f"recherche « {q} » : {error}" if error else
+                f"recherche « {q} » : {n} résultat{'s' if n > 1 else ''}"
+                + (" : " + " | ".join(record["results"][:30]) if n else ""))
+        if not shot:
+            ev.screenshot(page, "screen.png")
+        ev.json("search.json", record)
+        self._shared("@list", {"answer": text, "timing_s": None, "t": now_iso(), "composer": composer, "case": cid,
+                               "search": {k: record[k] for k in ("opened_by", "input", "result", "empty", "settled",
+                                                                 "closed", "seconds")}})
+        if error:
+            raise DriverRefusal("precondition", error, extra={"text": one_line(text, 300)})
+        return {"case": cid, "results": record["results"], "count": n, "closed": record["closed"],
+                "opened_by": record["opened_by"], "text": one_line(text, 300)}
+
+    def _target(self, case: dict) -> dict:
+        """La conversation du registre que le cas nomme par same_conversation_as (E1, E3) : celle que ce cas
+        a créée. Sinon un refus `precondition`, avant tout clic."""
+        cid, owner = case["id"], case.get("same_conversation_as")
+        if not owner:
+            raise DriverRefusal("precondition", f"le cas {cid} ne nomme pas sa conversation (same_conversation_as)")
+        entry = self._registered(owner)
+        if entry is None:
+            raise DriverRefusal("precondition", f"la conversation de {owner} n'est pas au registre des conversations "
+                                                "créées par la recette : rien n'est touché")
+        return entry
+
+    def renommer_conversation(self, args: dict, ev: Evidence) -> dict:
+        """v2.3, E3 — renommer la conversation que le cas nomme par same_conversation_as, et elle seule : la
+        conversation du registre que ce cas a créée (E1), retrouvée dans la barre latérale par son adresse
+        exacte, jamais par son rang ni par son titre seul. Son menu (_open_item_menu), l'entrée « Renommer »
+        d'un menu de conversation (menu_entry), la question du cas tapée comme titre dans le champ qui
+        s'ouvre (_rename). La barre latérale relue dans @list : « renommage de la conversation de X : titre
+        relu « … » ; n conversations : … ». Refus `precondition` sans aucun clic : un cas qui ne nomme pas
+        cette action, une conversation absente du registre, supprimée, ou absente de la barre latérale.
+        Irréversible (reversible: false)."""
+        case = self._case(args["case"])
+        self._played_by(case, "renommer_conversation")
+        if not (case.get("question") or "").strip():
+            raise DriverRefusal("precondition", f"le cas {case['id']} n'a pas de titre à donner (question)")
+        entry = self._target(case)
+        if entry["state"] == "supprimée":
+            raise DriverRefusal("precondition", f"la conversation de {case['same_conversation_as']} est supprimée : "
+                                                "rien à renommer")
+        return self._conversation_action(case, entry, "renommer", ev)
+
+    def supprimer_conversation(self, args: dict, ev: Evidence) -> dict:
+        """v2.3, E3 — supprimer la conversation que le cas nomme par same_conversation_as, et elle seule (la
+        même règle que renommer_conversation) : l'entrée « Supprimer » d'un menu de conversation, puis la
+        confirmation de l'application, la modale `own` « suppression », validée par son seul bouton de
+        confirmation (_confirm_delete). Le registre la note « supprimée ». Déjà supprimée au registre : rien
+        n'est cliqué, la barre latérale est relue. @list : « suppression de la conversation de X : plus
+        listée ; n conversations : … ». Irréversible (reversible: false)."""
+        case = self._case(args["case"])
+        self._played_by(case, "supprimer_conversation")
+        entry = self._target(case)
+        return self._conversation_action(case, entry, "supprimer", ev)
+
+    def _conversation_action(self, case: dict, entry: dict, how: str, ev: Evidence) -> dict:
+        """Le renommage ou la suppression de la conversation `entry` du registre, puis la barre latérale
+        relue dans @list (le titre relu de cette adresse, ou « plus listée », puis la liste), le registre mis
+        à jour, conversation.json. Un échec après le premier clic : l'observation le dit (le verdict sera
+        KO), et l'action refuse `precondition`."""
+        b = self.browser
+        page = b.page()
+        self._ensure_on_app(page)
+        cid, owner = case["id"], case["same_conversation_as"]
+        self._case_in_hand = cid
+        composer = self._composer_now(page)
+        arg = self._conv_arg(entry["href"])
+        t0 = time.monotonic()
+        record = {"case": cid, "action": how, "conversation": {k: entry.get(k) for k in ("href", "case", "state", "title")},
+                  "item": None, "trigger": None, "menu": None, "picked": None, "field": None, "confirmation": None}
+        outcome, error = None, None
+        listed = {p for p, _ in (self._conversation_state(page) or {}).get("items") or []}
+        if how == "supprimer" and entry["state"] == "supprimée":
+            outcome = "déjà supprimée au registre : rien n'est cliqué"
+        else:
+            record["item"] = b.call(ITEM_JS, arg, page=page)
+            if not record["item"].get("found"):
+                ev.json("conversation.json", record)
+                raise DriverRefusal("precondition", f"la conversation de {owner} ({entry['href']}) n'est pas dans la "
+                                                    "barre latérale : rien n'est touché")
+            try:
+                menu = self._open_item_menu(page, arg, record)
+                if menu is None:
+                    error = record.get("error") or "le menu de la conversation ne s'ouvre pas"
+                else:
+                    pick, why = menu_entry(menu["items"], how)
+                    if pick is None:
+                        record["closed_menu"] = self._close_menu(page)
+                        error = why
+                    else:
+                        record["picked"] = pick["label"]
+                        self._click_menu_entry(page, menu, how)
+                        if how == "renommer":
+                            outcome, error = self._rename(page, arg, case["question"].strip(), record)
+                        else:
+                            outcome, error = self._confirm_delete(page, arg, record)
+            except PWTimeout:
+                if b.pending():
+                    raise
+                error = "délai d'une lecture de la page dépassé"
+            except PWError as e:
+                error = one_line(str(e), 200)
+        after = b.call(ITEM_JS, arg, page=page)
+        record["item_after"] = {k: after.get(k) for k in ("found", "title", "count")}
+        now_listed = {p for p, _ in (self._conversation_state(page) or {}).get("items") or []}
+        others = sorted((listed - now_listed) - {entry["href"]})
+        if others:  # never expected: noted loud, for the judge and the founder
+            record["others_gone"] = others
+            log.warning("other conversations left the sidebar during %s: %s", how, others)
+        if how == "renommer":
+            state = (f"titre relu « {after.get('title')} »" if after.get("found")
+                     else "conversation absente de la barre latérale")
+            if outcome and not error:
+                entry.update(state="renommée", title=after.get("title"))
+                entry.setdefault("history", []).append({"t": now_iso(), "state": "renommée", "case": cid,
+                                                        "title": after.get("title")})
+        else:
+            state = "encore listée" if after.get("found") else "plus listée"
+            if after.get("found") and not error:
+                error = "encore listée"
+            if not after.get("found") and entry["state"] != "supprimée" and (outcome or not error):
+                entry["state"] = "supprimée"
+                entry.setdefault("history", []).append({"t": now_iso(), "state": "supprimée", "case": cid})
+        self._save_registry()
+        titles = b.call(TITLES_JS, {"items": SELECTORS["conversation_items"]}, page=page)
+        listing = f"{len(titles)} conversation{'s' if len(titles) != 1 else ''} : " + " | ".join(titles[:30])
+        verb = "renommage" if how == "renommer" else "suppression"
+        text = (f"{verb} de la conversation de {owner} : {state}" + (f" ({error})" if error else "")
+                + (f" ; {len(others)} autre(s) conversation(s) plus listée(s)" if others else "") + f" ; {listing}")
+        record.update(outcome=outcome, error=error, seconds=round(time.monotonic() - t0, 1))
+        ev.json("conversation.json", record)
+        ev.screenshot(page, "screen.png")
+        self._shared("@list", {"answer": text, "timing_s": None, "t": now_iso(), "composer": composer, "case": cid,
+                               "conversation": {"href": entry["href"], "created_by": entry["case"],
+                                                "state": entry["state"]}})
+        if error:
+            raise DriverRefusal("precondition", f"{verb} de la conversation de {owner} : {error}",
+                                extra={"text": one_line(text, 300)})
+        return {"case": cid, "conversation": entry["href"], "state": entry["state"], "text": one_line(text, 300)}
+
+    def _open_item_menu(self, page, arg: dict, record: dict) -> dict | None:
+        """Le menu de la conversation que nomme `arg` (son adresse) : son lien survolé (le déclencheur se
+        révèle au survol), son déclencheur — au plus près du lien, dans l'élément de cette conversation
+        seule — cliqué, puis le menu lu (celui que le déclencheur nomme, sinon le dernier visible). Rend le
+        menu, ou None (la raison dans record["error"])."""
+        b = self.browser
+        if b.call(MENU_OPEN_JS, {"menu": SELECTORS["menu"]}, page=page) and not self._close_menu(page):
+            record["error"] = "un menu était déjà ouvert et ne se ferme pas : rien n'est cliqué"
+            return None  # the menu read after the click must be the one this click opened
+        anchor = b.element(ITEM_EL_JS, arg, page=page, timeout_ms=3000)
+        if anchor is None:
+            record["error"] = "le lien de la conversation a disparu"
+            return None
+        try:
+            anchor.hover(timeout=5000)
+        finally:
+            anchor.dispose()
+
+        def with_trigger():
+            info = b.call(ITEM_JS, arg, page=page, timeout_ms=2000)
+            return info if info.get("trigger") else None
+
+        info = self._wait_for(page, with_trigger, 1.5)
+        if not info:
+            record["error"] = "pas de bouton de menu sur la conversation, même au survol"
+            return None
+        record["trigger"] = {k: info.get(k) for k in ("trigger", "trigger_level", "trigger_label", "expanded", "scope",
+                                                      "scope_is_link", "html")}
+        trigger = b.element(TRIGGER_EL_JS, arg, page=page, timeout_ms=3000)
+        if trigger is None:
+            record["error"] = "le bouton de menu de la conversation a disparu"
+            return None
+        try:
+            trigger.click(timeout=5000)
+        finally:
+            trigger.dispose()
+        controls = (b.call(ITEM_JS, arg, page=page, timeout_ms=2000) or {}).get("controls")
+        margs = {"menu": SELECTORS["menu"], "item": SELECTORS["menu_item"], "controls": controls}
+        menu = self._wait_for(page, lambda: b.call(MENU_JS, margs, page=page, timeout_ms=2000), UI_WAIT_S)
+        if not menu:
+            page.keyboard.press("Escape")
+            record["error"] = "le menu de la conversation ne s'ouvre pas"
+            return None
+        record["menu"] = {k: menu[k] for k in ("how", "id", "items", "html")}
+        return {**menu, "arg": margs}
+
+    def _click_menu_entry(self, page, menu: dict, how: str) -> None:
+        """Cliquer l'entrée de renommage ou de suppression du menu ouvert : la seule, active, dont le texte
+        suit son motif (MENU_ITEM_EL_JS), jamais un rang."""
+        pattern = SELECTORS["menu_rename"] if how == "renommer" else SELECTORS["menu_delete"]
+        el = self.browser.element(MENU_ITEM_EL_JS, {**menu["arg"], "pattern": pattern}, page=page, timeout_ms=3000)
+        if el is None:
+            raise PWError("l'entrée du menu a disparu")
+        try:
+            el.click(timeout=5000)
+        finally:
+            el.dispose()
+
+    def _close_menu(self, page) -> bool:
+        """Échap, deux fois au plus, jusqu'à ce qu'aucun menu ne soit visible."""
+        b = self.browser
+        for _ in range(2):
+            page.keyboard.press("Escape")
+            if self._wait_for(page, lambda: not b.call(MENU_OPEN_JS, {"menu": SELECTORS["menu"]}, page=page,
+                                                         timeout_ms=2000), 1.5):
+                return True
+        return False
+
+    def _rename(self, page, arg: dict, title: str, record: dict) -> tuple[str | None, str | None]:
+        """Après « Renommer » : le champ du nouveau titre (le focus, sinon rename_field ; jamais le
+        compositeur ni une recherche) rempli du titre et validé par Entrée, à défaut par le seul bouton de
+        validation de sa fenêtre ; abandonné par Échap s'il ne se valide pas. Puis le titre relu sur la
+        conversation de cette adresse. Rend (« renommée », None) ou (None, la raison)."""
+        b = self.browser
+        farg = {"fields": SELECTORS["rename_field"], "sidebar": SELECTORS["sidebar"], "composer": SELECTORS["textarea"],
+                "submit": SELECTORS["rename_submit"]}
+        field = self._wait_for(page, lambda: b.call(RENAME_FIELD_JS, farg, page=page, timeout_ms=2000), UI_WAIT_S)
+        if not field:
+            return None, "pas de champ pour le nouveau titre après « Renommer »"
+        record["field"] = field
+        if field["in_dialog"]:
+            b.own_modal = "renommer"
+        el = b.element(RENAME_FIELD_EL_JS, farg, page=page, timeout_ms=3000)
+        if el is None:
+            return None, "le champ du nouveau titre a disparu"
+        try:
+            el.fill(title, timeout=5000)
+            el.press("Enter", timeout=5000)
+        finally:
+            el.dispose()
+
+        def gone():
+            return not b.call(RENAME_FIELD_JS, farg, page=page, timeout_ms=2000)
+
+        done = self._wait_for(page, gone, 2.0)
+        if not done and field["in_dialog"]:
+            button = b.element(RENAME_SUBMIT_EL_JS, farg, page=page, timeout_ms=3000)
+            if button is not None:
+                try:
+                    button.click(timeout=5000)
+                finally:
+                    button.dispose()
+                done = self._wait_for(page, gone, 2.0)
+        if not done:
+            page.keyboard.press("Escape")  # abandoned, never left half-typed
+            if self._wait_for(page, gone, 1.5) and b.own_modal == "renommer":
+                b.own_modal = None
+            return None, "le nouveau titre n'a pas été validé"
+        if b.own_modal == "renommer":
+            b.own_modal = None
+
+        def renamed():
+            info = b.call(ITEM_JS, arg, page=page, timeout_ms=2000)
+            return info if info.get("found") and same_title(info.get("title"), title) else None
+
+        if not self._wait_for(page, renamed, UI_WAIT_S):
+            return None, "le nouveau titre n'est pas relu sur la conversation"
+        return "renommée", None
+
+    def _confirm_delete(self, page, arg: dict, record: dict) -> tuple[str | None, str | None]:
+        """Après « Supprimer » : la confirmation de l'application (une fenêtre d'alerte, à défaut une fenêtre),
+        validée par son seul bouton dont le texte suit `confirm` (KNOWN_MODALS « suppression ») ; annulée par
+        Échap s'il n'y en a pas un et un seul. Puis la conversation de cette adresse absente de la barre
+        latérale. Sans confirmation, une conversation déjà partie a été supprimée sans elle (noté). Rend
+        (« supprimée », None) ou (None, la raison)."""
+        b = self.browser
+        k = next(k for k in KNOWN_MODALS if k["name"] == "suppression")
+        carg = {"confirm": k["confirm"]}
+
+        def gone():
+            return not b.call(ITEM_JS, arg, page=page, timeout_ms=2000).get("found")
+
+        def closed():
+            return not b.call(CONFIRM_JS, carg, page=page, timeout_ms=2000)
+
+        dlg = self._wait_for(page, lambda: b.call(CONFIRM_JS, carg, page=page, timeout_ms=2000), UI_WAIT_S)
+        if not dlg:
+            if gone():
+                record["confirmation"] = "aucune"
+                return "supprimée sans confirmation", None
+            return None, "pas de confirmation de suppression"
+        record["confirmation"] = dlg
+        if dlg["role"] == "alertdialog":
+            b.own_modal = "suppression"
+        if dlg["hits"] != 1:
+            page.keyboard.press("Escape")  # cancelled, never confirmed blind
+            if self._wait_for(page, closed, 1.5) and b.own_modal == "suppression":
+                b.own_modal = None
+            return None, f"confirmation sans bouton de suppression unique : {' | '.join(dlg['buttons'])}"
+        el = b.element(CONFIRM_EL_JS, carg, page=page, timeout_ms=3000)
+        if el is None:
+            return None, "le bouton de confirmation a disparu"
+        try:
+            el.click(timeout=5000)
+        finally:
+            el.dispose()
+        if self._wait_for(page, closed, UI_WAIT_S) and b.own_modal == "suppression":
+            b.own_modal = None
+        if not self._wait_for(page, gone, UI_WAIT_S):
+            return None, "encore listée après la confirmation"
+        return "supprimée", None
+
+    def ouvrir_avis(self, args: dict, ev: Evidence) -> dict:
+        """v2.3, E5 — l'enquête « Votre avis », ouverte exprès depuis son entrée (feedback_entry ; vue le
+        18/10 : button[aria-label="Send feedback"]), reconnue par sa structure (KNOWN_MODALS « avis ») et
+        fermée par sa croix, jamais par « Envoyer » : rien n'y est choisi, écrit ni envoyé. L'observation du
+        cas : « avis : ouvert (entrée : X) ; fermé par : croix ; envoyé : non ». Une entrée introuvable, une
+        enquête qui ne s'ouvre pas : observation et refus `precondition` ; une fenêtre non reconnue, ou qui
+        ne se ferme pas par sa croix : observation et refus `dialog`, laissée à l'humain."""
+        cid = args["case"]
+        case = self._case(cid)
+        self._played_by(case, "ouvrir_avis")
+        b = self.browser
+        page = b.page()
+        self._ensure_on_app(page)
+        self._case_in_hand = cid
+        composer = self._composer_now(page)
+        avis = next(k for k in KNOWN_MODALS if k["name"] == "avis")
+        margs = {"known": [avis], "modal": SELECTORS["modal"]}
+        record = {"case": cid, "entry": None, "opened": False, "closed_by": None, "sent": False}
+        refusal = None
+        start = page.url
+        entry = self._first_visible(page, SELECTORS["feedback_entry"])
+        record["entry"] = entry
+        if entry is None:
+            text = "avis : entrée introuvable ; envoyé : non"
+            refusal = ("precondition", "pas d'entrée « Votre avis » (Send feedback) dans la page")
+        else:
+            name = entry["label"] or entry["text"] or entry["selector"]
+            page.locator(entry["selector"]).nth(entry["index"]).click(timeout=5000)
+
+            def opened():
+                m = b.call(MODALS_JS, margs, page=page, timeout_ms=2000)
+                return m if (m["known"] or m["unknown"]) else None
+
+            seen = self._wait_for(page, opened, UI_WAIT_S)
+            if not seen:
+                text = f"avis : ne s'ouvre pas (entrée : {name}) ; envoyé : non"
+                refusal = ("precondition", "l'enquête « Votre avis » ne s'ouvre pas depuis son entrée")
+            elif "avis" not in seen["known"]:
+                record["unknown"] = seen["unknown"]
+                text = f"avis : fenêtre non reconnue (entrée : {name}) ; fermé par : non fermé ; envoyé : non"
+                refusal = ("dialog", f"modale inconnue après l'entrée « Votre avis » : {seen['unknown'][0]}")
+            else:
+                record["opened"] = True
+                record["survey"] = b.call(AVIS_JS, {"sel": avis["selector"]}, page=page)
+                ev.screenshot(page, "avis.png")
+                page.locator(avis["dismiss"]).first.click(timeout=5000)  # its cross, never « Envoyer »
+                shut = self._wait_for(page, lambda: "avis" not in b.call(MODALS_JS, margs, page=page,
+                                                                         timeout_ms=2000)["known"], 2.0)
+                record["closed_by"] = "croix" if shut else None
+                if shut:
+                    text = f"avis : ouvert (entrée : {name}) ; fermé par : croix ; envoyé : non"
+                else:
+                    text = f"avis : ouvert (entrée : {name}) ; fermé par : non fermé ; envoyé : non"
+                    refusal = ("dialog", "l'enquête « Votre avis » ne se ferme pas par sa croix : à fermer dans "
+                                         "Chrome, jamais par « Envoyer »")
+        if not refusal or refusal[0] != "dialog":
+            self._restore_page(page, start, record)
+        ev.json("avis.json", record)
+        self.observations[cid] = {"answer": text, "timing_s": None, "t": now_iso(), "composer": composer,
+                                  "avis": {"entry": (entry or {}).get("selector"), "opened": record["opened"],
+                                           "closed_by": record["closed_by"], "sent": False}}
+        if refusal:
+            raise DriverRefusal(refusal[0], refusal[1], extra={"text": text})
+        return {"case": cid, "opened": True, "closed_by": "croix", "sent": False, "text": text}
+
+    def sonder_interface(self, args: dict, ev: Evidence) -> dict:
+        """v2.3, E11 — la sonde d'interface, en lecture seule, que la recette joue en M0, avant que M8 ait
+        besoin de ces adresses : chaque sélecteur de SELECTORS résolu sur la page (trouvés, visibles ; les
+        motifs de texte exceptés), l'entrée de la recherche ⌘K et la palette (ouverte, son balisage relevé
+        sans les titres, refermée par Échap, rien tapé), l'entrée de « Votre avis » (jamais cliquée), le
+        bouton de dictée (jamais pressé), la liste `accept` du champ de fichier, et le menu de la PREMIÈRE
+        conversation de la barre latérale (survolée, déclencheur cliqué, entrées lues, refermé par Échap ;
+        aucune entrée cliquée ; ni son titre ni son adresse gardés). probe.json. Ne refuse rien : ce qui
+        échoue est noté dans `errors` (seule la garde commune refuse, un dialogue gelant la page)."""
+        b = self.browser
+        page = b.page()
+        probe = {"t": now_iso(), "url": None, "selectors": None, "search_entry": None, "search": None,
+                 "feedback_entry": None, "mic": None, "file_input": None, "menu": None, "errors": []}
+
+        def step(name, fn):
+            try:
+                probe[name] = fn()
+            except (PWError, DriverRefusal) as e:
+                if b.pending():
+                    raise
+                probe["errors"].append(f"{name} : {one_line(getattr(e, 'detail', '') or str(e), 200)}")
+
+        def url():
+            self._ensure_on_app(page)
+            return short_url(page.url)
+
+        step("url", url)
+        start = page.url
+        step("selectors", lambda: self._probe_selectors(page))
+        step("search_entry", lambda: self._first_visible(page, SELECTORS["search_entry"]))
+        step("feedback_entry", lambda: self._first_visible(page, SELECTORS["feedback_entry"]))
+        step("mic", lambda: b.call(MIC_JS, {"sel": SELECTORS["mic_button"]}, page=page))
+        step("file_input", lambda: self._file_input(page))
+        step("search", lambda: self._probe_search(page))
+        step("menu", lambda: self._probe_menu(page))
+        step("restored", lambda: self._restore_page(page, start, probe) or "moved_to" in probe)
+        ev.json("probe.json", probe)
+        sel = probe["selectors"] or {}
+        found = sorted(k for k, rows in sel.items() if any(r.get("count") for r in rows))
+        missing = sorted(k for k, rows in sel.items() if not any(r.get("count") for r in rows))
+        menu = probe["menu"] or {}
+        items = " | ".join(i["label"] for i in (menu.get("menu") or {}).get("items") or [])
+        text = (f"sonde : {len(found)} sélecteurs sur {len(sel)} trouvés"
+                + (f" (absents : {', '.join(missing)})" if missing else "")
+                + f" ; ⌘K : {'ouverte' if (probe['search'] or {}).get('opened_by') else 'non ouverte'}"
+                + f" ; avis : {'entrée trouvée' if probe['feedback_entry'] else 'entrée absente'}"
+                + f" ; micro : {(probe['mic'] or {}).get('status') or 'absent'}"
+                + f" ; accept : {(probe['file_input'] or {}).get('accept') or 'aucun'}"
+                + f" ; menu de la première conversation : {items or menu.get('error') or 'non lu'}"
+                + (f" ; {len(probe['errors'])} erreur(s)" if probe["errors"] else ""))
+        return {"found": found, "missing": missing, "menu": items or None, "errors": probe["errors"],
+                "text": one_line(text, 800)}
+
+    def _probe_selectors(self, page) -> dict:
+        """Chaque entrée de SELECTORS qui est une adresse dans la page (SELECTOR_PATTERNS exceptés), chaque
+        variante : combien d'éléments elle trouve, combien sont visibles ; une variante refusée porte son
+        erreur."""
+        out = {}
+        for key, value in SELECTORS.items():
+            if key in SELECTOR_PATTERNS:
+                continue
+            rows = []
+            for sel in (value if isinstance(value, list) else [value]):
+                try:
+                    rows.append({"selector": sel, "count": page.locator(sel).count(),
+                                 "visible": page.locator(f"{sel} >> visible=true").count()})
+                except PWError as e:
+                    if self.browser.pending():
+                        raise
+                    rows.append({"selector": sel, "error": one_line(str(e), 160)})
+            out[key] = rows
+        return out
+
+    @staticmethod
+    def _file_input(page) -> dict:
+        """Le champ de fichier : combien la page en a, et la liste `accept` du premier (E6)."""
+        loc = page.locator(SELECTORS["file_input"])
+        n = loc.count()
+        return {"count": n, "accept": loc.first.get_attribute("accept", timeout=3000) if n else None}
+
+    def _probe_search(self, page) -> dict:
+        """La palette ⌘K de la sonde : ouverte, son champ, sa racine et le nombre de ses résultats avant toute
+        frappe relevés, son HTML sans les titres ; refermée par Échap ; rien n'y est tapé."""
+        b = self.browser
+        arg = {"inputs": SELECTORS["search_input"], "results": SELECTORS["search_result"],
+               "empty": SELECTORS["search_empty"], "redact": True}
+        record = {"opened_by": None}
+        try:
+            if self._open_search(page, arg, record):
+                got = b.call(SEARCH_JS, arg, page=page, timeout_ms=2000) or {}
+                record.update({k: got.get(k) for k in ("input", "root", "count", "result", "empty", "focused", "html")})
+        finally:
+            if record["opened_by"] and not b.pending():
+                record["closed"] = self._close_search(page, arg)
+        return record
+
+    def _probe_menu(self, page) -> dict:
+        """Le menu de la PREMIÈRE conversation de la barre latérale, pour en confirmer le balisage avant M8 :
+        son élément sans titre ni adresse, son déclencheur survolé puis cliqué, ses entrées lues, refermé par
+        Échap. Aucune entrée n'est cliquée."""
+        b = self.browser
+        first = b.call(ITEM_JS, self._conv_arg(None, redact=True), page=page)
+        if not first.get("found"):
+            return {"found": False, "conversations": first.get("total", 0)}
+        record = {"found": True, "conversations": first.get("total"),
+                  "item": {k: first.get(k) for k in ("scope", "scope_is_link", "trigger", "trigger_level",
+                                                     "trigger_label", "expanded", "html")}}
+        menu = self._open_item_menu(page, self._conv_arg(first["href"], redact=True), record)
+        if menu is not None:
+            record["closed"] = self._close_menu(page)
+        record["trigger"] = {k: v for k, v in (record.get("trigger") or {}).items() if k != "html"} or None
+        return record
 
     def charge_concurrente(self, args: dict, ev: Evidence) -> dict:
         """N8 : deux traitements lourds en parallèle, dans deux onglets, envoyés à moins de 2 s
@@ -2930,6 +4447,7 @@ class Recette:
         try:
             self._goto(second, self.entry)
             out, turns = {}, []
+            before = {id(first): self._conversation_state(first), id(second): self._conversation_state(second)}
             for page, case in ((first, cases[0]), (second, cases[1])):
                 out[case["id"]] = {}
                 # The pinned web mode in each tab, read for each (PROCEDURE-2 §8.5).
@@ -2941,8 +4459,11 @@ class Recette:
                 else:
                     out[case["id"]]["web"] = web_mode_of(self._control(page, SELECTORS["web_button"]))
                 if case.get("file"):
-                    att = self._attach(page, self._resolve(case["file"]), budget_of(case))
-                    out[case["id"]]["attach"] = {k: att[k] for k in ("state", "label", "seconds", "ready_by")}
+                    path = self._resolve(case["file"])
+                    att = self._attach(page, path, budget_of(case))
+                    out[case["id"]]["attach"] = {k: att[k] for k in ("state", "seconds", "ready_by")} | {
+                        "label": (attach_error_class(att["label"], path.name) if att["state"] == "failed"
+                                  else sanitise(att["label"], 120, keep=(path.name,)))}
             if all(o.get("attach", {"state": "ready"})["state"] == "ready" for o in out.values()):
                 for page, case in ((first, cases[0]), (second, cases[1])):
                     # no popover read here: the two sends must leave within 2 s of each other
@@ -2964,6 +4485,12 @@ class Recette:
                         obs = self._collect(turn)
                         out[turn["case"]].update(answer=one_line(obs["answer"], 300), total_s=obs["total_s"],
                                                  end=obs["end"], server_steps=obs["server_steps"])
+                        if obs.get("failure"):
+                            out[turn["case"]]["error_class"] = obs["failure"]["error_class"]
+                for turn in turns:  # E1: the conversations the two sends created, before the tab closes
+                    if turn.get("end") != "<HORS PÉRIMÈTRE>":
+                        self._note_conversation_quietly(cid, before.get(id(turn["page"])), turn["page"],
+                                                        f"charge_concurrente ({turn['case']})")
                 out["gap_s"] = gap
             ev.screenshot(second, "screen.png")
         finally:
@@ -3004,7 +4531,8 @@ class Recette:
         line = self._journal_add(cid, verdict, timing, " ; ".join(parts),
                                  nfr_union(self._case(cid)["nfr"] if cid in self.cases else [],
                                            ["disponibilite", "scalabilite"],
-                                           ["securite"] if off or dialog else []))
+                                           ["securite"] if off or dialog else []),
+                                 extra=self._line_extra(cid, {}))  # modals_closed, as on every line
         self.observations["@concurrent"] = {**out, "case": cid, "verdict": verdict, "t": now_iso()}
         if dialog:
             # First, as `_after` would: a frozen tab cannot be sent back to the entry page.
@@ -3020,8 +4548,15 @@ class Recette:
         return self.browser.call(CONTROL_JS, {"sels": sels}, page=page)
 
     def _composer_now(self, page) -> dict:
+        """Le compositeur tel qu'il est : le modèle et le mode web affichés, et depuis la v2.3 (E4) l'état
+        du bouton de dictée (`mic`, son data-status, « absent » sans bouton), lu, jamais pressé."""
         return {"model": model_of(self._control(page, SELECTORS["model_button"])),
-                "web": web_mode_of(self._control(page, SELECTORS["web_button"]))}
+                "web": web_mode_of(self._control(page, SELECTORS["web_button"])), "mic": self._mic(page)}
+
+    def _mic(self, page) -> str:
+        """L'état du bouton de dictée (v2.3, E4) : son data-status, ou « absent » ; jamais pressé."""
+        got = self.browser.call(MIC_JS, {"sel": SELECTORS["mic_button"]}, page=page)
+        return (got or {}).get("status") or "absent"
 
     def _close_list(self, page, sel: str) -> bool:
         """Une liste encore ouverte est refermée par Échap ; rend True si elle est fermée."""
@@ -3048,7 +4583,8 @@ class Recette:
             raise DriverRefusal("precondition", "pas de bouton de modèle (« Model: … ») dans le compositeur")
         previous = model_of(button)
         record = {"asked": want, "previous": previous, "options": [], "picked": None, "candidates": [],
-                  "read_back": previous, "changed": False, "list_opened": False, "list_closed": None}
+                  "read_back": previous, "changed": False, "list_opened": False, "list_closed": None,
+                  "mic": self._mic(page)}  # E4: the dictation button, read with the selector, never pressed
         page.locator(button["sel"]).nth(button["index"]).click(timeout=5000)
         arg = {"list": SELECTORS["listbox"], "option": SELECTORS["option"]}
         options, deadline = None, time.monotonic() + 5
@@ -3096,14 +4632,16 @@ class Recette:
     @staticmethod
     def model_text(record: dict) -> str:
         """Le texte d'un choix de modèle, celui que juge un cas de configuration `model`
-        (PROCEDURE-2 §4) : « options : A | B | C ; choisi : X ; relu : Y »."""
+        (PROCEDURE-2 §4) : « options : A | B | C ; choisi : X ; relu : Y ; micro : Z », Z l'état du bouton
+        de dictée (v2.3, E4 : son data-status, ou « absent »)."""
         options = ' | '.join(record.get('options') or []) or 'non relevées'
+        mic = f" ; micro : {record.get('mic') or 'absent'}"
         if record.get("refused"):  # the judge sees why nothing was chosen, candidates included
             why = (f"ambigu entre : {' | '.join(record['candidates'])}" if record.get("ambiguous")
                    else f"refusé : {record['refused']}")
-            return f"options : {options} ; choisi : aucun ; {why} ; relu : {record.get('read_back')}"
+            return f"options : {options} ; choisi : aucun ; {why} ; relu : {record.get('read_back')}{mic}"
         chosen = (record.get("picked") or {}).get("text") or record.get("read_back")
-        return f"options : {options} ; choisi : {chosen} ; relu : {record.get('read_back')}"
+        return f"options : {options} ; choisi : {chosen} ; relu : {record.get('read_back')}{mic}"
 
     def choisir_modele(self, args: dict, ev: Evidence) -> dict:
         """Choisir le modèle du compositeur (_set_model) ; model.json, et l'observation `@model` qui
@@ -3120,17 +4658,18 @@ class Recette:
                 # A refused choice is observed too: a configuration case judged on @model then sees
                 # it (an ambiguous label lists its candidates), never an older success.
                 rec = r.extra["record"]
-                self.observations["@model"] = {"answer": self.model_text(rec), "timing_s": None,
-                                               "model": rec.get("read_back"), "options": rec.get("options"),
-                                               "t": now_iso()}
+                self._shared("@model", {"answer": self.model_text(rec), "timing_s": None,
+                                        "model": rec.get("read_back"), "options": rec.get("options"), "t": now_iso(),
+                                        "composer": {"model": rec.get("read_back"), "web": None, "mic": rec.get("mic")}})
             raise
         ev.json("model.json", record)
         text = self.model_text(record)
-        self.observations["@model"] = {"answer": text, "timing_s": record.get("seconds"), "model": record["read_back"],
-                                       "options": record["options"], "t": now_iso()}
+        self._shared("@model", {"answer": text, "timing_s": record.get("seconds"), "model": record["read_back"],
+                                "options": record["options"], "t": now_iso(), "composer": self._composer_now(page)})
         self.pinned["model"] = (record.get("picked") or {}).get("text") or want
         return {"model": record["read_back"], "previous": record["previous"], "changed": record["changed"],
-                "options": record["options"], "picked": (record.get("picked") or {}).get("text"), "text": text}
+                "options": record["options"], "picked": (record.get("picked") or {}).get("text"),
+                "mic": record["mic"], "text": text}
 
     def _set_web(self, page, want: str) -> dict:
         """Cliquer le bouton « Web search: … » (data-mode) jusqu'à afficher `want` (un cycle, quatre
@@ -3183,8 +4722,8 @@ class Recette:
             raise
         ev.json("web.json", record)
         text = f"mode : {record['read_back']} (trouvé : {record['previous']})"
-        self.observations["@web"] = {"answer": text, "timing_s": record["seconds"], "mode": record["read_back"],
-                                     "t": now_iso()}
+        self._shared("@web", {"answer": text, "timing_s": record["seconds"], "mode": record["read_back"],
+                              "t": now_iso(), "composer": self._composer_now(page)})
         self.pinned["web"] = want
         clicks = record["clicks"]
         return {"mode": record["read_back"], "previous": record["previous"], "changed": record["read_back"] != record["previous"],
@@ -3205,28 +4744,41 @@ class Recette:
             raise DriverRefusal("precondition", str(e)) from None
         self._case_in_hand = cid
         self.observations[cid] = {}
-        composer = self._composer_now(self.browser.page())
+        page = self.browser.page()
+        self._ensure_on_app(page)
+        composer = self._composer_now(page)
+        conv_before = self._conversation_state(page)
         mark = self.browser.mark()
         self._last_asked = {"case": cid, "mark": mark}
         budget = budget_of(case)
-        turns, obs = [], {}
+        turns, obs, failure = [], {}, None
         for i, q in enumerate(questions, 1):
             try:
                 obs = self._ask(q, budget, pii=case.get("pii"))
             except AskTimeout as t:
                 why = f"{t.why} au tour {i}/{n}"
-                line = self._timeout_line(cid, case["nfr"], t, why)
+                line = self._timeout_line(cid, case["nfr"], t, why, extra=self._line_extra(cid, {"composer": composer}))
                 timeout = {"seconds": round(t.seconds, 1), "turn": i, "t": now_iso(), **t.profile}
                 self.observations[cid] = {"turns": turns, "timeout": timeout}
+                conversation = self._note_conversation_quietly(cid, conv_before, page, "conversation_longue")
+                if conversation:
+                    self.observations[cid]["conversation"] = conversation
                 ev.json("turns.json", {"case": cid, "asked_turns": n, "turns": turns, "timeout": timeout})
+                if failure:
+                    ev.json("failure.json", failure)
                 raise DriverRefusal("timeout", why, extra={"journal": line, "abort": t.profile, "turns": len(turns)},
                                     evidence=ev.items) from None
+            failure = obs.pop("failure_raw", None) or failure  # the last turn left without answer (E10)
             turns.append(turn_summary(i, q, obs))
+        conversation = self._note_conversation(cid, conv_before, page, "conversation_longue")
         self.conv["asked"].append(cid)
         slowest = max(turns, key=lambda t: t["total_s"] or 0)  # timing_s: the slowest turn (PROCEDURE-2)
         self.observations[cid] = {**obs, "html": None, "turns": turns, "composer": composer,
-                                  "timing_s": slowest["total_s"], "slowest_turn": slowest["turn"]}
+                                  "timing_s": slowest["total_s"], "slowest_turn": slowest["turn"],
+                                  **({"conversation": conversation} if conversation else {})}
         ev.json("turns.json", {"case": cid, "asked_turns": n, "turns": turns, "slowest_turn": slowest["turn"]})
+        if failure:
+            ev.json("failure.json", failure)
         self._answer_png(ev, self.browser.page())
         return {"case": cid, "turns": len(turns), "answer": obs.get("answer"),
                 "total_s": [t["total_s"] for t in turns],

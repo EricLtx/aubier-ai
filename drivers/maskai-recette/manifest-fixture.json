@@ -8,7 +8,7 @@
       "-I",
       "driver.py"
     ],
-    "files_sha256": "sha256:d26703f9befeb5dc90b554253372eb09effb773e9e327670a08e2dc94eb19e83",
+    "files_sha256": "sha256:e3574d5012ec07dc4498086696d6b03113d7fbf58ce1871b5246914a32507722",
     "browser_channel": null,
     "headless": true,
     "max_memory_bytes": 6442450944
@@ -57,7 +57,8 @@
       },
       "evidence": [
         "attach.png",
-        "network.json"
+        "network.json",
+        "chip.json"
       ],
       "to_register": false
     },
@@ -81,7 +82,8 @@
         "guard.json",
         "sent.json",
         "network.json",
-        "answer.png"
+        "answer.png",
+        "failure.json"
       ],
       "to_register": false
     },
@@ -105,7 +107,8 @@
         "guard.json",
         "sent.json",
         "network.json",
-        "answer.png"
+        "answer.png",
+        "failure.json"
       ],
       "to_register": false
     },
@@ -202,7 +205,8 @@
       },
       "evidence": [
         "turns.json",
-        "answer.png"
+        "answer.png",
+        "failure.json"
       ],
       "to_register": false
     },
@@ -231,10 +235,16 @@
       "reversible": true,
       "args": {
         "type": "object",
+        "properties": {
+          "case": {
+            "type": "string"
+          }
+        },
         "additionalProperties": false
       },
       "evidence": [
-        "screen.png"
+        "screen.png",
+        "search.json"
       ],
       "to_register": false
     },
@@ -287,6 +297,81 @@
         "journal.jsonl"
       ],
       "to_register": true
+    },
+    {
+      "name": "renommer_conversation",
+      "reversible": false,
+      "args": {
+        "type": "object",
+        "properties": {
+          "case": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "case"
+        ],
+        "additionalProperties": false
+      },
+      "evidence": [
+        "conversation.json",
+        "screen.png"
+      ],
+      "to_register": false
+    },
+    {
+      "name": "supprimer_conversation",
+      "reversible": false,
+      "args": {
+        "type": "object",
+        "properties": {
+          "case": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "case"
+        ],
+        "additionalProperties": false
+      },
+      "evidence": [
+        "conversation.json",
+        "screen.png"
+      ],
+      "to_register": false
+    },
+    {
+      "name": "ouvrir_avis",
+      "reversible": true,
+      "args": {
+        "type": "object",
+        "properties": {
+          "case": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "case"
+        ],
+        "additionalProperties": false
+      },
+      "evidence": [
+        "avis.json",
+        "avis.png"
+      ],
+      "to_register": false
+    },
+    {
+      "name": "sonder_interface",
+      "reversible": true,
+      "args": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "evidence": [
+        "probe.json"
+      ],
+      "to_register": false
     }
   ],
   "min_interval_ms": 2000,

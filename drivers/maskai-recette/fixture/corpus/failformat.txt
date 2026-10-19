@@ -1,0 +1,1 @@
+Banc d'essai : failformat.txt, une pièce jointe que la puce refuse.

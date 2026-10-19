@@ -28,6 +28,16 @@
   [data-slot="popover-content"] { position: fixed; bottom: 70px; right: 20px; width: 320px; background: #fff; border: 1px solid #999; padding: 8px; }
   [data-slot="dialog-content"], #mystery { position: fixed; top: 30%; left: 35%; width: 300px; background: #fff; border: 2px solid #333; padding: 12px; }
   #cookies { position: fixed; bottom: 0; left: 0; right: 0; background: #333; color: #fff; padding: 12px; }
+  .conv-item { display: flex; gap: 4px; align-items: center; }
+  .conv-item a { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .conv-menu { display: none; }
+  .conv-item:hover .conv-menu, .conv-menu[aria-expanded="true"] { display: inline-block; }
+  #feedback { position: fixed; bottom: 8px; left: 8px; }
+  [role="menu"] { position: fixed; top: 120px; left: 230px; background: #fff; border: 1px solid #999; padding: 4px; }
+  [role="menuitem"] { padding: 2px 8px; cursor: pointer; }
+  #palette, #rename-dialog, [role="alertdialog"] { position: fixed; top: 20%; left: 35%; width: 320px; background: #fff; border: 2px solid #333; padding: 12px; }
+  [cmdk-item] { padding: 2px 6px; }
+  [data-sonner-toaster] { position: fixed; bottom: 8px; right: 8px; list-style: none; }
 </style>
 </head>
 <body>
@@ -60,12 +70,26 @@
      `aria-controls` (the content's id), `?nostructure=1` draws the trigger without its
      `data-slot` and `aria-label` and puts before it a reveal toggle that carries a
      visually hidden « Afficher les détails » (the driver's text fallbacks must still
-     click the right button); all hold for the tab's life. -->
+     click the right button); all hold for the tab's life.
+     Pilot v2.3, in the shapes the founder saw on 18–19/10 (the markup of a conversation's menu was never
+     read: structure-first guesses): the sidebar's « Search conversations ⌘K » entry, the
+     `button[aria-label="Send feedback"]` fixed bottom-left (it opens the « Votre avis » survey), a menu
+     trigger per conversation (`aria-haspopup="menu"`, shown on hover only) whose Radix-like menu offers
+     « Renommer », « Partager », « Supprimer »; rename edits the title inline (`?renamedialog=1`: in a
+     dialog), delete asks through an `alertdialog` (« Annuler » / « Supprimer »); a cmdk-like ⌘K palette
+     (ControlOrMeta+K or the entry; `?nokbd=1` ignores the shortcut) that lists the conversations whose
+     title holds the query; `#chat-input-status` (role="status") under the composer; the file input's
+     `accept` list. `window.__seed(title)` adds a conversation the driver did not create. The counters
+     (`__menu_opens`, `__menu_picks`, `__renamed`, `__deleted`, `__palette_queries`, `__feedback_opens`,
+     `__mic_clicks`, `__survey_sent`) let the tests prove what was, and was not, touched. `?nomic=1` draws
+     no dictation button. -->
 <aside data-slot="sidebar">
   <nav aria-label="Main navigation">
     <a href="/new" data-slot="button" aria-label="Nouvelle conversation">Nouvelle conversation</a>
+    <button type="button" id="search-entry">Search conversations <kbd>⌘K</kbd></button>
     <ul id="conversations"></ul>
   </nav>
+  <button type="button" id="feedback" aria-label="Send feedback">&#9993;</button>
   <div data-slot="sidebar-footer" id="account"><span data-slot="avatar">CT</span> compte.test@exemple.fr</div>
 </aside>
 <main>
@@ -73,7 +97,7 @@
   <form id="composer" onsubmit="return false">
     <div id="chips"></div>
     <button type="button" id="clip" aria-label="Joindre un fichier" title="Joindre un fichier">&#128206;</button>
-    <input type="file" id="file" hidden>
+    <input type="file" id="file" hidden accept=".txt,.md,.json,.csv,.pdf,.docx,.xlsx,.pptx,.png,.jpg,.jpeg">
     <button type="button" id="model" aria-haspopup="listbox" aria-expanded="false"></button>
     <button type="button" id="web" data-mode="auto" aria-label="Web search: Auto">Web</button>
     <button type="button" id="enc" aria-haspopup="dialog" aria-expanded="false" data-slot="popover-trigger"
@@ -89,6 +113,7 @@
     </script>
     <button type="button" id="send" aria-label="Envoyer">Envoyer</button>
     <button type="button" id="stop" aria-label="Stop generating" hidden>Stop</button>
+    <div id="chat-input-status" role="status" aria-live="polite" class="sr-only"></div>
   </form>
 </main>
 <div id="model-list" role="listbox" hidden></div>
@@ -109,6 +134,32 @@
   <button type="button" data-slot="dialog-close" aria-label="Fermer">&times;</button>
 </div>
 <div id="cookies" role="dialog" hidden>Ce site utilise des cookies. <button id="accept">Accepter</button></div>
+<div id="conv-menu" role="menu" data-slot="dropdown-menu-content" hidden>
+  <div role="menuitem" data-action="rename">Renommer</div>
+  <div role="menuitem" data-action="share">Partager</div>
+  <div role="menuitem" data-action="delete">Supprimer</div>
+</div>
+<div id="palette" role="dialog" aria-label="Search conversations" cmdk-dialog hidden>
+  <div cmdk-root>
+    <input cmdk-input type="text" role="combobox" placeholder="Search conversations" aria-expanded="true">
+    <div cmdk-list role="listbox">
+      <div cmdk-empty hidden>No results found.</div>
+      <div id="palette-items"></div>
+    </div>
+  </div>
+</div>
+<div id="rename-dialog" role="dialog" aria-modal="true" hidden>
+  <p>Renommer la conversation</p>
+  <input type="text" id="rename-input">
+  <button type="button" id="rename-cancel">Annuler</button>
+  <button type="button" id="rename-save">Enregistrer</button>
+</div>
+<div id="confirm-delete" role="alertdialog" aria-modal="true" data-slot="alert-dialog-content" hidden>
+  <p>Supprimer cette conversation ? Cette action est définitive.</p>
+  <button type="button" id="delete-cancel">Annuler</button>
+  <button type="button" id="delete-confirm">Supprimer</button>
+</div>
+<ol data-sonner-toaster id="toaster"></ol>
 <script>
 "use strict";
 const MODELS = [
@@ -125,15 +176,22 @@ window.__dialog_answered = false;
 window.__survey_shown = 0;
 window.__survey_answered = false;
 window.__reveal_clicks = 0;
-// ?nodetails=1, ?revealed=1, ?controls=1, ?nostructure=1: kept in sessionStorage, the page
-// pushes /conversation/<id> URLs that drop the query.
-for (const k of ["nodetails", "revealed", "controls", "nostructure"]) {
+// v2.3: what the driver touched, and what it must never touch.
+Object.assign(window, { __menu_opens: [], __menu_picks: [], __renamed: {}, __deleted: [], __palette_opens: 0,
+                        __palette_queries: [], __feedback_opens: 0, __mic_clicks: 0, __survey_sent: 0 });
+// ?nodetails=1, ?revealed=1, ?controls=1, ?nostructure=1, and since v2.3 ?renamedialog=1, ?nokbd=1,
+// ?nomic=1: kept in sessionStorage, the page pushes /conversation/<id> URLs that drop the query.
+for (const k of ["nodetails", "revealed", "controls", "nostructure", "renamedialog", "nokbd", "nomic"]) {
   if (new URLSearchParams(location.search).get(k) === "1") sessionStorage.setItem("bench-" + k, "1");
 }
 const NODETAILS = sessionStorage.getItem("bench-nodetails") === "1";
 const REVEALED = sessionStorage.getItem("bench-revealed") === "1";
 const CONTROLS = sessionStorage.getItem("bench-controls") === "1";
 const NOSTRUCTURE = sessionStorage.getItem("bench-nostructure") === "1";
+const RENAMEDIALOG = sessionStorage.getItem("bench-renamedialog") === "1";
+const NOKBD = sessionStorage.getItem("bench-nokbd") === "1";
+if (sessionStorage.getItem("bench-nomic") === "1") $("mic").remove();
+else $("mic").onclick = () => { window.__mic_clicks += 1; };
 
 if (!localStorage.getItem("cookies-ok")) $("cookies").hidden = false;
 $("accept").onclick = () => { localStorage.setItem("cookies-ok", "1"); $("cookies").hidden = true; };
@@ -231,6 +289,10 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("enc-pop").hidden) closePopover();
   if (!$("model-list").hidden) closeModels();
+  if (!$("conv-menu").hidden) closeMenu();
+  if (!$("palette").hidden) closePalette();
+  if (!$("confirm-delete").hidden) closeConfirm();
+  if (!$("rename-dialog").hidden) closeRenameDialog();
 });
 
 // -- attachments: a chip per file, uploading → indexing → ready (or failed) -------------
@@ -259,9 +321,14 @@ function attach(name) {
   if (/instant/i.test(name)) { chip.state = "ready"; status(""); return; }
   status('<span class="text-xs">Uploading…</span>' + SPIN);
   setTimeout(() => {
-    if (/fail/i.test(name)) {
+    if (/fail/i.test(name)) {  // « faildb », « failformat », « failsize »: the labels of v2.3 (E9)
       chip.state = "failed";
-      status('<span class="text-xs text-red-600" aria-label="Failed">Failed</span>');
+      const why = /faildb/i.test(name)
+        ? 'Failed: psycopg2.OperationalError: could not translate host name "docstore-db.internal.maskai.local" to address: '
+          + 'Name or service not known Traceback (most recent call last): File "/srv/maskai/ingest/worker.py", line 88, in index'
+        : /failformat/i.test(name) ? "Failed: unsupported file format"
+        : /failsize/i.test(name) ? "Failed: file too large (max 20 MB)" : "Failed";
+      status('<span class="text-xs text-red-600" aria-label="Failed">' + why.replace(/</g, "&lt;") + "</span>");
       return;
     }
     chip.state = "indexing";
@@ -274,7 +341,8 @@ function attach(name) {
 // -- conversations, and the survey that follows a generation left in flight -------------
 function showSurvey() { window.__survey_shown += 1; $("avis").hidden = false; }
 for (const r of $("avis").querySelectorAll("[role=radio]")) r.onclick = () => { window.__survey_answered = true; };
-$("avis-send").onclick = () => { window.__survey_answered = true; $("avis").hidden = true; };
+$("avis-send").onclick = () => { window.__survey_answered = true; window.__survey_sent += 1; $("avis").hidden = true; };
+$("feedback").onclick = () => { window.__feedback_opens += 1; showSurvey(); };
 $("avis").querySelector("[data-slot=dialog-close]").onclick = () => { $("avis").hidden = true; };
 if (sessionStorage.getItem("survey-pending")) {
   sessionStorage.removeItem("survey-pending");
@@ -299,6 +367,136 @@ document.querySelector('a[href="/new"]').addEventListener("click", (e) => {
   $("chips").innerHTML = "";
   $("stop").hidden = true;
   history.pushState({}, "", "/new");
+});
+
+// -- v2.3: the sidebar's conversations, their menu, rename and delete, the ⌘K palette ----------------
+let menuFor = null, seedCount = 0;
+function addConversation(id, title) {
+  const li = document.createElement("li");
+  li.className = "conv-item";
+  li.dataset.id = id;
+  const a = document.createElement("a");
+  a.href = "/conversation/" + id;
+  a.textContent = title;
+  const t = document.createElement("button");
+  t.type = "button";
+  t.className = "conv-menu";
+  t.setAttribute("aria-haspopup", "menu");
+  t.setAttribute("aria-expanded", "false");
+  t.setAttribute("aria-label", "Options");
+  t.textContent = "⋯";
+  t.onclick = (e) => { e.stopPropagation(); openMenu(li, t); };
+  li.append(a, t);
+  $("conversations").prepend(li);
+  return li;
+}
+window.__seed = (title) => {  // a conversation the driver did not create (the founder's, say)
+  const id = "seed" + (++seedCount) + "-" + Date.now();
+  addConversation(id, title);
+  return "/conversation/" + id;
+};
+function openMenu(li, trigger) {
+  closeMenu();
+  menuFor = li;
+  window.__menu_opens.push(li.dataset.id);
+  trigger.setAttribute("aria-expanded", "true");
+  trigger.setAttribute("aria-controls", "conv-menu");
+  $("conv-menu").hidden = false;
+}
+function closeMenu() {
+  $("conv-menu").hidden = true;
+  for (const t of document.querySelectorAll(".conv-menu")) { t.setAttribute("aria-expanded", "false"); t.removeAttribute("aria-controls"); }
+}
+for (const item of $("conv-menu").querySelectorAll("[role=menuitem]")) item.onclick = () => {
+  const li = menuFor, action = item.dataset.action;
+  closeMenu();
+  if (!li) return;
+  window.__menu_picks.push([li.dataset.id, action]);
+  if (action === "rename") (RENAMEDIALOG ? openRenameDialog : renameInline)(li);
+  if (action === "delete") openConfirm(li);
+};
+document.addEventListener("click", (e) => { if (!$("conv-menu").hidden && !$("conv-menu").contains(e.target)) closeMenu(); });
+function rename(li, title) {
+  li.querySelector("a").textContent = title;
+  window.__renamed[li.dataset.id] = title;
+}
+function renameInline(li) {
+  const a = li.querySelector("a");
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = a.textContent;
+  a.style.display = "none";
+  li.insertBefore(input, a);
+  input.focus();
+  input.select();
+  const done = (keep) => { if (keep) rename(li, input.value.trim()); input.remove(); a.style.display = ""; };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); done(true); }
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); done(false); }
+  });
+}
+let renaming = null;
+function openRenameDialog(li) {
+  renaming = li;
+  $("rename-input").value = li.querySelector("a").textContent;
+  $("rename-dialog").hidden = false;
+  $("rename-input").focus();
+}
+function closeRenameDialog() { $("rename-dialog").hidden = true; renaming = null; }
+$("rename-save").onclick = () => { if (renaming) rename(renaming, $("rename-input").value.trim()); closeRenameDialog(); };
+$("rename-cancel").onclick = closeRenameDialog;
+$("rename-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("rename-save").click(); } });
+let deleting = null;
+function openConfirm(li) { deleting = li; $("confirm-delete").hidden = false; }
+function closeConfirm() { $("confirm-delete").hidden = true; deleting = null; }
+$("delete-cancel").onclick = closeConfirm;
+$("delete-confirm").onclick = () => {
+  const li = deleting;
+  closeConfirm();
+  if (!li) return;
+  window.__deleted.push(li.dataset.id);
+  li.remove();
+  if (state.conversation === li.dataset.id) {  // the page showed it: back to a new conversation
+    state.conversation = null;
+    $("messages").innerHTML = "";
+    history.pushState({}, "", "/new");
+  }
+};
+let paletteTimer = null;
+function openPalette() {
+  window.__palette_opens += 1;
+  $("palette").hidden = false;
+  $("palette").querySelector("[cmdk-input]").value = "";
+  renderPalette("");
+  $("palette").querySelector("[cmdk-input]").focus();
+}
+function closePalette() { $("palette").hidden = true; clearTimeout(paletteTimer); }
+function renderPalette(q) {  // the conversations whose title holds the query, as a server-side search would
+  const items = $("palette-items");
+  items.innerHTML = "";
+  const hits = [...document.querySelectorAll("#conversations .conv-item")].filter((li) =>
+    q && li.querySelector("a").textContent.toLowerCase().includes(q.toLowerCase()));
+  for (const li of hits) {
+    const it = document.createElement("div");
+    it.setAttribute("cmdk-item", "");
+    it.setAttribute("role", "option");
+    it.dataset.value = li.dataset.id;
+    it.textContent = li.querySelector("a").textContent;
+    items.appendChild(it);
+  }
+  $("palette").querySelector("[cmdk-empty]").hidden = !q || hits.length > 0;
+}
+$("palette").querySelector("[cmdk-input]").addEventListener("input", (e) => {
+  const q = e.target.value;
+  window.__palette_queries.push(q);
+  clearTimeout(paletteTimer);
+  paletteTimer = setTimeout(() => renderPalette(q), 300);  // a debounced search
+});
+$("search-entry").onclick = openPalette;
+document.addEventListener("keydown", (e) => {
+  if (NOKBD || !(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "k") return;
+  e.preventDefault();
+  if ($("palette").hidden) openPalette();
 });
 
 function addUser(text) {
@@ -411,12 +609,7 @@ async function send() {
   if (!state.conversation) {
     state.conversation = "c" + (++state.count) + "-" + Date.now();
     history.pushState({}, "", "/conversation/" + state.conversation);
-    const li = document.createElement("li");
-    const a = document.createElement("a");
-    a.href = "/conversation/" + state.conversation;
-    a.textContent = text.trim().slice(0, 40);
-    li.appendChild(a);
-    $("conversations").prepend(li);
+    addConversation(state.conversation, text.trim().slice(0, 40));
   }
   addUser(text);
   $("prompt").value = "";
@@ -427,14 +620,17 @@ async function send() {
   $("chips").innerHTML = "";
   state.chips = [];
   $("stop").hidden = false;
-  const art = addAnswer(mask(text).tokens, state.model);
-  const typer = typewriter(art.querySelector(".prose-llm"));
+  // SILENT_FAIL, SILENT_502 (v2.3, E10): no answer card at all, as the 14 models of the night of 18–19/10.
+  const silent = /SILENT_(FAIL|502)/.test(text);
+  $("chat-input-status").textContent = "";
+  const art = silent ? null : addAnswer(mask(text).tokens, state.model);
+  const typer = art ? typewriter(art.querySelector(".prose-llm")) : null;
   const gen = { controller: new AbortController(), stopped: false };
   state.generating = gen;
   try {
     const res = await fetch("/chat/stream", { method: "POST", headers: { "Content-Type": "application/json" },
                                               body, signal: gen.controller.signal });
-    art.__sent = decodeURIComponent(res.headers.get("X-Sent-Anonymized") || "");
+    if (art) art.__sent = decodeURIComponent(res.headers.get("X-Sent-Anonymized") || "");
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
@@ -448,12 +644,12 @@ async function send() {
         buf = buf.slice(i + 2);
         try {
           const o = JSON.parse(event);
-          if (o.delta !== undefined) typer.push(o.delta);
+          if (o.delta !== undefined && typer) typer.push(o.delta);
         } catch (e) { /* not an answer chunk */ }
       }
     }
   } catch (e) {
-    typer.push(gen.stopped ? " [génération arrêtée]" : " Erreur : " + e.message);
+    if (typer) typer.push(gen.stopped ? " [génération arrêtée]" : " Erreur : " + e.message);
   }
   if (state.generating === gen) state.generating = null;
   if (!state.generating) $("stop").hidden = true;  // the stop goes with the stream; the drawing goes on
@@ -463,6 +659,16 @@ async function send() {
   if (/NAVIGATE_AWAY/.test(text)) location.assign(location.protocol + "//localhost:" + location.port + "/away");
   // A dialog nobody catalogued (the guard must refuse it, never close it).
   if (/UNKNOWN_MODAL/.test(text)) $("mystery").hidden = false;
+  if (silent) {  // what the page says of it: the composer's status line, and a toast for 4 s
+    $("chat-input-status").textContent = /502/.test(text) ? "Le service est momentanément indisponible (502)."
+      : "Une erreur est survenue lors de l'analyse du message (pii-guard.internal:8443).";
+    const toast = document.createElement("li");
+    toast.setAttribute("data-sonner-toast", "");
+    toast.textContent = "Échec de l'envoi : réessayez dans un instant.";
+    $("toaster").appendChild(toast);
+    setTimeout(() => toast.remove(), 4000);
+    return;
+  }
   await typer.end();
   const live = art.querySelector(".live");
   if (live) live.remove();

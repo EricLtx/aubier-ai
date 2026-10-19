@@ -70,8 +70,13 @@ class CasesTest(unittest.TestCase):
             self.assertIn(c["kind"], ("load", "message", "attach_question", "list", "concurrent",
                                       "model", "web", "long"), c["id"])
             self.assertLessEqual(set(c["nfr"]), set(drv.journal.NFR), c["id"])
-            if c["kind"] in ("message", "attach_question"):
+            if c["kind"] in ("message", "attach_question") and not c.get("action"):
                 self.assertIn("question", c, c["id"])
+            if c.get("action"):  # v2.3: the one action that plays the case, an action of the manifest
+                self.assertIn(c["action"], manifest_evidence(), c["id"])
+            if c.get("action") in ("renommer_conversation", "supprimer_conversation"):  # a conversation a question created
+                self.assertEqual(c["kind"], "list", c["id"])
+                self.assertIn("question", cases[c["same_conversation_as"]], c["id"])
             if c["kind"] in ("model", "web") and "question" not in c:  # a configuration case: an oracle
                 self.assertTrue(c["must"], c["id"])
             if c["kind"] == "model":
@@ -93,11 +98,14 @@ class CasesTest(unittest.TestCase):
                                  f"{c['id']} replays {first['id']} with the same entry")
         for n in range(10):
             self.assertGreaterEqual(len(levels.get(f"N{n}", [])), 2, f"N{n}")
-        for n in range(10):  # PROCEDURE-2 §3 + PROCEDURE-3 §3: 103 cases since 18/10, M5 has one
+        for n in range(10):  # PROCEDURE-2 §3 + PROCEDURE-3 §3: 108 cases since 19/10, M5 has one
             self.assertGreaterEqual(len(levels.get(f"M{n}", [])), 1, f"M{n}")
-        self.assertEqual(sum(len(v) for k, v in levels.items() if k.startswith("M")), 103)
+        self.assertEqual(sum(len(v) for k, v in levels.items() if k.startswith("M")), 108)
         self.assertEqual(len(levels["M3"]), 42, "3 questions × 14 models (18/10)")
-        self.assertEqual((len(levels["M8"]), len(levels["M9"])), (3, 6), "recette 3: the nine runnable M8/M9 cases")
+        self.assertEqual((len(levels["M8"]), len(levels["M9"])), (8, 6), "recette 3: M8-1 … M8-8 (v2.3), M9-1 … M9-6")
+        self.assertEqual({c["id"]: c["action"] for c in levels["M8"] if c.get("action")},
+                         {"M8-4": "lister_conversations", "M8-5": "renommer_conversation",
+                          "M8-6": "supprimer_conversation", "M8-8": "ouvrir_avis"})
         self.assertEqual(len([c for c in levels["M1"] if c.get("replay_of")]), 12)
         oracle_m = {c["oracle"] for c in cases.values() if c.get("oracle") and c["level"].startswith("M")}
         self.assertEqual(oracle_m, {f"V3-{x}{n}" for x in "JC" for n in range(1, 7)} | {f"DOC-{n:02d}" for n in range(1, 11)})
@@ -336,7 +344,7 @@ class KindChecksTest(unittest.TestCase):
                   "refused": "…", "read_back": "google/eu.claude-haiku-5-5"}
         self.assertEqual(drv.Recette.model_text(record),
                          "options : Gemini 3 Flash | Gemini 3 Pro | Claude Haiku 5.5 | Claude Sonnet 5 ; choisi : aucun ; "
-                         "ambigu entre : Gemini 3 Flash | Gemini 3 Pro ; relu : google/eu.claude-haiku-5-5")
+                         "ambigu entre : Gemini 3 Flash | Gemini 3 Pro ; relu : google/eu.claude-haiku-5-5 ; micro : absent")
 
     def check(self, case, obs):
         drv = load_driver()
@@ -552,7 +560,8 @@ class DriverOnFixture(FixtureBench):
             res, ev = self.act(A, "joindre_document", {"case": cid})
             # v2 (D7): « ready » once the chip left its pending states, not « attached » at once
             self.assertEqual((res["state"], res["ready_by"]), ("ready", "after_pending"))
-            self.assertEqual({e["name"] for e in ev}, {"attach.png", "network.json"})
+            # v2.3 (E9): the chip's raw reading goes to chip.json, the evidence only
+            self.assertEqual({e["name"] for e in ev}, {"attach.png", "network.json", "chip.json"})
             res, ev = self.act(A, "poser_question", {"case": cid})
             self.assertIn("QUEL EST LE MONTANT DU LOYER", res["answer"])
             self.assertIn("Quel est le montant du loyer", res["sent"])
@@ -999,6 +1008,21 @@ class DriverOnFixture(FixtureBench):
                                        "nfr": ["veracite"], "first": "Bonjour", "last": "Au revoir",
                                        "must": ["revoir"], "must_not": [], "pii": []}
         self.assertEqual(run("conversation_longue", {"case": "every-long", "turns": 2})["turns"], 2)
+        # v2.3: the search, rename and delete of the conversation every-long created, the survey, the probe
+        listing = {"level": "M8", "kind": "list", "budget_s": 10, "nfr": ["disponibilite"], "must": [], "must_not": [],
+                   "pii": []}
+        recette.cases["every-search"] = {**listing, "id": "every-search", "action": "lister_conversations",
+                                         "question": "Bonjour"}
+        recette.cases["every-rename"] = {**listing, "id": "every-rename", "action": "renommer_conversation",
+                                         "same_conversation_as": "every-long", "question": "Banc renommé"}
+        recette.cases["every-delete"] = {**listing, "id": "every-delete", "action": "supprimer_conversation",
+                                         "same_conversation_as": "every-long"}
+        recette.cases["every-avis"] = {**listing, "id": "every-avis", "kind": "message", "action": "ouvrir_avis"}
+        self.assertEqual(run("lister_conversations", {"case": "every-search"})["count"], 1)
+        self.assertIn("titre relu « Banc renommé »", run("renommer_conversation", {"case": "every-rename"})["text"])
+        self.assertEqual(run("supprimer_conversation", {"case": "every-delete"})["state"], "supprimée")
+        self.assertEqual(run("ouvrir_avis", {"case": "every-avis"})["closed_by"], "croix")
+        self.assertEqual(run("sonder_interface")["errors"], [])
         n = len(journal_lines(recette.work))
         self.assertEqual(run("exporter_journal")["lines"], n)
         self.assertEqual(run("exporter_journal")["lines"], 0)
@@ -1663,7 +1687,7 @@ class Recette2OnFixture(FixtureBench):
         res, _ = self.act(A, "choisir_modele", {"model": "claude haiku 5-5"})
         self.assertEqual(res["options"], ["Claude Haiku 5.5", "Gemini 3 Flash", "Mistral Large 3"])
         self.assertEqual(res["text"], "options : Claude Haiku 5.5 | Gemini 3 Flash | Mistral Large 3 ; "
-                                      "choisi : Claude Haiku 5.5 ; relu : google/eu.claude-haiku-5-5")
+                                      "choisi : Claude Haiku 5.5 ; relu : google/eu.claude-haiku-5-5 ; micro : idle")
         self.assertEqual(self.act(A, "poser_question", {"case": "M0-3"})[0]["answer"], res["text"])
         self.assertEqual(self.act(A, "verdict_oracle", {"case": "M0-3"})[0]["verdict"], "OK")
         res, _ = self.act(A, "recherche_web", {"mode": "off"})
@@ -1686,7 +1710,7 @@ class Recette2OnFixture(FixtureBench):
         self.assertEqual(self.act(A, "verdict_oracle", {"case": "v2-model-b"})[0]["verdict"], "OK")
         line = journal_lines(recette.work)[-1]
         self.assertEqual(line["config"], {"model": "google/eu.gemini-3-flash", "web": "auto",
-                                          "banner": "google/eu.gemini-3-flash"})
+                                          "banner": "google/eu.gemini-3-flash", "mic": "idle"})
 
     def test_a_long_case_plays_its_messages_and_its_line_keeps_the_slowest_turn(self):
         drv, recette, A = self.make()
@@ -1718,7 +1742,7 @@ class Recette2OnFixture(FixtureBench):
         page.goto(recette.entry)  # a reload: the bench comes back with its defaults
         res, _ = self.act(A, "nouvelle_conversation")
         self.assertEqual(res["reapplied"], {"modèle": "google/eu.gemini-3-flash", "web": "off"})
-        self.assertEqual(recette._composer_now(page), {"model": "google/eu.gemini-3-flash", "web": "off"})
+        self.assertEqual(recette._composer_now(page), {"model": "google/eu.gemini-3-flash", "web": "off", "mic": "idle"})
 
     def test_charge_concurrente_sets_the_pinned_web_mode_in_both_tabs(self):
         drv, recette, A = self.make()
@@ -1903,6 +1927,582 @@ class FieldFixesOnFixture(FixtureBench):
         # 18/10: the live composer is no <form>; the structure comes first, without it.
         self.assertEqual(drv.SELECTORS["model_button"][0], 'button[aria-haspopup="listbox"]')
         self.assertEqual(drv.SELECTORS["web_button"][0], 'button[data-mode]')
+
+
+class PilotV23Units(unittest.TestCase):
+    """Pilot v2.3 (PROCEDURE-3 §6), what needs no browser: the sent-text inventory (E7), the error classes
+    and their sanitising (E9, E10), the conversation menu's safety rule (E3), the shared observations."""
+
+    def recette(self, drv):
+        work, profile = tempfile.mkdtemp(prefix="maskai-recette-"), tempfile.mkdtemp(prefix="maskai-recette-")
+        self.addCleanup(shutil.rmtree, work, True)
+        self.addCleanup(shutil.rmtree, profile, True)
+        return drv.Recette(env={"VK_DRIVER_WORK_DIR": work, "VK_DRIVER_PROFILE_DIR": profile,
+                                "VK_DRIVER_HOSTS": "127.0.0.1"})
+
+    def test_the_sent_text_inventory_and_the_masked_sets_compared(self):
+        drv = load_driver()
+        self.assertEqual(drv.token_inventory("Relance <PERSON_1>, <PERSON_2> au <PHONE_1> ; <PERSON_1>"),
+                         {"PERSON": 3, "PHONE": 1})
+        self.assertEqual(drv.token_inventory("sans jeton"), {})
+        self.assertIsNone(drv.token_inventory(None), "not observed is not « no token »")
+        self.assertEqual(drv.inventory_note({"PERSON": 2, "IBAN": 1}, {"IBAN": 1, "PERSON": 2}), "ensemble masqué identique")
+        self.assertEqual(drv.inventory_note({"PERSON": 2, "IBAN": 1}, {"PERSON": 1, "PHONE": 3}),
+                         "ensemble masqué différent : +PHONE ×3 −IBAN −PERSON")
+        self.assertEqual(drv.inventory_note({}, None), "ensemble masqué non comparable (texte envoyé non observé au passage b)")
+        g = drv.parse_guard("Anonymisé → <PERSON_1> <PHONE_1> L'Aiguilleur : PASS·Le Chirurgien : 2 PII détectées Détails "
+                            "maskai google/eu.claude-haiku-5-5 noté", "noté", True)
+        self.assertEqual(g["pii_count"], 2)
+        self.assertEqual(drv.parse_guard("Aucune donnée personnelle détectée L'Aiguilleur : PASS maskai x/y OK", "OK",
+                                         True)["pii_count"], 0)
+
+    def test_an_error_shown_by_the_page_reaches_the_line_without_host_path_or_stack(self):
+        drv = load_driver()
+        raw = ('faildb.txt Failed: psycopg2.OperationalError: could not translate host name "docstore-db.internal.maskai.local" '
+               'to address: Name or service not known Traceback (most recent call last): File "/srv/maskai/ingest/worker.py", '
+               'line 88, in index')
+        clean = drv.sanitise(raw, 500, keep=("faildb.txt",))
+        for bad in ("docstore-db", "maskai.local", "/srv/", "worker.py", "Traceback", "line 88", "psycopg2."):
+            self.assertNotIn(bad, clean)
+        self.assertIn("faildb.txt", clean, "the attached file's own name is kept")
+        self.assertIn("could not translate host name", clean)
+        self.assertLessEqual(len(drv.sanitise(raw)), drv.EXCERPT_MAX)
+        for text in ("connect to server at 10.0.3.4:5432 failed", "GET https://intra.example.net/v1/x?k=1 : 500",
+                     "host=db-primary.svc.cluster.local port=5432", "at Object.run (/app/node_modules/x/index.js:12:7)",
+                     "upstream pii-guard.internal:8443 unavailable"):
+            out = drv.sanitise(text, 500)
+            for bad in ("10.0.3.4", "intra.example", "db-primary", "node_modules", "index.js", "pii-guard", "8443"):
+                self.assertNotIn(bad, out, text)
+        self.assertTrue(drv.exposes_internals(raw, keep=("faildb.txt",)))
+        self.assertFalse(drv.exposes_internals("case1.txt Failed", keep=("case1.txt",)))
+        self.assertEqual(drv.attach_error_class(raw, "faildb.txt"), "service documentaire injoignable")
+        self.assertEqual(drv.attach_error_class("x.pdf Failed: unsupported file format", "x.pdf"), "format refusé")
+        self.assertEqual(drv.attach_error_class("x.pdf Échec : fichier trop volumineux", "x.pdf"), "fichier trop volumineux")
+        self.assertEqual(drv.attach_error_class("x.pdf Failed", "x.pdf"), "échec de la pièce jointe")
+        self.assertEqual(drv.attach_error_class("format_size_database.csv Failed", "format_size_database.csv"),
+                         "échec de la pièce jointe", "the file's name says nothing of the error")
+
+    def test_a_silent_failure_is_classed_from_the_stream_and_the_page(self):
+        drv = load_driver()
+        events = [[0, "<START>"], [10, 'data: {"node": "detect_pii"}'], [20, 'data: {"node": "detect_pii"}'],
+                  [30, "event: error"],
+                  [31, 'data: {"error": "psycopg2.OperationalError: could not translate host name \'pii-db.internal\' to add'],
+                  [40, "<END>"]]
+        d = drv.stream_digest(events)
+        self.assertEqual(d["names"], ["<START>", "node:detect_pii ×2", "event:error", "error", "<END>"])
+        self.assertEqual(d["last_node"], "detect_pii")
+        self.assertIn("could not translate host name", d["error"], "a payload cut at 160 characters is still read")
+        self.assertEqual(drv.failure_class(200, d["error"], [], d["names"], True), "service interne injoignable")
+        self.assertEqual(drv.failure_class(502, None, [], [], True), "erreur serveur (HTTP 502)")
+        self.assertEqual(drv.failure_class(429, None, [], [], True), "limite de débit (HTTP 429)")
+        self.assertEqual(drv.failure_class(401, None, [], [], True), "session refusée (HTTP 401)")
+        self.assertEqual(drv.failure_class(404, None, [], [], True), "requête refusée (HTTP 404)")
+        self.assertEqual(drv.failure_class(200, "Rate limited", [], [], True), "erreur signalée par le flux")
+        self.assertEqual(drv.failure_class(200, None, [["status", "Une erreur est survenue"]], [], True),
+                         "erreur affichée par l'application")
+        self.assertEqual(drv.failure_class(200, None, [], ["<START>", "<ABORT>"], True), "flux coupé")
+        self.assertEqual(drv.failure_class(200, None, [], ["<START>", "node:detect_pii ×2", "<END>"], True),
+                         "flux terminé sans réponse")
+        self.assertEqual(drv.failure_class(None, None, [], [], False), "aucun flux")
+        self.assertEqual(drv.stream_digest([[0, 'data: {"type": "error", "message": "quota"}']])["error"], "quota")
+        self.assertIsNone(drv.stream_digest([[0, 'data: {"message": "bonjour"}']])["error"], "a message is no error")
+
+    def test_a_menu_is_a_conversation_menu_only_with_one_rename_and_one_delete(self):
+        """E3: never « Supprimer tout », never a menu that is not a conversation's."""
+        drv = load_driver()
+
+        def item(label, disabled=False):
+            return {"text": drv.evaluer.fold(label), "label": label, "disabled": disabled}
+
+        menu = [item("Renommer"), item("Partager"), item("Supprimer")]
+        self.assertEqual(drv.menu_entry(menu, "supprimer")[0]["label"], "Supprimer")
+        self.assertEqual(drv.menu_entry(menu, "renommer")[0]["label"], "Renommer")
+        self.assertEqual(drv.menu_entry([item("Rename"), item("Delete chat")], "supprimer")[0]["label"], "Delete chat")
+        for bad in ([item("Supprimer")], [item("Renommer"), item("Supprimer"), item("Supprimer tout l'historique")],
+                    [item("Rename"), item("Delete"), item("Delete all")], [item("Renommer"), item("Supprimer", True)],
+                    [item("Renommer"), item("Supprimer"), item("Supprimer définitivement")],
+                    [item("Renommer"), item("Supprimer"), item("Vider la conversation")]):
+            pick, why = drv.menu_entry(bad, "supprimer")
+            self.assertIsNone(pick, bad)
+            self.assertTrue(why)
+        self.assertTrue(drv.same_title("Recette trois renommée", "Recette trois renommée"))
+        self.assertTrue(drv.same_title("Recette trois, fiche pratique : qu'est-ce…",
+                                       "Recette trois, fiche pratique : qu'est-ce qu'un état des lieux"))
+        self.assertFalse(drv.same_title("Recette trois, fiche pratique", "Recette trois renommée"))
+
+    def test_a_shared_observation_judges_one_case_unless_a_case_was_probed_before_it(self):
+        """N7-1 and N7-2 on one listing (recette 1, both probed first); M8-4 never on M8-2's listing; M8-7
+        never on the model chosen for M8-1's question; the snapshot kept for an offline replay."""
+        drv = load_driver()
+        recette = self.recette(drv)
+        actions = recette.actions()
+        ev = tempfile.mkdtemp(prefix="maskai-recette-")
+        self.addCleanup(shutil.rmtree, ev, True)
+
+        def verdict(cid):
+            return actions["verdict_oracle"]({"case": cid}, ev)[0]["verdict"]
+
+        for cid in ("N7-1", "N7-2"):
+            with self.assertRaises(drv.DriverRefusal):
+                verdict(cid)
+        recette._shared("@list", {"answer": "2 conversations : Quelle est la capitale du Portugal ? | Bonjour",
+                                  "timing_s": None})
+        self.assertEqual((verdict("N7-1"), verdict("N7-2")), ("OK", "OK"))
+        with self.assertRaises(drv.DriverRefusal):
+            verdict("M8-2")
+        recette._shared("@list", {"answer": "1 conversation : Recette trois, fiche pratique : qu'est-c", "timing_s": None})
+        self.assertEqual(verdict("M8-2"), "OK")
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            verdict("M8-4")
+        self.assertEqual(refused.exception.detail, "aucune observation pour M8-4 : lister_conversations d'abord")
+        recette._shared("@list", {"answer": "recherche « Recette trois » : 1 résultat : Recette trois, fiche pratique : "
+                                            "qu'est-c", "timing_s": None})
+        self.assertEqual(verdict("M8-4"), "OK")
+        self.assertIn("recherche « Recette trois »", recette.observations["M8-4"]["observed"]["answer"])
+        recette._shared("@model", {"answer": "options : claude haiku 5-5 ; choisi : claude haiku 5-5 ; relu : "
+                                             "google/eu.claude-haiku-5-5 ; micro : idle", "timing_s": 1.0})
+        recette.observations["M8-1"] = {"answer": "Un état des lieux d'entrée décrit le logement.", "timing_s": 3.0,
+                                        "guard": {"model": "google/eu.claude-haiku-5-5"},
+                                        "composer": {"model": "google/eu.claude-haiku-5-5", "web": "off", "mic": "idle"},
+                                        "sent_info": {"source": None}}
+        self.assertEqual(verdict("M8-1"), "OK")
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            verdict("M8-7")
+        self.assertIn("choisir_modele d'abord", refused.exception.detail)
+        recette._shared("@model", {"answer": "options : claude haiku 5-5 ; choisi : claude haiku 5-5 ; relu : "
+                                             "google/eu.claude-haiku-5-5 ; micro : idle", "timing_s": 1.0})
+        self.assertEqual(verdict("M8-7"), "OK")
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual((line["case"], line["modals_closed"]), ("M8-7", []))
+
+    def test_every_selector_is_a_page_address_or_a_named_pattern(self):
+        drv = load_driver()
+        self.assertLessEqual(set(drv.SELECTOR_PATTERNS), set(drv.SELECTORS))
+        for key, value in drv.SELECTORS.items():
+            self.assertIsInstance(value, (str, list, dict), key)
+            if key not in drv.SELECTOR_PATTERNS:
+                self.assertIsInstance(value, (str, list), key)
+        self.assertEqual([k["name"] for k in drv.KNOWN_MODALS if k.get("own")], ["envoi", "recherche", "renommer",
+                                                                                   "suppression"])
+
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class PilotV23OnFixture(FixtureBench):
+    """Pilot v2.3 (PROCEDURE-3 §6, E1 to E11) on the bench, in the shapes of 18–19/10."""
+
+    TITLE = "Recette banc : premier message"
+    ACCEPT = ".txt,.md,.json,.csv,.pdf,.docx,.xlsx,.pptx,.png,.jpg,.jpeg"
+    HREFS = "() => [...document.querySelectorAll('#conversations a')].map((a) => a.getAttribute('href'))"
+    TITLES = "() => [...document.querySelectorAll('#conversations a')].map((a) => a.textContent)"
+
+    def first_message(self, recette, A, cid="t-a"):
+        recette.cases[cid] = {"id": cid, "level": "M8", "kind": "message", "question": self.TITLE, "budget_s": 5,
+                              "nfr": ["disponibilite"], "must": ["recette banc"], "must_not": [], "pii": []}
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "poser_question", {"case": cid})
+        return recette._registered(cid)
+
+    @staticmethod
+    def list_case(recette, cid, **over):
+        recette.cases[cid] = {"id": cid, "level": "M8", "kind": "list", "budget_s": 10, "nfr": ["disponibilite"],
+                              "must": [], "must_not": [], "pii": [], **over}
+
+    def test_the_registry_holds_the_conversations_the_run_created(self):
+        """E1: the conversation a question created, with its case, in the work directory; a question in it
+        creates nothing; same_conversation_as resolves through the registry after a relaunch."""
+        drv, recette, A = self.make()
+        recette.open()
+        entry = self.first_message(recette, A)
+        page = recette.browser.page()
+        self.assertEqual(entry["href"], drv.urlsplit(page.url).path)
+        self.assertEqual((entry["case"], entry["state"], entry["title"], entry["via"]),
+                         ("t-a", "créée", self.TITLE, "poser_question"))
+        with open(os.path.join(recette.work, "conversations.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["conversations"], [entry])
+        recette.cases["t-b"] = {**recette.cases["t-a"], "id": "t-b", "question": "Et ensuite ?",
+                                "same_conversation_as": "t-a"}
+        self.act(A, "poser_question", {"case": "t-b"})
+        self.assertEqual(len(recette.registry), 1, "a question in a conversation already open creates nothing")
+        for cid in ("t-a", "t-b"):
+            self.act(A, "verdict_oracle", {"case": cid})
+            self.assertEqual(journal_lines(recette.work)[-1]["conversation"],
+                             {"href": entry["href"], "created_by": "t-a", "state": "créée"})
+        recette.browser.close()  # a relaunched driver: its memory of the conversation is gone, the registry is not
+        drv2, recette2, A2 = self.make(work=str(recette.work), module=load_driver())
+        self.assertEqual(recette2.registry, recette.registry)
+        recette2.cases.update({k: recette.cases[k] for k in ("t-a", "t-b")})
+        recette2.cases["t-c"] = {**recette.cases["t-b"], "id": "t-c", "question": "Et enfin ?"}
+        recette2.open()
+        with self.assertRaises(drv2.DriverRefusal) as refused:  # on another page: refused, as before
+            self.act(A2, "poser_question", {"case": "t-c"})
+        self.assertIn("se pose dans la conversation de t-a", refused.exception.detail)
+        recette2.browser.page().goto(f"http://127.0.0.1:{self.port}{entry['href']}")
+        self.assertTrue(recette2._in_conversation_of("t-a"))
+        self.act(A2, "poser_question", {"case": "t-c"})  # on the registered conversation: it resolves
+        self.assertEqual(recette2.observations["t-c"]["conversation"]["created_by"], "t-a")
+        self.assertEqual(len(recette2.registry), 1)
+
+    def test_the_search_types_its_question_in_the_palette_only_and_closes_it(self):
+        """E2: ⌘K (or the sidebar entry), the question typed in the palette and nowhere else, the titles
+        found read, the palette closed by Escape; @list « recherche « q » : n résultats : … »."""
+        for nokbd in (False, True):
+            with self.subTest(nokbd=nokbd):
+                drv, recette, A = self.make()
+                try:
+                    if nokbd:
+                        recette.entry += "?nokbd=1"
+                    recette.open()
+                    self.first_message(recette, A)
+                    page = recette.browser.page()
+                    page.evaluate("() => window.__seed('Autre sujet sans rapport')")
+                    self.list_case(recette, "t-search", action="lister_conversations", question="Recette banc",
+                                   must=["resultats? : .*recette banc"])
+                    self.list_case(recette, "t-none", action="lister_conversations", question="Introuvable",
+                                   must=["resultats? : .*introuvable"])
+                    res, ev = self.act(A, "lister_conversations", {"case": "t-search"})
+                    self.assertEqual(res["text"], f"recherche « Recette banc » : 1 résultat : {self.TITLE}")
+                    self.assertEqual(res["opened_by"], drv.SELECTORS["search_entry"][0] if nokbd else "ControlOrMeta+K")
+                    self.assertEqual({e["name"] for e in ev}, {"screen.png", "search.json"})
+                    search = self.evidence_json(ev, "search.json")
+                    self.assertEqual((search["input"], search["result"], search["closed"], search["settled"]),
+                                     ("[cmdk-input]", "[cmdk-item]", True, True))
+                    self.assertEqual(page.evaluate("() => window.__palette_queries"), ["Recette banc"], "typed once, there")
+                    self.assertEqual(page.evaluate("() => document.getElementById('prompt').value"), "", "never the composer")
+                    self.assertTrue(page.evaluate("() => document.getElementById('palette').hidden"))
+                    self.assertIsNone(recette.browser.own_modal)
+                    self.assertEqual(self.act(A, "verdict_oracle", {"case": "t-search"})[0]["verdict"], "OK")
+                    res, _ = self.act(A, "lister_conversations", {"case": "t-none"})
+                    self.assertEqual(res["text"], "recherche « Introuvable » : 0 résultat")
+                    self.assertEqual(self.act(A, "verdict_oracle", {"case": "t-none"})[0]["verdict"], "KO",
+                                     "the query's echo is no result")
+                    res, _ = self.act(A, "lister_conversations")  # without case: the sidebar, as before
+                    self.assertEqual(res["text"], f"2 conversations : Autre sujet sans rapport | {self.TITLE}")
+                    if not nokbd:
+                        page.keyboard.press("Control+K")  # opened by hand: not the driver's, refused, left alone
+                        with self.assertRaises(drv.DriverRefusal) as refused:
+                            self.act(A, "capture_ecran")
+                        self.assertEqual(refused.exception.reason, "dialog")
+                        self.assertFalse(page.evaluate("() => document.getElementById('palette').hidden"))
+                        page.keyboard.press("Escape")
+                        recette.browser.own_modal = "recherche"  # left open by the driver's own action, cut short
+                        page.keyboard.press("Control+K")
+                        self.act(A, "capture_ecran")
+                        self.assertTrue(page.evaluate("() => document.getElementById('palette').hidden"))
+                finally:
+                    recette.browser.close()
+
+    def test_rename_and_delete_touch_the_registered_conversation_only(self):
+        """E3: two conversations with the same title, the one the run did not create first in the sidebar:
+        only the registered one is renamed, then deleted through the application's confirmation; a target
+        absent from the registry, or a case of another action, is refused before any click."""
+        drv, recette, A = self.make()
+        recette.open()
+        entry = self.first_message(recette, A)
+        page = recette.browser.page()
+        decoy = page.evaluate(f"() => window.__seed({json.dumps(self.TITLE)})")
+        mine = entry["href"].rsplit("/", 1)[1]
+        self.assertEqual(page.evaluate(self.HREFS), [decoy, entry["href"]], "the decoy first, same title")
+        self.list_case(recette, "t-ren", action="renommer_conversation", same_conversation_as="t-a",
+                       question="Recette banc renommée", must=["recette banc renommee"])
+        self.list_case(recette, "t-del", action="supprimer_conversation", same_conversation_as="t-a",
+                       must=["[0-9]+ conversation"], must_not=["recette banc renommee"])
+        recette.cases["t-never"] = {**recette.cases["t-a"], "id": "t-never"}  # never asked: no conversation
+        self.list_case(recette, "t-stray", action="supprimer_conversation", same_conversation_as="t-never")
+        self.list_case(recette, "t-bare", same_conversation_as="t-a")  # names no action
+        untouched = ("() => [window.__menu_opens.length, window.__menu_picks.length, window.__deleted.length, "
+                     "Object.keys(window.__renamed).length]")
+        for cid, action, why in (("t-stray", "supprimer_conversation", "n'est pas au registre"),
+                                 ("t-ren", "supprimer_conversation", "se joue par renommer_conversation"),
+                                 ("t-bare", "renommer_conversation", "ne nomme pas l'action")):
+            with self.assertRaises(drv.DriverRefusal) as refused:
+                self.act(A, action, {"case": cid})
+            self.assertEqual(refused.exception.reason, "precondition", cid)
+            self.assertIn(why, refused.exception.detail)
+            self.assertEqual(page.evaluate(untouched), [0, 0, 0, 0], f"{cid}: refused before any click")
+        res, ev = self.act(A, "renommer_conversation", {"case": "t-ren"})
+        self.assertEqual(page.evaluate("() => window.__renamed"), {mine: "Recette banc renommée"})
+        self.assertEqual(page.evaluate("() => window.__menu_opens"), [mine], "never the decoy's menu")
+        self.assertEqual(page.evaluate(self.TITLES), [self.TITLE, "Recette banc renommée"])
+        self.assertIn("titre relu « Recette banc renommée »", res["text"])
+        record = self.evidence_json(ev, "conversation.json")
+        self.assertEqual((record["picked"], record["trigger"]["trigger"], record["trigger"]["trigger_level"],
+                          record["menu"]["how"]), ("Renommer", 'button[aria-haspopup="menu"]', 1, "aria-controls"))
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "t-ren"})[0]["verdict"], "OK")
+        self.assertEqual(recette._registered("t-a")["state"], "renommée")
+        res, ev = self.act(A, "supprimer_conversation", {"case": "t-del"})
+        self.assertEqual(page.evaluate("() => window.__deleted"), [mine])
+        self.assertEqual(page.evaluate(self.HREFS), [decoy], "the decoy is still there")
+        self.assertTrue(page.evaluate("() => document.getElementById('confirm-delete').hidden"))
+        self.assertIsNone(recette.browser.own_modal)
+        record = self.evidence_json(ev, "conversation.json")
+        self.assertEqual((record["picked"], record["confirmation"]["role"], record["confirmation"]["buttons"]),
+                         ("Supprimer", "alertdialog", ["Annuler", "Supprimer"]))
+        self.assertNotIn("others_gone", record)
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "t-del"})[0]["verdict"], "OK")
+        self.assertEqual(journal_lines(recette.work)[-1]["conversation"],
+                         {"href": entry["href"], "created_by": "t-a", "state": "supprimée"})
+        with open(os.path.join(recette.work, "conversations.json"), encoding="utf-8") as f:
+            self.assertEqual([h["state"] for h in json.load(f)["conversations"][0]["history"]],
+                             ["créée", "renommée", "supprimée"])
+        opens = page.evaluate("() => window.__menu_opens.length")
+        self.list_case(recette, "t-del2", action="supprimer_conversation", same_conversation_as="t-a")
+        res, _ = self.act(A, "supprimer_conversation", {"case": "t-del2"})  # deleted already: nothing clicked
+        self.assertIn("plus listée", res["text"])
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "renommer_conversation", {"case": "t-ren"})
+        self.assertIn("est supprimée", refused.exception.detail)
+        self.assertEqual(page.evaluate("() => window.__menu_opens.length"), opens)
+
+    def test_a_rename_dialog_and_a_confirmation_left_open(self):
+        """E3: a rename in a dialog (`?renamedialog=1`), validated by Enter; the application's delete
+        confirmation opened by hand is an unknown dialog, refused and left alone; left open by the driver's
+        own action, the next guard cancels it, never confirms it."""
+        drv, recette, A = self.make()
+        recette.entry += "?renamedialog=1"
+        recette.open()
+        self.first_message(recette, A)
+        page = recette.browser.page()
+        self.list_case(recette, "t-ren", action="renommer_conversation", same_conversation_as="t-a",
+                       question="Titre par la fenêtre", must=["titre par la fenetre"])
+        res, ev = self.act(A, "renommer_conversation", {"case": "t-ren"})
+        self.assertTrue(self.evidence_json(ev, "conversation.json")["field"]["in_dialog"])
+        self.assertTrue(page.evaluate("() => document.getElementById('rename-dialog').hidden"))
+        self.assertIsNone(recette.browser.own_modal)
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "t-ren"})[0]["verdict"], "OK")
+        page.evaluate("() => openConfirm(document.querySelector('#conversations .conv-item'))")
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "capture_ecran")
+        self.assertEqual(refused.exception.reason, "dialog")
+        self.assertFalse(page.evaluate("() => document.getElementById('confirm-delete').hidden"))
+        recette.browser.own_modal = "suppression"
+        self.act(A, "capture_ecran")
+        self.assertTrue(page.evaluate("() => document.getElementById('confirm-delete').hidden"))
+        self.assertEqual(page.evaluate("() => window.__deleted"), [], "cancelled, never confirmed")
+
+    def test_the_dictation_state_is_read_with_the_model_selector_and_never_pressed(self):
+        """E4: choisir_modele's @model text ends with « ; micro : <data-status> » (M8-7), or « absent »;
+        every line's config carries it; the button is never pressed."""
+        for nomic in (False, True):
+            with self.subTest(nomic=nomic):
+                drv, recette, A = self.make()
+                try:
+                    if nomic:
+                        recette.entry += "?nomic=1"
+                    recette.open()
+                    want = "absent" if nomic else "idle"
+                    with self.assertRaises(drv.DriverRefusal):
+                        self.act(A, "verdict_oracle", {"case": "M8-7"})
+                    res, ev = self.act(A, "choisir_modele", {"model": "claude haiku 5-5"})
+                    self.assertTrue(res["text"].endswith(f" ; micro : {want}"), res["text"])
+                    self.assertEqual((res["mic"], self.evidence_json(ev, "model.json")["mic"]), (want, want))
+                    self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-7"})[0]["verdict"], "KO" if nomic else "OK")
+                    self.assertEqual(journal_lines(recette.work)[-1]["config"]["mic"], want)
+                    self.message_case(recette, "t-mic", "Bonjour")
+                    self.act(A, "nouvelle_conversation")
+                    self.act(A, "poser_question", {"case": "t-mic"})
+                    self.act(A, "verdict_oracle", {"case": "t-mic"})
+                    self.assertEqual(journal_lines(recette.work)[-1]["config"]["mic"], want)
+                    if not nomic:
+                        page = recette.browser.page()
+                        self.assertEqual(page.evaluate("() => [window.__mic_clicks, document.getElementById('mic').dataset.status]"),
+                                         [0, "idle"])
+                finally:
+                    recette.browser.close()
+
+    def test_the_survey_opens_from_its_entry_and_closes_by_its_cross_sending_nothing(self):
+        """E5: ouvrir_avis M8-8, the observation « avis : ouvert (entrée : X) ; fermé par : croix ;
+        envoyé : non » ; a survey that shows up by itself is closed by the guard and counted on the line of
+        the case in hand (modals_closed)."""
+        drv, recette, A = self.make()
+        recette.open()
+        page = recette.browser.page()
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, "ouvrir_avis", {"case": "M8-7"})
+        self.assertEqual(refused.exception.reason, "precondition")
+        self.assertEqual(page.evaluate("() => window.__feedback_opens"), 0)
+        res, ev = self.act(A, "ouvrir_avis", {"case": "M8-8"})
+        self.assertEqual(res["text"], "avis : ouvert (entrée : Send feedback) ; fermé par : croix ; envoyé : non")
+        self.assertEqual({e["name"] for e in ev}, {"avis.json", "avis.png"})
+        self.assertEqual(self.evidence_json(ev, "avis.json")["survey"]["radios"], ["suggestion", "probleme"])
+        self.assertEqual(page.evaluate("() => [window.__feedback_opens, window.__survey_answered, window.__survey_sent, "
+                                       "document.getElementById('avis').hidden]"), [1, False, 0, True])
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-8"})[0]["verdict"], "OK")
+        self.assertEqual(journal_lines(recette.work)[-1]["modals_closed"], [], "the survey it opened is no spontaneous one")
+        self.message_case(recette, "t-spont", "Bonjour")
+        self.act(A, "nouvelle_conversation")
+        page.evaluate("() => showSurvey()")  # the survey shows up by itself
+        self.act(A, "poser_question", {"case": "t-spont"})
+        self.act(A, "verdict_oracle", {"case": "t-spont"})
+        self.assertEqual(journal_lines(recette.work)[-1]["modals_closed"], ["avis"])
+        self.assertEqual(page.evaluate("() => [window.__survey_answered, window.__survey_sent]"), [False, 0])
+
+    def test_the_accept_list_and_the_class_of_a_failed_chip(self):
+        """E6: the file input's accept list in joindre_document's result and on the line. E9: a failed chip
+        gives its class, never its raw label (a host name and a stack), which stays in chip.json."""
+        drv, recette, A = self.make()
+        recette.open()
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "joindre_document", {"case": "fixture-case-1"})
+        self.assertEqual(res["accept"], self.ACCEPT)
+        self.assertEqual({e["name"] for e in ev}, {"attach.png", "network.json", "chip.json"})
+        self.act(A, "poser_question", {"case": "fixture-case-1"})
+        self.act(A, "verdict_oracle", {"case": "fixture-case-1"})
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual((line["attach"]["state"], line["attach"]["accept"]), ("ready", self.ACCEPT))
+        self.assertNotIn("error_class", line)
+        for name, cls, internal in (("faildb", "service documentaire injoignable", True),
+                                    ("failformat", "format refusé", False),
+                                    ("failsize", "fichier trop volumineux", False),
+                                    ("fail", "échec de la pièce jointe", False)):
+            cid = f"t-{name}"
+            recette.cases[cid] = {**recette.cases["fixture-case-1"], "id": cid, "file": f"fixture/corpus/{name}.txt"}
+            self.act(A, "nouvelle_conversation")
+            with self.assertRaises(drv.DriverRefusal) as refused:
+                self.act(A, "joindre_document", {"case": cid})
+            extra = refused.exception.extra
+            self.assertEqual((refused.exception.detail, extra["error_class"], extra["internal_error_shown"]),
+                             ("attachment failed", cls, internal))
+            chip = self.evidence_json(refused.exception.evidence, "chip.json")
+            self.assertIn("Failed", chip["label"])
+            expected = f"pièce jointe en échec ({cls})"
+            if internal:
+                self.assertIn("docstore-db.internal.maskai.local", chip["label"], "the raw label stays in the evidence")
+                with self.assertRaises(drv.DriverRefusal) as not_sent:  # read again before sending: still failed
+                    self.act(A, "poser_question", {"case": cid})
+                self.assertEqual(not_sent.exception.extra["error_class"], cls)
+                expected = f"question non envoyée (précondition) : pièce jointe failed ({cls})"
+            self.act(A, "verdict_oracle", {"case": cid})
+            line = journal_lines(recette.work)[-1]
+            self.assertEqual((line["verdict"], line["error_class"], line["attach"]["error_class"]), ("KO", cls, cls))
+            self.assertTrue(line["evidence"].startswith(expected), line["evidence"])
+            seen = json.dumps([line, extra, recette.observations[cid]], ensure_ascii=False)
+            for bad in ("docstore-db", "maskai.local", "/srv/", "Traceback", "worker.py"):
+                self.assertNotIn(bad, seen, name)
+
+    def test_a_silent_failure_is_named_on_the_line_without_its_internals(self):
+        """E10: no answer card (the night of 18–19/10): the line carries the failure's class and a sanitised
+        excerpt; the raw capture (status line, toast, HTTP status, last events) goes to failure.json only."""
+        drv, recette, A = self.make()
+        recette.open()
+        for word, cls, excerpt in (("SILENT_FAIL", "service interne injoignable", "could not translate host name"),
+                                   ("SILENT_502", "erreur serveur (HTTP 502)", "momentanément indisponible")):
+            cid = f"t-{word.lower()}"
+            self.message_case(recette, cid, f"Bonjour {word}")
+            self.act(A, "nouvelle_conversation")
+            res, ev = self.act(A, "poser_question", {"case": cid})
+            self.assertEqual(res["error_class"], cls)
+            failure = self.evidence_json(ev, "failure.json")
+            self.assertIn("pii-", json.dumps(failure), "the raw capture keeps the internals, in the evidence only")
+            self.assertIn(["toast", "Échec de l'envoi : réessayez dans un instant."], failure["notices"])
+            self.act(A, "verdict_oracle", {"case": cid})
+            line = journal_lines(recette.work)[-1]
+            self.assertEqual((line["verdict"], line["error_class"]), ("KO", cls))
+            self.assertIn("réponse vide : échec silencieux (aucune nouvelle carte de réponse", line["evidence"])
+            self.assertIn(cls, line["evidence"])
+            self.assertIn(excerpt, line["error_excerpt"])
+            self.assertLessEqual(len(line["error_excerpt"]), drv.EXCERPT_MAX)
+            seen = json.dumps([line, recette.observations[cid]], ensure_ascii=False)
+            for bad in ("pii-db", "pii-guard", "maskai.local", "/srv/", "detect.py", "8443"):
+                self.assertNotIn(bad, seen, word)
+        self.assertIn("dernier nœud detect_pii", journal_lines(recette.work)[-2]["evidence"])
+        self.assertEqual(journal_lines(recette.work)[-1]["error_excerpt"], "Le service est momentanément indisponible (502).")
+
+    def test_the_line_carries_the_masked_inventory_and_the_replay_compares_it(self):
+        """E7: sent_source, sent_tokens and pii_declared on the line; the replay_of note compares the masked
+        sets; a sent text not observed is null, with the reason."""
+        drv, recette, A = self.make()
+        recette.open()
+        q = "Relance M. Hugo Bernard au 06 12 34 56 78 pour le loyer."
+        base = {"level": "M1", "kind": "message", "question": q, "budget_s": 5, "nfr": ["securite"], "must": ["relance"],
+                "must_not": [], "pii": ["Hugo Bernard", "06 12 34 56 78"]}
+        recette.cases["t-a"] = {**base, "id": "t-a"}
+        recette.cases["t-b"] = {**base, "id": "t-b", "replay_of": "t-a"}
+        recette.cases["t-c"] = {**base, "id": "t-c", "replay_of": "t-a", "question": q + " LEAK"}
+        recette.cases["t-st"] = {**base, "id": "t-st", "question": q + " DETAILS_STATUS"}
+        for cid in ("t-a", "t-b", "t-c", "t-st"):
+            self.act(A, "nouvelle_conversation")
+            self.act(A, "poser_question", {"case": cid})
+            self.act(A, "verdict_oracle", {"case": cid})
+        a, b, c, st = journal_lines(recette.work)[-4:]
+        self.assertEqual((a["sent_source"], a["sent_tokens"], a["pii_declared"]), ("card-details", {"PERSON": 1, "PHONE": 1}, 2))
+        self.assertIn("passage a (t-a) : OK ; texte envoyé identique ; ensemble masqué identique", b["evidence"])
+        self.assertEqual((c["verdict"], c["sent_tokens"]), ("KO", {}))
+        self.assertIn("passage a (t-a) : OK ; texte envoyé différent ; ensemble masqué différent : −PERSON −PHONE",
+                      c["evidence"])
+        self.assertEqual((st["sent_source"], st["sent_tokens"], st["sent_rejected"]),
+                         (None, None, "le panneau « Détails » ne montre pas le texte de la question"))
+
+    def test_the_interface_probe_reads_everything_and_touches_nothing(self):
+        """E11: sonder_interface resolves every selector, records the ⌘K entry and palette, the feedback
+        entry, the dictation button, the accept list and the first conversation's menu (opened, read,
+        closed by Escape, no item clicked), without the title or the address of that conversation."""
+        drv, recette, A = self.make()
+        recette.open()
+        page = recette.browser.page()
+        res, ev = self.act(A, "sonder_interface")
+        self.assertEqual(self.evidence_json(ev, "probe.json")["menu"], {"found": False, "conversations": 0},
+                         "no conversation yet: nothing to read, nothing refused")
+        page.evaluate("() => { window.__seed('Mon dossier privé numéro un'); window.__seed('Mon dossier privé numéro deux'); }")
+        res, ev = self.act(A, "sonder_interface")
+        probe = self.evidence_json(ev, "probe.json")
+        self.assertEqual(probe["errors"], [])
+        self.assertEqual(set(probe["selectors"]), set(drv.SELECTORS) - set(drv.SELECTOR_PATTERNS))
+        for key, rows in probe["selectors"].items():
+            for row in rows:
+                self.assertNotIn("error", row, (key, row))
+        self.assertEqual((probe["search"]["opened_by"], probe["search"]["input"], probe["search"]["closed"]),
+                         ("ControlOrMeta+K", "[cmdk-input]", True))
+        self.assertEqual((probe["search_entry"]["selector"], probe["feedback_entry"]["label"]),
+                         (drv.SELECTORS["search_entry"][0], "Send feedback"))
+        self.assertEqual((probe["mic"]["status"], probe["file_input"]["accept"]), ("idle", self.ACCEPT))
+        self.assertEqual([i["label"] for i in probe["menu"]["menu"]["items"]], ["Renommer", "Partager", "Supprimer"])
+        self.assertEqual((probe["menu"]["closed"], probe["menu"]["trigger"]["trigger"]), (True, 'button[aria-haspopup="menu"]'))
+        self.assertEqual(page.evaluate("() => [window.__menu_opens.length, window.__menu_picks.length, "
+                                       "window.__palette_queries.length, window.__feedback_opens, window.__mic_clicks, "
+                                       "window.__survey_shown]"), [1, 0, 0, 0, 0, 0])
+        text = json.dumps(probe, ensure_ascii=False)
+        for bad in ("Mon dossier privé", "/conversation/seed", "seed2"):
+            self.assertNotIn(bad, text)
+        self.assertIn("Renommer | Partager | Supprimer", res["text"])
+        self.assertTrue(page.evaluate("() => document.getElementById('conv-menu').hidden "
+                                      "&& document.getElementById('palette').hidden"))
+
+    def test_the_m8_level_plays_its_cases_in_order(self):
+        """recette-maskai-3.json, step M8, on the bench with the cases of cases.json (M8-3 aside, an image of
+        the corpus): each case probed, then played for itself; M8-1's conversation renamed, then deleted, and
+        no other; the dictation button never pressed; the survey never sent."""
+        drv, recette, A = self.make()
+        recette.open()
+        page = recette.browser.page()
+        self.act(A, "choisir_modele", {"model": "claude haiku 5-5"})  # the level's configuration
+        self.act(A, "recherche_web", {"mode": "off"})
+        older = page.evaluate("() => window.__seed(\"Recette trois, fiche pratique : une conversation d'avant\")")
+
+        def play(cid, *steps):
+            with self.assertRaises(drv.DriverRefusal) as refused:  # still to do
+                self.act(A, "verdict_oracle", {"case": cid})
+            self.assertEqual(refused.exception.reason, "precondition", cid)
+            for name, args in steps:
+                self.act(A, name, args)
+            res, _ = self.act(A, "verdict_oracle", {"case": cid})
+            self.assertEqual(res["verdict"], "OK", (cid, json.loads(res["text"])["evidence"]))
+
+        play("M8-1", ("nouvelle_conversation", {}), ("choisir_modele", {"model": "claude haiku 5-5"}),
+             ("poser_question", {"case": "M8-1"}))
+        play("M8-2", ("lister_conversations", {}))
+        play("M8-4", ("lister_conversations", {"case": "M8-4"}))
+        play("M8-5", ("renommer_conversation", {"case": "M8-5"}))
+        play("M8-6", ("supprimer_conversation", {"case": "M8-6"}))
+        play("M8-7", ("choisir_modele", {"model": "claude haiku 5-5"}))
+        play("M8-8", ("ouvrir_avis", {"case": "M8-8"}))
+        self.assertEqual(page.evaluate(self.HREFS), [older], "the conversation of before is still there")
+        self.assertEqual(page.evaluate("() => [window.__mic_clicks, window.__survey_sent, window.__deleted.length]"),
+                         [0, 0, 1])
+        lines = {line["case"]: line for line in journal_lines(recette.work)}
+        self.assertIn("recherche « Recette trois » : 2 résultats", lines["M8-4"]["evidence"])
+        self.assertEqual([lines[c]["conversation"]["state"] for c in ("M8-1", "M8-5", "M8-6")],
+                         ["créée", "renommée", "supprimée"])
+        self.assertIsNone(recette.browser.own_modal)
 
 
 if __name__ == "__main__":

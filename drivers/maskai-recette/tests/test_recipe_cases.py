@@ -50,9 +50,9 @@ class RecipeCasesTest(unittest.TestCase):
                          ["M1-J1a", "M3-B2", "M0-3", "M4-O1", "M5-1"])
 
     def test_the_rules_block_is_the_same_in_every_harness_step(self):
-        """One rules block, twenty copies (ten N levels, two fixture levels, eight M levels):
-        a correction made in one step and not the others would leave levels that refuse,
-        replay or stop differently."""
+        """One rules block, thirty copies (ten N levels, two fixture levels, eight M levels of
+        recette 2, ten of recette 3): a correction made in one step and not the others would
+        leave levels that refuse, replay or stop differently."""
         blocks = []
         for name, recipe in self.recipes.items():
             for i, step in enumerate(harness_steps(recipe)):
@@ -104,6 +104,30 @@ class RecipeCasesTest(unittest.TestCase):
                     and int(c["level"][1:]) <= top and not cid.startswith("fixture-")}
             self.assertEqual(sorted(grid - named), [], f"{name}: cases of the grid no step runs")
         self.assertEqual({c["level"][0] for c in self.cases.values()}, {"N", "M"})
+
+    def test_recette_3_probes_the_interface_and_plays_the_eight_m8_cases(self):
+        """Pilot v2.3 (PROCEDURE-3 §4, §6): M0 calls sonder_interface after its loads; M8 plays M8-1 …
+        M8-8 in order, renames and deletes through M8-5 and M8-6 only, reads the dictation state
+        through choisir_modele (M8-7) and opens the survey through ouvrir_avis (M8-8); max_actions is
+        3 × the acts of the full path + 10 (M0: 14 acts, M8: 32)."""
+        steps = harness_steps(self.recipes["recette-maskai-3.json"])
+        m0, m8 = steps[0], steps[8]
+        self.assertTrue(m0["instruction"].startswith("Niveau M0") and m8["instruction"].startswith("Niveau M8"))
+        text = m0["instruction"]
+        self.assertGreater(text.index("sonder_interface"), text.rindex("mesurer_chargement"))
+        self.assertEqual(m0["max_actions"], 3 * 14 + 10)
+        text = m8["instruction"]
+        played = [text.index(f"verdict_oracle M8-{n} ; s'il reste à faire") for n in range(1, 9)]
+        self.assertEqual(played, sorted(played), "the eight cases, in order")
+        self.assertEqual(re.findall(r"(renommer_conversation|supprimer_conversation) (M\d-\d+)", text),
+                         [("renommer_conversation", "M8-5"), ("supprimer_conversation", "M8-6")])
+        for call in ("lister_conversations M8-4", "ouvrir_avis M8-8",
+                     'choisir_modele {"model":"claude haiku 5-5"}, puis verdict_oracle M8-7'):
+            self.assertIn(call, text)
+        self.assertEqual(m8["max_actions"], 3 * 32 + 10)
+        self.assertEqual({cid: self.cases[cid].get("action") for cid in ("M8-4", "M8-5", "M8-6", "M8-7", "M8-8")},
+                         {"M8-4": "lister_conversations", "M8-5": "renommer_conversation",
+                          "M8-6": "supprimer_conversation", "M8-7": None, "M8-8": "ouvrir_avis"})
 
     def test_each_recipe_drives_its_own_driver(self):
         """The recette acts on maskai-1 and the dry run on maskai-fixture, the names

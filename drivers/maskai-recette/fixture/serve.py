@@ -28,12 +28,22 @@ words in the request body:
   LEAK            the « Chiffré » popover and the card's « Détails » show the
                   text unmasked (a leak);
   POPOVER_STATUS  the « Chiffré » popover shows a status line, not the text;
-  DETAILS_STATUS  the card's « Détails » shows a status line, not the text.
+  DETAILS_STATUS  the card's « Détails » shows a status line, not the text;
+  SILENT_FAIL     (pilot v2.3, E10) the stream emits `detect_pii` twice, then an
+                  `event: error` whose payload names an internal host, a module
+                  and a path, and ends; the page draws no answer card, writes a
+                  status line under the composer and shows a toast (the night of
+                  18–19/10: 12 of 14 models answered nothing after detect_pii);
+  SILENT_502      the stream request answers HTTP 502 with a plain-text body that
+                  names an internal host; no card, a status line.
 
 The page side (index.html) draws each answer behind the stream and ends about
 1.5 s after the server; shows the « Votre avis » survey after a generation left
-in flight; steers the attachment chip by file name (« fail », « slowidx »,
-« instant »).
+in flight (and from its « Send feedback » entry); steers the attachment chip by
+file name (« fail », « slowidx », « instant », and since v2.3 « faildb »,
+« failformat », « failsize », whose failed chips carry a host name and a stack,
+a format refusal, a size refusal); gives each sidebar conversation a menu
+(rename, delete with a confirmation) and a ⌘K search palette.
 
 Other paths: /busy (requests, then a popup after 3 s; /stats says when the popup
 was announced and when its request arrived), /redirect-unreachable (a 302 to an
@@ -105,6 +115,9 @@ MASKS = (
     (re.compile(r"(?:\+33\s?|\b0)[1-9](?:[\s.-]?\d{2}){4}\b"), "PHONE"),
 )
 DETAILS_STATUS = "Aucune PII détectée — rien à anonymiser pour l'instant"
+# What the stream says when it fails silently (SILENT_FAIL, v2.3): an internal host, a module, a path.
+SILENT_ERROR = ("psycopg2.OperationalError: could not translate host name 'pii-db.internal.maskai.local' to address: "
+                "Name or service not known (File '/srv/maskai/guard/detect.py', line 42, in detect)")
 
 
 def anonymise(text: str) -> str:
@@ -179,6 +192,9 @@ class Handler(BaseHTTPRequestHandler):
             msg = json.loads(body)
         except ValueError:
             msg = {"message": body}
+        if "SILENT_502" in body:  # v2.3, E10: no stream at all, a gateway error naming an internal host
+            self.reply(502, b"Bad Gateway: upstream pii-guard.internal:8443 unavailable", "text/plain; charset=utf-8")
+            return
         attachments = msg.get("attachments") or []
         answer = (html.escape(str(msg.get("message", "")).strip().upper())
                   + " — pièces jointes : " + (", ".join(attachments) or "aucune"))
@@ -195,6 +211,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if "SLOW" in body:
                 time.sleep(8)
+            if "SILENT_FAIL" in body:  # v2.3, E10: detect_pii twice, an error event, the end; no answer
+                for _ in range(2):
+                    self.event({"node": "detect_pii"})
+                    time.sleep(0.05)
+                self.wfile.write(("event: error\ndata: " + json.dumps({"error": SILENT_ERROR}) + "\n\n").encode("utf-8"))
+                self.wfile.flush()
+                return
             steps = ["retrieve"] + (["web_search"] if msg.get("web_search") == "on" else []) + ["generate"]
             for step in steps:
                 self.event({"node": step})
