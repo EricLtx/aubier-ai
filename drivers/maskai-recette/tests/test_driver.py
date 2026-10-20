@@ -4154,5 +4154,46 @@ class FixRound4OnFixture(FixtureBench):
         self.assertIs(line.get("internal_error_shown"), True)
 
 
+# -- Fix round 5 (coordinator's ruling): « autre(s) » / « other(s) » as a noun, or after a number or a determiner,
+# anywhere in a delete confirmation, refuses it. One test per shape.
+R5_CONFIRMS_REFUSED = {
+    "et_les_deux_autres": "Supprimer cette conversation et les deux autres ?",
+    "et_2_autres": "Supprimer cette conversation et 2 autres ?",
+    "ainsi_que_les_autres": "Supprimer cette conversation ainsi que les autres ?",
+    "et_toutes_les_autres": "Supprimer cette conversation et toutes les autres ?",
+    "une_autre_conversation": "Supprimer cette conversation et une autre conversation ?",
+    "and_2_others_en": "Delete this chat and 2 others?",
+    "and_the_others_en": "Delete this chat and the others?",
+    "and_all_others_en": "Delete this chat and all others?",
+    "another_chat_en": "Delete this chat and another chat?",
+}
+R5_CONFIRMS_ACCEPTED = {
+    "irreversible": "Supprimer cette conversation ? Cette action est irréversible.",
+}
+
+
+class FixRound5Units(unittest.TestCase):
+    """Fix round 5: the elliptical « others » of a delete confirmation."""
+
+    def check_confirm_refused(self, text):
+        self.assertFalse(load_driver().confirms_one_deletion(text, "Recette trois renommée"), text)
+
+    def check_confirm_accepted(self, text):
+        self.assertTrue(load_driver().confirms_one_deletion(text, "Recette trois renommée"), text)
+
+
+def _r5_generate():
+    def add(name, fn):
+        fn.__name__ = name
+        setattr(FixRound5Units, name, fn)
+    for key, text in R5_CONFIRMS_REFUSED.items():
+        add(f"test_others_confirmation_refused_{key}", lambda self, text=text: self.check_confirm_refused(text))
+    for key, text in R5_CONFIRMS_ACCEPTED.items():
+        add(f"test_others_confirmation_accepted_{key}", lambda self, text=text: self.check_confirm_accepted(text))
+
+
+_r5_generate()
+
+
 if __name__ == "__main__":
     unittest.main()
