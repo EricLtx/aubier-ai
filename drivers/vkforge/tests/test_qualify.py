@@ -10,18 +10,18 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vkdriver.hash_dir import hash_dir
 from vkforge import __main__ as entry
 from vkforge import canon, generate, mine, ontology, plan, qualify
 from vkforge.errors import Refusal
 from vkforge.tests import ooxml_fixtures
+from vkforge.tests.ooxml_fixtures import OTHER_SALT, SALT
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 HOUSE_POST = {"title_style": True, "body_font": True, "footer_text": True, "pdf_exists": True}
 NOTHING_REPAIRED = {"title_style": False, "body_font": False, "footer_text": False, "pdf_exists": True}
-SALT = bytes(range(32))
-OTHER_SALT = bytes(range(1, 33))
 
 # A stand-in for the generated driver.py (L-P51): protocol 1 by hand, stdlib only. Per document name it
 # sleeps past the deadline or exits without answering; otherwise it writes the PDF and answers ok
@@ -68,6 +68,22 @@ def learned(corpus: Path, salt: bytes | None = None):
     driver = Path(tempfile.mkdtemp()) / "word-maison" / "driver"
     generate.generate(p, binding, inv, vault, driver, name="word-maison")
     return driver, p, inv
+
+
+def write_artefacts(driver: Path, p: dict, inv: dict) -> Path:
+    """plan.json and invariants.json beside the driver, in canonical form, as `vk driver learn` leaves
+    them in its --out; that directory."""
+    out = driver.parent
+    plan.write_plan(p, [], out)
+    canon.write(inv, out / "invariants.json")
+    return out
+
+
+def qualify_argv(driver: Path, corpus: Path, out: Path, work: Path, salt_file: Path | None) -> list:
+    """`vkforge qualify` on the fake application over the artefacts in `out`; no --salt-file when None."""
+    argv = ["qualify", "--driver", str(driver), "--corpus", str(corpus), "--plan", str(out / "plan.json"),
+            "--invariants", str(out / "invariants.json"), "--work", str(work), "--fake"]
+    return argv if salt_file is None else [*argv, "--salt-file", str(salt_file)]
 
 
 def stand_in(driver: Path, p: dict, default: str, behaviour: dict | None = None) -> Path:
@@ -195,16 +211,12 @@ class QualifyTest(unittest.TestCase):
 
     def test_the_cli_qualifies_from_the_artefacts(self):
         driver, p, inv = learned(self.corpus, SALT)
-        out = driver.parent
-        plan.write_plan(p, [], out)
-        canon.write(inv, out / "invariants.json")
+        out = write_artefacts(driver, p, inv)
         salt = out / ".salt"
         salt.write_bytes(SALT)
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
-            code = entry.main(["qualify", "--driver", str(driver), "--corpus", str(self.corpus),
-                               "--plan", str(out / "plan.json"), "--invariants", str(out / "invariants.json"),
-                               "--work", str(self.work), "--fake", "--salt-file", str(salt)])
+            code = entry.main(qualify_argv(driver, self.corpus, out, self.work, salt))
         self.assertEqual(code, 0)
         self.assertEqual(json.loads((self.work / "qualification.json").read_text(encoding="utf-8"))["passes"], 10)
         self.assertEqual(printed.getvalue(),
@@ -226,18 +238,38 @@ class QualifyTest(unittest.TestCase):
                              "the salt does not give back the footer_text token of invariants.json; "
                              "remedy: vk driver learn again: the salt and invariants.json are one learn's")
             self.assertFalse(work.exists(), "refused before any copy")
-        out = driver.parent
-        plan.write_plan(p, [], out)
-        canon.write(inv, out / "invariants.json")
+        out = write_artefacts(driver, p, inv)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            code = entry.main(["qualify", "--driver", str(driver), "--corpus", str(self.corpus),
-                               "--plan", str(out / "plan.json"), "--invariants", str(out / "invariants.json"),
-                               "--work", str(Path(tempfile.mkdtemp()) / "w"), "--fake",
-                               "--salt-file", str(out / "absent.salt")])
+            code = entry.main(qualify_argv(driver, self.corpus, out, Path(tempfile.mkdtemp()) / "w",
+                                           out / "absent.salt"))
         self.assertEqual(code, 2)
         self.assertIn("vkforge qualify: salt file ", err.getvalue())
         self.assertIn(" cannot be read (", err.getvalue())
+
+    def test_a_perturbation_that_left_the_footer_is_refused_under_the_learns_salt(self):
+        # Task review tests-5, L-P52 under D-01: `_prepare` reads each perturbed copy again under the
+        # learn's salt, so a footer the perturbation left in place is seen held and refused.
+        driver, p, inv = learned(self.corpus, SALT)
+        perturb = qualify._perturb
+
+        def leaves_the_footer(copy, post, expected):
+            perturb(copy, [ident for ident in post if ident != "footer_text"], expected)
+
+        with mock.patch.object(qualify, "_perturb", leaves_the_footer), self.assertRaises(Refusal) as cm:
+            qualify.qualify(driver, self.corpus, p, inv, self.work, fake=True, salt=SALT)
+        self.assertIn("cannot perturb footer_text for qualification", str(cm.exception))
+
+    def test_the_stage_refuses_to_run_without_a_salt_file(self):
+        # Task review tests-4: `vkforge qualify` requires the learn's salt (D-01); it never re-mines
+        # the copies unsalted.
+        out = write_artefacts(self.driver, self.plan, self.inv)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            entry.main(qualify_argv(self.driver, self.corpus, out, self.work, None))
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("the following arguments are required: --salt-file", err.getvalue())
+        self.assertFalse(self.work.exists())
 
     # --- L-P52: perturb then repair; L-P50/L-P51: the stage's own reasons, the timeout and the crash ---
 

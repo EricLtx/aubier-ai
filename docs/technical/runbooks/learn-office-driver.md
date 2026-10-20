@@ -157,7 +157,7 @@ Mêmes étapes avec `--app powerpoint` et un dossier de présentations `.pptx`. 
 
 ## 8. Quand ça coince
 
-Toute étape qui refuse parle d'une ligne, `vkforge <étape>: <ce qui ne va pas>; remedy: <quoi faire>`, et cette ligne est le refus. Les journaux complets sont sous `%LOCALAPPDATA%\vk\...\forge\<nom>\` (état du démon).
+Toute étape qui refuse parle d'une ligne, `vkforge <étape>: <ce qui ne va pas>; remedy: <quoi faire>`, et cette ligne est le refus. Les journaux complets sont sous `%LOCALAPPDATA%\vk\...\forge\<nom>\` (état du démon). Ce dossier garde aussi `.salt`, la clé des jetons de `invariants.json` : on n'en transmet que les fichiers `forge-*.out` et `forge-*.err`, jamais le dossier entier.
 
 | Ligne | Cause | Remède |
 |---|---|---|
@@ -172,8 +172,9 @@ Toute étape qui refuse parle d'une ligne, `vkforge <étape>: <ce qui ne va pas>
 | `--deliberate needs --arch: a proposal is drafted by an arch; remedy: --arch NAME` | pas d'arch | donner `--arch` |
 | `out <dir> holds no catalogue.json; remedy: --out names a learned driver's output` | `--deliberate` hors d'un apprentissage | le `--out` d'un `learn` |
 | `corpus changed since vkforge mine; remedy: qualify on the corpus the driver was learned from, or learn again` | le corpus a bougé depuis le `learn` | rejouer sur le même dossier, ou réapprendre |
-| `salt file <…>\.salt cannot be read (…); remedy: vk driver learn again: …` | le sel de l'apprentissage a disparu (répertoire `forge` vidé à la main), ou le driver a été appris avant le sel | réapprendre (§3), puis requalifier |
-| `the salt does not give back the footer_text token of invariants.json; remedy: vk driver learn again: …` | le sel n'est plus celui de cet apprentissage : un autre `learn` du même nom l'a remplacé | réapprendre, puis requalifier |
+| `salt file <…>\.salt cannot be read (…); remedy: vk driver learn again: …` | le sel de l'apprentissage a disparu : répertoire `forge` vidé à la main, ou un `learn` du même nom arrêté avant `mine`, même interrompu (il vide `<état>\forge\<nom>\` dès son départ et ne tire son sel qu'au `mine`) ; ou le driver a été appris avant le sel | réapprendre (§3), puis requalifier ; ce refus a effacé la qualification précédente, et le montage refuse le driver jusque-là |
+| `salt file <…>\.salt holds N bytes, not 32; remedy: vk driver learn again: …` | le fichier du sel a été tronqué ou remplacé : `learn` l'écrit avec exactement 32 octets | réapprendre (§3), puis requalifier ; ce refus a effacé la qualification précédente, et le montage refuse le driver jusque-là |
+| `the salt does not give back the footer_text token of invariants.json; remedy: vk driver learn again: …` | le sel n'est plus celui de cet apprentissage : un autre `learn` du même nom l'a remplacé | réapprendre, puis requalifier ; ce refus a effacé la qualification précédente, et le montage refuse le driver jusque-là |
 | `cannot perturb <id> for qualification` | une postcondition que la qualification ne sait pas dégrader | c'est un défaut de vkforge, pas du cabinet |
 | l'action rend `dialog` | une boîte de dialogue a retenu l'appel (connexion, écrasement) ; elle est fermée, jamais acceptée | traiter la cause (se connecter à Office, fermer les documents ouverts), puis requalifier |
 | `document opened read-only (locked elsewhere)` | une copie en lecture seule, ou un document tenu ouvert ailleurs | fermer le document ; une copie lecture seule reste lecture seule |

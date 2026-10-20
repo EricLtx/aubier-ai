@@ -14,11 +14,9 @@ from vkforge import __main__ as entry
 from vkforge import canon, mine
 from vkforge.errors import Refusal
 from vkforge.tests import ooxml_fixtures
-from vkforge.tests.ooxml_fixtures import FOOTER
+from vkforge.tests.ooxml_fixtures import FOOTER, OTHER_SALT, SALT
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-SALT = bytes(range(32))
-OTHER_SALT = bytes(range(1, 33))
 
 
 def salt_file(salt: bytes = SALT) -> Path:
@@ -37,10 +35,7 @@ def a_corpus(n: int, **kw) -> Path:
 
 class MineTest(unittest.TestCase):
     def corpus(self, n=10, **kw) -> Path:
-        d = Path(tempfile.mkdtemp())
-        for i in range(n):
-            ooxml_fixtures.docx(d / f"c{i}.docx", **kw)
-        return d
+        return a_corpus(n, **kw)
 
     def test_ten_contracts_yield_the_house_invariants_at_full_support(self):
         d = self.corpus(10, title_style="Heading1", body_font=("Garamond", 11), footer=FOOTER, pdf=True)
@@ -323,9 +318,42 @@ class SaltTest(unittest.TestCase):
         self.assertEqual(sorted(mine.tokens(inv)), sorted(vault), "tokens() sees the salted form")
         self.assertEqual(mine.mine_file(d / "c0.docx", SALT)["vault"], vault, "one file, the same tokens")
 
+    def test_a_presentation_footer_is_salted_too(self):
+        # Task review tests-1: the footer of a slide master (`_pptx`) is keyed by the salt as well.
+        d = Path(tempfile.mkdtemp())
+        for i in range(5):
+            ooxml_fixtures.pptx(d / f"p{i}.pptx", footer=FOOTER)
+        inv, vault = mine.mine_corpus(d, salt=SALT)
+        by_id = {i["id"]: i for i in inv["invariants"]}
+        self.assertEqual(by_id["footer_text"]["value"], mine.redact(FOOTER, SALT))
+        self.assertEqual(vault, {mine.redact(FOOTER, SALT): FOOTER})
+        self.assertNotIn("<redacted:sha256:", json.dumps(inv))
+
+    def test_a_custom_body_style_and_a_header_are_salted_too(self):
+        # Task review tests-1: the style every body paragraph carries (`where: all`), and the header.
+        d = a_corpus(5, body_style="Corps Dupont", header="En-tête Dupont")
+        inv, vault = mine.mine_corpus(d, salt=SALT)
+        by_id = {i["id"]: i for i in inv["invariants"]}
+        self.assertEqual(by_id["body_style"]["value"], {"custom": mine.redact("Corps Dupont", SALT)})
+        self.assertEqual(by_id["header_text"]["value"], mine.redact("En-tête Dupont", SALT))
+        self.assertEqual(vault, {mine.redact("Corps Dupont", SALT): "Corps Dupont",
+                                 mine.redact("En-tête Dupont", SALT): "En-tête Dupont"})
+        self.assertNotIn("<redacted:sha256:", json.dumps(inv))
+
+    def test_the_stage_refuses_to_run_without_a_salt_file(self):
+        # Task review tests-4, ruling LF-2: `vkforge mine` requires the salt; it never falls back to
+        # the unsalted form.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            entry.main(["mine", "--corpus", str(a_corpus(5)), "--out", str(Path(tempfile.mkdtemp()) / "out")])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("the following arguments are required: --salt-file", err.getvalue())
+
     def test_a_salt_file_is_read_whole_or_refused_in_one_line(self):
         self.assertEqual(mine.read_salt(salt_file()), SALT)
         for path, said in ((salt_file(SALT[:31]), "holds 31 bytes, not 32"),
+                           (salt_file(SALT + b"\0"), "holds 33 bytes, not 32"),
+                           (salt_file(b""), "holds 0 bytes, not 32"),
                            (Path(tempfile.mkdtemp()) / "absent.salt", "cannot be read")):
             with self.assertRaises(Refusal) as cm:
                 mine.read_salt(path)

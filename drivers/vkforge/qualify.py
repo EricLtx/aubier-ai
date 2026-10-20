@@ -188,7 +188,8 @@ def _start(command: list, work: Path, env: dict, log, driver_dir: Path, plan_sha
 
 def _check(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: Path, salt: bytes | None) -> tuple:
     """Every refusal before any copy, in this order; (the manifest, the plan's action, the manifest's
-    entry for it, the corpus files sorted by name — the one survey of the corpus, under the salt)."""
+    entry for it, the corpus files sorted by name — the one survey of the corpus, under the salt —
+    and the values the postconditions expect, the ones the salt was checked against)."""
     if work.exists() and (not work.is_dir() or any(work.iterdir())):
         raise Refusal(f"work {work} is not empty", "a new directory: a qualification never reuses one")
     if not (driver_dir / "vendor" / "vkdriver" / "protocol.py").is_file():
@@ -215,8 +216,9 @@ def _check(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: P
     unknown = next((ident for ident in action["post"] if ident not in PERTURBABLE), None)
     if unknown is not None:
         raise Refusal(f"cannot perturb {unknown} for qualification", _PERTURB_REMEDY)
-    _salt_gives_back(mined, action["post"], _expected(plan, invariants))
-    return manifest, action, entry, files
+    expected = _expected(plan, invariants)
+    _salt_gives_back(mined, action["post"], expected)
+    return manifest, action, entry, files, expected
 
 
 def _salt_gives_back(mined: list, post: list, expected: dict) -> None:
@@ -496,8 +498,8 @@ def qualify(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: 
             deadline_s: float = PASS_DEADLINE_S, salt: bytes | None = None) -> dict:
     """The record, also written as <work>/qualification.json (canon.write)."""
     driver_dir, corpus, work = Path(os.path.abspath(driver_dir)), Path(corpus), Path(os.path.abspath(work))
-    manifest, action, entry, files = _check(driver_dir, corpus, plan, invariants, work, salt)
-    plan_sha256, expected = canon.sha256(plan), _expected(plan, invariants)
+    manifest, action, entry, files, expected = _check(driver_dir, corpus, plan, invariants, work, salt)
+    plan_sha256 = canon.sha256(plan)
     work.mkdir(parents=True, exist_ok=True)
     if fake:
         canon.write({"vkforge_root": str(VKFORGE_ROOT)}, work / "fake.json")

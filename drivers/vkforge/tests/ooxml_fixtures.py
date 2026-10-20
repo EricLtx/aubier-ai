@@ -15,6 +15,8 @@ from pathlib import Path
 from xml.sax.saxutils import escape, quoteattr
 
 FOOTER = "Cabinet Exemple – Confidentiel"
+SALT = bytes(range(32))             # a learn's salt for the tests (D-01): `vk driver learn` draws its own
+OTHER_SALT = bytes(range(1, 33))    # another learn's
 
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _A = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -62,16 +64,20 @@ def _word_style_name(style: str) -> str:
 
 
 def docx(path, title_style="Heading1", body_font=("Garamond", 11), footer=None, header=None,
-         personal=None, style_id=None, pdf=False) -> Path:
+         personal=None, style_id=None, pdf=False, body_style=None) -> Path:
     """One title paragraph in `title_style` (declared under `style_id` when given, as French Word
-    does: styleId Titre1 for the name "heading 1"), three body paragraphs in `body_font`."""
+    does: styleId Titre1 for the name "heading 1"), three body paragraphs in `body_font` — each in
+    the paragraph style named `body_style` when given (declared under that name, letters and digits
+    of it as its styleId), in none otherwise."""
     path = Path(path)
     style_id = style_id or title_style
     name, size = body_font
+    body_id = None if body_style is None else "".join(c for c in body_style if c.isalnum())
+    body_ppr = "" if body_id is None else f'<w:pPr><w:pStyle w:val={quoteattr(body_id)}/></w:pPr>'
     body = [f'<w:p><w:pPr><w:pStyle w:val={quoteattr(style_id)}/></w:pPr><w:r><w:t>Titre du document</w:t></w:r></w:p>']
     for i, text in enumerate(_BODY):
         text = personal if (personal and i == 0) else text
-        body.append(f'<w:p><w:r><w:rPr><w:rFonts w:ascii={quoteattr(name)} w:hAnsi={quoteattr(name)}/>'
+        body.append(f'<w:p>{body_ppr}<w:r><w:rPr><w:rFonts w:ascii={quoteattr(name)} w:hAnsi={quoteattr(name)}/>'
                     f'<w:sz w:val="{int(size * 2)}"/></w:rPr><w:t>{escape(text)}</w:t></w:r></w:p>')
     refs, rels = "", [("rIdS", f"{_R}/styles", "styles.xml")]
     wml = "application/vnd.openxmlformats-officedocument.wordprocessingml."
@@ -93,10 +99,13 @@ def docx(path, title_style="Heading1", body_font=("Garamond", 11), footer=None, 
         title_def = (f'<w:style w:type="paragraph" w:styleId={quoteattr(style_id)}>'
                      f'<w:name w:val={quoteattr(_word_style_name(title_style))}/>'
                      '<w:basedOn w:val="Normal"/><w:qFormat/></w:style>')
+    body_def = ("" if body_id is None else
+                f'<w:style w:type="paragraph" w:styleId={quoteattr(body_id)}><w:name w:val={quoteattr(body_style)}/>'
+                '<w:basedOn w:val="Normal"/><w:qFormat/></w:style>')
     styles = (f'<w:styles xmlns:w="{_W}"><w:docDefaults><w:rPrDefault><w:rPr>'
               '<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>'
               '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>'
-              f'{title_def}</w:styles>')
+              f'{title_def}{body_def}</w:styles>')
     _write(path, {
         "[Content_Types].xml": _content_types(overrides),
         "_rels/.rels": _rels([("rId1", f"{_R}/officeDocument", "word/document.xml"),
