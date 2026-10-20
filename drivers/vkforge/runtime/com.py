@@ -15,7 +15,7 @@ import os
 import sys
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from vkdriver.protocol import DriverRefusal
 
@@ -25,6 +25,7 @@ QUIT_WAIT_S = 3.0        # the clean-end window (D-35 (1)), under the 5 s grace 
 COM_TRUE = -1            # VARIANT_TRUE, also PowerPoint's msoTrue: true for a bool and an MsoTriState alike (L-P31)
 DIALOG_CLASS = "#32770"  # the Win32 dialog box class: a sign-in, an overwrite, a repair prompt
 WM_CLOSE = 0x0010
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_TERMINATE = 0x0001
 PROCESS_SET_QUOTA = 0x0100
 SYNCHRONIZE = 0x00100000
@@ -68,6 +69,10 @@ class _EXTENDED_LIMIT(ctypes.Structure):            # JOBOBJECT_EXTENDED_LIMIT_I
                 ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
 
 
+class _FILETIME(ctypes.Structure):                  # FILETIME: 100 ns intervals since 1601, in two DWORDs
+    _fields_ = [("dwLowDateTime", ctypes.c_uint32), ("dwHighDateTime", ctypes.c_uint32)]
+
+
 class _SERVICE_STATUS_PROCESS(ctypes.Structure):    # SERVICE_STATUS_PROCESS: nine DWORDs
     _fields_ = [(name, ctypes.c_uint32) for name in (
         "dwServiceType", "dwCurrentState", "dwControlsAccepted", "dwWin32ExitCode", "dwServiceSpecificExitCode",
@@ -96,6 +101,10 @@ def _kernel32():
         k.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
         k.WaitForSingleObject.restype = wintypes.DWORD
         k.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                 ctypes.POINTER(wintypes.DWORD))
+        k.GetProcessTimes.argtypes = (wintypes.HANDLE, *(ctypes.POINTER(_FILETIME),) * 4)
+        k.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
         k.CloseHandle.argtypes = (wintypes.HANDLE,)
         _K32 = k
     return _K32
@@ -222,7 +231,8 @@ class Job:
     the user and `disarm` clears the limit of this instance's Job alone — its process then outlives the
     handles. Any failure before that disarm leaves the Job armed. Never made for an instance the adapter
     attached to or could not identify (PF-4); and when Windows refuses it, the instance just started is
-    quit and the session refused (ruling PF-16): no instance of the driver's runs outside a Job."""
+    quit, or ended by its PID once checked to be the process identified, and the session refused
+    (rulings PF-16, PF-23): no instance of the driver's runs outside a Job."""
 
     def __init__(self, job, process, pid: int):
         self.job, self.process, self.pid = job, process, pid
@@ -288,14 +298,79 @@ _HELD = []
 
 
 def _hold(pid: int):
-    """The Job that ends `pid` with this driver (D-04). Windows' refusal is said on stderr (the driver's
-    driver.log) and raised: D-04 has no exception (ruling PF-16), so the start that made `pid` goes no
-    further."""
+    """The Job that ends `pid` with this driver (D-04). Windows' refusal is raised: D-04 has no exception
+    (rulings PF-16, PF-23), so the start that made `pid` goes no further, and its caller says how that
+    instance ended, on the `job: process … not held` line."""
+    return Job.hold(pid)
+
+
+def _identity(pid: int, handle):
+    """What names process `pid` beyond its number (ruling PF-23): (executable name, parent id, creation
+    time), the image and the creation time read through `handle`, the parent from a snapshot; None when
+    any of them cannot be read."""
+    k = _kernel32()
+    image, size = ctypes.create_unicode_buffer(32768), ctypes.c_ulong(32768)
+    if not k.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(size)):
+        return None
+    created, exited, kernel, user = _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME()
+    if not k.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel),
+                             ctypes.byref(user)):
+        return None
+    parent = next((parent for listed, parent, _ in processes() or () if listed == pid), None)
+    if parent is None:
+        return None
+    return PureWindowsPath(image.value).name.upper(), parent, created.dwHighDateTime << 32 | created.dwLowDateTime
+
+
+def identity(pid: int):
+    """Process `pid`'s identity (`_identity`), taken now: when the adapter identifies the process its
+    start added (ruling PF-23). None off Windows or when it cannot be read."""
+    if sys.platform != "win32":
+        return None
+    k = _kernel32()
+    handle = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
     try:
-        return Job.hold(pid)
-    except OSError as e:
-        sys.stderr.write(f"job: process {pid} not held: {e}\n")
-        raise
+        return _identity(pid, handle)
+    finally:
+        k.CloseHandle(handle)
+
+
+def end_by_pid(pid: int, known):
+    """Process `pid` terminated by its PID (TerminateProcess; ruling PF-23, D-04 to the letter), only while
+    it is still the process identified: `known`, its identity taken then, is read again — the same image,
+    the same parent, the same creation time — through the very handle that ends it, which pins the
+    process, so a PID reused since is never hit. None when it was ended; else why nothing was terminated:
+    a check that fails, or cannot be made."""
+    if known is None:
+        return "its identity was not taken when it was identified"
+    if sys.platform != "win32":
+        return "no process to end off Windows"
+    k = _kernel32()
+    handle = k.OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return f"process {pid} cannot be opened (error {ctypes.get_last_error()})"
+    try:
+        now = _identity(pid, handle)
+        if now is None:
+            return f"process {pid} cannot be checked again"
+        if now != known:
+            return f"process {pid} is no longer the one identified"
+        if not k.TerminateProcess(handle, 1):
+            return f"process {pid} cannot be terminated (error {ctypes.get_last_error()})"
+        return None
+    finally:
+        k.CloseHandle(handle)
+
+
+class JobRefused(OSError):
+    """Windows refused to hold process `pid` in a Job (D-04): its error, with that process and its
+    identity as taken when it was identified (rulings PF-16, PF-23)."""
+
+    def __init__(self, pid: int, known, error: OSError):
+        super().__init__(str(error))
+        self.pid, self.known = pid, known
 
 
 def own(started: bool, before, after, launcher, hold=_hold):
@@ -305,14 +380,19 @@ def own(started: bool, before, after, launcher, hold=_hold):
     user's (CreateObject handed back a running PowerPoint, several new processes, a parent other than
     the DcomLaunch service, no snapshot, no launcher). An attached instance is never quit, never held in
     a Job, its dialog boxes never closed; a start that cannot be told apart is one stderr line. The
-    OSError of a Job Windows refuses is the caller's (ruling PF-16)."""
+    identity of the process identified is taken there and then (`identity`), and a Job Windows refuses
+    is raised as JobRefused, with them, for the caller to end that instance (rulings PF-16, PF-23)."""
     if not started:
         return None
     pid, why = identified(before, after, launcher)
     if pid is None:
         sys.stderr.write(f"start: treated as attached: {why}\n")
         return None
-    return Owned(pid, hold(pid))
+    known = identity(pid)
+    try:
+        return Owned(pid, hold(pid))
+    except OSError as e:
+        raise JobRefused(pid, known, e) from e
 
 
 def _end_held(exes: set) -> None:
@@ -337,8 +417,10 @@ def _start(progid: str, get_active, create, errors: tuple, deadline_s: float) ->
     driver's, so no box is closed and no process held (PF-17); past it, a box of the new process
     positively identified is closed, and that process held in _HELD, to end at the next start or with
     this driver (LF-8). A start identified whose Job Windows refuses is quit at once — no document is in
-    it yet — and the session refuses `precondition` (PF-16). `get_active` and `create` are comtypes' in
-    a driver, stubs in the tests; `errors`, what a COM call raises."""
+    it yet — or, with no reference to quit it (a start past its deadline) or a quit that fails, ended by
+    its PID once checked to be the process identified; the session refuses `precondition` (PF-16,
+    PF-23). `get_active` and `create` are comtypes' in a driver, stubs in the tests; `errors`, what a
+    COM call raises."""
     exes, launcher = executables(), dcom_launcher_pid()
     _end_held(exes)
     before = pids_of(exes)                              # before get_active: an attach starts nothing
@@ -360,6 +442,25 @@ def _start(progid: str, get_active, create, errors: tuple, deadline_s: float) ->
     def started_pid():
         return identified(before, pids_of(exes), launcher)[0] if reached["create"] else None
 
+    def unheld(e: JobRefused, app=None) -> DriverRefusal:
+        """The instance Windows will not hold ends at once (D-04 to the letter): quit through the
+        reference its start returned (PF-16); with none — a start past its deadline — or a quit that
+        fails, ended by its PID once checked to be the process identified (PF-23). One line says how;
+        the session refuses `precondition`."""
+        how = "no reference to quit it"
+        if app is not None:
+            try:
+                guarded(lambda: app.Quit(), f"quit {progid}", CLEANUP_DEADLINE_S, owner=e.pid)
+                how = "quit"
+            except (DriverRefusal, *errors) as q:
+                how = f"not quit ({q})"
+        if how != "quit":
+            why = end_by_pid(e.pid, e.known)
+            how += "; ended by its PID" if why is None else f"; not ended: {why}"
+        sys.stderr.write(f"job: process {e.pid} not held: {e}; {how}\n")
+        return DriverRefusal("precondition", f"{progid} cannot be started: process {e.pid} cannot be held in a "
+                                             f"Job: {e}")
+
     try:
         # A box raised while the instance starts (a first-run prompt) is closed only when the start
         # reached CreateObject and its new process is positively identified by then (D-03, PF-4, PF-17).
@@ -367,22 +468,16 @@ def _start(progid: str, get_active, create, errors: tuple, deadline_s: float) ->
     except DriverRefusal:
         try:
             held = owned(reached["create"], pids_of(exes))     # LF-8: a positively owned start only
-        except OSError:
-            held = None                                 # said by _hold; no reference to quit it with
+        except JobRefused as e:                         # PF-23: no Job, and no reference to quit it with
+            raise unheld(e) from e
         if held is not None:
             _HELD.append(held.job)                      # it ends at the next start, or with this driver
         raise
     after = pids_of(exes) if started else None
     try:
         return app, owned(started, after)
-    except OSError as e:                                # PF-16: no Job, no session
-        pid = identified(before, after, launcher)[0]
-        try:
-            guarded(lambda: app.Quit(), f"quit {progid}", CLEANUP_DEADLINE_S, owner=pid)
-        except (DriverRefusal, *errors) as q:
-            sys.stderr.write(f"start: process {pid} not quit ({q}); it outlives the driver\n")
-        raise DriverRefusal("precondition", f"{progid} cannot be started: process {pid} cannot be held in a "
-                                            f"Job: {e}") from e
+    except JobRefused as e:                             # PF-16: no Job, no session
+        raise unheld(e, app) from e
 
 
 def dialogs(exes: set) -> list:

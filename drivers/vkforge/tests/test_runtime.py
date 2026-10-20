@@ -985,7 +985,8 @@ class RuntimeTest(unittest.TestCase):
     def office_start(self, attach, create, now, err, **patches):
         """com.Application on its own start, comtypes' GetActiveObject and CreateObject replaced by `attach`
         and `create`, every snapshot read from `now["pids"]`, the DcomLaunch service's process 900, and the
-        start's deadline 0.3 s (rulings PF-4, PF-16, PF-17). Windows only: the start loads comtypes."""
+        start's deadline 0.3 s, and the identity ("WINWORD.EXE", 900, 1234) for any process it identifies
+        (rulings PF-4, PF-16, PF-17, PF-23). Windows only: the start loads comtypes."""
         import comtypes.client
 
         with contextlib.ExitStack() as stack:
@@ -996,6 +997,7 @@ class RuntimeTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(com, "pids_of", lambda exes: dict(now["pids"]) if exes else None))
             stack.enter_context(mock.patch.object(com, "dcom_launcher_pid", lambda: 900))
             stack.enter_context(mock.patch.object(com, "CALL_DEADLINE_S", 0.3))
+            stack.enter_context(mock.patch.object(com, "identity", lambda pid: ("WINWORD.EXE", 900, 1234)))
             for name, value in patches.items():
                 stack.enter_context(mock.patch.object(com, name, value))
             stack.enter_context(contextlib.redirect_stderr(err))
@@ -1042,26 +1044,34 @@ class RuntimeTest(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "win32", "the adapter's start is Windows' (comtypes)")
     def test_a_start_windows_will_not_hold_ends_at_once_and_refuses(self):
-        # Ruling PF-16 (review spec-1): D-04 has no exception. A start positively identified whose Job
-        # Windows refuses is quit at once — no document is in it yet — and the session refuses
-        # `precondition`: no instance of the driver's runs outside a Job, and Owned.job is never None.
-        word, now, err = StubWord(), {"pids": {1: 4}}, io.StringIO()
-
+        # Rulings PF-16 and PF-23 (review spec-1): D-04 has no exception. A start positively identified
+        # whose Job Windows refuses is quit at once — no document is in it yet — and the session refuses
+        # `precondition`: no instance of the driver's runs outside a Job, and Owned.job is never None. A
+        # quit that fails leaves its process to be ended by its PID, once checked to be the one identified;
+        # one line of driver.log says how the instance ended.
         def nothing_running(progid):
             raise OSError("operation unavailable")
 
-        def start(progid):
-            now["pids"] = {1: 4, 7: 900}
-            return word
+        for quits, ended, said in [
+                (True, [], "quit"),
+                (False, [(7, ("WINWORD.EXE", 900, 1234))], "not quit (the application is not answering); ended by its PID")]:
+            word, now, err, seen = StubWord(), {"pids": {1: 4}}, io.StringIO(), []
+            if not quits:
+                word.Quit = lambda: (_ for _ in ()).throw(OSError("the application is not answering"))
 
-        with mock.patch.object(com.Job, "hold", side_effect=OSError("[WinError 5] Access is denied")), \
-                self.assertRaises(DriverRefusal) as cm:
-            self.office_start(nothing_running, start, now, err)
-        self.assertEqual((cm.exception.reason, cm.exception.detail),
-                         ("precondition", "Word.Application cannot be started: process 7 cannot be held in a Job: "
-                                          "[WinError 5] Access is denied"))
-        self.assertEqual((word.quits, word.DisplayAlerts), (1, -1), "quit at once, before the session began")
-        self.assertEqual(err.getvalue(), "job: process 7 not held: [WinError 5] Access is denied\n")
+            def start(progid, word=word, now=now):
+                now["pids"] = {1: 4, 7: 900}
+                return word
+
+            with mock.patch.object(com.Job, "hold", side_effect=OSError("[WinError 5] Access is denied")), \
+                    self.assertRaises(DriverRefusal) as cm:
+                self.office_start(nothing_running, start, now, err,
+                                  end_by_pid=lambda pid, known, seen=seen: seen.append((pid, known)))
+            self.assertEqual((cm.exception.reason, cm.exception.detail),
+                             ("precondition", "Word.Application cannot be started: process 7 cannot be held in a Job: "
+                                              "[WinError 5] Access is denied"))
+            self.assertEqual((word.quits, word.DisplayAlerts, seen), (1 if quits else 0, -1, ended), said)
+            self.assertEqual(err.getvalue(), f"job: process 7 not held: [WinError 5] Access is denied; {said}\n")
 
     @unittest.skipUnless(sys.platform == "win32", "the adapter's start is Windows' (comtypes)")
     def test_a_new_start_first_ends_the_instance_a_refused_start_left(self):
@@ -1118,6 +1128,116 @@ class RuntimeTest(unittest.TestCase):
             job.close()
             with self.assertRaises(OSError):
                 job.wait(0)
+        finally:
+            sleeper.kill()
+            sleeper.wait(timeout=10)
+
+    @unittest.skipUnless(sys.platform == "win32", "the adapter's start is Windows' (comtypes)")
+    def test_a_timed_out_start_windows_will_not_hold_is_ended_by_its_pid(self):
+        # Ruling PF-23: a start held past its deadline in CreateObject, its new process identified but
+        # refused a Job by Windows, leaves the adapter no reference to quit it with: that one process is
+        # ended by its PID — after the check that the PID still names it — and the session refuses
+        # `precondition`. When the check fails, nothing is terminated, and the `job: … not held` line says so.
+        def nothing_running(progid):
+            raise OSError("operation unavailable")
+
+        for why, said in [(None, "ended by its PID"),
+                          ("process 7 is no longer the one identified",
+                           "not ended: process 7 is no longer the one identified")]:
+            hang, now, err, seen, jobs = threading.Event(), {"pids": {1: 4}}, io.StringIO(), [], []
+
+            def appear_then_hang(progid, now=now, hang=hang):
+                now["pids"] = {1: 4, 7: 900}
+                hang.wait(30)
+                raise OSError("never answered")
+
+            def end_by_pid(pid, known, seen=seen, why=why):
+                seen.append((pid, known))
+                return why
+
+            try:
+                with mock.patch.object(com.Job, "hold", side_effect=OSError("[WinError 5] Access is denied")), \
+                        self.assertRaises(DriverRefusal) as cm:
+                    self.office_start(nothing_running, appear_then_hang, now, err, end_by_pid=end_by_pid,
+                                      dialogs=lambda exes: [], _HELD=jobs)
+            finally:
+                hang.set()
+            self.assertEqual((cm.exception.reason, cm.exception.detail),
+                             ("precondition", "Word.Application cannot be started: process 7 cannot be held in a Job: "
+                                              "[WinError 5] Access is denied"))
+            self.assertEqual((seen, jobs), ([(7, ("WINWORD.EXE", 900, 1234))], []), why)
+            self.assertEqual(err.getvalue(), "job: process 7 not held: [WinError 5] Access is denied; no reference to "
+                                             f"quit it; {said}\n")
+
+    def test_a_process_is_ended_by_its_pid_only_while_it_is_still_the_one_identified(self):
+        # Ruling PF-23: ending a process by its PID reads again, through the very handle that ends it —
+        # which pins the process — what names it beyond its number: its image, its parent, its creation
+        # time; it terminates only when all three are those taken when it was identified, so a PID reused
+        # since is never hit. A check that fails or cannot be made terminates nothing, and says why.
+        known = ("WINWORD.EXE", 900, 1234)
+
+        class Kernel:
+            def __init__(self, opens=True, image=r"C:\Office\WINWORD.EXE", created=1234, reads=True):
+                self.opens, self.image, self.created, self.reads = opens, image, created, reads
+                self.ended, self.closed = [], []
+
+            def OpenProcess(self, access, inherit, pid):
+                return 55 if self.opens else 0
+
+            def QueryFullProcessImageNameW(self, handle, flags, buf, size):
+                if self.reads:
+                    buf.value = self.image
+                return int(self.reads)
+
+            def GetProcessTimes(self, handle, created, exited, kernel, user):
+                created._obj.dwLowDateTime, created._obj.dwHighDateTime = self.created & 0xFFFFFFFF, self.created >> 32
+                return 1
+
+            def TerminateProcess(self, handle, code):
+                self.ended.append(handle)
+                return 1
+
+            def CloseHandle(self, handle):
+                self.closed.append(handle)
+
+        for kernel, listed, pid_known, why in [
+                (Kernel(), [(7, 900, "WINWORD.EXE")], known, None),
+                (Kernel(created=1235), [(7, 900, "WINWORD.EXE")], known, "process 7 is no longer the one identified"),
+                (Kernel(created=1234 + (1 << 32)), [(7, 900, "WINWORD.EXE")], known,
+                 "process 7 is no longer the one identified"),                      # the high word differs
+                (Kernel(image=r"C:\Windows\NOTEPAD.EXE"), [(7, 900, "NOTEPAD.EXE")], known,
+                 "process 7 is no longer the one identified"),
+                (Kernel(), [(7, 33, "WINWORD.EXE")], known, "process 7 is no longer the one identified"),
+                (Kernel(), [], known, "process 7 cannot be checked again"),          # gone from the snapshot
+                (Kernel(reads=False), [(7, 900, "WINWORD.EXE")], known, "process 7 cannot be checked again"),
+                (Kernel(opens=False), [(7, 900, "WINWORD.EXE")], known, "process 7 cannot be opened (error 5)"),
+                (Kernel(), [(7, 900, "WINWORD.EXE")], None, "its identity was not taken when it was identified")]:
+            with mock.patch.object(sys, "platform", "win32"), mock.patch.object(com, "_kernel32", lambda: kernel), \
+                    mock.patch.object(com, "processes", lambda: listed), \
+                    mock.patch.object(com.ctypes, "get_last_error", lambda: 5, create=True):
+                self.assertEqual(com.end_by_pid(7, pid_known), why, (kernel.__dict__, listed))
+            self.assertEqual(kernel.ended, [55] if why is None else [], why)
+            self.assertEqual(kernel.closed, [55] if kernel.opens and pid_known else [], "the handle closed once")
+        with mock.patch.object(sys, "platform", "win32"), mock.patch.object(com, "_kernel32", lambda: Kernel()), \
+                mock.patch.object(com, "processes", lambda: [(7, 900, "WINWORD.EXE")]):
+            self.assertEqual(com.identity(7), known, "the identity taken when the process is identified")
+
+    @unittest.skipUnless(sys.platform == "win32", "process identities are Windows'")
+    def test_a_sleeper_is_ended_by_its_pid_and_never_once_its_identity_changed(self):
+        # Ruling PF-23 on Windows, on a process of the test's own: its identity read through a real handle
+        # and a real snapshot; a creation time that differs terminates nothing, the identity taken when
+        # the process was identified ends it.
+        base = getattr(sys, "_base_executable", sys.executable)
+        sleeper = subprocess.Popen([base, "-I", "-c", "import time; time.sleep(120)"])
+        try:
+            known = com.identity(sleeper.pid)
+            self.assertEqual(known[:2], (Path(base).name.upper(), os.getpid()), known)
+            self.assertEqual(com.end_by_pid(sleeper.pid, (*known[:2], known[2] + 1)),
+                             f"process {sleeper.pid} is no longer the one identified")
+            time.sleep(0.5)
+            self.assertIsNone(sleeper.poll(), "another creation time: nothing terminated")
+            self.assertIsNone(com.end_by_pid(sleeper.pid, known))
+            self.assertEqual(sleeper.wait(timeout=10), 1, "ended by its PID (TerminateProcess, exit code 1)")
         finally:
             sleeper.kill()
             sleeper.wait(timeout=10)
