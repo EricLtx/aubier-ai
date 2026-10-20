@@ -517,7 +517,9 @@ pub fn learn(
             threshold.to_string(),
         ],
     )?;
-    // 4. With an arch, one model call per ambiguity; then the plan.
+    // 4. With an arch, one model call per ambiguity; then the plan, which rewrites the vault in place
+    // with only the values it keeps (founder decision D-02): a purged candidate — a client's name in
+    // a per-document footer — never reaches `generate`.
     let mut args = vec![
         "--invariants".into(),
         arg(&invariants),
@@ -525,6 +527,8 @@ pub fn learn(
         arg(&binding),
         "--out".into(),
         arg(&out),
+        "--vault".into(),
+        arg(&vault.0),
     ];
     if let Some(arch) = &arch {
         let mined = read_json(&invariants, "mine", "invariants.json")?;

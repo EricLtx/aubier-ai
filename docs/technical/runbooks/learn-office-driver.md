@@ -25,7 +25,7 @@ Apprendre un driver, c'est générer un pilote de périphérique à partir de la
 | `qualify` | Le banc de test de l'image : le driver rejoué sur des copies du lot, chaque postcondition revérifiée dans le code. |
 | `learned` (table du noyau) | Le dossier de fabrication de l'image : les hashes de tout ce dont elle est issue. |
 | La porte du montage | La ROM de boot qui refuse une image sans rapport de test signé, ou dont le rapport n'est plus celui que l'usine a classé. |
-| `.vault.json` | La mémoire de travail du mineur (le texte clair d'un pied de page), en RAM protégée : sous le répertoire privé du démon (`<état>\forge\<nom>\`), jamais dans le dossier `--out`. Elle est effacée dès que `generate` rend la main. |
+| `.vault.json` | La mémoire de travail du mineur (le texte clair d'un pied de page), en RAM protégée : sous le répertoire privé du démon (`<état>\forge\<nom>\`), jamais dans le dossier `--out`. Après `plan`, elle ne garde que les valeurs dont le plan se sert : les candidats d'une ambiguïté purgée (dix pieds de page différents, un nom de client dans chacun) en sortent. Elle est effacée dès que `generate` rend la main. |
 | `.salt` | Le sel de l'apprentissage : 32 octets tirés au sort par `learn`, posés à côté du coffre (`<état>\forge\<nom>\.salt`). Les jetons de `invariants.json` en dépendent : sans lui, on ne peut pas vérifier un pied de page deviné. Il survit à `generate`, parce que `qualify` en a besoin. |
 
 ---

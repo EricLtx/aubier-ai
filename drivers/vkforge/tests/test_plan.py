@@ -8,8 +8,9 @@ import unittest
 from pathlib import Path
 
 from vkforge import __main__ as entry
-from vkforge import canon, inventory, mine, ontology, plan
+from vkforge import canon, generate, inventory, mine, ontology, plan
 from vkforge.errors import Refusal
+from vkforge.tests import ooxml_fixtures
 from vkforge.tests.ooxml_fixtures import FOOTER
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -17,6 +18,17 @@ ARCH = "arch:sha256:" + "a" * 64
 TIE = {"invariant": "body_font", "kind": "font_run", "candidates": [
     {"value": {"name": "Calibri", "size": 12}, "support": 0.5},
     {"value": {"name": "Garamond", "size": 11}, "support": 0.5}]}
+FOOTERS = [f"Contrat client {n}" for n in range(10)]
+VAULT_SALT = bytes(32)
+
+
+def footer_corpus() -> Path:
+    """Ten contracts whose footers all differ — a client's name in each: the footer is an ambiguity
+    of ten token candidates (founder decision D-02's case)."""
+    d = Path(tempfile.mkdtemp())
+    for n, footer in enumerate(FOOTERS):
+        ooxml_fixtures.docx(d / f"c{n}.docx", footer=footer, pdf=True)
+    return d
 
 
 def house_invariants() -> dict:
@@ -237,3 +249,89 @@ class PlanTest(unittest.TestCase):
             if not path.exists():
                 canon.write(obj, path)
             self.assertEqual(path.read_bytes(), canon.dumps(obj), f"{name} is stale: delete it, run this test, commit it")
+
+
+class VaultTest(unittest.TestCase):
+    """Founder decision D-02, ruling LF-4: after plan, the vault keeps the values the plan uses and
+    nothing else — here, none of ten per-document footers unless an arch chose one."""
+
+    def setUp(self):
+        self.ont = ontology.load()
+        self.binding = json.loads((FIXTURES / "binding-word.json").read_text(encoding="utf-8"))
+        self.inv, self.vault = mine.mine_corpus(footer_corpus(), salt=VAULT_SALT)
+        (self.amb,) = self.inv["ambiguities"]
+        self.assertEqual((self.amb["invariant"], len(self.amb["candidates"]), sorted(self.vault.values())),
+                         ("footer_text", 10, sorted(FOOTERS)))
+        self.dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def written_vault(self) -> Path:
+        path = self.dir / ".vault.json"
+        canon.write(self.vault, path)
+        return path
+
+    def test_a_purged_ambiguity_leaves_none_of_its_candidates_in_the_vault(self):
+        p, _ = plan.build(self.inv, self.binding, self.ont)
+        self.assertEqual(p["ambiguities"], [{"invariant": "footer_text", "resolved_by": "purged"}])
+        self.assertEqual(plan.vault_tokens(p, self.inv), set())
+        path = self.written_vault()
+        self.assertEqual(plan.reduce_vault(path, self.vault, p, self.inv), (0, 10))
+        self.assertEqual(path.read_bytes(), canon.dumps({}))
+
+    def test_a_resolved_ambiguity_keeps_only_the_chosen_token_and_generate_still_resolves_it(self):
+        chosen = self.amb["candidates"][3]["value"]
+        p, _ = plan.build(self.inv, self.binding, self.ont,
+                          resolve=lambda amb: {"value": chosen, "resolved_by": ARCH})
+        self.assertEqual(plan.vault_tokens(p, self.inv), {chosen})
+        path = self.written_vault()
+        self.assertEqual(plan.reduce_vault(path, self.vault, p, self.inv), (1, 10))
+        reduced = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(reduced, {chosen: self.vault[chosen]})
+        out = self.dir / "word-maison"
+        generate.generate(p, self.binding, self.inv, reduced, out, name="word-maison")
+        self.assertEqual(json.loads((out / "secrets.json").read_text(encoding="utf-8")),
+                         {"footer_text": self.vault[chosen]})
+
+    def test_an_excluded_invariant_loses_its_token_and_a_kept_one_keeps_it(self):
+        d = Path(tempfile.mkdtemp())
+        for n in range(5):
+            ooxml_fixtures.docx(d / f"c{n}.docx", title_style="Clause Dupont", style_id="ClauseId7", footer=FOOTER)
+        inv, vault = mine.mine_corpus(d, salt=VAULT_SALT)
+        p, excluded = plan.build(inv, self.binding, self.ont)
+        self.assertIn({"invariant": "title_style", "why": "a custom style has no built-in anchor (v1)"}, excluded)
+        footer = mine.redact(FOOTER, VAULT_SALT)
+        self.assertEqual(plan.vault_tokens(p, inv), {footer})
+        path = self.dir / "custom.vault.json"
+        canon.write(vault, path)
+        self.assertEqual(plan.reduce_vault(path, vault, p, inv), (1, 2))
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {footer: FOOTER},
+                         "the custom style's name is gone, the footer stays")
+
+    def test_the_cli_rewrites_the_vault_in_place_and_says_what_it_kept(self):
+        canon.write(self.inv, self.dir / "invariants.json")
+        path = self.written_vault()
+        chosen = self.amb["candidates"][0]["value"]
+        canon.write({"footer_text": {"value": chosen, "resolved_by": ARCH}}, self.dir / "resolver.json")
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(entry.main(["plan", "--invariants", str(self.dir / "invariants.json"),
+                                         "--binding", str(FIXTURES / "binding-word.json"),
+                                         "--out", str(self.dir / "out"), "--resolver", str(self.dir / "resolver.json"),
+                                         "--vault", str(path)]), 0)
+        self.assertIn(f"; vault kept 1 of 10 -> {self.dir / 'out' / 'plan.json'}\n", printed.getvalue())
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {chosen: self.vault[chosen]})
+        for clear in FOOTERS:
+            if clear != self.vault[chosen]:
+                self.assertNotIn(clear.encode("utf-8"), path.read_bytes())
+
+    def test_a_vault_that_is_not_an_object_of_clear_strings_is_refused_before_the_plan(self):
+        path = self.dir / ".vault.json"
+        path.write_text(json.dumps({"<redacted:sha256:aa>": 3}), encoding="utf-8")
+        canon.write(self.inv, self.dir / "invariants.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(entry.main(["plan", "--invariants", str(self.dir / "invariants.json"),
+                                         "--binding", str(FIXTURES / "binding-word.json"),
+                                         "--out", str(self.dir / "out"), "--vault", str(path)]), 2)
+        self.assertEqual(err.getvalue(), f"vkforge plan: vault {path} is not an object of clear strings; "
+                                         "remedy: run vkforge mine again\n")
+        self.assertFalse((self.dir / "out").exists(), "refused before the plan was written")

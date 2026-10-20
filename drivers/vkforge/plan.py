@@ -17,7 +17,7 @@ import copy
 import re
 from pathlib import Path
 
-from . import canon, inventory, ontology
+from . import canon, inventory, mine, ontology
 from .errors import Refusal
 from .ontology import ontology_sha256     # build's `ontology` parameter shadows the module inside build
 
@@ -311,12 +311,43 @@ def load_resolver(path: Path):
     return resolve
 
 
+def vault_tokens(plan: dict, invariants: dict) -> set:
+    """The tokens the generator may resolve (founder decision D-02, ruling LF-4): those at any depth
+    of the value of every invariant an action of the plan keeps (its id among the action's `post`)
+    and of every ambiguity the plan resolved. A purged ambiguity's candidates — per-document footers,
+    a client's name in each — and an excluded invariant's text are not among them."""
+    kept = {ident for action in plan["actions"] for ident in action["post"]}
+    values = [i["value"] for i in invariants["invariants"] if i["id"] in kept]
+    values += [a["value"] for a in plan["ambiguities"] if a.get("value") is not None]
+    return {token for value in values for token in mine.tokens(value)}
+
+
+def read_vault(path: Path) -> dict:
+    """The vault mine wrote: a JSON object of clear strings, or the refusal (one line, L-P15)."""
+    vault, _ = ontology.read_json(path, "vault", "run vkforge mine again")
+    if not (isinstance(vault, dict) and all(isinstance(v, str) for v in vault.values())):
+        raise Refusal(f"vault {path} is not an object of clear strings", "run vkforge mine again")
+    return vault
+
+
+def reduce_vault(path: Path, vault: dict, plan: dict, invariants: dict) -> tuple[int, int]:
+    """Founder decision D-02: the vault at `path` rewritten in place — the same file, so the same
+    private directory and ACL, by canon.write — keeping only vault_tokens(plan, invariants).
+    (kept, of)."""
+    keep = vault_tokens(plan, invariants)
+    reduced = {token: vault[token] for token in sorted(vault) if token in keep}
+    canon.write(reduced, Path(path))
+    return len(reduced), len(vault)
+
+
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--invariants", required=True, type=Path, help="invariants.json written by vkforge mine")
     parser.add_argument("--binding", required=True, type=Path, help="binding-<app>.json written by vkforge bind")
     parser.add_argument("--out", required=True, type=Path, help="directory that receives plan.json and plan-excluded.json")
     parser.add_argument("--ontology", type=Path, help="an ontology file instead of ontology/office-document.json")
     parser.add_argument("--resolver", type=Path, help="resolver.json: the ambiguities an arch resolved")
+    parser.add_argument("--vault", type=Path,
+                        help="the vault mine wrote: rewritten in place with only the values the plan uses (D-02)")
 
 
 def run(ns: argparse.Namespace) -> int:
@@ -326,10 +357,15 @@ def run(ns: argparse.Namespace) -> int:
         raise Refusal("invariants.json is not in canonical form", "run vkforge mine again")
     binding, _ = ontology.read_json(ns.binding, "binding", "run vkforge bind again")
     resolve = None if ns.resolver is None else load_resolver(ns.resolver)
+    vault = None if ns.vault is None else read_vault(ns.vault)
     p, excluded = build(invariants, binding, ont, resolve)
     path = write_plan(p, excluded, ns.out)
     a = p["actions"][0]
     purged = sum(x["resolved_by"] == "purged" for x in p["ambiguities"])
-    print(f"plan: {a['name']} {len(a['steps'])} steps, post {','.join(a['post'])}; "
-          f"ambiguities {len(p['ambiguities'])} ({purged} purged); excluded {len(excluded)} -> {path}")
+    line = (f"plan: {a['name']} {len(a['steps'])} steps, post {','.join(a['post'])}; "
+            f"ambiguities {len(p['ambiguities'])} ({purged} purged); excluded {len(excluded)}")
+    if vault is not None:
+        kept, of = reduce_vault(ns.vault, vault, p, invariants)
+        line += f"; vault kept {kept} of {of}"
+    print(f"{line} -> {path}")
     return 0

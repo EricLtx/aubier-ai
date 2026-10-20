@@ -1183,3 +1183,61 @@ async fn a_second_learn_of_the_name_draws_a_new_salt_and_the_first_driver_no_lon
     );
     node.shutdown().await;
 }
+
+/// Ten contracts whose footers all differ — a client's name in each — written with
+/// `drivers/vkforge/tests/ooxml_fixtures.py` (founder decision D-02's case).
+const FOOTER_CORPUS: &str = r#"import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from vkforge.tests import ooxml_fixtures
+d = Path(sys.argv[2])
+d.mkdir(parents=True, exist_ok=True)
+for n in range(10):
+    ooxml_fixtures.docx(d / f"c{n}.docx", footer=f"Contrat client {n}", pdf=True)
+"#;
+
+fn footer_corpus(dir: &Path) -> PathBuf {
+    let ok = std::process::Command::new(forge_python())
+        .args(["-I", "-c", FOOTER_CORPUS])
+        .arg(repo_root().join("drivers"))
+        .arg(dir)
+        .status()
+        .expect("run the vkforge interpreter")
+        .success();
+    assert!(ok, "the footer corpus {}", dir.display());
+    dir.to_path_buf()
+}
+
+/// Founder decision D-02, ruling LF-4: the kernel hands `plan` the vault, which it rewrites in place
+/// before `generate` reads it. Ten footers that all differ are one ambiguity of ten token
+/// candidates; with no arch it is purged, and the vault `generate` reads holds none of them.
+#[tokio::test]
+async fn learn_leaves_no_purged_candidate_in_the_vault_before_generate() {
+    if !forge_available() {
+        return;
+    }
+    let node = Node::start().await;
+    let corpus = footer_corpus(&node.dir().join("corpus"));
+    let out = node.dir().join("word-maison");
+    let r = node
+        .call_human("driver.learn", learn_params(&corpus, &out))
+        .await
+        .unwrap();
+    assert_eq!(
+        r["ambiguities"],
+        json!([{"invariant": "footer_text", "resolved_by": "purged"}])
+    );
+    let said = std::fs::read_to_string(
+        node.dir()
+            .join("forge")
+            .join("word-maison")
+            .join("forge-plan.out"),
+    )
+    .unwrap();
+    assert!(said.contains("; vault kept 0 of 10 -> "), "{said}");
+    assert!(
+        !out.join("driver").join("secrets.json").exists(),
+        "no secret left to resolve"
+    );
+    node.shutdown().await;
+}
