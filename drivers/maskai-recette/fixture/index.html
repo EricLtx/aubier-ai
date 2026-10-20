@@ -130,7 +130,9 @@
      (with deletefail, the row comes back 4 s after the refusal), `telemetry` (each delete also POSTs to
      another host, which answers 204); round 6: `triggerlabel=…` (the row trigger's aria-label, « Actions de
      la conversation » on the live site), `destructive` (the entries as shadcn destructive items, a trash
-     icon on the delete one). Words: TOAST_HOST (a toast naming an internal host 0.8 s into
+     icon on the delete one); round 8: `anonymiser` (a sidebar link « Anonymiseur » under the search entry, to
+     /anonymiser: a title, a textarea, a file input, a button « Anonymiser » and an output pre),
+     `anonymiserhost` (the same entry, to another host). Words: TOAST_HOST (a toast naming an internal host 0.8 s into
      the question), ALERT_HOST (an alert naming one at the end of the stream), UNKNOWN_MODAL_TITLES (a
      window that lists the sidebar's titles). Counters: `__theme_clicks`, `__sidebar_select_clicks`,
      `__clear_clicks`, `__sidebar_filter_value`. -->
@@ -254,7 +256,7 @@ for (const k of ["nodetails", "revealed", "controls", "nostructure", "renamedial
                  "surveyonrename", "surveyother", "recents", "echo", "searchfail", "searchfilter", "nonewlink",
                  "clearbutton", "senddisabled", "micdictation", "themetoggle", "sidebarselect", "modeldialog",
                  "feedbackincomposer", "menuspanhint", "searchsnippet", "searchunknown", "searchentrydead",
-                 "nativedelay", "slowrollback", "telemetry", "destructive"]) {
+                 "nativedelay", "slowrollback", "telemetry", "destructive", "anonymiser", "anonymiserhost"]) {
   if (new URLSearchParams(location.search).get(k) === "1") sessionStorage.setItem("bench-" + k, "1");
 }
 for (const k of ["menuitems", "searchentry", "feedbacklabel", "confirmtext", "canceltext", "confirmlabel",
@@ -853,6 +855,23 @@ $("palette").querySelector("[cmdk-input]").addEventListener("input", (e) => {
   paletteTimer = setTimeout(() => renderPalette(q), flag("recents") ? 1500 : 300);  // a debounced search
 });
 if (SEARCHENTRY !== "link" && !flag("searchentrydead")) $("search-entry").onclick = openPalette;
+if (flag("anonymiser") || flag("anonymiserhost")) {  // round 8: MaskAI's standalone tool, under the search entry
+  const a = document.createElement("a");
+  a.id = "anon-entry";
+  a.href = flag("anonymiserhost") ? "https://outils.example.invalid/anonymiser?src=sidebar" : "/anonymiser";
+  a.textContent = "Anonymiseur";
+  $("search-entry").after(a);
+}
+if (location.pathname === "/anonymiser") {  // round 8: the tool's page; its counters survive the way back
+  sessionStorage.setItem("bench-anon-visits", String(+(sessionStorage.getItem("bench-anon-visits") || 0) + 1));
+  document.querySelector("main").style.display = "none";  // the page's CSS sets main's display: hidden is not enough
+  document.querySelector("main").insertAdjacentHTML("afterend", '<section id="anon-page"><h1>Anonymiseur</h1>'
+    + '<h2>Texte à anonymiser</h2><form id="anon-form" onsubmit="return false"><textarea id="anon-input" '
+    + 'placeholder="Collez votre texte"></textarea><input type="file" id="anon-file" accept=".txt,.pdf,.docx">'
+    + '<button type="button" id="anon-go">Anonymiser</button></form><pre id="anon-out" aria-live="polite"></pre></section>');
+  $("anon-go").onclick = () => sessionStorage.setItem("bench-anon-clicks", "1");
+  $("anon-input").addEventListener("input", () => sessionStorage.setItem("bench-anon-typed", "1"));
+}
 if (flag("nonewlink")) document.querySelector('a[href="/new"]').remove();  // click-targets-8
 document.addEventListener("keydown", (e) => {
   if (NOKBD || !(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "k") return;

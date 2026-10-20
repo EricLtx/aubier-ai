@@ -4374,5 +4374,57 @@ class FixRound7Units(unittest.TestCase):
             self.check(os.path.join(repo, "contracts", "examples", "driver_manifest", *name.split("/")))
 
 
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class FixRound8OnFixture(FixtureBench):
+    """Round 8: the read-only discovery of MaskAI's « Anonymiseur » in sonder_interface (M0)."""
+
+    bench = FixRound2OnFixture.bench
+    start = FixRound2OnFixture.start
+    q = staticmethod(FixRound2OnFixture.q)
+
+    def probe(self, A):
+        res, ev = self.act(A, "sonder_interface")
+        return res, self.evidence_json(ev, "probe.json")
+
+    def test_the_probe_finds_the_anonymiser_reads_it_and_comes_back(self):
+        """The entry under the search entry is followed, the page read (titles, controls, outputs, accept), nothing
+        typed nor pressed, /new restored; no conversation title among the navigation entries."""
+        drv, recette, A, page = self.bench(self.q(anonymiser="1"))
+        page.evaluate("() => window.__seed('Mon dossier privé numéro un')")
+        res, probe = self.probe(A)
+        anon = probe["anonymiser"]
+        self.assertIs(anon["found"], True)
+        self.assertEqual(anon["path"], "/anonymiser")
+        self.assertIn("Anonymiseur", anon["headings"])
+        tags = [c["tag"] for c in anon["controls"]]
+        self.assertIn("textarea", tags)
+        self.assertIn("Anonymiser", [c.get("text") for c in anon["controls"] if c["tag"] == "button"])
+        self.assertEqual(anon["accept"], ".txt,.pdf,.docx")
+        self.assertIn("pre", [o["tag"] for o in anon["outputs"]])
+        self.assertIs(anon["restored"], True)
+        self.assertIn("Anonymiseur", [e.get("text") for e in anon["entries"]])
+        self.assertNotIn("Mon dossier", json.dumps(probe, ensure_ascii=False))
+        self.assertIn("anonymiseur : trouvé (/anonymiser)", res["text"])
+        self.assertEqual(page.evaluate("() => [sessionStorage.getItem('bench-anon-visits'), "
+                                       "sessionStorage.getItem('bench-anon-clicks'), sessionStorage.getItem('bench-anon-typed')]"),
+                         ["1", None, None])
+        self.assertTrue(page.url.split("?")[0].endswith("/new"))
+
+    def test_no_entry_is_not_found(self):
+        drv, recette, A, page = self.bench()
+        res, probe = self.probe(A)
+        self.assertIs(probe["anonymiser"]["found"], False)
+        self.assertIn("anonymiseur : non trouvé", res["text"])
+
+    def test_an_entry_to_another_host_is_never_followed(self):
+        drv, recette, A, page = self.bench(self.q(anonymiserhost="1"))
+        res, probe = self.probe(A)
+        anon = probe["anonymiser"]
+        self.assertIs(anon["host_refused"], True)
+        self.assertEqual(anon["href_path"], "/anonymiser")
+        self.assertNotIn("src=", json.dumps(anon))
+        self.assertIsNone(page.evaluate("() => sessionStorage.getItem('bench-anon-visits')"))
+
+
 if __name__ == "__main__":
     unittest.main()

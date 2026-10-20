@@ -1267,6 +1267,73 @@ NEW_CONV_EL_JS = "(a) => {" + _VISIBLE + r"""
   return [null];
 }"""
 
+# Round 8 (la demande du fondateur, découverte seule) : les entrées de navigation de la barre latérale sous l'entrée de
+# la recherche (liens et boutons, jamais une ligne ni la liste des conversations), dans l'ordre ; l'entrée de
+# l'anonymiseur (texte ou libellé « anonymis », ou chemin « anonymi ») ; puis, la page suivie, ses titres, ses
+# commandes, ses zones de sortie et un échantillon expurgé de son formulaire. Rien n'est tapé ni pressé.
+_ANON_FIND = _CONV_ROWS + r"""
+  const navOf = (a) => {
+    const side = a.sidebar ? [...document.querySelectorAll(a.sidebar)].find(visible) : null;
+    if (!side) return { after: [], search: false };
+    const links = convLinks();
+    const words = new RegExp(a.searchWords, 'i');
+    const text = (el) => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    const label = (el) => (el.getAttribute('aria-label') || '').trim();
+    const cands = [...side.querySelectorAll('a[href], button, [role="button"]')].filter(visible)
+      .filter((el) => !(el.closest('a[href]') && convRe && convRe.test(pathOf(el.closest('a[href]')) || ''))
+                      && !inConversations(el, links));
+    const search = cands.find((el) => words.test(text(el) + ' ' + label(el)));
+    const after = search ? cands.filter((el) => el !== search && !search.contains(el)
+                                         && (search.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) : cands;
+    const isAnon = (el) => {
+      if (/anonymis/i.test(text(el) + ' ' + label(el))) return true;
+      if (!el.matches('a[href]')) return false;
+      try { return /anonymi/i.test(new URL(el.getAttribute('href'), location.href).pathname); } catch (e) { return false; }
+    };
+    return { after: after.slice(0, 30), search: !!search, text, label, isAnon };
+  };"""
+ANON_NAV_JS = "(a) => {" + _VISIBLE + _ANON_FIND + r"""
+  const n = navOf(a);
+  return { search: n.search, entries: n.after.map((el, i) => {
+    let path = null, host = null;
+    if (el.matches('a[href]')) { try { const u = new URL(el.getAttribute('href'), location.href); path = u.pathname; host = u.hostname; }
+                                 catch (e) {} }
+    return { index: i, tag: el.tagName.toLowerCase(), text: n.text(el), label: n.label(el) || null, href_path: path,
+             host, anonymiser: n.isAnon(el) };
+  }) };
+}"""
+ANON_EL_JS = "(a) => {" + _VISIBLE + _ANON_FIND + r"""
+  const n = navOf(a);
+  return [n.after.find((el) => n.isAnon(el)) || null];
+}"""
+ANON_PAGE_JS = "(a) => {" + _VISIBLE + r"""
+  const t = (el) => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+  const side = a.sidebar ? [...document.querySelectorAll(a.sidebar)] : [];
+  const out = (el) => !side.some((s) => s.contains(el));
+  const shown = (el) => visible(el) || (el.matches('input[type="file"]') && visible(el.parentElement));
+  const headings = [...document.querySelectorAll('h1, h2')].filter((el) => visible(el) && out(el)).map(t).filter(Boolean).slice(0, 10);
+  const sel = 'textarea, input[type="text"], input:not([type]), input[type="file"], select, button, [role="switch"], [contenteditable="true"], [contenteditable=""]';
+  const ctl = [...document.querySelectorAll(sel)].filter((el) => shown(el) && out(el)).slice(0, 40);
+  const controls = ctl.map((el) => ({ tag: el.tagName.toLowerCase(), type: el.getAttribute('type'),
+    text: el.matches('button') ? t(el).slice(0, 60) : null, label: el.getAttribute('aria-label'),
+    placeholder: el.getAttribute('placeholder'), role: el.getAttribute('role'), accept: el.getAttribute('accept') }));
+  const outRe = /résultat|resultat|anonymisé|masqué/i;
+  const zones = [...document.querySelectorAll('pre, output, [aria-live]')].filter(out)
+    .concat([...document.querySelectorAll('body *')].filter((el) => el.children.length === 0 && visible(el) && out(el)
+                                                             && outRe.test(el.textContent || '')));
+  const outputs = [...new Set(zones)].slice(0, 20).map((el) => ({ tag: el.tagName.toLowerCase(), id: el.id || null,
+    live: el.getAttribute('aria-live'), text: t(el).slice(0, 60) }));
+  const file = ctl.find((el) => el.matches('input[type="file"]'));
+  const field = ctl.find((el) => el.matches('textarea, input[type="text"], [contenteditable]'));
+  const box = (field && (field.closest('form') || field.parentElement)) || document.querySelector('main') || document.body;
+  const copy = box.cloneNode(true);
+  for (const x of copy.querySelectorAll('textarea, [contenteditable]')) x.textContent = '';
+  for (const x of copy.querySelectorAll('[value]')) x.setAttribute('value', '…');
+  return { path: location.pathname, headings, controls, outputs, accept: file ? file.getAttribute('accept') : null,
+           sample: (copy.outerHTML || '').slice(0, 600) };
+}"""
+COMPOSER_SHOWN_JS = "(a) => {" + _VISIBLE + " return [...document.querySelectorAll(a.sel)].some(visible); }"
+
 # Round 2 (robustness-4) : le recensement des sélecteurs de la sonde en un appel borné (a.rows : {key, sel, css,
 # text}), et le champ de fichier.
 PROBE_SELECTORS_JS = "(a) => {" + _VISIBLE + r"""
@@ -5664,7 +5731,7 @@ class Recette:
         page = b.page()
         probe = {"t": now_iso(), "url": None, "selectors": None, "search_entry": None, "search": None,
                  "feedback_entry": None, "mic": None, "file_input": None, "menu": None, "menu_verdict": None,
-                 "errors": []}
+                 "anonymiser": None, "errors": []}
 
         def step(name, fn):
             try:
@@ -5687,6 +5754,7 @@ class Recette:
         step("file_input", lambda: self._file_input(page))
         step("search", lambda: self._probe_search(page))
         step("menu", lambda: self._probe_menu(page))
+        step("anonymiser", lambda: self._probe_anonymiser(page))  # round 8: discovery only
         step("restored", lambda: self._restore_page(page, start, probe) or "moved_to" in probe)
         menu = probe["menu"] or {}
         verdict = probe["menu_verdict"] = menu.get("verdict")  # robustness-1: what M8-5 and M8-6 will meet
@@ -5711,9 +5779,62 @@ class Recette:
                 + f" ; micro : {(probe['mic'] or {}).get('status') or 'absent'}"
                 + f" ; accept : {(probe['file_input'] or {}).get('accept') or 'aucun'}"
                 + f" ; {menu_text}"
+                + f" ; {self._anonymiser_text(probe['anonymiser'])}"
                 + (f" ; {len(probe['errors'])} erreur(s)" if probe["errors"] else ""))
         return {"found": found, "missing": missing, "menu_entries": entries, "menu_verdict": verdict,
                 "errors": probe["errors"], "text": one_line(text, 800)}
+
+    def _probe_anonymiser(self, page) -> dict:
+        """Round 8 : la découverte de l'« Anonymiseur » de MaskAI, en lecture seule. Les entrées de navigation sous
+        l'entrée de la recherche (jamais une conversation : ni son titre ni son adresse) ; l'entrée de l'anonymiseur,
+        suivie si c'est un bouton ou un lien d'un hôte de la liste (sinon `host_refused`, rien n'est suivi) ; la page
+        lue (chemin, titres h1/h2, commandes, zones de sortie, `accept`, un échantillon expurgé de 600 caractères de
+        son formulaire), puis le retour à /new et le compositeur revu (`restored`). Rien n'est tapé, aucun fichier
+        n'est joint, rien d'autre que l'entrée n'est cliqué."""
+        b = self.browser
+        arg = {"sidebar": SELECTORS["sidebar"], "convPath": SELECTORS["conversation_path"],
+               "row": SELECTORS["conversation_row"], "searchWords": SELECTORS["search_words"]}
+        nav = b.call(ANON_NAV_JS, arg, page=page, timeout_ms=3000) or {}
+        entries = nav.get("entries") or []
+        hit = next((e for e in entries if e.get("anonymiser")), None)
+        record = {"found": hit is not None, "search_entry": nav.get("search"), "host_refused": False,
+                  "entries": [{k: v for k, v in e.items() if k != "host"} for e in entries]}
+        if hit is None:
+            record["candidates"] = record["entries"]
+            return record
+        record.update(entry={k: hit.get(k) for k in ("tag", "text", "label", "href_path")},
+                      href_path=hit.get("href_path"))
+        if hit.get("host") and not b.allowed(f"https://{hit['host']}/"):
+            record["host_refused"] = True  # never followed off the host list
+            return record
+        el = b.element(ANON_EL_JS, arg, page=page, timeout_ms=3000)
+        if el is None:
+            record["error"] = "l'entrée de l'anonymiseur a disparu avant le clic : rien n'est cliqué"
+            return record
+        try:
+            el.click(timeout=5000)
+        finally:
+            el.dispose()
+        self._after_click(page)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10_000)
+        except PWTimeout:
+            if b.pending():
+                raise
+        page.wait_for_timeout(500)
+        record.update(b.call(ANON_PAGE_JS, {"sidebar": SELECTORS["sidebar"]}, page=page, timeout_ms=3000) or {})
+        self._goto(page, self.entry)
+        record["restored"] = bool(b.call(COMPOSER_SHOWN_JS, {"sel": SELECTORS["textarea"]}, page=page, timeout_ms=3000))
+        return record
+
+    @staticmethod
+    def _anonymiser_text(anon: dict | None) -> str:
+        """La clause de l'anonymiseur dans le résultat de la sonde (round 8) : un chemin, jamais un texte de la page."""
+        if not anon or not anon.get("found"):
+            return "anonymiseur : non trouvé"
+        if anon.get("host_refused"):
+            return f"anonymiseur : trouvé ({anon.get('href_path') or '?'}), hôte hors liste : non suivi"
+        return f"anonymiseur : trouvé ({anon.get('path') or anon.get('href_path') or '?'})"
 
     def _probe_selectors(self, page) -> dict:
         """Chaque entrée de SELECTORS qui est une adresse dans la page (SELECTOR_PATTERNS exceptés), chaque
