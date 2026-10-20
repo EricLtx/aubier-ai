@@ -232,9 +232,10 @@ class Job:
     handles. Any failure before that disarm leaves the Job armed. Never made for an instance the adapter
     attached to or could not identify (PF-4); and when Windows refuses it, the instance just started is
     quit, or ended by its PID once checked to be the process identified, and the session refused
-    (rulings PF-16, PF-23). No instance of the driver's is left outside a Job, save one (PF-25): one
-    whose PID check fails or cannot be made — nothing is then terminated, it outlives the driver, and
-    driver.log's `job: process … not held` line says `not ended: …`."""
+    (rulings PF-16, PF-23). An instance of the driver's stays outside a Job only in these cases (PF-25,
+    PF-27), each named in driver.log: its end by PID is not made because the PID check fails or cannot
+    be made, or TerminateProcess fails after the check (`… not ended: …`); or its start is not
+    identified (`start: treated as attached: …`, PF-4) — it is then never quit nor held."""
 
     def __init__(self, job, process, pid: int):
         self.job, self.process, self.pid = job, process, pid
@@ -300,9 +301,10 @@ _HELD = []
 
 
 def _hold(pid: int):
-    """The Job that ends `pid` with this driver (D-04). Windows' refusal is raised: D-04 has no exception
-    (rulings PF-16, PF-23), so the start that made `pid` goes no further, and its caller says how that
-    instance ended, on the `job: process … not held` line."""
+    """The Job that ends `pid` with this driver (D-04). Windows' refusal is raised, so the start that made
+    `pid` goes no further: its caller quits that instance, or ends it by its PID once checked, and says
+    how on the `job: process … not held` line — `not ended: …` when the check or the termination fails,
+    the instance then outliving the driver (rulings PF-16, PF-23, PF-27)."""
     return Job.hold(pid)
 
 
@@ -459,14 +461,24 @@ def _start(progid: str, get_active, create, errors: tuple, deadline_s: float) ->
             return state["pid"]
 
     def ended(app) -> None:
-        """A CreateObject already in flight when the start was given up returned: what it got back holds no
-        document, and is quit; failing that, ended by its PID with PF-23's check (PF-24). One line."""
-        pid = state["pid"]
+        """A CreateObject already in flight when the start was given up returned (PF-24, PF-26). What it got
+        back is the driver's only when positively identified: the process latched when the start was given
+        up, or else, now, the one new process of the executable whose parent is the DcomLaunch service. Then
+        it holds no document and is quit, or — the Quit failing — ended by its PID with PF-23's check.
+        Otherwise it may be the user's (PowerPoint hands its running instance to CreateObject): the
+        reference is released untouched, and it is said attached (PF-4, D-03). One line."""
+        pid, known = state["pid"], state["known"]
+        if pid is None:
+            pid, why = identified(before, pids_of(exes), launcher)
+            if pid is None:
+                sys.stderr.write(f"start: abandoned at its deadline; treated as attached: {why}\n")
+                return
+            known = identity(pid)
         try:
             guarded(lambda: app.Quit(), f"quit {progid}", CLEANUP_DEADLINE_S, owner=pid)
             how = "quit"
         except (DriverRefusal, *errors) as q:
-            why = end_by_pid(pid, state["known"]) if pid is not None else "not identified"
+            why = end_by_pid(pid, known)
             how = f"not quit ({q}); " + ("ended by its PID" if why is None else f"not ended: {why}")
         sys.stderr.write(f"start: abandoned at its deadline; process {pid} {how}\n")
 

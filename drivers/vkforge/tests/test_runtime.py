@@ -365,8 +365,10 @@ class RuntimeTest(unittest.TestCase):
         try:
             checks, wrong = self.house_style(app, doc)
         finally:
+            pid = app.pid
             with contextlib.redirect_stderr(err):
                 app.quit()
+        self.assertIsNotNone(pid, "the start was identified: the end below is the started instance's")
         self.assertEqual((checks, wrong), ([True, True, True, True], False))
         self.assertNotIn("not handed over", err.getvalue(), "the end read the real Word's inventory and quit it")
         obs = mine.mine_file(doc)["obs"]
@@ -396,9 +398,10 @@ class RuntimeTest(unittest.TestCase):
             finally:
                 com.guarded(lambda: users.Close(SaveChanges=False), "user's close")
         finally:
-            err = io.StringIO()
+            err, pid = io.StringIO(), app.pid
             with contextlib.redirect_stderr(err):
                 app.quit()
+        self.assertIsNotNone(pid, "the start was identified: the end below is the started instance's")
         self.assertEqual(doc.read_bytes(), before)
         self.assertNotIn("not handed over", err.getvalue(), "the end read the real Word's inventory and quit it")
 
@@ -1336,3 +1339,47 @@ class RuntimeTest(unittest.TestCase):
             self.assertEqual((refusal.reason, held, len(jobs)), ("timeout", [7], 1), said)
             self.assertEqual((word.quits, seen), (1, []) if quits else (0, [(7, ("WINWORD.EXE", 900, 1234))]))
             self.assertEqual(err.getvalue(), f"start: abandoned at its deadline; process 7 {said}\n")
+
+    def test_a_late_return_is_quit_only_when_positively_identified(self):
+        # Ruling PF-26 (re-review N1, N2): what a CreateObject returns after the start was given up is quit
+        # only when its process is positively identified — latched at the give-up, or found now, from a
+        # fresh snapshot (one new process of the executable, child of the DcomLaunch service). A
+        # PowerPoint the user runs, handed back by CreateObject (no new process), is released untouched
+        # and said attached, never quit (D-03). An identified one whose Quit fails is ended by its PID.
+        for appears, fails, quits, ended, said in [
+                (None, False, 0, [], "treated as attached: 0 new processes of the application"),   # the user's
+                ({7: 900}, False, 1, [], "process 7 quit"),                    # the driver's, spawned late
+                ({7: 900}, True, 0, [7], "process 7 not quit (the application is not answering); ended by its PID"),
+                ({7: 33}, False, 0, [], "treated as attached: process 7 was not started by the DCOM launcher")]:
+            release, now, err, word, seen = threading.Event(), {"pids": {55: 33}}, io.StringIO(), StubWord(), []
+            if fails:
+                word.Quit = lambda: (_ for _ in ()).throw(OSError("the application is not answering"))
+
+            def nothing(progid):
+                raise OSError("operation unavailable")
+
+            def create(progid, release=release, now=now, word=word, appears=appears):
+                release.wait(30)
+                if appears:
+                    now["pids"] = {55: 33, **appears}
+                return word
+
+            try:
+                with mock.patch.dict(os.environ, {"VK_DRIVER_APPLICATIONS": "POWERPNT.EXE"}), \
+                        mock.patch.object(com, "pids_of", lambda exes, now=now: dict(now["pids"]) if exes else None), \
+                        mock.patch.object(com, "dcom_launcher_pid", lambda: 900), \
+                        mock.patch.object(com, "identity", lambda pid: ("POWERPNT.EXE", 900, 1234)), \
+                        mock.patch.object(com, "dialogs", lambda exes: []), \
+                        mock.patch.object(com, "_hold", lambda pid: StubJob()), mock.patch.object(com, "_HELD", []), \
+                        mock.patch.object(com, "end_by_pid", lambda pid, known, seen=seen: seen.append(pid)), \
+                        contextlib.redirect_stderr(err):
+                    with self.assertRaises(DriverRefusal):
+                        com._start("PowerPoint.Application", nothing, create, (OSError,), 0.3)
+                    release.set()
+                    deadline = time.monotonic() + 5
+                    while "start: abandoned" not in err.getvalue() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+            finally:
+                release.set()
+            self.assertEqual((word.quits, seen), (quits, ended), said)
+            self.assertIn(f"start: abandoned at its deadline; {said}\n", err.getvalue())
