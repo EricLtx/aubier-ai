@@ -132,7 +132,13 @@
      la conversation » on the live site), `destructive` (the entries as shadcn destructive items, a trash
      icon on the delete one); round 8: `anonymiser` (a sidebar link « Anonymiseur » under the search entry, to
      /anonymiser: a title, a textarea, a file input, a button « Anonymiser » and an output pre),
-     `anonymiserhost` (the same entry, to another host). Words: TOAST_HOST (a toast naming an internal host 0.8 s into
+     `anonymiserhost` (the same entry, to another host); round 9: `card20=pasted|chips` (the answer card seen
+     live on 20/10: `<article aria-label="Réponse MASKAI">`, a `section[data-slot="anonymized"]` with one
+     `pii-chip` button per token, the guard's verdicts, the reveal toggle « Révéler les originaux » and an
+     empty collapsible content; `pasted` adds the 18/10 trigger with `aria-controls`, whose panel reads
+     « ENVOYÉ AU LLM » then the text in a <p>; `chips` has no trigger at all; a card without a token has no
+     section; every card has a `steps-summary` button « 8 étapes · 26.9s · N données masquées »; counters
+     `__chip_touches` (click, focus, hover) and `__steps_clicks`). Words: TOAST_HOST (a toast naming an internal host 0.8 s into
      the question), ALERT_HOST (an alert naming one at the end of the stream), UNKNOWN_MODAL_TITLES (a
      window that lists the sidebar's titles). Counters: `__theme_clicks`, `__sidebar_select_clicks`,
      `__clear_clicks`, `__sidebar_filter_value`. -->
@@ -243,6 +249,8 @@ window.__dialog_answered = false;
 window.__survey_shown = 0;
 window.__survey_answered = false;
 window.__reveal_clicks = 0;
+window.__chip_touches = 0;
+window.__steps_clicks = 0;
 // v2.3: what the driver touched, and what it must never touch.
 Object.assign(window, { __menu_opens: [], __menu_picks: [], __renamed: {}, __deleted: [], __palette_opens: 0,
                         __palette_queries: [], __feedback_opens: 0, __mic_clicks: 0, __survey_sent: 0 });
@@ -260,7 +268,7 @@ for (const k of ["nodetails", "revealed", "controls", "nostructure", "renamedial
   if (new URLSearchParams(location.search).get(k) === "1") sessionStorage.setItem("bench-" + k, "1");
 }
 for (const k of ["menuitems", "searchentry", "feedbacklabel", "confirmtext", "canceltext", "confirmlabel",
-                 "grouplabel", "groupitems", "menutitle", "triggerlabel"]) {  // valued flags
+                 "grouplabel", "groupitems", "menutitle", "triggerlabel", "card20"]) {  // valued flags
   const v = new URLSearchParams(location.search).get(k);
   if (v !== null) sessionStorage.setItem("bench-" + k, v);
 }
@@ -347,6 +355,7 @@ if (flag("menushortcut"))  // shadcn's DropdownMenuShortcut inside the delete en
   for (const it of $("conv-menu").querySelectorAll('[role=menuitem][data-action="delete"]'))
     it.insertAdjacentHTML("beforeend", '<span data-slot="dropdown-menu-shortcut">⌘⌫</span>');
 const NODETAILS = sessionStorage.getItem("bench-nodetails") === "1";
+const CARD20 = sessionStorage.getItem("bench-card20");  // round 9: "pasted" | "chips"
 const REVEALED = sessionStorage.getItem("bench-revealed") === "1";
 const CONTROLS = sessionStorage.getItem("bench-controls") === "1";
 const NOSTRUCTURE = sessionStorage.getItem("bench-nostructure") === "1";
@@ -906,7 +915,69 @@ function toggleDetails(art, trigger, content) {  // bound to its own content, as
   }
 }
 
+// Round 9: the card seen live on 20/10 (two shapes: a pasted message keeps the 18/10 trigger, an attachment's
+// card has chips only); nothing here is clickable by the driver but the trigger.
+function addAnswer20(tokens, model) {
+  const art = document.createElement("article");
+  art.setAttribute("aria-label", "Réponse MASKAI");
+  art.__sent = null;
+  const parts = [];
+  if (tokens.length) {
+    const id = "anon-content-" + (++detailsCount);
+    const sec = document.createElement("section");
+    sec.setAttribute("aria-label", "Anonymisation appliquée");
+    sec.dataset.slot = "anonymized";
+    sec.dataset.state = "closed";
+    sec.innerHTML = "<header>" + (CARD20 === "chips" ? "Anonymisé · Dans vos documents →" : "Anonymisé →") + "</header>"
+      + "<ul>" + tokens.map((t) => '<li><button type="button" data-slot="pii-chip" aria-pressed="false"></button></li>').join("")
+      + "</ul><p>L'Aiguilleur : PASS · Le Chirurgien : " + tokens.length + " PII détectées</p>"
+      + (CARD20 === "pasted" ? '<button data-slot="collapsible-trigger" type="button" aria-expanded="false" data-state="closed" '
+         + 'aria-label="Voir le texte anonymisé envoyé au LLM" aria-controls="' + id + '"><span>Détails</span>' + CHEVRON + "</button>" : "")
+      + '<button type="button" data-slot="pii-reveal-toggle" aria-label="Révéler les originaux" aria-pressed="false">' + EYE + "</button>"
+      + '<div data-slot="collapsible-content" data-state="closed" id="' + id + '" hidden></div>';
+    [...sec.querySelectorAll('[data-slot="pii-chip"]')].forEach((b, i) => {
+      b.setAttribute("aria-label", "Token anonymisé " + tokens[i]);
+      b.textContent = tokens[i];
+      for (const ev of ["click", "focus", "mouseenter"]) b.addEventListener(ev, () => { window.__chip_touches += 1; });
+    });
+    sec.querySelector('[data-slot="pii-reveal-toggle"]').onclick = () => { window.__reveal_clicks += 1; };
+    const trigger = sec.querySelector('[data-slot="collapsible-trigger"]');
+    if (trigger) {
+      const content = sec.querySelector('[data-slot="collapsible-content"]');
+      trigger.onclick = () => {
+        const open = trigger.getAttribute("aria-expanded") !== "true";
+        trigger.setAttribute("aria-expanded", String(open));
+        trigger.dataset.state = content.dataset.state = sec.dataset.state = open ? "open" : "closed";
+        content.hidden = !open;
+        content.innerHTML = open ? "<p>ENVOYÉ AU LLM</p><p></p>" : "";
+        if (open) content.lastChild.textContent = art.__sent || "";
+      };
+    }
+    parts.push(sec);
+  } else {
+    const guard = document.createElement("div");
+    guard.className = "head";
+    guard.innerHTML = "<span>Aucune donnée personnelle détectée</span><span>L'Aiguilleur : PASS</span>";
+    parts.push(guard);
+  }
+  const steps = document.createElement("div");
+  steps.dataset.slot = "steps-summary";
+  steps.innerHTML = '<button type="button" aria-expanded="false">8 étapes · 26.9s · ' + tokens.length + " données masquées</button>";
+  steps.querySelector("button").onclick = () => { window.__steps_clicks += 1; };
+  const banner = document.createElement("div");
+  banner.className = "head";
+  banner.innerHTML = '<span>maskai</span><span class="model"></span>';
+  banner.querySelector(".model").textContent = model;
+  const body = document.createElement("div");
+  body.className = "pl-6";
+  body.innerHTML = '<div class="prose-llm"></div>';
+  art.append(...parts, steps, banner, body);
+  $("messages").appendChild(art);
+  return art;
+}
+
 function addAnswer(tokens, model) {
+  if (CARD20) return addAnswer20(tokens, model);
   const art = document.createElement("article");
   art.setAttribute("aria-label", "MASKAI response");
   art.__sent = null;  // the anonymised text, from the stream's X-Sent-Anonymized header

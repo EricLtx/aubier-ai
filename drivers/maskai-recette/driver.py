@@ -309,15 +309,32 @@ SELECTORS = {
     # (`details_label`), et en garde le texte entier et le HTML (sent.json). Un candidat qui est le
     # bouton de révélation des PII (`pii_reveal`) ou qui est dans le corps de la réponse
     # (`answer_body`) n'est jamais retenu.
+    # Round 9, vu le 20/10 : la section `section[data-slot="anonymized"]` de la carte ; pour un message collé, le
+    # déclencheur du 18/10 y est ; pour une pièce jointe, aucun déclencheur, seulement des puces. Un bouton de cette
+    # section qui nomme par aria-controls le contenu repliable de la section, ou qui porte aria-expanded, est aussi
+    # un déclencheur ; jamais un élément de `card_never`.
     "card_details_trigger": ['article button[data-slot="collapsible-trigger"][aria-label*="anonymis" i]',
                              'article button[data-slot="collapsible-trigger"]:has-text("Détails")',
-                             'article button:has-text("Détails")'],
+                             'article button:has-text("Détails")',
+                             'article section[data-slot="anonymized"] button[aria-controls]',
+                             'article section[data-slot="anonymized"] button[aria-expanded]'],
     "card_details_content": '[data-slot="collapsible-content"]',
+    "card_anonymized": 'section[data-slot="anonymized"]',
+    # Round 9 : ce que le driver ne presse, ne survole ni ne focalise jamais dans une carte : les puces des
+    # jetons, le bouton de révélation, le résumé des étapes (son bouton aria-expanded est hors de la section).
+    "card_never": '[data-slot="pii-chip"], [data-slot="pii-reveal-toggle"], [data-slot="steps-summary"]',
+    # Les puces (20/10) : <button data-slot="pii-chip" aria-label="Token anonymisé <PHONE_1>" aria-pressed="false">,
+    # une par jeton masqué ; lues par leur aria-label seulement (`chip_token`).
+    "pii_chip": 'button[data-slot="pii-chip"]',
+    "chip_token": r"^\s*token\s+anonymis[ée]\s*(<[A-Z][A-Z_]*_\d+>)\s*$",
+    # Le résumé des étapes (20/10) : « 8 étapes · 26.9s · 9 données masquées », lu sans être déplié.
+    "steps_summary": '[data-slot="steps-summary"]',
     # Le libellé en tête du panneau, retiré du texte envoyé (le banc : « Texte anonymisé envoyé au
     # LLM : ») ; à défaut, une première ligne qui finit par « : » et que la question ne contient
     # pas (details_text). Formulation réelle à relever au premier passage (sent.json `label`).
-    "details_label": (r"^\s*(?:texte\s+anonymis[ée]\s+envoy[ée]\s+au\s+(?:llm|mod[èe]le)"
-                      r"|anonymi[sz]ed\s+text\s+sent\s+to\s+the\s+(?:llm|model))\s*:?\s*"),
+    # Round 9 : « ENVOYÉ AU LLM », vu le 20/10 en tête du panneau d'un message collé.
+    "details_label": (r"^\s*(?:(?:texte\s+anonymis[ée]\s+)?envoy[ée]\s+au\s+(?:llm|mod[èe]le)"
+                      r"|(?:anonymi[sz]ed\s+text\s+)?sent\s+to\s+the\s+(?:llm|model))\s*:?\s*"),
     # Le bouton qui révèle les PII dans la réponse, juste après « Détails » (18/10, même carte) :
     # <button type="button" aria-pressed="false" data-state="closed" data-slot="pii-reveal-toggle" …>.
     # Jamais pressé par le driver ; son état au moment de la lecture est noté (`reveal_pressed`).
@@ -450,7 +467,7 @@ SELECTOR_PATTERNS = ("stop_text", "model_banner", "brand_model", "brand", "live_
                      "mask_token", "attach_failed", "attach_uploading", "attach_pending", "attach_ready",
                      "details_label", "sent_label", "model_prefix", "web_words", "maintenance", "auth_error",
                      "conversation_path", "menu_rename", "menu_delete", "rename_submit", "search_words",
-                     "feedback_words", "new_conversation_labels")
+                     "feedback_words", "new_conversation_labels", "chip_token")
 # Modales connues : reconnues par leur sélecteur et fermées par leur bouton documenté (ou une touche,
 # « key:<touche> »), jamais par « OK » ni « Envoyer ». Une modale `own` est une fenêtre que le
 # driver ouvre lui-même : connue seulement quand c'est lui qui l'a ouverte ; ouverte par quelqu'un
@@ -780,9 +797,16 @@ _DETAILS_FIND = r"""
       const cards = all(document, s);
       if (!cards.length) continue;
       const card = cards[cards.length - 1];
-      for (const t of a.triggers) {  // never the PII reveal toggle, never a button of the answer's body
-        const el = all(card, t.css).find((e) => !e.closest(a.reveal) && !(a.body && e.closest(a.body))
-                                               && (t.text === null || norm(e.textContent).includes(t.text)));
+      const names = (e) => {  // round 9: aria-controls names the collapsible content of its own section
+        const sec = a.section ? e.closest(a.section) : null, id = e.getAttribute('aria-controls');
+        const c = id ? document.getElementById(id) : null;
+        return !!(sec && c && sec.contains(c) && c.matches(a.content));
+      };
+      for (const t of a.triggers) {  // never the PII reveal toggle, a chip, the steps summary, the answer's body
+        const el = all(card, t.css).find((e) => !e.closest(a.reveal) && !(a.never && e.closest(a.never))
+                                               && !(a.body && e.closest(a.body))
+                                               && (t.text === null || norm(e.textContent).includes(t.text))
+                                               && (!t.controls || names(e)));
         if (el) return { sel: s, count: cards.length, card, trigger: el, triggerSel: t.sel };
       }
       return { sel: s, count: cards.length, card, trigger: null, triggerSel: null };
@@ -796,6 +820,11 @@ DETAILS_JS = "(a) => {" + _VISIBLE + _DETAILS_FIND + r"""
   if (!f.card) return out;
   const rv = f.card.querySelector(a.reveal);
   if (rv) out.reveal = rv.getAttribute('aria-pressed');
+  // round 9: the chips' labels and the steps summary's text, read, never pressed nor expanded
+  out.chips = a.chip ? all(f.card, a.chip).filter((e) => !(a.body && e.closest(a.body)))
+                         .map((e) => e.getAttribute('aria-label')).slice(0, 200) : [];
+  const st = a.steps ? f.card.querySelector(a.steps) : null;
+  out.steps = st ? (st.innerText || st.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200) : null;
   const el = f.trigger;
   if (!el) return out;
   out.label = (el.getAttribute('aria-label') || el.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 300);
@@ -1794,7 +1823,7 @@ def details_triggers() -> list:
         css = css.strip()
         if css.startswith("article "):
             css = css[len("article "):].strip()
-        out.append({"sel": sel, "css": css or "*", "text": text})
+        out.append({"sel": sel, "css": css or "*", "text": text, "controls": css.endswith("[aria-controls]")})
     return out
 
 
@@ -1836,6 +1865,55 @@ def token_inventory(text: str | None) -> dict | None:
     for kind in re.findall(TOKEN_TYPE, text):
         counts[kind] = counts.get(kind, 0) + 1
     return dict(sorted(counts.items()))
+
+
+# Round 9 : la raison d'une carte du 20/10 sans déclencheur, dont les jetons sont lus sur les puces.
+CHIPS_REJECTED = "panneau du texte envoyé sans déclencheur (carte du 20/10) : jetons lus sur les puces"
+
+
+def chip_tokens(labels: list | None) -> list:
+    """Round 9 : les jetons que portent les puces d'une carte (« Token anonymisé <PHONE_1> »), dans l'ordre ; un
+    libellé d'une autre forme n'en donne aucun (jamais une valeur en clair)."""
+    out = []
+    for label in labels or []:
+        m = re.match(SELECTORS["chip_token"], label or "", flags=re.I)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+def chip_inventory(info: dict | None) -> dict | None:
+    """Les types des jetons lus sur les puces d'une carte `card-chips` (token_inventory), sinon None."""
+    if not info or info.get("source") != "card-chips":
+        return None
+    return token_inventory(" ".join(info.get("tokens") or []))
+
+
+def guard_crosscheck(guard_text: str | None, steps: str | None, chips: int | None) -> dict:
+    """Round 9 : les comptes de la carte mis côte à côte, pour les preuves seules (guard.json) : « Le Chirurgien :
+    N PII détectées », « N données masquées » du résumé des étapes (lu, jamais déplié : son texte, ses étapes, ses
+    secondes, son compte), le nombre de puces ; `pii_count_mismatch` quand deux comptes lus diffèrent."""
+    surgeon = re.search(r"chirurgien\s*:\s*(\d+)\s*PII", guard_text or "", re.I)
+    summary = None
+    if steps:
+        n_steps = re.search(r"(\d+)\s*[ée]tapes?", steps, re.I)
+        secs = re.search(r"(\d+(?:[.,]\d+)?)\s*s\b", steps)
+        masked = re.search(r"(\d+)\s*donn[ée]es?\s+masqu[ée]es?", steps, re.I)
+        summary = {"text": steps, "steps": int(n_steps.group(1)) if n_steps else None,
+                   "seconds": float(secs.group(1).replace(",", ".")) if secs else None,
+                   "masked": int(masked.group(1)) if masked else None}
+    counts = {"surgeon": int(surgeon.group(1)) if surgeon else None,
+              "steps_masked": (summary or {}).get("masked"), "chips": chips}
+    seen = {v for v in counts.values() if v is not None}
+    return {"steps_summary": summary, "pii_counts": counts, "pii_count_mismatch": len(seen) > 1}
+
+
+def chips_note(first: dict | None, mine: dict | None) -> str:
+    """Round 9 : les entités masquées des passages a et b lues sur les puces (types, numérotation repliée) :
+    « entités masquées identiques (puces) », ou « entités masquées différentes : +X −Y (puces) »."""
+    if (first or {}) == (mine or {}):
+        return "entités masquées identiques (puces)"
+    return "entités masquées différentes : " + type_delta(first or {}, mine or {}) + " (puces)"
 
 
 def signed_types(plus: dict, minus: dict) -> str:
@@ -3612,7 +3690,9 @@ class Recette:
             return info
         arg = {"assistant": SELECTORS["assistant_message"], "triggers": details_triggers(),
                "reveal": SELECTORS["pii_reveal"], "body": SELECTORS["answer_body"],
-               "content": SELECTORS["card_details_content"], "text": SELECTORS["sent_text"]}
+               "content": SELECTORS["card_details_content"], "text": SELECTORS["sent_text"],
+               "never": SELECTORS["card_never"], "section": SELECTORS["card_anonymized"],
+               "chip": SELECTORS["pii_chip"], "steps": SELECTORS["steps_summary"]}
         question, pii = turn.get("text", ""), turn.get("pii")
         t0, clicked, content = time.monotonic(), False, None
         try:
@@ -3621,8 +3701,13 @@ class Recette:
                 info.update(source=None, missing="card", rejected="pas de carte de réponse")
                 return info
             info.update(card={"selector": seen["card"], "index": seen["index"]},
-                        reveal_pressed={"true": True, "false": False}.get(seen["reveal"]))
+                        reveal_pressed={"true": True, "false": False}.get(seen["reveal"]),
+                        steps_text=seen.get("steps"), chip_count=len(chip_tokens(seen.get("chips"))) or None)
             if seen["trigger"] is None:
+                tokens = chip_tokens(seen.get("chips"))
+                if tokens:  # round 9: the card of 20/10 without a trigger: the tokens its chips name
+                    info.update(source="card-chips", missing="trigger", tokens=tokens, rejected=CHIPS_REJECTED)
+                    return info
                 info.update(source=None, missing="trigger", rejected="pas de bouton Détails sur la carte")
                 return info
             info.update(trigger=seen["trigger"], trigger_label=seen.get("label"))
@@ -3845,6 +3930,9 @@ class Recette:
                 sent_info["rejected"] = "le panneau « Détails » ne montre pas le texte de la question"
             if not sent_info.get("rejected"):
                 sent_to_model = sent_info["text"]
+        elif card is not None and card.get("source") == "card-chips":
+            # Round 9: no trigger, the chips name the masked tokens: before the popover, no sent text.
+            sent_info = {**card, "composer_popover": popover}
         else:
             # No « Détails » on the card: the composer popover, then the 13/10 panel (the fallback).
             sent_info = {**popover, **({"card": card} if card is not None else {})}
@@ -3858,6 +3946,8 @@ class Recette:
                     sent_info["popover_rejected"] = popover["rejected"]
                 sent_info["rejected"] = card["rejected"]
         sent_info["panel_text"] = panel
+        if card is not None and "steps_text" in card:  # round 9: the counts side by side, evidence only
+            guard.update(guard_crosscheck(guard.get("guard_text"), card.get("steps_text"), card.get("chip_count")))
         said = self._turn_notices(turn, page)  # round 2, leakage-1: every turn, answered or not
         errs = error_notices(said)
         notices = ({"errors": len(errs), "internal_error_shown": notices_internal(said, self._keep_names())}
@@ -4672,12 +4762,13 @@ class Recette:
         if "sent_info" in obs or "guard" in obs:  # a question was asked (E7)
             info = obs.get("sent_info") or {}
             seen = obs.get("sent_to_model") is not None
-            extra["sent_source"] = info.get("source") if seen else None
+            chips = chip_inventory(info)  # round 9: the card of 20/10, its chips
+            extra["sent_source"] = info.get("source") if seen or chips is not None else None
             if not seen:
                 extra["sent_rejected"] = (info.get("rejected") or info.get("popover_rejected")
                                           or ("pas de carte de réponse" if obs.get("new_answer") is False
                                               else "texte envoyé non observé"))
-            extra["sent_tokens"] = token_inventory(obs.get("sent_to_model"))
+            extra["sent_tokens"] = token_inventory(obs.get("sent_to_model")) if seen else chips
             extra["pii_declared"] = guard.get("pii_count")
         attach = obs.get("attach")
         if attach:
@@ -4731,10 +4822,14 @@ class Recette:
             a_sent = None  # not the text passage a's line was judged on
         ents_a = masked_entities(a_sent, (self.cases.get(case["replay_of"]) or {}).get("question"))
         ents_b = masked_entities(obs.get("sent_to_model"), case.get("question"))
+        b_chips = chip_inventory(obs.get("sent_info"))
         if ents_a is not None and ents_b is not None:
             note += " ; " + entity_note(ents_a, ents_b)
+        elif first.get("sent_source") == "card-chips" and b_chips is not None:  # round 9: both read on the chips
+            note += " ; " + chips_note(first.get("sent_tokens"), b_chips)
         elif "sent_tokens" in first:
-            note += " ; " + inventory_note(first["sent_tokens"], token_inventory(obs.get("sent_to_model")))
+            mine_tokens = token_inventory(obs.get("sent_to_model"))
+            note += " ; " + inventory_note(first["sent_tokens"], mine_tokens if mine_tokens is not None else b_chips)
         else:
             note += " ; types masqués non comparables (passage a journalisé sans ses jetons)"
         r["notes"].append(note)

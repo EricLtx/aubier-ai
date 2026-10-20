@@ -4426,5 +4426,142 @@ class FixRound8OnFixture(FixtureBench):
         self.assertIsNone(page.evaluate("() => sessionStorage.getItem('bench-anon-visits')"))
 
 
+
+class FixRound9Units(unittest.TestCase):
+    """Round 9: the answer card of 20/10, its two shapes; the pure readings."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.drv = load_driver()
+
+    def test_the_label_envoye_au_llm_is_stripped(self):
+        """Ruling 4: the panel seen live on 20/10 starts with « ENVOYÉ AU LLM », then the anonymised text."""
+        q = "Rédige une relance pour Hugo Bernard."
+        for raw in ("ENVOYÉ AU LLM\n\nRédige une relance pour <PERSON_1>.",
+                    "Envoyé au LLM : Rédige une relance pour <PERSON_1>."):
+            with self.subTest(raw=raw):
+                text, label = self.drv.details_text(raw, None, q)
+                self.assertEqual(text, "Rédige une relance pour <PERSON_1>.")
+                self.assertEqual(self.drv.evaluer.fold(label or "").strip(" :"), "envoye au llm")
+
+    def test_the_chips_give_the_tokens(self):
+        """Ruling 1(b): « Token anonymisé <TYPE_n> » → the tokens; anything else is not a token."""
+        labels = ["Token anonymisé <PHONE_1>", "Token anonymisé <PERSON_1>", "Token anonymisé <PHONE_2>",
+                  "Révéler les originaux", None, "Token anonymisé Hugo"]
+        tokens = self.drv.chip_tokens(labels)
+        self.assertEqual(tokens, ["<PHONE_1>", "<PERSON_1>", "<PHONE_2>"])
+        self.assertEqual(self.drv.token_inventory(" ".join(tokens)), {"PERSON": 1, "PHONE": 2})
+
+    def test_the_guard_counts_are_cross_checked(self):
+        """Rulings 2 and 3: the surgeon's count, the steps summary's (never expanded), the chips'; a mismatch in
+        the evidence only."""
+        g = self.drv.guard_crosscheck("Anonymisé · Dans vos documents → L'Aiguilleur : PASS · Le Chirurgien : "
+                                      "9 PII détectées", "8 étapes · 26.9s · 9 données masquées", 9)
+        self.assertEqual(g["steps_summary"], {"text": "8 étapes · 26.9s · 9 données masquées", "steps": 8,
+                                              "seconds": 26.9, "masked": 9})
+        self.assertEqual(g["pii_counts"], {"surgeon": 9, "steps_masked": 9, "chips": 9})
+        self.assertIs(g["pii_count_mismatch"], False)
+        g = self.drv.guard_crosscheck("Le Chirurgien : 9 PII détectées", "8 étapes · 26,9 s · 8 données masquées", None)
+        self.assertEqual((g["steps_summary"]["seconds"], g["pii_counts"]["steps_masked"]), (26.9, 8))
+        self.assertIs(g["pii_count_mismatch"], True)
+        g = self.drv.guard_crosscheck("Aucune donnée personnelle détectée", None, None)
+        self.assertEqual((g["steps_summary"], g["pii_count_mismatch"]), (None, False))
+
+    def test_the_chips_toggle_and_steps_summary_are_on_the_never_click_list(self):
+        never = self.drv.SELECTORS["card_never"]
+        for slot in ("pii-chip", "pii-reveal-toggle", "steps-summary"):
+            self.assertIn(f'[data-slot="{slot}"]', never)
+        sels = [t["css"] for t in self.drv.details_triggers()]
+        self.assertIn('section[data-slot="anonymized"] button[aria-controls]', sels)
+        self.assertTrue(any(t.get("controls") for t in self.drv.details_triggers()))
+
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class FixRound9OnFixture(FixtureBench):
+    """Round 9: the card of 20/10 on the bench (`card20=pasted|chips`): the trigger when there is one
+    (card-details), the chips' tokens when there is none (card-chips), the popover for a card without PII;
+    the chips, the reveal toggle and the steps summary never touched."""
+
+    IBAN = CardDetailsOnFixture.IBAN
+    SENT = CardDetailsOnFixture.SENT
+    iban_case = CardDetailsOnFixture.iban_case
+    TOUCHED_JS = "() => [window.__chip_touches, window.__reveal_clicks, window.__steps_clicks]"
+
+    def bench(self, shape):
+        drv, recette, A = self.make()
+        recette.entry = f"http://127.0.0.1:{self.port}/new?card20={shape}"
+        recette.open()
+        return drv, recette, A, recette.browser.page()
+
+    def test_a_pasted_message_reads_the_panel_through_its_trigger(self):
+        drv, recette, A, page = self.bench("pasted")
+        self.iban_case(recette, "r9-pasted")
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "poser_question", {"case": "r9-pasted"})
+        sent = self.evidence_json(ev, "sent.json")
+        self.assertEqual((sent["source"], sent["closed"]), ("card-details", True), sent)
+        self.assertEqual(sent["trigger_label"], "Voir le texte anonymisé envoyé au LLM")
+        self.assertEqual(sent["text"], self.SENT, "the label « ENVOYÉ AU LLM » kept apart")
+        self.assertEqual(sent["reveal_pressed"], False)
+        self.assertEqual(res["sent_source"], "card-details")
+        guard = self.evidence_json(ev, "guard.json")
+        self.assertEqual(guard["steps_summary"]["masked"], 1)
+        self.assertEqual(guard["pii_counts"], {"surgeon": 1, "steps_masked": 1, "chips": 1})
+        self.assertEqual(page.evaluate(self.TOUCHED_JS), [0, 0, 0])
+        res, _ = self.act(A, "verdict_oracle", {"case": "r9-pasted"})
+        self.assertEqual((res["verdict"], res["leaks"]), ("OK", []))
+
+    def test_an_attachment_card_without_trigger_gives_the_chips_tokens(self):
+        drv, recette, A, page = self.bench("chips")
+        self.iban_case(recette, "r9-a")
+        recette.cases["r9-b"] = {**recette.cases["r9-a"], "id": "r9-b", "replay_of": "r9-a"}
+        for cid in ("r9-a", "r9-b"):
+            self.act(A, "nouvelle_conversation")
+            res, ev = self.act(A, "poser_question", {"case": cid})
+            sent = self.evidence_json(ev, "sent.json")
+            self.assertEqual((sent["source"], sent["text"], sent.get("tokens")), ("card-chips", None, ["<IBAN_1>"]),
+                             sent)
+            self.assertEqual(sent["rejected"], "panneau du texte envoyé sans déclencheur (carte du 20/10) : "
+                                               "jetons lus sur les puces")
+            self.assertEqual(sent["reveal_pressed"], False)
+            self.assertEqual(res["sent_source"], "card-chips")
+            self.assertNotIn("sent_to_model", res)
+            guard = self.evidence_json(ev, "guard.json")
+            self.assertEqual(guard["steps_summary"]["text"], "8 étapes · 26.9s · 1 données masquées")
+            self.assertEqual(page.evaluate(self.TOUCHED_JS), [0, 0, 0], "chips, toggle, steps never touched")
+            self.assertEqual(page.locator('article [data-slot="pii-reveal-toggle"]').last.get_attribute("aria-pressed"),
+                             "false")
+            self.act(A, "verdict_oracle", {"case": cid})
+            line = journal_lines(recette.work)[-1]
+            self.assertEqual((line["sent_source"], line["sent_tokens"]), ("card-chips", {"IBAN": 1}))
+            self.assertEqual(line["sent_rejected"], sent["rejected"])
+            self.assertIn("texte envoyé non observé : fuite de PII non vérifiable", line["evidence"])
+        self.assertIn("passage a (r9-a) : ", line["evidence"])
+        self.assertIn("entités masquées identiques (puces)", line["evidence"])
+
+    def test_a_card_without_pii_falls_back_to_the_popover(self):
+        drv, recette, A, page = self.bench("chips")
+        self.message_case(recette, "r9-clean", "Bonjour, quelle heure est-il à Paris ?")
+        self.act(A, "nouvelle_conversation")
+        res, ev = self.act(A, "poser_question", {"case": "r9-clean"})
+        sent = self.evidence_json(ev, "sent.json")
+        self.assertNotEqual(sent.get("source"), "card-chips")
+        self.assertEqual((sent["card"]["missing"], sent["card"]["rejected"]),
+                         ("trigger", "pas de bouton Détails sur la carte"))
+        self.assertEqual(page.evaluate(self.TOUCHED_JS), [0, 0, 0])
+        self.assertEqual(self.evidence_json(ev, "guard.json")["pii_counts"]["steps_masked"], 0)
+
+    def test_a_card_of_18_10_without_chips_is_no_count_mismatch(self):
+        """A card with no chip (the 18/10 markup) has no chip count: never a mismatch against the surgeon's."""
+        drv, recette, A = self.make()
+        recette.open()
+        self.iban_case(recette, "r9-old")
+        self.act(A, "nouvelle_conversation")
+        _, ev = self.act(A, "poser_question", {"case": "r9-old"})
+        guard = self.evidence_json(ev, "guard.json")
+        self.assertEqual((guard["pii_counts"], guard["pii_count_mismatch"]),
+                         ({"surgeon": 1, "steps_masked": None, "chips": None}, False))
+
+
 if __name__ == "__main__":
     unittest.main()
