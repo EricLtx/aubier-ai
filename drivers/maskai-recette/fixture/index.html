@@ -38,6 +38,10 @@
   #palette, #rename-dialog, [role="alertdialog"] { position: fixed; top: 20%; left: 35%; width: 320px; background: #fff; border: 2px solid #333; padding: 12px; }
   [cmdk-item] { padding: 2px 6px; }
   [data-sonner-toaster] { position: fixed; bottom: 8px; right: 8px; list-style: none; }
+  #decoy { position: fixed; top: 60%; left: 35%; width: 300px; background: #fff; border: 2px solid #933; padding: 12px; }
+  .pin { display: inline-block; width: 12px; height: 12px; border: 1px solid #999; padding: 0; }
+  .conv-group { list-style: none; }
+  .conv-group h3 { font-size: 11px; margin: 4px 0; }
 </style>
 </head>
 <body>
@@ -82,7 +86,20 @@
      `accept` list. `window.__seed(title)` adds a conversation the driver did not create. The counters
      (`__menu_opens`, `__menu_picks`, `__renamed`, `__deleted`, `__palette_queries`, `__feedback_opens`,
      `__mic_clicks`, `__survey_sent`) let the tests prove what was, and was not, touched. `?nomic=1` draws
-     no dictation button. -->
+     no dictation button.
+     Fix round 1 of v2.3 (review I1–I7, m1–m15), the shapes that must never be pressed or taken: valued
+     flags `?menuitems=A,B` (the conversation menu's entries), `?searchentry=div|link` (the ⌘K entry as a
+     plain div, or as a link to /search), `?feedbacklabel=…` (the feedback button relabelled), `?confirmtext=…`
+     (the delete confirmation's text), `?canceltext=…` (its cancel button's text); boolean flags `kbdmic` (the dictation button carries a <kbd> hint),
+     `ratings` (👍/👎 « Positive/Negative feedback » on each answer card), `menunames` (menu entries name the
+     conversation), `grouped` (rows in a headed group whose own menu deletes the whole group; rows have no
+     trigger), `noconfirm`, `decoydialog` (opening a menu shows an unrelated « Supprimer cette
+     conversation ? » dialog), `staledelete` (a confirmed delete leaves the row listed), `convonupload` (the
+     upload creates the conversation), `renamenofield` (« Renommer » opens no field), `filterfield` (a
+     « Filtrer… » field in the sidebar), `pinbutton` (a « Pin action » button inside each row's link),
+     `rowlabels` (each row's menu button shown without hover and labelled « Options de « <its title> » »). The
+     counters `__rating_clicks`, `__decoy_confirms`, `__pin_clicks`, `__group_menu_opens`, `__filter_value`
+     say what was touched. -->
 <aside data-slot="sidebar">
   <nav aria-label="Main navigation">
     <a href="/new" data-slot="button" aria-label="Nouvelle conversation">Nouvelle conversation</a>
@@ -160,6 +177,15 @@
   <button type="button" id="delete-confirm">Supprimer</button>
 </div>
 <ol data-sonner-toaster id="toaster"></ol>
+<div id="decoy" role="dialog" hidden>
+  <p>Supprimer cette conversation ?</p>
+  <button type="button" id="decoy-cancel">Annuler</button>
+  <button type="button" id="decoy-confirm">Supprimer</button>
+</div>
+<div id="group-menu" role="menu" data-slot="dropdown-menu-content" hidden>
+  <div role="menuitem" data-action="rename-group">Renommer le dossier</div>
+  <div role="menuitem" data-action="delete-group">Supprimer tous les chats du dossier</div>
+</div>
 <script>
 "use strict";
 const MODELS = [
@@ -181,9 +207,49 @@ Object.assign(window, { __menu_opens: [], __menu_picks: [], __renamed: {}, __del
                         __palette_queries: [], __feedback_opens: 0, __mic_clicks: 0, __survey_sent: 0 });
 // ?nodetails=1, ?revealed=1, ?controls=1, ?nostructure=1, and since v2.3 ?renamedialog=1, ?nokbd=1,
 // ?nomic=1: kept in sessionStorage, the page pushes /conversation/<id> URLs that drop the query.
-for (const k of ["nodetails", "revealed", "controls", "nostructure", "renamedialog", "nokbd", "nomic"]) {
+for (const k of ["nodetails", "revealed", "controls", "nostructure", "renamedialog", "nokbd", "nomic",
+                 "kbdmic", "ratings", "menunames", "grouped", "noconfirm", "decoydialog", "staledelete",
+                 "convonupload", "renamenofield", "filterfield", "pinbutton", "rowlabels"]) {
   if (new URLSearchParams(location.search).get(k) === "1") sessionStorage.setItem("bench-" + k, "1");
 }
+for (const k of ["menuitems", "searchentry", "feedbacklabel", "confirmtext", "canceltext"]) {  // valued flags
+  const v = new URLSearchParams(location.search).get(k);
+  if (v !== null) sessionStorage.setItem("bench-" + k, v);
+}
+const flag = (k) => sessionStorage.getItem("bench-" + k) === "1";
+const value = (k) => sessionStorage.getItem("bench-" + k);
+Object.assign(window, { __rating_clicks: 0, __decoy_confirms: 0, __pin_clicks: 0, __group_menu_opens: 0,
+                        __group_picks: [], __filter_value: null });
+const SEARCHENTRY = value("searchentry");
+if (SEARCHENTRY === "div" || SEARCHENTRY === "link") {  // the ⌘K entry as a plain div, or as a link
+  const entry = document.createElement(SEARCHENTRY === "div" ? "div" : "a");
+  if (SEARCHENTRY === "link") entry.href = "/search";
+  entry.id = "search-entry";
+  entry.innerHTML = "Search conversations <kbd>⌘K</kbd>";
+  $("search-entry").replaceWith(entry);
+}
+if (flag("filterfield")) {  // a field of the sidebar that is no rename field and no search field
+  const field = document.createElement("input");
+  field.type = "text";
+  field.id = "filter";
+  field.placeholder = "Filtrer…";
+  field.addEventListener("input", () => { window.__filter_value = field.value; });
+  $("search-entry").after(field);
+}
+if (value("feedbacklabel")) $("feedback").setAttribute("aria-label", value("feedbacklabel"));
+if (value("confirmtext")) $("confirm-delete").querySelector("p").textContent = value("confirmtext");
+if (value("canceltext")) $("delete-cancel").textContent = value("canceltext");
+if (value("menuitems")) {  // the conversation menu's own entries
+  $("conv-menu").innerHTML = "";
+  for (const label of value("menuitems").split(",")) {
+    const it = document.createElement("div");
+    it.setAttribute("role", "menuitem");
+    it.dataset.action = /renomm|rename/i.test(label) ? "rename" : /suppr|delete/i.test(label) ? "delete" : "share";
+    it.textContent = label;
+    $("conv-menu").appendChild(it);
+  }
+}
+for (const it of $("conv-menu").querySelectorAll("[role=menuitem]")) it.dataset.base = it.textContent;
 const NODETAILS = sessionStorage.getItem("bench-nodetails") === "1";
 const REVEALED = sessionStorage.getItem("bench-revealed") === "1";
 const CONTROLS = sessionStorage.getItem("bench-controls") === "1";
@@ -192,6 +258,7 @@ const RENAMEDIALOG = sessionStorage.getItem("bench-renamedialog") === "1";
 const NOKBD = sessionStorage.getItem("bench-nokbd") === "1";
 if (sessionStorage.getItem("bench-nomic") === "1") $("mic").remove();
 else $("mic").onclick = () => { window.__mic_clicks += 1; };
+if (flag("kbdmic") && $("mic")) $("mic").insertAdjacentHTML("beforeend", "<kbd>⌘D</kbd>");
 
 if (!localStorage.getItem("cookies-ok")) $("cookies").hidden = false;
 $("accept").onclick = () => { localStorage.setItem("cookies-ok", "1"); $("cookies").hidden = true; };
@@ -293,6 +360,7 @@ document.addEventListener("keydown", (e) => {
   if (!$("palette").hidden) closePalette();
   if (!$("confirm-delete").hidden) closeConfirm();
   if (!$("rename-dialog").hidden) closeRenameDialog();
+  if (!$("decoy").hidden) $("decoy").hidden = true;
 });
 
 // -- attachments: a chip per file, uploading → indexing → ready (or failed) -------------
@@ -306,6 +374,11 @@ $("file").addEventListener("change", (e) => {
 });
 const SPIN = '<svg class="animate-spin" viewBox="0 0 10 10" aria-hidden="true"><circle cx="5" cy="5" r="4" fill="none" stroke="#666"/></svg>';
 function attach(name) {
+  if (flag("convonupload") && !state.conversation) {  // the upload creates the conversation (m13)
+    state.conversation = "c" + (++state.count) + "-" + Date.now();
+    history.pushState({}, "", "/conversation/" + state.conversation);
+    addConversation(state.conversation, name.slice(0, 40));
+  }
   const chip = { name, state: "uploading", el: document.createElement("div") };
   chip.el.className = "flex items-center gap-1 rounded-md border px-2";
   const status = (html) => {
@@ -383,13 +456,60 @@ function addConversation(id, title) {
   t.className = "conv-menu";
   t.setAttribute("aria-haspopup", "menu");
   t.setAttribute("aria-expanded", "false");
-  t.setAttribute("aria-label", "Options");
+  t.setAttribute("aria-label", flag("rowlabels") ? "Options de « " + title + " »" : "Options");
+  if (flag("rowlabels")) t.style.display = "inline-block";  // shown without hover, as some sidebars do
   t.textContent = "⋯";
   t.onclick = (e) => { e.stopPropagation(); openMenu(li, t); };
+  if (flag("pinbutton")) {  // a row button that is no menu (m15)
+    const pin = document.createElement("button");
+    pin.type = "button";
+    pin.className = "pin";
+    pin.setAttribute("aria-label", "Pin action");
+    pin.onclick = (e) => { e.preventDefault(); e.stopPropagation(); window.__pin_clicks += 1; };
+    a.appendChild(pin);
+  }
+  if (flag("grouped")) {  // a row without a trigger, in a headed group that has its own menu (I7)
+    li.append(a);
+    groupList().prepend(li);
+    return li;
+  }
   li.append(a, t);
   $("conversations").prepend(li);
   return li;
 }
+function groupList() {
+  let g = document.querySelector("#conversations .conv-group");
+  if (!g) {
+    g = document.createElement("li");
+    g.className = "conv-group";
+    g.innerHTML = "<h3>Aujourd'hui</h3><button type=\"button\" class=\"group-menu\" aria-haspopup=\"menu\" "
+      + "aria-expanded=\"false\" aria-label=\"Options du dossier\">⋯</button><ul class=\"group-list\"></ul>";
+    g.querySelector(".group-menu").onclick = (e) => { e.stopPropagation(); openGroupMenu(g, e.currentTarget); };
+    $("conversations").prepend(g);
+  }
+  return g.querySelector(".group-list");
+}
+let groupFor = null;
+function openGroupMenu(g, trigger) {
+  closeMenu();
+  groupFor = g;
+  window.__group_menu_opens += 1;
+  trigger.setAttribute("aria-expanded", "true");
+  trigger.setAttribute("aria-controls", "group-menu");
+  $("group-menu").hidden = false;
+}
+for (const item of $("group-menu").querySelectorAll("[role=menuitem]")) item.onclick = () => {
+  const g = groupFor;
+  closeMenu();
+  if (!g) return;
+  window.__group_picks.push(item.dataset.action);
+  if (item.dataset.action === "delete-group") {
+    $("confirm-delete").querySelector("p").textContent = "Supprimer tous les chats du dossier ?";
+    openConfirm(g);
+  }
+};
+$("decoy-cancel").onclick = () => { $("decoy").hidden = true; };
+$("decoy-confirm").onclick = () => { window.__decoy_confirms += 1; $("decoy").hidden = true; };
 window.__seed = (title) => {  // a conversation the driver did not create (the founder's, say)
   const id = "seed" + (++seedCount) + "-" + Date.now();
   addConversation(id, title);
@@ -401,21 +521,28 @@ function openMenu(li, trigger) {
   window.__menu_opens.push(li.dataset.id);
   trigger.setAttribute("aria-expanded", "true");
   trigger.setAttribute("aria-controls", "conv-menu");
+  if (flag("menunames")) for (const it of $("conv-menu").querySelectorAll("[role=menuitem]"))
+    it.textContent = it.dataset.base + " « " + li.querySelector("a").textContent + " »";
   $("conv-menu").hidden = false;
+  if (flag("decoydialog")) $("decoy").hidden = false;  // an unrelated dialog, open before any delete click (m1)
 }
 function closeMenu() {
   $("conv-menu").hidden = true;
-  for (const t of document.querySelectorAll(".conv-menu")) { t.setAttribute("aria-expanded", "false"); t.removeAttribute("aria-controls"); }
+  $("group-menu").hidden = true;
+  for (const t of document.querySelectorAll(".conv-menu, .group-menu")) { t.setAttribute("aria-expanded", "false"); t.removeAttribute("aria-controls"); }
 }
 for (const item of $("conv-menu").querySelectorAll("[role=menuitem]")) item.onclick = () => {
   const li = menuFor, action = item.dataset.action;
   closeMenu();
   if (!li) return;
   window.__menu_picks.push([li.dataset.id, action]);
-  if (action === "rename") (RENAMEDIALOG ? openRenameDialog : renameInline)(li);
-  if (action === "delete") openConfirm(li);
+  if (action === "rename" && !flag("renamenofield")) (RENAMEDIALOG ? openRenameDialog : renameInline)(li);
+  if (action === "delete" && !flag("noconfirm")) openConfirm(li);
 };
-document.addEventListener("click", (e) => { if (!$("conv-menu").hidden && !$("conv-menu").contains(e.target)) closeMenu(); });
+document.addEventListener("click", (e) => {
+  if ((!$("conv-menu").hidden && !$("conv-menu").contains(e.target))
+      || (!$("group-menu").hidden && !$("group-menu").contains(e.target))) closeMenu();
+});
 function rename(li, title) {
   li.querySelector("a").textContent = title;
   window.__renamed[li.dataset.id] = title;
@@ -454,7 +581,13 @@ $("delete-confirm").onclick = () => {
   const li = deleting;
   closeConfirm();
   if (!li) return;
+  if (li.classList.contains("conv-group")) {  // the whole group, every row in it
+    for (const row of li.querySelectorAll(".conv-item")) window.__deleted.push(row.dataset.id);
+    li.remove();
+    return;
+  }
   window.__deleted.push(li.dataset.id);
+  if (flag("staledelete")) return;  // deleted, yet still listed (a stale sidebar, m2)
   li.remove();
   if (state.conversation === li.dataset.id) {  // the page showed it: back to a new conversation
     state.conversation = null;
@@ -492,7 +625,7 @@ $("palette").querySelector("[cmdk-input]").addEventListener("input", (e) => {
   clearTimeout(paletteTimer);
   paletteTimer = setTimeout(() => renderPalette(q), 300);  // a debounced search
 });
-$("search-entry").onclick = openPalette;
+if (SEARCHENTRY !== "link") $("search-entry").onclick = openPalette;
 document.addEventListener("keydown", (e) => {
   if (NOKBD || !(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "k") return;
   e.preventDefault();
@@ -572,6 +705,13 @@ function addAnswer(tokens, model) {
   body.className = "pl-6";
   body.innerHTML = '<div class="prose-llm"></div>';
   art.append(...parts, banner, body);
+  if (flag("ratings")) {  // 👍/👎 on the card: a click is a submission (I5)
+    const rate = document.createElement("div");
+    rate.innerHTML = '<button type="button" aria-label="Positive feedback">👍</button>'
+      + '<button type="button" aria-label="Negative feedback">👎</button>';
+    for (const b of rate.querySelectorAll("button")) b.onclick = () => { window.__rating_clicks += 1; };
+    art.append(rate);
+  }
   $("messages").appendChild(art);
   return art;
 }
@@ -606,11 +746,13 @@ function typewriter(el) {
 async function send() {
   const text = state.text;
   if (!text.trim() || state.generating) return;
-  if (!state.conversation) {
+  const nocreate = /NOCREATE/.test(text);  // nothing created, while another row shows up (I6)
+  if (!state.conversation && !nocreate) {
     state.conversation = "c" + (++state.count) + "-" + Date.now();
     history.pushState({}, "", "/conversation/" + state.conversation);
     addConversation(state.conversation, text.trim().slice(0, 40));
   }
+  if (nocreate) setTimeout(() => window.__seed("Ancienne conversation du fondateur"), 200);
   addUser(text);
   $("prompt").value = "";
   state.text = "";

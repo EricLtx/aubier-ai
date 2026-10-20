@@ -35,7 +35,11 @@ words in the request body:
                   status line under the composer and shows a toast (the night of
                   18–19/10: 12 of 14 models answered nothing after detect_pii);
   SILENT_502      the stream request answers HTTP 502 with a plain-text body that
-                  names an internal host; no card, a status line.
+                  names an internal host; no card, a status line;
+  ANSWER_TRACE    (fix round 1, m11) the answer itself ends with an internal error:
+                  a Python stack frame and a host name;
+  NOCREATE        (page side only) the page creates no conversation for that
+                  message, while another row shows up in the sidebar.
 
 The page side (index.html) draws each answer behind the stream and ends about
 1.5 s after the server; shows the « Votre avis » survey after a generation left
@@ -200,6 +204,9 @@ class Handler(BaseHTTPRequestHandler):
                   + " — pièces jointes : " + (", ".join(attachments) or "aucune"))
         if "EXTERNAL_IMG" in body:
             answer += ' <img src="http://example.invalid/x" alt="x">'
+        if "ANSWER_TRACE" in body:
+            answer += (' Traceback (most recent call last): File "/srv/maskai/answer/render.py", line 7, in run '
+                       'psycopg2.OperationalError: could not translate host name "db-answer.internal" to address')
         if "BODY_DETAILS" in body:
             answer += (' <button type="button" onclick="window.__body_clicks = (window.__body_clicks || 0) + 1">'
                        "Détails</button>")

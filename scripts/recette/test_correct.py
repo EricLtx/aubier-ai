@@ -59,15 +59,18 @@ class CorrectTest(unittest.TestCase):
             recette.actions()["verdict_oracle"]({"case": cid}, evidence)
         recette.observations["N7-1"] = {"verdict": {"verdict": "OK"}, "from": "@list"}  # pilot v2.2: no snapshot
         # 18/10, M3: a banner without provider (« maskai claude-haiku-4-5 ») the driver of then did not read
+        recette.observations["N3-1"] = {"answer": "Canberra, depuis 1913.", "timing_s": 2.0}
         recette.observations["M3-B1"] = {
             "answer": "Canberra, depuis 1913.", "timing_s": 4.0, "new_answer": True,
             "guard": {"model": None, "header": "Aucune donnée personnelle détectée L'Aiguilleur : PASS maskai "
                                                "claude-haiku-4-5"},
             "composer": {"model": "claude-haiku-4-5", "web": "off"}}
         recette._save_observations()
-        with open(self.journal, "a", encoding="utf-8") as f:  # lines 3 and 4
+        with open(self.journal, "a", encoding="utf-8") as f:  # lines 3, 4 and 5
             f.write(hand_line("N7-1", "OK", "valeurs attendues présentes"))
             f.write(hand_line("M3-B1", "KO", "réponse signée « sans bannière », modèle choisi « claude-haiku-4-5 »"))
+            # the same verdict and NFR as today's judgement, another evidence (m8)
+            f.write(hand_line("N3-1", "OK", "une preuve d'hier", nfr=["veracite"], timing_s=2.0))
 
     def bytes(self) -> bytes:
         with open(self.journal, "rb") as f:
@@ -102,7 +105,7 @@ class CorrectTest(unittest.TestCase):
         items, code = self.run_quiet(["N1-1", "N3-2"], write=True)
         self.assertEqual(code, 0)
         lines = self.lines()
-        self.assertEqual(len(lines), 6, "one line, for the one case that changes")
+        self.assertEqual(len(lines), 7, "one line, for the one case that changes")
         new = lines[-1]
         self.assertEqual((new["step"], new["case"], new["verdict"], new["supersedes"]), ("correction", "N1-1", "OK", 0))
         self.assertEqual(new["reason"], "oracle de N1-1 corrigé le 19/10")
@@ -115,8 +118,8 @@ class CorrectTest(unittest.TestCase):
         # Again: the correction is in force now, nothing more to write.
         items, _ = self.run_quiet(["N1-1"], write=True)
         self.assertTrue(items[0]["status"].startswith("inchangé"))
-        self.assertEqual(items[0]["supersedes"], 5, "the line in force is the correction")
-        self.assertEqual(len(self.lines()), 6)
+        self.assertEqual(items[0]["supersedes"], 6, "the line in force is the correction")
+        self.assertEqual(len(self.lines()), 7)
 
     def test_the_stored_header_is_read_again_with_the_rules_of_today_on_request(self):
         """The 18/10 correction of M3: without --reread-header the stored observation is judged as it is
@@ -136,6 +139,29 @@ class CorrectTest(unittest.TestCase):
                          ("M3-B1", "OK", 4, "claude-haiku-4-5"))
         with open(observations, "rb") as f:
             self.assertEqual(f.read(), before, "the observations are never written")
+
+    def test_m8_an_evidence_only_change_is_written_only_on_request(self):
+        """m8: N3-1's line differs from today's judgement by its evidence alone: no correction by default
+        (every replayed b-passage would get one), one with `evidence=True` (--evidence)."""
+        items, _ = self.run_quiet(["N3-1"], write=True)
+        self.assertTrue(items[0]["status"].startswith("inchangé"), items[0]["status"])
+        self.assertEqual(len(self.lines()), 6)
+        items, code = self.correct.run(self.work, ["N3-1"], "preuve réécrite", write_lines=True, out=io.StringIO(),
+                                       evidence=True)
+        self.assertEqual((code, items[0]["status"]), (0, "à corriger"))
+        self.assertEqual((self.lines()[-1]["case"], self.lines()[-1]["supersedes"]), ("N3-1", 5))
+
+    def test_m8_observations_set_aside_at_a_resumption_still_replay(self):
+        """m8: a resumption sets observations.json aside (runbook §12): the cases journaled before it replay
+        from that file (`observations=`, --observations), and the error says so."""
+        observations = os.path.join(self.work, "observations.json")
+        aside = os.path.join(self.work, "observations-essai1.json")
+        os.replace(observations, aside)
+        items, code = self.run_quiet(["N1-1"])
+        self.assertEqual(code, 1)
+        self.assertIn("--observations", items[0]["status"])
+        items, code = self.correct.run(self.work, ["N1-1"], "reprise", out=io.StringIO(), observations=aside)
+        self.assertEqual((code, items[0]["status"], items[0]["line"]["verdict"]), (0, "à corriger", "OK"))
 
     def test_the_command_line(self):
         before = self.bytes()

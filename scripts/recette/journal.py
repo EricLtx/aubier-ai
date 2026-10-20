@@ -81,8 +81,8 @@ def stats(events: list[dict]) -> str:
     by_verdict: dict[str, int] = {}
     by_nfr: dict[str, dict[str, int]] = {}
     pipeline: dict[str, list[int]] = {}
-    for e in ev:
-        if e.get("step") != "exec":
+    for e in ev:  # the lines in force: an exec line, or the correction that replaced one (review of v2.3, m9)
+        if e.get("step") not in ("exec", "correction"):
             continue
         by_verdict[e.get("verdict", "?")] = by_verdict.get(e.get("verdict", "?"), 0) + 1
         for n in e.get("nfr", []):
@@ -90,7 +90,8 @@ def stats(events: list[dict]) -> str:
             by_nfr[n][e.get("verdict", "?")] = by_nfr[n].get(e.get("verdict", "?"), 0) + 1
         for k, v in (e.get("pipeline_ms") or {}).items():
             pipeline.setdefault(k, []).append(v)
-    lines = ["Verdicts (étape exec) : " + ", ".join(f"{k} {v}" for k, v in sorted(by_verdict.items()))]
+    lines = ["Verdicts (lignes en vigueur, exec et correction) : "
+             + ", ".join(f"{k} {v}" for k, v in sorted(by_verdict.items()))]
     for n in NFR:
         if n in by_nfr:
             lines.append(f"  {n:<14} " + ", ".join(f"{k} {v}" for k, v in sorted(by_nfr[n].items())))

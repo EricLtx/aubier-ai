@@ -107,6 +107,27 @@ PROCEDURE-3.md §6, E1 à E11) :
   verdict_oracle, que `scripts/recette/correct.py` rejoue hors ligne pour écrire les lignes de
   correction.
 
+Ce que la revue de la v2.3 durcit (20/10, avant le passage réel ; I1 à I7, m1 à m15 ; PROCEDURE-3 §6) :
+- une entrée que le driver n'identifie pas n'est jamais cliquée : la recherche par une entrée de la
+  barre latérale dont le texte ou le libellé dit « search » ou « recherch » (jamais le bouton de
+  dictée, le compositeur ni une carte), « Votre avis » par ses libellés exacts ; sinon refus
+  `precondition` avant tout clic, sans observation, qui nomme les candidats vus ;
+- le registre n'admet qu'une conversation dont la page a pris l'adresse, absente de la barre
+  latérale avant la question ou le téléversement ; jamais une ligne apparue dans la barre latérale ;
+- le menu d'une conversation : un déclencheur qui annonce un menu (`aria-haspopup`), jamais au-dessus
+  de la ligne dans un groupe titré ; des entrées en liste blanche sur leur texte entier, seules de
+  leur sorte, aucune qui vise plusieurs conversations ; le champ du titre et la confirmation apparus
+  après le clic ; une confirmation qui parle de supprimer une conversation, sinon Échap ;
+  « suppression confirmée » notée au registre dès son clic, jamais refait ;
+- M8-5 et M8-6 se jugent sur l'état de leur conversation, relu à son adresse (« titre relu « … » »,
+  « plus listée »), jamais sur la liste entière ; une observation faite pour un cas ne juge que lui ;
+- `internal_error_shown` sur la ligne, dans `attach` et dans les résultats : une erreur interne
+  montrée à l'utilisateur (ligne d'état, alerte, toast, puce, réponse) ; l'extrait expurgé quitte la
+  ligne pour `failure.json`, et l'expurgation prend aussi l'hôte qui suit ENOTFOUND, lookup, connect
+  to, host… et un `nom:port` nu ;
+- la note `replay_of` compare les entités masquées des deux textes envoyés (leurs types seuls dans la
+  note), à défaut leurs types (« types masqués … »).
+
 Environnement (posé par l'hôte) : VK_DRIVER_PROFILE_DIR, VK_DRIVER_WORK_DIR,
 VK_DRIVER_HEADLESS, VK_DRIVER_CHANNEL, VK_DRIVER_HOSTS ; MASKAI_ENTRY_URL
 remplace `ENTRY_URL` (le banc d'essai sur un autre port).
@@ -122,6 +143,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -328,9 +350,14 @@ SELECTORS = {
     "conversation_path": r"^/conversation/[^/?#]+$",
     # L'entrée de la recherche ⌘K en tête de la barre latérale (vue le 18/10 : « Search conversations »
     # et l'indice ⌘K ; balisage à confirmer). La recherche s'ouvre d'abord au clavier (ControlOrMeta+K),
-    # par cette entrée en secours (Playwright).
+    # par cette entrée en secours (Playwright), et seulement par un candidat identifié (revue de la v2.3,
+    # I4) : dans la barre latérale, hors carte de réponse et compositeur, jamais le bouton de dictée, son
+    # texte ou son libellé suivant `search_words` ; aria-keyshortcuts seulement au jeton exact.
     "search_entry": ['button:has-text("Search conversations")', '[role="button"]:has-text("Search conversations")',
-                     'button:has-text("Rechercher")', '[aria-keyshortcuts*="k" i]', 'button:has(kbd)'],
+                     'a:has-text("Search conversations")', 'button:has-text("Rechercher")',
+                     '[role="button"]:has-text("Rechercher")', '[aria-keyshortcuts~="Control+K" i]',
+                     '[aria-keyshortcuts~="Meta+K" i]'],
+    "search_words": r"search|recherch",
     # La palette de recherche, attendue en cmdk comme la liste des modèles (à confirmer) : son champ, ses
     # résultats et son état vide, cherchés dans la palette seule (CSS).
     "search_input": ['[cmdk-input]', '[role="dialog"] input[role="combobox"]', '[role="dialog"] input[type="search"]',
@@ -338,15 +365,18 @@ SELECTORS = {
     "search_result": ['[cmdk-item]', '[role="option"]', 'a[href*="/conversation/"]'],
     "search_empty": '[cmdk-empty]',
     # Le menu d'une conversation de la barre latérale (jamais lu ; à confirmer par sonder_interface) : son
-    # déclencheur, cherché dans l'élément de cette conversation seule et révélé au survol ; le menu et ses
-    # entrées (CSS), retenues par leur texte (motifs, sur le texte replié).
-    "conversation_menu_trigger": ['button[aria-haspopup="menu"]', '[data-slot*="menu-trigger"]',
-                                  'button[aria-label*="option" i]', 'button[aria-label*="menu" i]',
-                                  'button[aria-label*="action" i]'],
+    # déclencheur, cherché dans l'élément de cette conversation seule et révélé au survol ; seulement un
+    # bouton qui annonce un menu (aria-haspopup, revue I4 et m15 : aucun bouton deviné par son libellé),
+    # chaque sélecteur à tous les niveaux avant le suivant ; au-dessus de la ligne, jamais dans un élément
+    # qui porte un titre de groupe (`group_heading`, I7). Le menu et ses entrées (CSS) ; les entrées
+    # cliquées sont celles des listes blanches (motifs sur le texte replié entier, I7).
+    "conversation_menu_trigger": ['button[aria-haspopup="menu"]', '[role="button"][aria-haspopup="menu"]',
+                                  '[data-slot*="menu-trigger"][aria-haspopup="menu"]', 'button[aria-haspopup="true"]'],
+    "group_heading": 'h1, h2, h3, h4, h5, h6, [role="heading"]',
     "menu": '[role="menu"]',
     "menu_item": '[role="menuitem"]',
-    "menu_rename": r"renommer|rename",
-    "menu_delete": r"supprimer|delete",
+    "menu_rename": r"^(?:renommer|rename)(?: (?:la |cette |this )?(?:conversation|discussion|chat))?$",
+    "menu_delete": r"^(?:supprimer|delete)(?: (?:la |cette |this )?(?:conversation|discussion|chat))?$",
     # Le champ du nouveau titre après « Renommer » (à confirmer) : l'élément qui a pris le focus, sinon un
     # champ texte de la barre latérale ou d'une fenêtre (CSS) ; jamais la zone de saisie du compositeur ni
     # un champ de recherche. Le bouton qui valide une fenêtre de renommage, par son texte (motif).
@@ -354,9 +384,13 @@ SELECTORS = {
                      '[role="dialog"] input:not([type])', 'aside [contenteditable="true"]'],
     "rename_submit": r"enregistrer|save|renommer|rename|valider|confirmer|confirm",
     # L'entrée de « Votre avis » (vue le 18/10 : button[aria-label="Send feedback"], fixé en bas à gauche) ;
-    # les suivantes à confirmer (Playwright).
-    "feedback_entry": ['button[aria-label="Send feedback"]', 'button[aria-label*="feedback" i]',
-                       'button[aria-label*="avis" i]', 'button:has-text("Votre avis")', 'button:has-text("Feedback")'],
+    # les suivantes à confirmer. Seulement un libellé exact (revue I5 : aucun bouton deviné, jamais une note
+    # 👍/👎 d'une carte), hors carte de réponse et compositeur ; sinon ouvrir_avis refuse `precondition`,
+    # avant tout clic, en nommant ce qu'il a vu (CSS).
+    "feedback_entry": ['button[aria-label="Send feedback"]', 'button[aria-label="Votre avis"]',
+                       'button[aria-label="Envoyer un avis"]', 'button[aria-label="Donner votre avis"]',
+                       'button[aria-label="Donnez votre avis"]'],
+    "feedback_words": r"feedback|avis|retour",
     # Ce que dit la page quand une question reste sans réponse (E10) : la ligne d'état sous le compositeur
     # (vue le 18/10 : #chat-input-status, role="status", aria-live="polite"), les alertes et les toasts
     # (à confirmer) (CSS).
@@ -368,7 +402,8 @@ SELECTORS = {
 SELECTOR_PATTERNS = ("stop_text", "model_banner", "brand_model", "brand", "live_marker", "guard_pii", "guard_clean",
                      "mask_token", "attach_failed", "attach_uploading", "attach_pending", "attach_ready",
                      "details_label", "sent_label", "model_prefix", "web_words", "maintenance", "auth_error",
-                     "conversation_path", "menu_rename", "menu_delete", "rename_submit")
+                     "conversation_path", "menu_rename", "menu_delete", "rename_submit", "search_words",
+                     "feedback_words")
 # Modales connues : reconnues par leur sélecteur et fermées par leur bouton documenté (ou une touche,
 # « key:<touche> »), jamais par « OK » ni « Envoyer ». Une modale `own` est une fenêtre que le
 # driver ouvre lui-même : connue seulement quand c'est lui qui l'a ouverte ; ouverte par quelqu'un
@@ -403,6 +438,9 @@ KNOWN_MODALS = [
     {"name": "suppression", "selector": '[role="alertdialog"]', "dismiss": "key:Escape",
      "confirm": r"supprimer|delete|confirmer|confirm", "own": True},
 ]
+# Les états d'une conversation du registre sur laquelle plus rien ne se clique : supprimée, ou dont la
+# confirmation de suppression a été cliquée (revue de la v2.3, m2 : jamais deux fois).
+GONE_STATES = ("supprimée", "suppression confirmée")
 # Motif de l'URL du flux de réponse (annexe A) : /api/chat/stream chez MaskAI.
 STREAM_PATTERN = r"chat/stream"
 
@@ -872,15 +910,19 @@ _ITEM_FIND = r"""
     return { anchor, scope, count: mine.length, all };
   };
   const triggerNear = (anchor, scope) => {
-    let level = 0;
-    for (let node = anchor; node; node = node.parentElement, level++) {
-      for (const s of a.triggers || []) {
+    // each selector at every level before the next one (the most precise first, m15); from the link up
+    // to `scope`; above the row (level 2 and more), never in an element that holds a group heading: a
+    // trigger there is the group's, never the conversation's (I7)
+    for (const s of a.triggers || []) {
+      let level = 0;
+      for (let node = anchor; node; node = node.parentElement, level++) {
+        if (level >= 2 && a.headings && node.querySelector(a.headings)) break;
         let els = [];
-        try { els = [...node.querySelectorAll(s)]; } catch (e) { continue; }
+        try { els = [...node.querySelectorAll(s)]; } catch (e) { break; }
         const el = els.find(visible);
         if (el) return { el, sel: s, level };
+        if (node === scope) break;
       }
-      if (node === scope) break;
     }
     return null;
   };"""
@@ -947,13 +989,28 @@ _MENU_FIND = r"""
     return menu ? { menu, how } : null;
   };"""
 
-MENU_JS = "(a) => {" + _VISIBLE + _MENU_FIND + r"""
+MENU_JS = "(a) => {" + _VISIBLE + _MENU_FIND + _ITEM_FIND + r"""
   const f = findMenu(a);
   if (!f) return null;
-  const items = [...f.menu.querySelectorAll(a.item)].map((el, i) => ({ index: i, text: fold(el.innerText || el.textContent).slice(0, 80),
-      label: (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80),
-      disabled: el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('data-disabled') }));
-  return { how: f.how, id: f.menu.id || null, items, html: (f.menu.outerHTML || '').slice(0, 5000) };
+  // `redactHref` (the probe, on a conversation the run did not create): the menu keeps no word of its
+  // title, in its entries as in its HTML (m10): the whole title, then its first twelve characters, each
+  // in one pass (a loop over what was left never ended on a title « … » in entries that hold « … »)
+  let title = null;
+  if (a.redactHref) { const it = findItem(a.redactHref); title = it ? textOf(it.anchor) : null; }
+  const keyRe = title ? new RegExp(title.slice(0, 12).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi') : null;
+  const scrub = (s) => (title && s) ? s.split(title).join('…').replace(keyRe, '…') : s;
+  const items = [...f.menu.querySelectorAll(a.item)].map((el, i) => {
+    const label = scrub((el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')).slice(0, 80);
+    return { index: i, text: fold(label).slice(0, 80), label,
+             disabled: el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('data-disabled') };
+  });
+  let html = f.menu.cloneNode(true);
+  if (title) {
+    const walker = document.createTreeWalker(html, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) n.nodeValue = scrub(n.nodeValue);
+    for (const x of [html, ...html.querySelectorAll('*')]) for (const at of [...x.attributes]) x.setAttribute(at.name, scrub(at.value));
+  }
+  return { how: f.how, id: f.menu.id || null, items, html: (html.outerHTML || '').slice(0, 5000) };
 }"""
 
 # L'entrée du menu à cliquer : la seule, active, dont le texte replié suit a.pattern ; aucune sinon.
@@ -968,11 +1025,59 @@ MENU_ITEM_EL_JS = "(a) => {" + _VISIBLE + _MENU_FIND + r"""
 
 MENU_OPEN_JS = "(a) => {" + _VISIBLE + " return [...document.querySelectorAll(a.menu)].some(visible); }"
 
+# What is open before a click, remembered in the page (WeakSet, no mark in the DOM): a confirmation or a
+# field read after the click must be one the click opened (revue de la v2.3, m1 et m14).
+MARK_BEFORE_JS = "(a) => {" + _VISIBLE + """
+  window.__vkDialogsBefore = new WeakSet([...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible));
+  window.__vkFieldsBefore = new WeakSet([...document.querySelectorAll('input, textarea, [contenteditable="true"]')].filter(visible));
+  return true;
+}"""
+
+# Un candidat d'entrée (recherche ⌘K, « Votre avis ») est-il identifié ? Jamais dans une carte de réponse,
+# une fenêtre, un menu ni le compositeur (le plus petit ancêtre de la zone de saisie qui porte aussi le
+# bouton de modèle), jamais le bouton de dictée ; dans la barre latérale si `a.sidebar` ; son texte ou son
+# libellé suivant `a.words` si donné (revue de la v2.3, I4 et I5).
+ENTRY_OK_JS = """(el, a) => {
+  if (el.closest('article, [role="dialog"], [role="menu"], [role="listbox"]')) return false;
+  if (a.mic && el.matches(a.mic)) return false;
+  const ta = document.querySelector(a.textarea);
+  if (ta) {
+    let box = ta.parentElement;
+    while (box && !box.querySelector(a.model)) box = box.parentElement;
+    if (box && box !== document.body && box !== document.documentElement && box.contains(el)) return false;
+  }
+  if (a.sidebar && !el.closest(a.sidebar)) return false;
+  const words = ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+  return !a.words || new RegExp(a.words, 'i').test(words);
+}"""
+
+# Ce que la page montre qui ressemble à une entrée (le refus d'une entrée non identifiée le nomme ; rien
+# n'est cliqué) : les boutons et liens visibles dont le texte ou le libellé suit a.words, hors cartes de
+# réponse et liens de conversation, et sans le début d'aucun titre listé : un bouton de la ligne d'une
+# conversation peut porter son titre dans son libellé (un titre de conversation n'est jamais recopié).
+ENTRY_CANDIDATES_JS = "(a) => {" + _VISIBLE + r"""
+  const re = new RegExp(a.words, 'i'), conv = a.convPath ? new RegExp(a.convPath) : null;
+  const isConvLink = (link) => {
+    if (!link || !conv) return false;
+    try { return conv.test(new URL(link.getAttribute('href'), location.href).pathname.replace(/\/+$/, '')); }
+    catch (e) { return false; }
+  };
+  const titles = [...document.querySelectorAll('a[href]')].filter(isConvLink)
+    .map((l) => (l.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 12).toLowerCase())
+    .filter((t) => t.length >= 3);
+  return [...document.querySelectorAll('button, a, [role="button"]')].filter(visible)
+    .filter((el) => !el.closest('article') && !isConvLink(el.closest('a[href]')))
+    .map((el) => ((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')).trim().replace(/\s+/g, ' '))
+    .filter((t) => re.test(t) && !titles.some((x) => t.toLowerCase().includes(x)))
+    .map((t) => t.slice(0, 60)).slice(0, 10);
+}"""
+
 # Le champ du nouveau titre (E3) : l'élément qui a le focus s'il est un champ texte de la barre latérale
 # ou d'une fenêtre, sinon le premier de a.fields ; jamais la zone de saisie du compositeur (a.composer),
 # jamais un champ de recherche.
 _FIELD_FIND = r"""
   const editable = (el) => !!el && el.matches && visible(el)
+      && !(window.__vkFieldsBefore && window.__vkFieldsBefore.has(el))
       && el.matches('input:not([type]), input[type="text"], textarea, [contenteditable="true"]')
       && !el.matches(a.composer) && !el.matches('[cmdk-input], input[type="search"], input[role="combobox"]')
       && !/search|recherch/i.test((el.getAttribute('placeholder') || '') + ' ' + (el.getAttribute('aria-label') || ''))
@@ -1016,11 +1121,12 @@ RENAME_SUBMIT_EL_JS = "(a) => {" + _VISIBLE + _FIELD_FIND + r"""
 _CONFIRM_FIND = r"""
   const fold = (s) => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
   const findConfirm = (a) => {
-    const alerts = [...document.querySelectorAll('[role="alertdialog"]')].filter(visible);
-    const boxes = alerts.length ? alerts : [...document.querySelectorAll('[role="dialog"]')].filter(visible);
+    const fresh = (d) => visible(d) && !(window.__vkDialogsBefore && window.__vkDialogsBefore.has(d));
+    const alerts = [...document.querySelectorAll('[role="alertdialog"]')].filter(fresh);
+    const boxes = alerts.length ? alerts : [...document.querySelectorAll('[role="dialog"]')].filter(fresh);
     if (!boxes.length) return null;
     const d = boxes[boxes.length - 1];
-    const re = new RegExp(a.confirm, 'i'), cancel = /annuler|cancel|^non|^no/i;
+    const re = new RegExp(a.confirm, 'i'), cancel = /annuler|cancel|^non\b|^no\b/i;
     const buttons = [...d.querySelectorAll('button')].filter(visible);
     const texts = buttons.map((b) => fold(b.innerText || b.getAttribute('aria-label')).slice(0, 60));
     const hits = buttons.filter((b, i) => re.test(texts[i]) && !cancel.test(texts[i]));
@@ -1335,7 +1441,15 @@ def turn_summary(i: int, question: str, obs: dict) -> dict:
             "display_stable": obs.get("display_stable"), "end": obs.get("end"), "model": guard.get("model"),
             "pii_detected": guard.get("pii_detected"), "sent_source": (obs.get("sent_info") or {}).get("source"),
             "sent_to_model": (obs.get("sent_to_model") or "")[:4000] or None, "pipeline_ms": obs.get("pipeline_ms"),
-            "error_class": (obs.get("failure") or {}).get("error_class")}
+            "error_class": (obs.get("failure") or {}).get("error_class"),
+            "internal_error_shown": shown_internal(obs)}
+
+
+def shown_internal(obs: dict) -> bool:
+    """Une question a-t-elle montré une erreur interne à l'utilisateur (revue de la v2.3, I3 et m11) ? Ce
+    que la page a dit d'un échec silencieux (la ligne d'état, les alertes, les toasts : `_diagnose`), ou
+    une réponse qui affiche une erreur interne."""
+    return bool((obs.get("failure") or {}).get("internal_error_shown")) or answer_shows_internal(obs.get("answer"))
 
 
 def looks_like_sent(shown: str | None, question: str, pii=()) -> bool:
@@ -1418,22 +1532,82 @@ def token_inventory(text: str | None) -> dict | None:
     return dict(sorted(counts.items()))
 
 
+def signed_types(plus: dict, minus: dict) -> str:
+    """« +X −Y » : les types en plus, puis en moins, au passage b, avec leur nombre au-delà de un."""
+    def fmt(sign: str, kind: str, n: int) -> str:
+        return sign + kind + (f" ×{n}" if n > 1 else "")
+    return " ".join([fmt("+", k, plus[k]) for k in sorted(plus) if plus[k] > 0]
+                    + [fmt("−", k, minus[k]) for k in sorted(minus) if minus[k] > 0])
+
+
+def type_delta(first: dict, mine: dict) -> str:
+    """Les types en plus et en moins au passage b (`signed_types`), d'un compte par type à l'autre."""
+    d = {k: mine.get(k, 0) - first.get(k, 0) for k in set(first) | set(mine)}
+    return signed_types({k: v for k, v in d.items() if v > 0}, {k: -v for k, v in d.items() if v < 0})
+
+
+def entity_note(first: list, mine: list) -> str:
+    """Les entités masquées des passages a (`first`) et b (`mine`), lues par masked_entities, comparées
+    (revue de la v2.3, m6 ; le contrat, point 5) : « entités masquées identiques », ou « entités masquées
+    différentes : +X −Y », les types des entités masquées en plus, puis en moins, au passage b ; jamais
+    leur valeur (une donnée du corpus)."""
+    if first == mine:
+        return "entités masquées identiques"
+    a, b = Counter(first), Counter(mine)
+    plus, minus = Counter(), Counter()
+    for (kind, _), n in (b - a).items():
+        plus[kind] += n
+    for (kind, _), n in (a - b).items():
+        minus[kind] += n
+    return "entités masquées différentes : " + signed_types(plus, minus)
+
+
 def inventory_note(first: dict | None, mine: dict | None) -> str:
-    """Les ensembles masqués des passages a (`first`) et b (`mine`) comparés, pour le point 5 du contrat
-    (non-déterminisme : un ensemble différent d'entités masquées, à la numérotation près) : « ensemble
-    masqué identique », ou « ensemble masqué différent : +X −Y » (les types en plus, puis en moins, au
-    passage b, avec leur nombre au-delà de un)."""
+    """Les types masqués des passages a (`first`) et b (`mine`) comparés, quand les entités elles-mêmes ne
+    peuvent pas l'être (le texte envoyé du passage a n'est plus là) : « types masqués identiques », ou
+    « types masqués différents : +X −Y ». Des types identiques ne prouvent pas des entités identiques
+    (revue de la v2.3, m6) : la note dit « types », jamais « ensemble »."""
     if first is None or mine is None:
         which = "a" if first is None else "b"
-        return f"ensemble masqué non comparable (texte envoyé non observé au passage {which})"
+        return f"types masqués non comparables (texte envoyé non observé au passage {which})"
     if first == mine:
-        return "ensemble masqué identique"
-    plus, minus = [], []
-    for kind in sorted(set(first) | set(mine)):
-        d = mine.get(kind, 0) - first.get(kind, 0)
-        if d:
-            (plus if d > 0 else minus).append(("+" if d > 0 else "−") + kind + (f" ×{abs(d)}" if abs(d) > 1 else ""))
-    return "ensemble masqué différent : " + " ".join(plus + minus)
+        return "types masqués identiques"
+    return "types masqués différents : " + type_delta(first, mine)
+
+
+def masked_entities(sent: str | None, question: str | None) -> list | None:
+    """Les entités que le texte envoyé masque, lues contre la question posée : chaque jeton <TYPE_n> prend
+    la portion de la question qu'il remplace, alignée par le texte qui l'entoure (blancs réduits). Rend la
+    liste triée des (type, portion repliée), ou None quand l'alignement échoue (le texte envoyé n'est pas la
+    question masquée, deux jetons se touchent). Le contrat, point 5 : un ensemble différent d'entités
+    masquées, à la numérotation près (revue de la v2.3, m6)."""
+    if sent is None or not question:
+        return None
+    norm = lambda s: re.sub(r"\s+", " ", s)  # noqa: E731
+    q = norm(question).strip()
+    parts = re.split(r"(<[A-Z][A-Z_]*_\d+>)", norm(sent).strip())
+    literals, kinds = parts[0::2], [re.match(r"<([A-Z][A-Z_]*)_\d+>", t).group(1) for t in parts[1::2]]
+    if not q.startswith(literals[0]):
+        return None
+    cursor, out = len(literals[0]), []
+    for i, kind in enumerate(kinds):
+        nxt = literals[i + 1]
+        last = i == len(kinds) - 1
+        if last:
+            if not q.endswith(nxt) or len(q) - len(nxt) <= cursor:
+                return None
+            end = len(q) - len(nxt)
+        elif not nxt:
+            return None  # two tokens side by side: their portions cannot be told apart
+        else:
+            end = q.find(nxt, cursor + 1)
+            if end < 0:
+                return None
+        out.append((kind, evaluer.fold(q[cursor:end]).strip()))
+        cursor = end + len(nxt)
+    if not kinds and q != literals[0]:
+        return None
+    return sorted(out)
 
 
 # v2.3, E9 et E10 : ce qu'une erreur montrée par la page ne porte jamais jusqu'au journal ni jusqu'au
@@ -1446,6 +1620,14 @@ PATH_RE = re.compile(r"(?:\b[A-Za-z]:)?(?:[\\/][\w.@~-]+){2,}[\\/]?")
 QUOTED_HOST_RE = re.compile(r"\b(host(?:\s*name)?|hostname|server(?:\s+at)?|h[ôo]te)\s*(?:[=:]\s*[^\s,;]+|\"[^\"]*\"|'[^']*')",
                             re.I)
 HOST_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?\.)+[a-z][a-z0-9_-]*\b(?::\d+)?", re.I)
+# Revue de la v2.3, I2 : les formes ordinaires d'un hôte interne sans point. Un nom suivi d'un port
+# (redis:6379), et le mot qui suit une résolution ou une connexion (ENOTFOUND x, lookup x, connect to
+# [host] x, host x, server at x), entre guillemets ou non, après « = » ou non.
+NAME_PORT_RE = re.compile(r"(?<![\w.-])[a-z][\w-]*:\d{2,5}\b", re.I)
+KEYWORD_HOST_RE = re.compile(
+    r"\b(ENOTFOUND|EAI_AGAIN|lookup|resolve|connect(?:ing)?\s+to|host(?:\s*name)?|hostname|server\s+at"
+    r"|server(?=\s*[=:]))((?:\s+(?:host(?:\s*name)?|hostname|server(?:\s+at)?))?\s*[=:]?\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s,;()\"']+)", re.I)
 
 
 def sanitise(text: str | None, n: int = EXCERPT_MAX, keep=()) -> str:
@@ -1456,10 +1638,12 @@ def sanitise(text: str | None, n: int = EXCERPT_MAX, keep=()) -> str:
     s = STACK_RE.sub(" ", text or "")
     s = URL_RE.sub("<adresse>", s)
     s = QUOTED_HOST_RE.sub(lambda m: m.group(1) + " <hôte>", s)
+    s = KEYWORD_HOST_RE.sub(lambda m: m.group(1) + m.group(2) + "<hôte>", s)
     s = IP_RE.sub("<hôte>", s)
     s = PATH_RE.sub("<chemin>", s)
     kept = {k.lower() for k in keep if k}
     s = HOST_RE.sub(lambda m: m.group(0) if m.group(0).lower() in kept else "<hôte>", s)
+    s = NAME_PORT_RE.sub(lambda m: m.group(0) if m.group(0).lower() in kept else "<hôte>", s)
     return one_line(s, n)
 
 
@@ -1468,6 +1652,19 @@ def exposes_internals(text: str | None, keep=()) -> bool:
     apprend d'une puce en échec (`internal_error_shown`), sans en recevoir le texte."""
     whole = 10 ** 6
     return bool(text) and sanitise(text, whole, keep) != one_line(text, whole)
+
+
+# Revue de la v2.3, m11 : ce qui fait d'une réponse affichée une erreur interne (une pile, ou une erreur de
+# résolution ou de connexion) ; avec un détail interne (exposes_internals), la réponse en montre une.
+INTERNAL_ERROR_RE = re.compile(r"Traceback \(most recent call last\)|File \"[^\"]+\", line \d+|could not translate host"
+                               r"|name or service not known|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|getaddrinfo"
+                               r"|OperationalError|connection refused", re.I)
+
+
+def answer_shows_internal(answer: str | None) -> bool:
+    """La réponse affichée montre-t-elle une erreur interne (m11) ? Une pile ou une erreur de connexion,
+    avec un hôte, un chemin ou une pile : c'est alors une constatation de sécurité (PROCEDURE-3 §2)."""
+    return bool(answer) and bool(INTERNAL_ERROR_RE.search(answer)) and exposes_internals(answer)
 
 
 # E9 : la classe d'une puce en échec, lue sur son libellé brut replié (casse, accents), le nom du fichier
@@ -1496,6 +1693,25 @@ def attach_error_class(label: str | None, name: str = "") -> str:
         if re.search(pattern, folded):
             return cls
     return "échec de la pièce jointe"
+
+
+def chip_shows_internal(label: str | None, name: str = "") -> bool:
+    """La puce en échec montre-t-elle une erreur interne (E9, revue I2) ? Un détail interne lisible (pile,
+    adresse, chemin, hôte), ou une classe de service injoignable : une base ou un hôte injoignable est
+    une erreur interne montrée à l'utilisateur, même quand le libellé ne nomme rien qu'on sache lire."""
+    return exposes_internals(label, keep=(name,)) or attach_error_class(label, name) == "service documentaire injoignable"
+
+
+# Revue de la v2.3, m7 : un texte d'état qui dit une erreur ; une alerte ou un toast en est une d'office.
+ERROR_TEXT_RE = (r"erreur|error|echec|failed|failure|impossible|indisponible|unavailable|reessay|retry"
+                 r"|probleme|problem|refus|denied|timeout|delai|injoignable|unreachable")
+
+
+def error_notices(notices: list) -> list:
+    """Les avis de la page qui disent une erreur (m7) : une alerte, un toast, ou un texte d'état d'erreur ;
+    une mise à jour ordinaire d'une région vivante n'en est pas une."""
+    return [n for n in notices or [] if n[0] in ("alert", "toast")
+            or re.search(ERROR_TEXT_RE, evaluer.fold(n[1] or ""))]
 
 
 def stream_digest(events: list) -> dict:
@@ -1562,6 +1778,7 @@ def failure_class(http: int | None, error: str | None, notices: list, names: lis
         if http in (401, 403):
             return f"session refusée (HTTP {http})"
         return f"requête refusée (HTTP {http})"
+    notices = error_notices(notices)
     said = evaluer.fold(" ".join([error or ""] + [t for _, t in notices]))
     if re.search(ATTACH_ERRORS[0][1], said):
         return "service interne injoignable"
@@ -1574,24 +1791,56 @@ def failure_class(http: int | None, error: str | None, notices: list, names: lis
     return "flux terminé sans réponse"
 
 
-# v2.3, E3 : une entrée de menu qui viserait plus d'une conversation (texte replié).
-MENU_TOO_WIDE = r"\btout(?:es)?\b|\ball\b|historique|history|everything|\bvider\b|\bclear\b"
+# v2.3, E3 : une entrée de menu (texte replié) qui viserait plus d'une conversation.
+# Revue de la v2.3, I7 : « tous », « toute », « every », « sélection », « selected » s'y ajoutent.
+MENU_TOO_WIDE = (r"\btou(?:t|te|tes|s)\b|\ball\b|\bevery|\bentire|\bbulk|selection|\bselected\b|historique"
+                 r"|history|\bvider\b|\bclear\b")
+
+# Revue de la v2.3, I7 : ce qui, dans le texte d'une confirmation de suppression, viserait plus d'une
+# conversation : un nom de conversation au pluriel, « every » devant ce nom, l'historique (sauf celui de
+# cette conversation), une sélection, un vidage. « Tous ses messages », « all of its messages » parlent du
+# contenu de la seule conversation : « tous » et « all » ne comptent que dans une entrée de menu.
+CONFIRM_TOO_WIDE = (r"\b(?:conversations|discussions|chats)\b|\bevery\s+(?:conversation|discussion|chat)\b"
+                    r"|(?:historique|history)(?!\s+(?:de\s+(?:la|cette)|of\s+(?:this|the))\s+(?:conversation|discussion|chat)\b)"
+                    r"|selection|\bselected\b|\bbulk\b|\bvider\b|\bclear\b")
+
+
+# Ce qui ressemble à une entrée de renommage ou de suppression (texte replié) : l'entrée en liste blanche
+# doit être la seule de sa sorte dans le menu (« Supprimer » à côté de « Supprimer définitivement » : refusé).
+MENU_RENAME_WORDS = r"renomm|rename"
+MENU_DELETE_WORDS = r"supprim|delete|effac|erase|trash|corbeille"
 
 
 def menu_entry(items: list, want: str) -> tuple[dict | None, str | None]:
-    """L'entrée du menu d'une conversation à cliquer pour `want` (« renommer » ou « supprimer »). Un menu
-    n'est celui d'une conversation que s'il porte exactement une entrée de renommage et une de
-    suppression, actives, et aucune qui viserait plus d'une conversation (« tout », « all »,
-    « historique ») : sinon rien n'est cliqué. Rend (l'entrée, None) ou (None, la raison)."""
-    usable = [i for i in items if not i.get("disabled")]
-    rename = [i for i in usable if re.search(SELECTORS["menu_rename"], i["text"])]
-    delete = [i for i in usable if re.search(SELECTORS["menu_delete"], i["text"])]
+    """L'entrée du menu d'une conversation à cliquer pour `want` (« renommer » ou « supprimer »). Les
+    entrées cliquées sont en liste blanche, sur leur texte replié entier (`menu_rename`, `menu_delete` :
+    « Supprimer », « Supprimer la conversation », « Delete chat »… ; revue de la v2.3, I7). Un menu n'est
+    celui d'une conversation que si chacune des deux sortes (renommer, supprimer) y a une seule entrée qui
+    lui ressemble, active et en liste blanche, et qu'aucune entrée ne vise plus d'une conversation (« tous »,
+    « all », « every », « sélection », « historique »…) : sinon rien n'est cliqué. Rend (l'entrée, None)
+    ou (None, la raison)."""
     listed = " | ".join(i.get("label") or i["text"] for i in items) or "aucune entrée"
     if any(re.search(MENU_TOO_WIDE, i["text"]) for i in items):
         return None, f"menu refusé, une entrée viserait plus d'une conversation : {listed}"
-    if len(rename) != 1 or len(delete) != 1:
-        return None, f"pas le menu d'une conversation (une entrée renommer et une supprimer) : {listed}"
-    return (rename if want == "renommer" else delete)[0], None
+    found = {}
+    for how, alike_re, exact_re in (("renommer", MENU_RENAME_WORDS, SELECTORS["menu_rename"]),
+                                    ("supprimer", MENU_DELETE_WORDS, SELECTORS["menu_delete"])):
+        alike = [i for i in items if re.search(alike_re, i["text"])]
+        if len(alike) != 1 or alike[0].get("disabled") or not re.search(exact_re, alike[0]["text"].strip()):
+            return None, ("pas le menu d'une conversation (une entrée renommer et une supprimer, exactes et seules "
+                          f"de leur sorte) : {listed}")
+        found[how] = alike[0]
+    return found[want], None
+
+
+def confirms_one_deletion(text: str | None) -> bool:
+    """La confirmation parle-t-elle de supprimer une conversation, et une seule (revue I7) ? Son texte
+    replié doit dire supprimer (ou delete) et conversation (ou discussion, chat), et rien qui viserait plus
+    d'une conversation (CONFIRM_TOO_WIDE) ; sinon elle est annulée par Échap, jamais validée."""
+    folded = evaluer.fold(text or "")
+    return (bool(re.search(r"\b(?:supprim\w*|suppression|delete\w*|deletion|effacer)\b", folded))
+            and bool(re.search(r"\b(?:conversation|discussion|chat)\b", folded))
+            and not re.search(CONFIRM_TOO_WIDE, folded))
 
 
 def same_title(read: str | None, want: str) -> bool:
@@ -2040,6 +2289,19 @@ class Browser:
     def pending(self) -> dict | None:
         return self.dialogs[-1] if self.dialogs else None
 
+    def settled(self, page=None, ms: int = 100) -> bool:
+        """Après un clic ou une touche qui peut ouvrir un dialogue : `ms` millisecondes d'un minuteur de
+        Playwright (il court et livre l'événement même quand un dialogue s'ouvre), puis True si aucun
+        dialogue n'attend. Un appel à la page en cours quand un dialogue s'ouvre ne revient jamais, son délai
+        compris (Playwright 1.64, un wait_for_function : relevé sur le banc, revue de la v2.3, m4) ; un
+        dialogue déjà ouvert, lui, fait lever le délai. Après un tel clic, on regarde donc avant de relire
+        la page."""
+        try:
+            (page or self.page()).wait_for_timeout(ms)
+        except PWError:
+            pass
+        return self.pending() is None
+
     # -- capture ------------------------------------------------------------------------
     def _push(self, lst: list, entry: dict) -> dict:
         self.seq += 1
@@ -2410,7 +2672,8 @@ class Recette:
     @staticmethod
     def _conv_arg(href: str | None = None, redact: bool = False) -> dict:
         return {"href": href, "sidebar": SELECTORS["sidebar"], "convPath": SELECTORS["conversation_path"],
-                "triggers": SELECTORS["conversation_menu_trigger"], "redact": redact}
+                "triggers": SELECTORS["conversation_menu_trigger"], "headings": SELECTORS["group_heading"],
+                "redact": redact}
 
     def _conversation_state(self, page) -> dict | None:
         """Le chemin de la page et les conversations de la barre latérale (chemin, titre) ; None si la page
@@ -2423,12 +2686,15 @@ class Recette:
             return None
 
     def _note_conversation(self, cid: str, before: dict | None, page, via: str) -> dict | None:
-        """Après une question : la conversation où elle a été posée, et ce que la ligne du cas en porte
-        (`conversation` : adresse, cas qui l'a créée, état), ou None. Elle entre au registre, avec le cas
-        `cid`, quand la question l'a créée : la page était, avant l'envoi, sur une page qui n'est pas une
-        conversation (une page neuve), et elle est maintenant sur /conversation/<id> ou, à défaut, une seule
-        conversation est apparue dans la barre latérale. Sans relevé d'avant l'envoi, rien n'entre au
-        registre : le driver ne s'attribue jamais une conversation qu'il n'a pas vue naître."""
+        """Après une question, ou un téléversement (revue de la v2.3, m13 : l'application peut créer la
+        conversation dès la pièce jointe) : la conversation où la page se trouve, et ce que la ligne du cas
+        en porte (`conversation` : adresse, cas qui l'a créée, état), ou None. Elle entre au registre, avec
+        le cas `cid`, seulement quand l'action l'a créée : la page était avant sur une page qui n'est pas une
+        conversation (une page neuve), elle est maintenant sur /conversation/<id>, et cette adresse n'était
+        pas dans la barre latérale avant. Rien d'autre (revue I6) : une ligne apparue dans la barre latérale
+        peut être celle d'une autre conversation (la liste qui finissait de charger, une conversation ouverte
+        ailleurs par le fondateur), elle n'entre jamais au registre. Sans relevé d'avant l'action non plus :
+        le driver ne s'attribue jamais une conversation qu'il n'a pas vue naître."""
         after = self._conversation_state(page)
         if not after:
             return None
@@ -2440,15 +2706,13 @@ class Recette:
                 return None
             return {"href": href, "created_by": entry["case"] if entry else None,
                     "state": entry["state"] if entry else "hors registre"}
-        if re.match(SELECTORS["conversation_path"], here):
-            href = here
-        else:
-            known = {p for p, _ in before.get("items") or []}
-            fresh = [p for p, _ in after.get("items") or [] if p not in known]
-            if len(fresh) != 1:
-                return None
-            href = fresh[0]
+        if not re.match(SELECTORS["conversation_path"], here):
+            return None  # no conversation page: nothing is registered, whatever the sidebar shows (I6)
+        href = here
         entry = next((e for e in self.registry if e["href"] == href), None)
+        if entry is None and href in {p for p, _ in before.get("items") or []}:
+            log.warning("conversation %s was listed before %s: not registered", href, cid)
+            return {"href": href, "created_by": None, "state": "hors registre"}
         if entry is None:
             title = next((t for p, t in after.get("items") or [] if p == href), None)
             entry = {"href": href, "case": cid, "via": via, "created": now_iso(), "state": "créée", "title": title,
@@ -2466,12 +2730,29 @@ class Recette:
             log.warning("conversation of %s not noted: %s", cid, one_line(str(e), 160))
             return None
 
+    def _take_case(self, cid: str) -> None:
+        """Le cas en main d'une action qui le nomme (lister_conversations, renommer_conversation,
+        supprimer_conversation, ouvrir_avis) : un dialogue ou une navigation hors liste pendant elle est noté
+        sous lui, et le juge le lit là, même quand le cas se juge sur une observation partagée (revue de la
+        v2.3, m4) ; ceux d'un essai antérieur, jamais jugé, sont oubliés."""
+        self._case_in_hand = cid
+        own = self.observations.get(cid)
+        if isinstance(own, dict):
+            own.pop("dialog", None)
+            own.pop("offlist", None)
+
+    def _after_click(self, page) -> None:
+        """Un dialogue ouvert par le clic ou la touche qui précède est vu avant tout appel à la page
+        (Browser.settled) : PWTimeout, que l'action change en refus `dialog`, noté sous le cas en main."""
+        if not self.browser.settled(page):
+            raise PWTimeout("un dialogue s'est ouvert au clic")
+
     def _in_conversation_of(self, cid: str) -> bool:
         """La page est-elle sur la conversation que `cid` a créée ? (E1 : same_conversation_as se résout par
         le registre, par exemple après une relance du driver, quand sa mémoire de la conversation est
         perdue.)"""
         entry = self._registered(cid)
-        if entry is None or entry["state"] == "supprimée":
+        if entry is None or entry["state"] in GONE_STATES:
             return False
         return urlsplit(self.browser.page().url).path.rstrip("/") == entry["href"]
 
@@ -2991,8 +3272,11 @@ class Recette:
         la page et le flux en ont dit. La ligne d'état du compositeur, les alertes et les toasts (vus pendant
         l'attente et maintenant, ceux d'avant l'envoi mis à part), le statut HTTP du flux, ses derniers
         événements et sa dernière charge utile d'erreur. Rend le résumé que porte la ligne (`error_class`, et
-        un extrait de EXCERPT_MAX caractères au plus, sans nom d'hôte, chemin ni pile) et la capture brute,
-        qui ne va qu'à la preuve `failure.json`."""
+        `internal_error_shown` : la ligne d'état, une alerte ou un toast a-t-il montré une erreur interne,
+        un hôte, un chemin, une pile ou un service injoignable ; ce que dit le flux, que l'utilisateur ne voit
+        pas, n'y compte pas : revue de la v2.3, I3) et la capture brute, qui ne va qu'à la preuve
+        `failure.json`, avec l'extrait expurgé de EXCERPT_MAX caractères au plus (revue I2 : l'expurgation
+        est une heuristique, l'extrait ne va plus sur la ligne)."""
         b = self.browser
         try:
             now = b.call(NOTICES_JS, {"status": SELECTORS["input_status"], "notices": SELECTORS["notices"]},
@@ -3014,9 +3298,12 @@ class Recette:
         cls = failure_class(http, digest["error"], said, digest["names"], bool(posts) or bool(digest["names"]))
         source = (digest["error"] or next((text for kind, text in said if kind == "status"), None)
                   or (said[0][1] if said else ""))
-        summary = {"error_class": cls, "excerpt": sanitise(source) or None, "http_status": http,
+        internal = any(exposes_internals(text) or re.search(ATTACH_ERRORS[0][1], evaluer.fold(text or ""))
+                       for _, text in said)
+        summary = {"error_class": cls, "internal_error_shown": internal, "http_status": http,
                    "last_node": digest["last_node"], "events": digest["names"], "new_card": fresh}
-        raw = {"error_class": cls, "http_status": http, "request_failure": net.get("failure"),
+        raw = {"error_class": cls, "internal_error_shown": internal, "excerpt": sanitise(source) or None,
+               "http_status": http, "request_failure": net.get("failure"),
                "events": (turn.get("events") or [])[-40:], "stream": digest, "notices": seen,
                "notices_before": before}
         log.warning("silent failure: %s", cls)
@@ -3142,10 +3429,18 @@ class Recette:
         result["sent_source"] = (obs.get("sent_info") or {}).get("source")
         if obs.get("sent_to_model") is not None:
             result["sent_to_model"] = obs["sent_to_model"][:2000]
-        result["text"] = f"{label} : réponse en {obs.get('total_s')} s — {one_line(obs.get('answer') or '', 160)}"
+        answer = obs.get("answer") or ""
+        internal = shown_internal(obs)
+        if answer_shows_internal(answer):  # m11: an answer that shows an internal error, sanitised
+            result["answer"] = sanitise(answer, 4000)
+        shown = sanitise(answer, 160) if answer_shows_internal(answer) else one_line(answer, 160)
+        result["text"] = f"{label} : réponse en {obs.get('total_s')} s — {shown}"
         if obs.get("failure"):  # E10: the class only, never the raw text
             result["error_class"] = obs["failure"]["error_class"]
             result["text"] += f" ; échec silencieux : {obs['failure']['error_class']}"
+        result["internal_error_shown"] = internal  # I3: what the user saw, for the harness to report
+        if internal:
+            result["text"] += " ; erreur interne affichée à l'utilisateur"
         return result
 
     # =========================================================================================
@@ -3246,18 +3541,23 @@ class Recette:
         b = self.browser
         page = b.page()
         self._ensure_on_app(page)
+        self._case_in_hand = cid
         mark = b.mark()
+        conv_before = self._conversation_state(page)  # m13: the upload may create the conversation
         att = self._attach(page, path, budget_of(case))
-        # v2.3, E9 : the raw label (a host name and a stack, on 18/10) goes to chip.json only; the line, the
-        # observation and the harness get its class, a sanitised label and whether it shows internals.
+        # v2.3, E9 : the raw label (a host name and a stack, on 18/10) goes to chip.json only. The line, the
+        # observation and the harness get its class and whether it shows an internal error (I2: a failed
+        # chip's label, even sanitised, never leaves the evidence); a chip not failed, its sanitised label.
         raw_label = att["label"]
+        failed = att["state"] == "failed"
         record = {"state": att["state"], "ready_by": att["ready_by"], "seconds": att["seconds"],
-                  "label": sanitise(raw_label, 120, keep=(path.name,)), "trace": att["trace"],
-                  "accept": att["accept"],
-                  "error_class": attach_error_class(raw_label, path.name) if att["state"] == "failed" else None,
-                  "internal_error_shown": exposes_internals(raw_label, keep=(path.name,))}
+                  "label": None if failed else sanitise(raw_label, 120, keep=(path.name,)), "trace": att["trace"],
+                  "accept": att["accept"], "error_class": attach_error_class(raw_label, path.name) if failed else None,
+                  "internal_error_shown": chip_shows_internal(raw_label, path.name)}
         self.conv["attached"][cid] = {k: att[k] for k in ("state", "ready_by", "pending_seen")} | {"file": path.name}
-        self.observations[cid] = {"attach": {**record, "t": now_iso()}}
+        conversation = self._note_conversation_quietly(cid, conv_before, page, "joindre_document")
+        self.observations[cid] = {"attach": {**record, "t": now_iso()},
+                                  **({"conversation": conversation} if conversation else {})}
         ev.screenshot(page, "attach.png")
         ev.json("network.json", b.capture(mark), cap=NETWORK_CAP)
         ev.json("chip.json", {**record, "label": raw_label, "reading": att["reading"], "uploads": att["uploads"]})
@@ -3340,8 +3640,9 @@ class Recette:
             ready, raw, label = self._chip_ready(cid)
             if not ready:  # the real chip, read now: a question on a chip not ready never leaves
                 name = self.conv["attached"][cid]["file"]
-                shown = {"chip": raw, "label": sanitise(label, 120, keep=(name,))}
-                if raw == "failed":  # E9: its class, never its raw label
+                shown = {"chip": raw, "label": None if raw == "failed" else sanitise(label, 120, keep=(name,)),
+                         "internal_error_shown": chip_shows_internal(label, name)}
+                if raw == "failed":  # E9: its class, never its label (I2)
                     shown["error_class"] = attach_error_class(label, name)
                 self.observations.setdefault(cid, {})["not_sent"] = {**shown, "t": now_iso()}
                 raise DriverRefusal("precondition", f"pièce jointe pas prête ({raw}) : question non envoyée",
@@ -3363,12 +3664,14 @@ class Recette:
         try:
             obs = self._ask(case["question"], budget, pii=case.get("pii"))
         except AskTimeout as t:
-            line = self._timeout_line(cid, case["nfr"], t, t.why, extra=self._line_extra(cid, {"composer": composer}))
             self.observations.setdefault(cid, {})["timeout"] = {"seconds": round(t.seconds, 1), "t": now_iso(),
                                                                 **t.profile}
+            # m3: the conversation first, so that the timeout line names it
             conversation = self._note_conversation_quietly(cid, conv_before, page, "poser_question")
+            seen = {"composer": composer, **({"conversation": conversation} if conversation else {})}
             if conversation:
                 self.observations[cid]["conversation"] = conversation
+            line = self._timeout_line(cid, case["nfr"], t, t.why, extra=self._line_extra(cid, seen))
             raise DriverRefusal("timeout", t.why, extra={"journal": line, "abort": t.profile}) from None
         failure = obs.pop("failure_raw", None)
         conversation = self._note_conversation(cid, conv_before, page, "poser_question")
@@ -3488,8 +3791,11 @@ class Recette:
         self._record_verdict(case, j)
         ev.add("journal.jsonl", (line + "\n").encode("utf-8", "replace"))
         r = j["r"]
-        return {"case": cid, "verdict": r["verdict"], "missing": r["missing"], "forbidden": r["forbidden"],
-                "leaks": r["leaks"], "span_issues": r["span_issues"], "replayed": False, "text": line}
+        result = {"case": cid, "verdict": r["verdict"], "missing": r["missing"], "forbidden": r["forbidden"],
+                  "leaks": r["leaks"], "span_issues": r["span_issues"], "replayed": False, "text": line}
+        if j["extra"].get("internal_error_shown"):  # I3: the harness reports it once per level
+            result["internal_error_shown"] = True
+        return result
 
     # -- le jugement (v2.3 : séparé de verdict_oracle, rejouable hors ligne) -------------------------
     def _next_seq(self) -> int:
@@ -3505,11 +3811,19 @@ class Recette:
         return obs
 
     def _fresh_for(self, cid: str, obs: dict) -> bool:
-        """Une observation partagée juge-t-elle encore `cid` ? Oui tant qu'elle n'a jugé aucun cas ; une
-        fois épuisée (`judged`), seulement un cas sondé (verdict_oracle refusé faute d'observation) avant
+        """Une observation partagée juge-t-elle encore `cid` ? Faite pour un cas (`case`, par une action qui
+        le nomme), elle ne juge que lui ; un cas qui se joue par sa propre action (`action`) ne se juge que
+        sur une observation faite pour lui (revue de la v2.3, m5 : M8-5 jamais sur la recherche de M8-4).
+        Sinon, oui tant qu'elle n'a jugé aucun cas ; une fois épuisée (`judged`, ou un verdict sans `judged`,
+        celui d'un pilote v2.2), seulement un cas sondé (verdict_oracle refusé faute d'observation) avant
         qu'elle soit faite : N7-1 et N7-2 se jugent sur une même liste, M8-4 jamais sur celle de M8-2, M8-7
         jamais sur le choix de modèle de M8-1."""
-        if not obs.get("judged"):
+        bound = obs.get("case")
+        if bound is not None and bound != cid:
+            return False
+        if bound is None and (self.cases.get(cid) or {}).get("action"):
+            return False
+        if not obs.get("judged") and not obs.get("verdict"):
             return True
         probe = (self.observations.get("@probes") or {}).get(cid)
         return probe is not None and probe < (obs.get("seq") or 0)
@@ -3530,16 +3844,20 @@ class Recette:
         if offline and key != cid:
             obs = own.get("observed")
             if obs is None:
-                raise ValueError(f"{cid} : jugé sur {key} sans instantané gardé sous le cas (pilote antérieur à la "
-                                 "v2.3) : non rejouable hors ligne")
+                why = ("pilote antérieur à la v2.3" if own else
+                       "aucune observation du cas dans ce fichier d'observations, mis de côté à une reprise ?")
+                raise ValueError(f"{cid} : jugé sur {key} sans instantané gardé sous le cas ({why}) : non rejouable "
+                                 "hors ligne")
         else:
             obs = self.observations.get(key) or {}
             if key != cid and obs and not self._fresh_for(cid, obs):
                 obs = {}  # it judged another case already: never a second time
         asked = "answer" in obs
         attach = obs.get("attach") or {}
-        dialog = obs.get("dialog")
-        offlist = obs.get("offlist")
+        # m4: a dialog or an off-list navigation during the case's own action (a rename, a delete, a search)
+        # is kept under the case, never on the shared observation
+        dialog = obs.get("dialog") or (own.get("dialog") if key != cid else None)
+        offlist = obs.get("offlist") or (own.get("offlist") if key != cid else None)
         nfr = case["nfr"]
         not_sent = obs.get("not_sent")
         maint = own.get("maintenance")
@@ -3574,7 +3892,7 @@ class Recette:
             nfr = nfr_union(nfr, ["disponibilite"])
         elif not asked and not dialog and not offlist:
             if offline:
-                raise ValueError(f"{cid} : aucune observation jugeable sous {key}")
+                raise ValueError(f"{cid} : aucune observation jugeable sous {key} dans ce fichier d'observations")
             hint = {"load": "mesurer_chargement", "list": "lister_conversations",
                     "concurrent": "charge_concurrente", "long": "conversation_longue"}.get(case["kind"], "poser_question")
             hint = case.get("action") or {"@model": "choisir_modele", "@web": "recherche_web"}.get(key, hint)
@@ -3599,6 +3917,8 @@ class Recette:
                 nfr = nfr_union(nfr, ["disponibilite"])
             if obs.get("body_found") is False and obs.get("answer"):
                 r["notes"].append("corps de réponse introuvable : texte de la carte entière, en-tête compris")
+            if answer_shows_internal(obs.get("answer")):  # m11: noted, and the answer below is sanitised
+                r["notes"].append("la réponse affiche une erreur interne (expurgée ici)")
             if obs.get("display_stable") is False:
                 r["notes"].append("affichage encore en mouvement à la capture")
             if obs.get("sent_to_model") is not None and in_doc is not True:
@@ -3635,12 +3955,19 @@ class Recette:
         aussi : un cas de configuration ne se juge jamais sur lui."""
         cid, key, obs, r = case["id"], j["key"], j["obs"], j["r"]
         record = {k: r[k] for k in ("verdict", "missing", "forbidden", "leaks", "span_issues", "notes")}
-        self.observations.setdefault(key, obs)["verdict"] = record
         if key != cid:
-            self.observations[key]["judged"] = cid
+            shared = self.observations.get(key)
+            if obs and shared is obs:  # the shared observation that judged it, and only that one
+                shared["verdict"] = record
+                shared["judged"] = cid
+            own = self.observations.get(cid) or {}
+            kept = {k: own[k] for k in ("dialog", "offlist") if k in own}  # m4: replayable offline
             self.observations[cid] = {"verdict": record, "from": key,
-                                      "observed": {k: v for k, v in obs.items() if k not in ("verdict", "judged")}}
-        elif case["kind"] in ("model", "web"):
+                                      "observed": {k: v for k, v in obs.items() if k not in ("verdict", "judged")},
+                                      **kept}
+            return
+        self.observations.setdefault(key, obs)["verdict"] = record
+        if case["kind"] in ("model", "web"):
             shared = self.observations.get("@model" if case["kind"] == "model" else "@web")
             if isinstance(shared, dict) and shared.get("answer") and not shared.get("judged"):
                 shared["judged"] = cid
@@ -3651,8 +3978,11 @@ class Recette:
         (replay_of). Depuis la v2.3 : sur la ligne d'une question, `sent_source` (nul, avec la raison en
         `sent_rejected`), `sent_tokens` et `pii_declared` (E7) ; la pièce jointe (`attach`, avec sa liste
         `accept`, E6, jamais son libellé brut) ; `error_class`, d'une puce en échec (E9) ou d'un échec
-        silencieux, avec son extrait expurgé `error_excerpt` (E10) ; la conversation du registre (E1) ; et
-        toujours `modals_closed`, les modales connues que la garde a fermées pendant les actions du cas (E5)."""
+        silencieux (E10 ; son extrait expurgé ne va qu'à failure.json, revue de la v2.3, I2) ;
+        `internal_error_shown`, une erreur interne montrée à l'utilisateur par la puce, la page ou la réponse
+        (revue I3 et m11), dès qu'il y a de quoi le dire ; la conversation du registre (E1), ou celles d'une
+        charge concurrente (`conversations`, m3) ; et toujours `modals_closed`, les modales connues que la
+        garde a fermées pendant les actions du cas (E5)."""
         extra = {}
         if obs.get("display_s") is not None:
             extra["display_s"] = obs["display_s"]
@@ -3674,23 +4004,35 @@ class Recette:
             extra["pii_declared"] = guard.get("pii_count")
         attach = obs.get("attach")
         if attach:
-            extra["attach"] = {k: attach.get(k) for k in ("state", "ready_by", "seconds", "accept", "error_class")}
+            extra["attach"] = {k: attach.get(k) for k in ("state", "ready_by", "seconds", "accept", "error_class",
+                                                          "internal_error_shown")}
         failure = obs.get("failure") or {}
         error = ((obs.get("not_sent") or {}).get("error_class") or (attach or {}).get("error_class")
                  or failure.get("error_class"))
         if error:
             extra["error_class"] = error
-        if failure.get("excerpt"):
-            extra["error_excerpt"] = failure["excerpt"]
+        flags = [x["internal_error_shown"] for x in (attach or {}, obs.get("not_sent") or {}, failure)
+                 if "internal_error_shown" in x]
+        flags += [True for t in obs.get("turns") or [] if t.get("internal_error_shown")]
+        if answer_shows_internal(obs.get("answer")):
+            flags.append(True)
+        if flags:
+            extra["internal_error_shown"] = any(flags)
         if obs.get("conversation"):
             extra["conversation"] = obs["conversation"]
+        if obs.get("conversations"):
+            extra["conversations"] = obs["conversations"]
         extra["modals_closed"] = list((self.observations.get("@modals") or {}).get(cid) or [])
         return extra
 
     def _replay_note(self, case: dict, obs: dict, r: dict) -> None:
         """Le second passage d'un cas (replay_of) : le verdict du premier, le texte envoyé comparé à la
-        numérotation des jetons près, et (v2.3, E7) les ensembles masqués comparés (`sent_tokens` des deux
-        lignes) : c'est sur eux que le juge applique le point 5 du contrat (non-déterminisme)."""
+        numérotation des jetons près, et les entités masquées des deux passages comparées : c'est sur elles
+        que le juge applique le point 5 du contrat (non-déterminisme). Revue de la v2.3, m6 : les entités sont
+        lues dans les deux textes envoyés contre leurs questions (masked_entities ; le texte du passage a,
+        celui de son observation, quand son empreinte est celle de sa ligne) ; sans eux, les types seuls
+        (`sent_tokens` des deux lignes, E7), et la note dit « types » : des types identiques ne prouvent pas
+        des entités identiques."""
         first = self._journaled(case["replay_of"])
         if first is None:
             r["notes"].append(f"passage a ({case['replay_of']}) pas encore journalisé")
@@ -3699,10 +4041,18 @@ class Recette:
         mine = sent_digest(obs.get("sent_to_model"))
         if mine and first.get("sent_sha256"):
             note += " ; texte envoyé identique" if mine == first["sent_sha256"] else " ; texte envoyé différent"
-        if "sent_tokens" in first:
+        a_obs = self.observations.get(case["replay_of"]) or {}
+        a_sent = a_obs.get("sent_to_model")
+        if a_sent is not None and first.get("sent_sha256") and sent_digest(a_sent) != first["sent_sha256"]:
+            a_sent = None  # not the text passage a's line was judged on
+        ents_a = masked_entities(a_sent, (self.cases.get(case["replay_of"]) or {}).get("question"))
+        ents_b = masked_entities(obs.get("sent_to_model"), case.get("question"))
+        if ents_a is not None and ents_b is not None:
+            note += " ; " + entity_note(ents_a, ents_b)
+        elif "sent_tokens" in first:
             note += " ; " + inventory_note(first["sent_tokens"], token_inventory(obs.get("sent_to_model")))
         else:
-            note += " ; ensemble masqué non comparable (passage a journalisé sans ses jetons)"
+            note += " ; types masqués non comparables (passage a journalisé sans ses jetons)"
         r["notes"].append(note)
 
     @staticmethod
@@ -3766,7 +4116,9 @@ class Recette:
         if model:
             parts.append(f"modèle {model}")
         if obs.get("answer"):
-            parts.append(f"réponse : « {one_line(obs['answer'], 160)} »")
+            answer = obs["answer"]
+            shown = sanitise(answer, 160) if answer_shows_internal(answer) else one_line(answer, 160)
+            parts.append(f"réponse : « {shown} »")
         return " ; ".join(parts)
 
     def lister_conversations(self, args: dict, ev: Evidence) -> dict:
@@ -3781,6 +4133,7 @@ class Recette:
             if case["kind"] != "list":
                 raise DriverRefusal("precondition", f"le cas {cid} ({case['kind']}) n'est pas un cas de liste")
             self._played_by(case, "lister_conversations")
+            self._take_case(cid)
         composer = self._composer_now(page)
         if case is not None and (case.get("question") or "").strip():
             return self._search(page, case, composer, ev)
@@ -3822,24 +4175,6 @@ class Recette:
                 return None
             page.wait_for_timeout(100)
 
-    def _first_visible(self, page, sels: list) -> dict | None:
-        """Le premier élément visible d'une liste de sélecteurs Playwright : son sélecteur, son rang parmi
-        ses correspondances, son aria-label et son texte ; None. Un sélecteur refusé est passé."""
-        for sel in sels:
-            try:
-                loc = page.locator(sel)
-                for i in range(min(loc.count(), 10)):
-                    item = loc.nth(i)
-                    if item.is_visible():
-                        return {"selector": sel, "index": i, "label": item.get_attribute("aria-label", timeout=2000),
-                                "text": one_line(item.inner_text(timeout=2000), 120)}
-            except PWTimeout:
-                if self.browser.pending():
-                    raise
-            except PWError:
-                continue
-        return None
-
     def _restore_page(self, page, url: str, record: dict) -> None:
         """Remettre la page où l'action l'a trouvée, si un clic l'a menée ailleurs (une entrée de recherche
         ou d'avis qui serait un lien) : le cas suivant attend le compositeur."""
@@ -3847,23 +4182,64 @@ class Recette:
             record["moved_to"] = short_url(page.url)
             self._goto(page, url)
 
+    def _identified_entry(self, page, sels: list, words: str, sidebar: bool) -> tuple[dict | None, list]:
+        """L'entrée positivement identifiée (la recherche ⌘K, « Votre avis » ; revue de la v2.3, I4 et I5) : le
+        premier élément visible d'un de ses sélecteurs, dans l'ordre, qui passe ENTRY_OK_JS (jamais dans une
+        carte de réponse, une fenêtre, un menu ni le compositeur, jamais le bouton de dictée ; dans la barre
+        latérale si `sidebar` ; son texte ou son libellé suivant `words`). Rend (l'entrée, []) ou (None, les
+        candidats que la page montre, pour le refus et la sonde). Rien n'est cliqué ici."""
+        b = self.browser
+        arg = {"mic": SELECTORS["mic_button"], "textarea": SELECTORS["textarea"],
+               "model": ", ".join(SELECTORS["model_button"]), "sidebar": SELECTORS["sidebar"] if sidebar else None,
+               "words": words}
+        for sel in sels:
+            try:
+                loc = page.locator(sel)
+                for i in range(min(loc.count(), 10)):
+                    item = loc.nth(i)
+                    if item.is_visible() and item.evaluate(ENTRY_OK_JS, arg, timeout=2000):
+                        return {"selector": sel, "index": i, "label": item.get_attribute("aria-label", timeout=2000),
+                                "text": one_line(item.inner_text(timeout=2000), 120)}, []
+            except PWTimeout:
+                if b.pending():
+                    raise
+            except PWError:
+                continue
+        try:
+            seen = b.call(ENTRY_CANDIDATES_JS, {"words": words, "convPath": SELECTORS["conversation_path"]},
+                          page=page, timeout_ms=2000) or []
+        except PWTimeout:
+            if b.pending():
+                raise
+            seen = []
+        return None, seen
+
     def _open_search(self, page, arg: dict, record: dict) -> bool:
         """La palette ⌘K ouverte par le driver : au clavier (ControlOrMeta+K), à défaut par l'entrée de la
-        barre latérale (search_entry). Modale `own` « recherche » dès avant la touche : laissée ouverte par
-        une action coupée, la garde suivante la referme. Rend True si son champ est visible."""
+        barre latérale, seulement identifiée (_identified_entry ; revue de la v2.3, I4 : jamais un bouton
+        deviné, le bouton de dictée moins que tout autre). Non identifiée, rien n'est cliqué : record["entry"]
+        reste None et record["candidates"] dit ce que la page montrait. Modale `own` « recherche » dès avant
+        la touche ou le clic : laissée ouverte par une action coupée, la garde suivante la referme. Rend True
+        si son champ est visible."""
         b = self.browser
         b.own_modal = "recherche"
         page.keyboard.press("ControlOrMeta+K")
+        self._after_click(page)
         if self._wait_for(page, lambda: b.call(SEARCH_JS, arg, page=page, timeout_ms=2000), SEARCH_OPEN_S):
             record["opened_by"] = "ControlOrMeta+K"
             return True
-        entry = self._first_visible(page, SELECTORS["search_entry"])
+        b.own_modal = None
+        entry, seen = self._identified_entry(page, SELECTORS["search_entry"], SELECTORS["search_words"], sidebar=True)
         record["entry"] = entry
-        if entry is not None:
-            page.locator(entry["selector"]).nth(entry["index"]).click(timeout=5000)
-            if self._wait_for(page, lambda: b.call(SEARCH_JS, arg, page=page, timeout_ms=2000), SEARCH_OPEN_S):
-                record["opened_by"] = entry["selector"]
-                return True
+        if entry is None:
+            record["candidates"] = seen
+            return False
+        b.own_modal = "recherche"
+        page.locator(entry["selector"]).nth(entry["index"]).click(timeout=5000)
+        self._after_click(page)
+        if self._wait_for(page, lambda: b.call(SEARCH_JS, arg, page=page, timeout_ms=2000), SEARCH_OPEN_S):
+            record["opened_by"] = entry["selector"]
+            return True
         b.own_modal = None
         return False
 
@@ -3904,7 +4280,9 @@ class Recette:
         (_open_search), la question tapée dans son champ et là seulement, les titres des résultats lus quand
         ils ne bougent plus (_search_results), la palette refermée par Échap. @list : « recherche « q » : n
         résultats : t1 | t2 … ». Une palette qui ne s'ouvre pas, un champ qui ne prend pas la question :
-        l'observation le dit, et l'action refuse `precondition`."""
+        l'observation le dit, et l'action refuse `precondition`. Une palette qui ne s'ouvre pas au clavier et
+        dont l'entrée n'est pas identifiée (revue de la v2.3, I4) : rien n'est cliqué, aucune observation (le
+        cas reste à faire, le driver n'ayant rien pu essayer), refus `precondition` qui nomme les candidats."""
         b = self.browser
         cid, q = case["id"], case["question"]
         t0 = time.monotonic()
@@ -3913,10 +4291,17 @@ class Recette:
                "empty": SELECTORS["search_empty"], "redact": False}
         record = {"case": cid, "query": q, "opened_by": None, "input": None, "results": [], "result": None,
                   "empty": None, "settled": None, "closed": None, "seconds": None}
-        error, shot = None, False
+        error, shot, unidentified = None, False, False
         try:
             if not self._open_search(page, arg, record):
-                error = "la recherche ne s'ouvre pas (ni ControlOrMeta+K, ni l'entrée de la barre latérale)"
+                if record.get("entry") is None:
+                    unidentified = True
+                    seen = record.get("candidates") or []
+                    error = ("la recherche ne s'ouvre pas au clavier (ControlOrMeta+K) et son entrée n'est pas "
+                             "identifiée dans la barre latérale : rien n'est cliqué"
+                             + (f" ; vu : {' | '.join(seen)}" if seen else ""))
+                else:
+                    error = "la recherche ne s'ouvre pas (ni ControlOrMeta+K, ni l'entrée de la barre latérale)"
             else:
                 field = b.element(SEARCH_INPUT_EL_JS, arg, page=page, timeout_ms=3000)
                 if field is None:
@@ -3952,6 +4337,8 @@ class Recette:
         if not shot:
             ev.screenshot(page, "screen.png")
         ev.json("search.json", record)
+        if unidentified:  # I4: nothing tried, nothing to judge: the case stays to do
+            raise DriverRefusal("precondition", error, extra={"candidates": record.get("candidates") or []})
         self._shared("@list", {"answer": text, "timing_s": None, "t": now_iso(), "composer": composer, "case": cid,
                                "search": {k: record[k] for k in ("opened_by", "input", "result", "empty", "settled",
                                                                  "closed", "seconds")}})
@@ -3986,9 +4373,9 @@ class Recette:
         if not (case.get("question") or "").strip():
             raise DriverRefusal("precondition", f"le cas {case['id']} n'a pas de titre à donner (question)")
         entry = self._target(case)
-        if entry["state"] == "supprimée":
-            raise DriverRefusal("precondition", f"la conversation de {case['same_conversation_as']} est supprimée : "
-                                                "rien à renommer")
+        if entry["state"] in GONE_STATES:
+            raise DriverRefusal("precondition", f"la conversation de {case['same_conversation_as']} est supprimée "
+                                                f"({entry['state']}) : rien à renommer")
         return self._conversation_action(case, entry, "renommer", ev)
 
     def supprimer_conversation(self, args: dict, ev: Evidence) -> dict:
@@ -4012,7 +4399,7 @@ class Recette:
         page = b.page()
         self._ensure_on_app(page)
         cid, owner = case["id"], case["same_conversation_as"]
-        self._case_in_hand = cid
+        self._take_case(cid)
         composer = self._composer_now(page)
         arg = self._conv_arg(entry["href"])
         t0 = time.monotonic()
@@ -4020,8 +4407,9 @@ class Recette:
                   "item": None, "trigger": None, "menu": None, "picked": None, "field": None, "confirmation": None}
         outcome, error = None, None
         listed = {p for p, _ in (self._conversation_state(page) or {}).get("items") or []}
-        if how == "supprimer" and entry["state"] == "supprimée":
-            outcome = "déjà supprimée au registre : rien n'est cliqué"
+        if how == "supprimer" and entry["state"] in GONE_STATES:
+            outcome = ("déjà supprimée au registre : rien n'est cliqué" if entry["state"] == "supprimée"
+                       else "suppression déjà confirmée au registre : rien n'est cliqué")  # m2: never twice
         else:
             record["item"] = b.call(ITEM_JS, arg, page=page)
             if not record["item"].get("found"):
@@ -4039,11 +4427,13 @@ class Recette:
                         error = why
                     else:
                         record["picked"] = pick["label"]
+                        # m1, m14: what is open before the click (a dialog, a field) is never what it opened
+                        b.call(MARK_BEFORE_JS, {}, page=page)
                         self._click_menu_entry(page, menu, how)
                         if how == "renommer":
                             outcome, error = self._rename(page, arg, case["question"].strip(), record)
                         else:
-                            outcome, error = self._confirm_delete(page, arg, record)
+                            outcome, error = self._confirm_delete(page, arg, record, entry, cid)
             except PWTimeout:
                 if b.pending():
                     raise
@@ -4124,8 +4514,12 @@ class Recette:
             trigger.click(timeout=5000)
         finally:
             trigger.dispose()
+        self._after_click(page)
         controls = (b.call(ITEM_JS, arg, page=page, timeout_ms=2000) or {}).get("controls")
-        margs = {"menu": SELECTORS["menu"], "item": SELECTORS["menu_item"], "controls": controls}
+        # m10: the menu of a conversation the run did not create (the probe) keeps no word of its title
+        margs = {"menu": SELECTORS["menu"], "item": SELECTORS["menu_item"], "controls": controls,
+                 "sidebar": SELECTORS["sidebar"], "convPath": SELECTORS["conversation_path"],
+                 "redactHref": arg["href"] if arg.get("redact") else None}
         menu = self._wait_for(page, lambda: b.call(MENU_JS, margs, page=page, timeout_ms=2000), UI_WAIT_S)
         if not menu:
             page.keyboard.press("Escape")
@@ -4145,6 +4539,7 @@ class Recette:
             el.click(timeout=5000)
         finally:
             el.dispose()
+        self._after_click(page)
 
     def _close_menu(self, page) -> bool:
         """Échap, deux fois au plus, jusqu'à ce qu'aucun menu ne soit visible."""
@@ -4178,6 +4573,7 @@ class Recette:
             el.press("Enter", timeout=5000)
         finally:
             el.dispose()
+        self._after_click(page)
 
         def gone():
             return not b.call(RENAME_FIELD_JS, farg, page=page, timeout_ms=2000)
@@ -4190,6 +4586,7 @@ class Recette:
                     button.click(timeout=5000)
                 finally:
                     button.dispose()
+                self._after_click(page)
                 done = self._wait_for(page, gone, 2.0)
         if not done:
             page.keyboard.press("Escape")  # abandoned, never left half-typed
@@ -4207,12 +4604,15 @@ class Recette:
             return None, "le nouveau titre n'est pas relu sur la conversation"
         return "renommée", None
 
-    def _confirm_delete(self, page, arg: dict, record: dict) -> tuple[str | None, str | None]:
+    def _confirm_delete(self, page, arg: dict, record: dict, entry: dict, cid: str) -> tuple[str | None, str | None]:
         """Après « Supprimer » : la confirmation de l'application (une fenêtre d'alerte, à défaut une fenêtre),
-        validée par son seul bouton dont le texte suit `confirm` (KNOWN_MODALS « suppression ») ; annulée par
-        Échap s'il n'y en a pas un et un seul. Puis la conversation de cette adresse absente de la barre
-        latérale. Sans confirmation, une conversation déjà partie a été supprimée sans elle (noté). Rend
-        (« supprimée », None) ou (None, la raison)."""
+        ouverte par ce clic (revue de la v2.3, m1 : une fenêtre déjà là avant n'est jamais prise), qui parle
+        de supprimer une conversation, une seule (confirms_one_deletion, revue I7), validée par son seul
+        bouton dont le texte suit `confirm` (KNOWN_MODALS « suppression ») ; sinon annulée par Échap. Le clic
+        de confirmation est noté au registre aussitôt (« suppression confirmée », revue m2 : jamais deux
+        fois). Puis la conversation de cette adresse absente de la barre latérale. Sans confirmation, une
+        conversation déjà partie a été supprimée sans elle (noté). Rend (« supprimée », None) ou (None, la
+        raison)."""
         b = self.browser
         k = next(k for k in KNOWN_MODALS if k["name"] == "suppression")
         carg = {"confirm": k["confirm"]}
@@ -4228,15 +4628,20 @@ class Recette:
             if gone():
                 record["confirmation"] = "aucune"
                 return "supprimée sans confirmation", None
-            return None, "pas de confirmation de suppression"
+            return None, "pas de confirmation de suppression (aucune fenêtre ouverte par le clic)"
         record["confirmation"] = dlg
         if dlg["role"] == "alertdialog":
             b.own_modal = "suppression"
-        if dlg["hits"] != 1:
+        why = None
+        if not confirms_one_deletion(dlg.get("text")):  # I7: it must speak of deleting one conversation
+            why = f"confirmation qui ne parle pas de supprimer une conversation : « {one_line(dlg.get('text') or '', 120)} »"
+        elif dlg["hits"] != 1:
+            why = f"confirmation sans bouton de suppression unique : {' | '.join(dlg['buttons'])}"
+        if why:
             page.keyboard.press("Escape")  # cancelled, never confirmed blind
             if self._wait_for(page, closed, 1.5) and b.own_modal == "suppression":
                 b.own_modal = None
-            return None, f"confirmation sans bouton de suppression unique : {' | '.join(dlg['buttons'])}"
+            return None, why
         el = b.element(CONFIRM_EL_JS, carg, page=page, timeout_ms=3000)
         if el is None:
             return None, "le bouton de confirmation a disparu"
@@ -4244,6 +4649,10 @@ class Recette:
             el.click(timeout=5000)
         finally:
             el.dispose()
+        entry["state"] = "suppression confirmée"  # m2: at the click, before anything can fail
+        entry.setdefault("history", []).append({"t": now_iso(), "state": "suppression confirmée", "case": cid})
+        self._save_registry()
+        self._after_click(page)
         if self._wait_for(page, closed, UI_WAIT_S) and b.own_modal == "suppression":
             b.own_modal = None
         if not self._wait_for(page, gone, UI_WAIT_S):
@@ -4254,30 +4663,39 @@ class Recette:
         """v2.3, E5 — l'enquête « Votre avis », ouverte exprès depuis son entrée (feedback_entry ; vue le
         18/10 : button[aria-label="Send feedback"]), reconnue par sa structure (KNOWN_MODALS « avis ») et
         fermée par sa croix, jamais par « Envoyer » : rien n'y est choisi, écrit ni envoyé. L'observation du
-        cas : « avis : ouvert (entrée : X) ; fermé par : croix ; envoyé : non ». Une entrée introuvable, une
-        enquête qui ne s'ouvre pas : observation et refus `precondition` ; une fenêtre non reconnue, ou qui
-        ne se ferme pas par sa croix : observation et refus `dialog`, laissée à l'humain."""
+        cas : « avis : ouvert (entrée : X) ; fermé par : croix ; envoyé : non ». L'entrée est identifiée par
+        son libellé exact (feedback_entry), hors carte de réponse et compositeur (revue de la v2.3, I5 : une
+        note 👍/👎 d'une carte est un envoi) ; non identifiée, rien n'est cliqué, aucune observation (le cas
+        reste à faire), refus `precondition` qui nomme les candidats vus. Une enquête qui ne s'ouvre pas :
+        observation et refus `precondition` ; une fenêtre non reconnue, ou qui ne se ferme pas par sa
+        croix : observation et refus `dialog`, laissée à l'humain."""
         cid = args["case"]
         case = self._case(cid)
         self._played_by(case, "ouvrir_avis")
         b = self.browser
         page = b.page()
         self._ensure_on_app(page)
-        self._case_in_hand = cid
+        self._take_case(cid)
         composer = self._composer_now(page)
         avis = next(k for k in KNOWN_MODALS if k["name"] == "avis")
         margs = {"known": [avis], "modal": SELECTORS["modal"]}
         record = {"case": cid, "entry": None, "opened": False, "closed_by": None, "sent": False}
         refusal = None
         start = page.url
-        entry = self._first_visible(page, SELECTORS["feedback_entry"])
+        entry, seen = self._identified_entry(page, SELECTORS["feedback_entry"], SELECTORS["feedback_words"],
+                                             sidebar=False)
         record["entry"] = entry
-        if entry is None:
-            text = "avis : entrée introuvable ; envoyé : non"
-            refusal = ("precondition", "pas d'entrée « Votre avis » (Send feedback) dans la page")
+        if entry is None:  # I5: never a guessed button; nothing clicked, nothing to judge
+            record["candidates"] = seen
+            ev.json("avis.json", record)
+            expected = ", ".join(re.search(r'aria-label="([^"]+)"', s).group(1) for s in SELECTORS["feedback_entry"])
+            raise DriverRefusal("precondition", f"pas d'entrée « Votre avis » identifiée (libellés attendus : {expected}) : "
+                                                "rien n'est cliqué" + (f" ; vu : {' | '.join(seen)}" if seen else ""),
+                                extra={"candidates": seen})
         else:
             name = entry["label"] or entry["text"] or entry["selector"]
             page.locator(entry["selector"]).nth(entry["index"]).click(timeout=5000)
+            self._after_click(page)
 
             def opened():
                 m = b.call(MODALS_JS, margs, page=page, timeout_ms=2000)
@@ -4296,6 +4714,7 @@ class Recette:
                 record["survey"] = b.call(AVIS_JS, {"sel": avis["selector"]}, page=page)
                 ev.screenshot(page, "avis.png")
                 page.locator(avis["dismiss"]).first.click(timeout=5000)  # its cross, never « Envoyer »
+                self._after_click(page)
                 shut = self._wait_for(page, lambda: "avis" not in b.call(MODALS_JS, margs, page=page,
                                                                          timeout_ms=2000)["known"], 2.0)
                 record["closed_by"] = "croix" if shut else None
@@ -4344,8 +4763,8 @@ class Recette:
         step("url", url)
         start = page.url
         step("selectors", lambda: self._probe_selectors(page))
-        step("search_entry", lambda: self._first_visible(page, SELECTORS["search_entry"]))
-        step("feedback_entry", lambda: self._first_visible(page, SELECTORS["feedback_entry"]))
+        step("search_entry", lambda: self._probe_entry(page, "search"))
+        step("feedback_entry", lambda: self._probe_entry(page, "feedback"))
         step("mic", lambda: b.call(MIC_JS, {"sel": SELECTORS["mic_button"]}, page=page))
         step("file_input", lambda: self._file_input(page))
         step("search", lambda: self._probe_search(page))
@@ -4360,7 +4779,7 @@ class Recette:
         text = (f"sonde : {len(found)} sélecteurs sur {len(sel)} trouvés"
                 + (f" (absents : {', '.join(missing)})" if missing else "")
                 + f" ; ⌘K : {'ouverte' if (probe['search'] or {}).get('opened_by') else 'non ouverte'}"
-                + f" ; avis : {'entrée trouvée' if probe['feedback_entry'] else 'entrée absente'}"
+                + f" ; avis : {'entrée trouvée' if (probe['feedback_entry'] or {}).get('selector') else 'entrée non identifiée'}"
                 + f" ; micro : {(probe['mic'] or {}).get('status') or 'absent'}"
                 + f" ; accept : {(probe['file_input'] or {}).get('accept') or 'aucun'}"
                 + f" ; menu de la première conversation : {items or menu.get('error') or 'non lu'}"
@@ -4387,6 +4806,14 @@ class Recette:
                     rows.append({"selector": sel, "error": one_line(str(e), 160)})
             out[key] = rows
         return out
+
+    def _probe_entry(self, page, which: str) -> dict:
+        """L'entrée de la recherche ⌘K ou de « Votre avis », telle que l'action la prendrait
+        (_identified_entry), jamais cliquée ; non identifiée, les candidats que la page montre."""
+        sels, words, sidebar = ((SELECTORS["search_entry"], SELECTORS["search_words"], True) if which == "search"
+                                else (SELECTORS["feedback_entry"], SELECTORS["feedback_words"], False))
+        entry, seen = self._identified_entry(page, sels, words, sidebar)
+        return entry or {"selector": None, "candidates": seen}
 
     @staticmethod
     def _file_input(page) -> dict:
@@ -4443,6 +4870,7 @@ class Recette:
         mark = b.mark()
         first = b.page()
         self._goto(first, self.entry)  # two fresh conversations
+        conversations = []  # m3: the two it creates, on its line
         second = b.context.new_page()
         try:
             self._goto(second, self.entry)
@@ -4463,7 +4891,8 @@ class Recette:
                     att = self._attach(page, path, budget_of(case))
                     out[case["id"]]["attach"] = {k: att[k] for k in ("state", "seconds", "ready_by")} | {
                         "label": (attach_error_class(att["label"], path.name) if att["state"] == "failed"
-                                  else sanitise(att["label"], 120, keep=(path.name,)))}
+                                  else sanitise(att["label"], 120, keep=(path.name,))),
+                        "internal_error_shown": chip_shows_internal(att["label"], path.name)}
             if all(o.get("attach", {"state": "ready"})["state"] == "ready" for o in out.values()):
                 for page, case in ((first, cases[0]), (second, cases[1])):
                     # no popover read here: the two sends must leave within 2 s of each other
@@ -4483,14 +4912,20 @@ class Recette:
                         out[turn["case"]]["end"] = turn["end"]
                     elif turn["done"]:
                         obs = self._collect(turn)
-                        out[turn["case"]].update(answer=one_line(obs["answer"], 300), total_s=obs["total_s"],
+                        answer = (sanitise(obs["answer"], 300) if answer_shows_internal(obs["answer"])
+                                  else one_line(obs["answer"], 300))
+                        out[turn["case"]].update(answer=answer, total_s=obs["total_s"],
                                                  end=obs["end"], server_steps=obs["server_steps"])
                         if obs.get("failure"):
                             out[turn["case"]]["error_class"] = obs["failure"]["error_class"]
+                        if shown_internal(obs):
+                            out[turn["case"]]["internal_error_shown"] = True
                 for turn in turns:  # E1: the conversations the two sends created, before the tab closes
                     if turn.get("end") != "<HORS PÉRIMÈTRE>":
-                        self._note_conversation_quietly(cid, before.get(id(turn["page"])), turn["page"],
-                                                        f"charge_concurrente ({turn['case']})")
+                        noted = self._note_conversation_quietly(cid, before.get(id(turn["page"])), turn["page"],
+                                                                f"charge_concurrente ({turn['case']})")
+                        if noted:
+                            conversations.append({**noted, "case": turn["case"]})
                 out["gap_s"] = gap
             ev.screenshot(second, "screen.png")
         finally:
@@ -4528,12 +4963,17 @@ class Recette:
         if "gap_s" in out:
             parts.append(f"écart d'envoi {out['gap_s']} s")
         timing = max([o.get("total_s") or o.get("timeout_s") or 0 for k, o in out.items() if k != "gap_s"] or [0])
+        extra = self._line_extra(cid, {"conversations": conversations} if conversations else {})  # modals_closed too
+        if any(o.get("internal_error_shown") or (o.get("attach") or {}).get("internal_error_shown")
+               for k, o in out.items() if k != "gap_s"):
+            extra["internal_error_shown"] = True
         line = self._journal_add(cid, verdict, timing, " ; ".join(parts),
                                  nfr_union(self._case(cid)["nfr"] if cid in self.cases else [],
                                            ["disponibilite", "scalabilite"],
                                            ["securite"] if off or dialog else []),
-                                 extra=self._line_extra(cid, {}))  # modals_closed, as on every line
-        self.observations["@concurrent"] = {**out, "case": cid, "verdict": verdict, "t": now_iso()}
+                                 extra=extra)
+        self.observations["@concurrent"] = {**out, "case": cid, "verdict": verdict, "t": now_iso(),
+                                            "conversations": conversations}
         if dialog:
             # First, as `_after` would: a frozen tab cannot be sent back to the entry page.
             raise self._dialog_refusal(ev)
@@ -4541,7 +4981,10 @@ class Recette:
             # The driver's own tab goes back to the entry page: the navigation's tab index was
             # recorded with the second tab open, and may name another tab now.
             raise self._host_refusal(navs[-1], ev, page=b.page())
-        return {"case": cid, "a": out[a], "b": out[bb], "verdict": verdict, "replayed": False, "text": line}
+        result = {"case": cid, "a": out[a], "b": out[bb], "verdict": verdict, "replayed": False, "text": line}
+        if extra.get("internal_error_shown"):  # I3: the harness reports it once per level
+            result["internal_error_shown"] = True
+        return result
 
     # -- le compositeur (v2) -----------------------------------------------------------------
     def _control(self, page, sels: list) -> dict | None:
@@ -4757,12 +5200,14 @@ class Recette:
                 obs = self._ask(q, budget, pii=case.get("pii"))
             except AskTimeout as t:
                 why = f"{t.why} au tour {i}/{n}"
-                line = self._timeout_line(cid, case["nfr"], t, why, extra=self._line_extra(cid, {"composer": composer}))
                 timeout = {"seconds": round(t.seconds, 1), "turn": i, "t": now_iso(), **t.profile}
                 self.observations[cid] = {"turns": turns, "timeout": timeout}
+                # m3: the conversation first, so that the timeout line names it
                 conversation = self._note_conversation_quietly(cid, conv_before, page, "conversation_longue")
                 if conversation:
                     self.observations[cid]["conversation"] = conversation
+                seen = {"composer": composer, "turns": turns, **({"conversation": conversation} if conversation else {})}
+                line = self._timeout_line(cid, case["nfr"], t, why, extra=self._line_extra(cid, seen))
                 ev.json("turns.json", {"case": cid, "asked_turns": n, "turns": turns, "timeout": timeout})
                 if failure:
                     ev.json("failure.json", failure)
@@ -4780,10 +5225,13 @@ class Recette:
         if failure:
             ev.json("failure.json", failure)
         self._answer_png(ev, self.browser.page())
-        return {"case": cid, "turns": len(turns), "answer": obs.get("answer"),
-                "total_s": [t["total_s"] for t in turns],
-                "text": f"{cid} : {len(turns)} tours, le dernier en {obs.get('total_s')} s — "
-                        f"{one_line(obs.get('answer') or '', 140)}"}
+        internal = any(t.get("internal_error_shown") for t in turns)  # I3, m11: any turn
+        answer = obs.get("answer") or ""
+        shown = sanitise(answer, 140) if answer_shows_internal(answer) else one_line(answer, 140)
+        return {"case": cid, "turns": len(turns), "answer": sanitise(answer, 4000) if answer_shows_internal(answer) else answer,
+                "total_s": [t["total_s"] for t in turns], "internal_error_shown": internal,
+                "text": f"{cid} : {len(turns)} tours, le dernier en {obs.get('total_s')} s — {shown}"
+                        + (" ; erreur interne affichée à l'utilisateur" if internal else "")}
 
     def capture_ecran(self, args: dict, ev: Evidence) -> dict:
         """Une capture de la partie visible de la page."""

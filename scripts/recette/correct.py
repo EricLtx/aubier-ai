@@ -2,7 +2,8 @@
 """Lignes de correction du journal d'une recette (procédure Aubier, PROCEDURE-3.md §6, E8).
 
 Usage :
-    python -I scripts/recette/correct.py WORK_DIR --cases M1-J1a,M3-B2 --reason "…" [--driver DIR] [--write]
+    python -I scripts/recette/correct.py WORK_DIR --cases M1-J1a,M3-B2 --reason "…" [--driver DIR]
+        [--observations FICHIER] [--evidence] [--reread-header] [--write]
 
 WORK_DIR est le dossier de travail du driver maskai-recette : son journal (journal.jsonl), ses
 observations (observations.json) et son registre des conversations. Pour chaque cas nommé, le script
@@ -15,11 +16,16 @@ Avec --reread-header, l'en-tête gardé de la carte de réponse (`guard.header`)
 règles du driver d'aujourd'hui (`parse_guard` : bannière du modèle, panneau de garde), en mémoire
 seulement : c'est la correction du 18/10, quand la bannière d'un modèle sans fournisseur n'était pas lue.
 
+Avec --observations FICHIER, les observations sont lues dans ce fichier au lieu de
+WORK_DIR/observations.json : à une reprise, le runbook (§12) met observations.json de côté, et les cas
+journalisés avant elle se rejouent sur le fichier mis de côté (revue de la v2.3, m8).
+
 Sans --write, il affiche ce qu'il écrirait et ne touche à rien. Avec --write, il ajoute au journal une
-ligne par cas dont le verdict, la preuve ou les ENF changent : `step` « correction », `supersedes`
-(l'index, parmi les lignes non vides, de la ligne remplacée), `reason`, et les champs d'une ligne
-d'exécution (inputs_sha256 et ui_profile_sha256 des règles qui jugent maintenant, config, sent_*,
-error_class…). Un cas inchangé n'a pas de ligne.
+ligne par cas dont le verdict ou les ENF changent (avec --evidence, la preuve seule aussi : sans lui, une
+preuve rédigée autrement, la note de rejeu d'un passage b par exemple, n'est pas une correction) : `step`
+« correction », `supersedes` (l'index, parmi les lignes non vides, de la ligne remplacée), `reason`, et
+les champs d'une ligne d'exécution (inputs_sha256 et ui_profile_sha256 des règles qui jugent maintenant,
+config, sent_*, error_class…). Un cas inchangé n'a pas de ligne.
 
 Ce qui ne se rejoue pas, et le dit : un cas sans ligne en vigueur (verdict_oracle le journalisera), un
 cas jugé par une autre action (charge_concurrente, un abandon), un cas jugé sur une observation partagée
@@ -42,7 +48,9 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 DEFAULT_DRIVER = os.path.join(REPO, "drivers", "maskai-recette")
-COMPARED = ("verdict", "evidence", "nfr")
+COMPARED = ("verdict", "nfr")  # with --evidence, the evidence too (review of v2.3, m8)
+OBSERVATIONS_HINT = (" ; à une reprise, les observations d'avant sont dans le fichier mis de côté : "
+                     "--observations FICHIER")
 
 
 def load_driver(driver_dir: str):
@@ -82,9 +90,12 @@ def reread_header(recette, drv, cid: str) -> bool:
     return True
 
 
-def plan(recette, drv, cases: list, reason: str, reread: bool = False) -> list:
-    """Pour chaque cas : la ligne remplacée et la ligne de correction (ou pourquoi il n'y en a pas)."""
+def plan(recette, drv, cases: list, reason: str, reread: bool = False, evidence: bool = False,
+         observations: str | None = None) -> list:
+    """Pour chaque cas : la ligne remplacée et la ligne de correction (ou pourquoi il n'y en a pas). Le
+    verdict et les ENF sont comparés ; la preuve aussi avec `evidence`."""
     events = drv.journal.load(str(recette.journal_path))
+    compared = COMPARED + (("evidence",) if evidence else ())
     out = []
     for cid in cases:
         item = {"case": cid, "supersedes": None, "old": None, "line": None, "status": None}
@@ -106,7 +117,7 @@ def plan(recette, drv, cases: list, reason: str, reread: bool = False) -> list:
         try:
             j = recette._judge(case, offline=True)
         except ValueError as e:
-            item["status"] = f"erreur : {e}"
+            item["status"] = f"erreur : {e}" + ("" if observations else OBSERVATIONS_HINT)
             continue
         line = {"step": "correction", "case": cid, "verdict": j["verdict"],
                 "timing_s": round(j["timing_s"], 1) if isinstance(j["timing_s"], (int, float)) else None,
@@ -115,8 +126,10 @@ def plan(recette, drv, cases: list, reason: str, reread: bool = False) -> list:
                 "nfr": j["nfr"] or None, "supersedes": idx, "reason": reason,
                 "inputs_sha256": recette.inputs_sha256, "ui_profile_sha256": recette.ui_profile_sha256,
                 **drv.clean(j["extra"])}
-        if all(line.get(k) == events[idx].get(k) for k in COMPARED):
+        if all(line.get(k) == events[idx].get(k) for k in compared):
             item["status"] = "inchangé : rien à corriger"
+            if not evidence and line.get("evidence") != events[idx].get("evidence"):
+                item["status"] += " (la preuve seule diffère : --evidence pour l'écrire)"
             continue
         item["line"], item["status"] = line, "à corriger"
         item["judged"] = j
@@ -133,16 +146,24 @@ def write(recette, item: dict) -> dict:
 
 
 def run(work: str, cases: list, reason: str, driver_dir: str = DEFAULT_DRIVER, write_lines: bool = False,
-        hosts: str = "app.maskai.fr", out=None, reread: bool = False) -> tuple[list, int]:
-    """Le plan des corrections (et, avec `write_lines`, les lignes écrites) ; le code de retour."""
+        hosts: str = "app.maskai.fr", out=None, reread: bool = False, evidence: bool = False,
+        observations: str | None = None) -> tuple[list, int]:
+    """Le plan des corrections (et, avec `write_lines`, les lignes écrites) ; le code de retour.
+    `observations` : le fichier d'observations à rejouer (par défaut WORK_DIR/observations.json), lu,
+    jamais écrit."""
     out = out or sys.stdout
     if not os.path.isfile(os.path.join(work, "journal.jsonl")):
         raise SystemExit(f"pas de journal.jsonl sous {work}")
+    if observations is not None and not os.path.isfile(observations):
+        raise SystemExit(f"pas de fichier d'observations {observations}")
     drv = load_driver(driver_dir)
     with tempfile.TemporaryDirectory(prefix="correct-profile-") as profile:  # never used: no browser offline
         recette = drv.Recette(env={"VK_DRIVER_WORK_DIR": work, "VK_DRIVER_PROFILE_DIR": profile,
                                    "VK_DRIVER_HOSTS": hosts})
-        items = plan(recette, drv, cases, reason, reread)
+        if observations is not None:
+            with open(observations, encoding="utf-8") as f:
+                recette.observations = json.load(f)
+        items = plan(recette, drv, cases, reason, reread, evidence, observations)
         for item in items:
             old = item["old"] or {}
             head = f"{item['case']} : {item['status']}"
@@ -170,13 +191,18 @@ def main(argv: list) -> int:
     p.add_argument("--hosts", default="app.maskai.fr", help="la liste d'hôtes du driver (sans effet hors ligne)")
     p.add_argument("--reread-header", action="store_true",
                    help="relire l'en-tête gardé de chaque carte avec les règles du driver d'aujourd'hui")
+    p.add_argument("--observations", default=None,
+                   help="le fichier d'observations à rejouer (par défaut WORK_DIR/observations.json ; à une "
+                        "reprise, celui qui a été mis de côté)")
+    p.add_argument("--evidence", action="store_true",
+                   help="écrire aussi une correction quand seule la preuve change")
     p.add_argument("--write", action="store_true", help="ajouter les lignes au journal (sinon : à blanc)")
     args = p.parse_args(argv[1:])
     cases = [c.strip() for c in args.cases.split(",") if c.strip()]
     if not cases or not args.reason.strip():
         p.error("--cases et --reason ne peuvent pas être vides")
     _, code = run(args.work, cases, args.reason.strip(), args.driver, args.write, args.hosts,
-                  reread=args.reread_header)
+                  reread=args.reread_header, evidence=args.evidence, observations=args.observations)
     return code
 
 

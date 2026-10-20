@@ -1946,10 +1946,10 @@ class PilotV23Units(unittest.TestCase):
                          {"PERSON": 3, "PHONE": 1})
         self.assertEqual(drv.token_inventory("sans jeton"), {})
         self.assertIsNone(drv.token_inventory(None), "not observed is not « no token »")
-        self.assertEqual(drv.inventory_note({"PERSON": 2, "IBAN": 1}, {"IBAN": 1, "PERSON": 2}), "ensemble masqué identique")
+        self.assertEqual(drv.inventory_note({"PERSON": 2, "IBAN": 1}, {"IBAN": 1, "PERSON": 2}), "types masqués identiques")
         self.assertEqual(drv.inventory_note({"PERSON": 2, "IBAN": 1}, {"PERSON": 1, "PHONE": 3}),
-                         "ensemble masqué différent : +PHONE ×3 −IBAN −PERSON")
-        self.assertEqual(drv.inventory_note({}, None), "ensemble masqué non comparable (texte envoyé non observé au passage b)")
+                         "types masqués différents : +PHONE ×3 −IBAN −PERSON")
+        self.assertEqual(drv.inventory_note({}, None), "types masqués non comparables (texte envoyé non observé au passage b)")
         g = drv.parse_guard("Anonymisé → <PERSON_1> <PHONE_1> L'Aiguilleur : PASS·Le Chirurgien : 2 PII détectées Détails "
                             "maskai google/eu.claude-haiku-5-5 noté", "noté", True)
         self.assertEqual(g["pii_count"], 2)
@@ -2056,7 +2056,7 @@ class PilotV23Units(unittest.TestCase):
             verdict("M8-4")
         self.assertEqual(refused.exception.detail, "aucune observation pour M8-4 : lister_conversations d'abord")
         recette._shared("@list", {"answer": "recherche « Recette trois » : 1 résultat : Recette trois, fiche pratique : "
-                                            "qu'est-c", "timing_s": None})
+                                            "qu'est-c", "timing_s": None, "case": "M8-4"})
         self.assertEqual(verdict("M8-4"), "OK")
         self.assertIn("recherche « Recette trois »", recette.observations["M8-4"]["observed"]["answer"])
         recette._shared("@model", {"answer": "options : claude haiku 5-5 ; choisi : claude haiku 5-5 ; relu : "
@@ -2243,7 +2243,7 @@ class PilotV23OnFixture(FixtureBench):
                          {"href": entry["href"], "created_by": "t-a", "state": "supprimée"})
         with open(os.path.join(recette.work, "conversations.json"), encoding="utf-8") as f:
             self.assertEqual([h["state"] for h in json.load(f)["conversations"][0]["history"]],
-                             ["créée", "renommée", "supprimée"])
+                             ["créée", "renommée", "suppression confirmée", "supprimée"])
         opens = page.evaluate("() => window.__menu_opens.length")
         self.list_case(recette, "t-del2", action="supprimer_conversation", same_conversation_as="t-a")
         res, _ = self.act(A, "supprimer_conversation", {"case": "t-del2"})  # deleted already: nothing clicked
@@ -2380,8 +2380,9 @@ class PilotV23OnFixture(FixtureBench):
                 self.assertNotIn(bad, seen, name)
 
     def test_a_silent_failure_is_named_on_the_line_without_its_internals(self):
-        """E10: no answer card (the night of 18–19/10): the line carries the failure's class and a sanitised
-        excerpt; the raw capture (status line, toast, HTTP status, last events) goes to failure.json only."""
+        """E10: no answer card (the night of 18–19/10): the line carries the failure's class and whether an
+        internal error was shown (review I3); the sanitised excerpt and the raw capture (status line, toast,
+        HTTP status, last events) go to failure.json only (review I2)."""
         drv, recette, A = self.make()
         recette.open()
         for word, cls, excerpt in (("SILENT_FAIL", "service interne injoignable", "could not translate host name"),
@@ -2399,13 +2400,15 @@ class PilotV23OnFixture(FixtureBench):
             self.assertEqual((line["verdict"], line["error_class"]), ("KO", cls))
             self.assertIn("réponse vide : échec silencieux (aucune nouvelle carte de réponse", line["evidence"])
             self.assertIn(cls, line["evidence"])
-            self.assertIn(excerpt, line["error_excerpt"])
-            self.assertLessEqual(len(line["error_excerpt"]), drv.EXCERPT_MAX)
+            self.assertNotIn("error_excerpt", line)
+            self.assertIn(excerpt, failure["excerpt"])
+            self.assertLessEqual(len(failure["excerpt"]), drv.EXCERPT_MAX)
             seen = json.dumps([line, recette.observations[cid]], ensure_ascii=False)
             for bad in ("pii-db", "pii-guard", "maskai.local", "/srv/", "detect.py", "8443"):
                 self.assertNotIn(bad, seen, word)
+            if word == "SILENT_502":
+                self.assertEqual(failure["excerpt"], "Le service est momentanément indisponible (502).")
         self.assertIn("dernier nœud detect_pii", journal_lines(recette.work)[-2]["evidence"])
-        self.assertEqual(journal_lines(recette.work)[-1]["error_excerpt"], "Le service est momentanément indisponible (502).")
 
     def test_the_line_carries_the_masked_inventory_and_the_replay_compares_it(self):
         """E7: sent_source, sent_tokens and pii_declared on the line; the replay_of note compares the masked
@@ -2425,9 +2428,9 @@ class PilotV23OnFixture(FixtureBench):
             self.act(A, "verdict_oracle", {"case": cid})
         a, b, c, st = journal_lines(recette.work)[-4:]
         self.assertEqual((a["sent_source"], a["sent_tokens"], a["pii_declared"]), ("card-details", {"PERSON": 1, "PHONE": 1}, 2))
-        self.assertIn("passage a (t-a) : OK ; texte envoyé identique ; ensemble masqué identique", b["evidence"])
+        self.assertIn("passage a (t-a) : OK ; texte envoyé identique ; entités masquées identiques", b["evidence"])
         self.assertEqual((c["verdict"], c["sent_tokens"]), ("KO", {}))
-        self.assertIn("passage a (t-a) : OK ; texte envoyé différent ; ensemble masqué différent : −PERSON −PHONE",
+        self.assertIn("passage a (t-a) : OK ; texte envoyé différent ; entités masquées différentes : −PERSON −PHONE",
                       c["evidence"])
         self.assertEqual((st["sent_source"], st["sent_tokens"], st["sent_rejected"]),
                          (None, None, "le panneau « Détails » ne montre pas le texte de la question"))
@@ -2503,6 +2506,443 @@ class PilotV23OnFixture(FixtureBench):
         self.assertEqual([lines[c]["conversation"]["state"] for c in ("M8-1", "M8-5", "M8-6")],
                          ["créée", "renommée", "supprimée"])
         self.assertIsNone(recette.browser.own_modal)
+
+
+class FixRound1Units(unittest.TestCase):
+    """Review of pilot v2.3, fix round 1 (.superpowers/review-v2.3.md): what needs no browser."""
+
+    def recette(self, drv):
+        work, profile = tempfile.mkdtemp(prefix="maskai-recette-"), tempfile.mkdtemp(prefix="maskai-recette-")
+        self.addCleanup(shutil.rmtree, work, True)
+        self.addCleanup(shutil.rmtree, profile, True)
+        return drv.Recette(env={"VK_DRIVER_WORK_DIR": work, "VK_DRIVER_PROFILE_DIR": profile,
+                                "VK_DRIVER_HOSTS": "127.0.0.1"})
+
+    @staticmethod
+    def verdict(recette, cid):
+        ev = tempfile.mkdtemp(prefix="maskai-recette-")
+        try:
+            return recette.actions()["verdict_oracle"]({"case": cid}, ev)[0]
+        finally:
+            shutil.rmtree(ev, True)
+
+    def test_i2_the_usual_forms_of_an_internal_host_are_sanitised_and_flagged(self):
+        """I2: name:port, ENOTFOUND, « connect to host », « lookup »: never on a line, always flagged."""
+        drv = load_driver()
+        for text, host in (("Error -3 connecting to redis:6379. Temporary failure in name resolution.", "redis"),
+                           ("getaddrinfo ENOTFOUND presidio-analyzer", "presidio-analyzer"),
+                           ("Cannot connect to host anonymizer:8080 ssl:default", "anonymizer"),
+                           ("Connection refused connecting to pii_guard:8000", "pii_guard"),
+                           ("dial tcp: lookup pii-db on 10.0.0.2:53: no such host", "pii-db")):
+            self.assertNotIn(host, drv.sanitise(text, 500), text)
+            self.assertTrue(drv.exposes_internals(text), text)
+        # a chip whose class is a service out of reach showed an internal error, even with no host to read
+        self.assertTrue(drv.chip_shows_internal("x.txt Failed: database unavailable", "x.txt"))
+        self.assertFalse(drv.chip_shows_internal("x.txt Failed: unsupported file format", "x.txt"))
+
+    def test_i7_only_the_exact_entries_of_a_conversation_menu_are_clicked(self):
+        """I7: the rename and delete entries are allow-listed; the confirmation must speak of deleting one
+        conversation."""
+        drv = load_driver()
+
+        def item(label):
+            return {"text": drv.evaluer.fold(label), "label": label, "disabled": False}
+
+        for labels in (["Renommer le dossier", "Supprimer tous les chats du dossier"],
+                       ["Renommer", "Supprimer tous les messages"], ["Rename", "Delete every chat in this folder"],
+                       ["Renommer", "Supprimer toute la sélection"], ["Rename", "Delete selected"],
+                       ["Renommer", "Supprimer ⌘⌫"], ["Renommer", "Supprimer", "Supprimer tous les messages"]):
+            pick, why = drv.menu_entry([item(x) for x in labels], "supprimer")
+            self.assertIsNone(pick, labels)
+            self.assertTrue(why)
+        for labels, want in ((["Renommer", "Partager", "Supprimer"], "Supprimer"),
+                             (["Rename chat", "Delete chat"], "Delete chat"),
+                             (["Renommer la conversation", "Supprimer la conversation"], "Supprimer la conversation"),
+                             (["Rename", "Delete this conversation"], "Delete this conversation")):
+            self.assertEqual(drv.menu_entry([item(x) for x in labels], "supprimer")[0]["label"], want, labels)
+        for text in ("Supprimer cette conversation ? Cette action est définitive.",
+                     "Delete chat? This will permanently delete it.", "Supprimer la discussion « Recette trois » ?",
+                     # what a confirmation says of the one conversation's own content is never « several »
+                     "Supprimer la conversation ? La conversation et tous ses messages seront définitivement supprimés.",
+                     "Delete chat? This will delete the chat and all of its messages.",
+                     "Supprimer cette conversation ? Tout l'historique de cette conversation sera effacé."):
+            self.assertTrue(drv.confirms_one_deletion(text), text)
+        for text in ("Supprimer tous les chats du dossier ?", "Êtes-vous sûr ?", "Delete all chats?",
+                     "Supprimer la sélection ?", "Supprimer le dossier ?", "Vider la conversation ?",
+                     "Supprimer toutes les conversations ?", "Delete every chat in this folder?",
+                     "Supprimer la conversation et tout l'historique ?", "Delete this chat and clear your history?",
+                     "Supprimer les 3 conversations sélectionnées ?"):
+            self.assertFalse(drv.confirms_one_deletion(text), text)
+
+    def test_m5_a_case_bound_observation_judges_its_own_case_only(self):
+        """m5: an @list made for M8-4 never judges M8-5; a pre-v2.3 shared observation that carries a
+        verdict is consumed."""
+        drv = load_driver()
+        recette = self.recette(drv)
+        recette._shared("@list", {"answer": "recherche « Recette trois » : 1 résultat : Recette trois renommée",
+                                  "timing_s": None, "case": "M8-4"})
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.verdict(recette, "M8-5")
+        self.assertIn("renommer_conversation d'abord", refused.exception.detail)
+        self.assertEqual(self.verdict(recette, "M8-4")["verdict"], "OK", "its own case is judged on it")
+        recette.observations["@list"] = {"answer": "3 conversations : a | b | c", "timing_s": None,
+                                         "verdict": {"verdict": "OK"}}  # pilot v2.2: judged, no `judged`
+        with self.assertRaises(drv.DriverRefusal):
+            self.verdict(recette, "N7-1")
+
+    def test_m6_the_replay_note_compares_the_masked_entities_not_only_their_types(self):
+        """m6: two persons masked in a, a person and a city in b: the types match, the entities do not."""
+        drv = load_driver()
+        recette = self.recette(drv)
+        q = "Relance M. Hugo Bernard et Paul Martin pour Lyon."
+        base = {"level": "M1", "kind": "message", "question": q, "budget_s": 10, "nfr": ["securite"],
+                "must": ["relance"], "must_not": [], "pii": []}
+        sent = {"t-a": "Relance <PERSON_1> et <PERSON_2> pour Lyon.", "t-b": "Relance <PERSON_1> et Paul Martin pour <PERSON_2>.",
+                "t-c": "Relance <PERSON_1> et <PERSON_2> pour Lyon."}
+        for cid in ("t-a", "t-b", "t-c"):
+            recette.cases[cid] = {**base, "id": cid, **({} if cid == "t-a" else {"replay_of": "t-a"})}
+            recette.observations[cid] = {"answer": "Relance envoyée.", "timing_s": 3.0, "sent_to_model": sent[cid],
+                                         "sent_info": {"source": "card-details"}, "guard": {"pii_count": 2}}
+            self.verdict(recette, cid)
+        b, c = journal_lines(recette.work)[-2:]
+        self.assertNotIn("ensemble masqué identique", b["evidence"], "the same types over other entities")
+        self.assertIn("entités masquées différentes", b["evidence"])
+        self.assertIn("entités masquées identiques", c["evidence"])
+        recette.observations.pop("t-a")  # passage a's text gone (observations set aside): types only, said so
+        recette.cases["t-d"] = {**base, "id": "t-d", "replay_of": "t-a"}
+        recette.observations["t-d"] = {**recette.observations["t-c"], "verdict": None}
+        recette.observations["t-d"].pop("verdict")
+        self.verdict(recette, "t-d")
+        self.assertIn("types masqués identiques", journal_lines(recette.work)[-1]["evidence"])
+
+    def test_m7_an_ordinary_status_update_is_no_displayed_error(self):
+        """m7: only an alert, a toast, or an error-like status text counts as an error shown."""
+        drv = load_driver()
+        end = ["<START>", "node:detect_pii ×2", "<END>"]
+        self.assertEqual(drv.failure_class(200, None, [["status", "Message envoyé"]], end, True),
+                         "flux terminé sans réponse")
+        self.assertEqual(drv.failure_class(200, None, [["status", "Une erreur est survenue"]], end, True),
+                         "erreur affichée par l'application")
+        self.assertEqual(drv.failure_class(200, None, [["alert", "Quota"]], end, True),
+                         "erreur affichée par l'application")
+        self.assertEqual(drv.failure_class(200, None, [["toast", "Réessayez dans un instant"]], end, True),
+                         "erreur affichée par l'application")
+
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class FixRound1OnFixture(FixtureBench):
+    """Review of pilot v2.3, fix round 1, on the bench: what must never be pressed, taken or judged OK."""
+
+    HREFS = "() => [...document.querySelectorAll('#conversations a')].map((a) => a.getAttribute('href'))"
+
+    def start(self, query=""):
+        drv, recette, A = self.make()
+        recette.entry += query
+        recette.open()
+        return drv, recette, A, recette.browser.page()
+
+    def play_m8_1(self, A):
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "choisir_modele", {"model": "claude haiku 5-5"})
+        self.act(A, "poser_question", {"case": "M8-1"})
+        self.act(A, "verdict_oracle", {"case": "M8-1"})
+
+    def refused(self, drv, A, action, args):
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            self.act(A, action, args)
+        return refused.exception
+
+    def verdict_after(self, drv, A, action, cid):
+        try:
+            self.act(A, action, {"case": cid})
+        except drv.DriverRefusal:
+            pass
+        return self.act(A, "verdict_oracle", {"case": cid})[0]["verdict"]
+
+    @staticmethod
+    def list_case(recette, cid, **over):
+        recette.cases[cid] = {"id": cid, "level": "M8", "kind": "list", "budget_s": 10, "nfr": ["disponibilite"],
+                              "must": [], "must_not": [], "pii": [], **over}
+
+    def first_message(self, recette, A, cid="t-a", question="Recette banc : premier message"):
+        self.message_case(recette, cid, question)
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "poser_question", {"case": cid})
+        return recette._registered(cid)
+
+    def test_i1_m8_5_and_m8_6_are_judged_on_their_conversation_not_on_the_listing(self):
+        """I1: a refused menu gives KO and KO; a listed « Recette trois renommée » that is not M8-1's
+        changes neither verdict."""
+        for name, query, decoy, want in (("menu refused", "?menuitems=Partager,Supprimer", False, ("KO", "KO")),
+                                         ("both done, decoy listed", "", True, ("OK", "OK")),
+                                         ("menu refused, decoy listed", "?menuitems=Partager,Supprimer", True, ("KO", "KO"))):
+            with self.subTest(name):
+                drv, recette, A, page = self.start(query)
+                try:
+                    if decoy:
+                        page.evaluate("() => window.__seed('Recette trois renommée')")
+                    self.play_m8_1(A)
+                    got = (self.verdict_after(drv, A, "renommer_conversation", "M8-5"),
+                           self.verdict_after(drv, A, "supprimer_conversation", "M8-6"))
+                    self.assertEqual(got, want)
+                    if want == ("KO", "KO"):
+                        self.assertEqual(page.evaluate("() => window.__deleted"), [])
+                finally:
+                    recette.browser.close()
+
+    def test_i3_an_internal_error_shown_to_the_user_is_flagged_and_the_excerpt_stays_in_the_evidence(self):
+        """I3: the status line shows « pii-guard.internal:8443 » (SILENT_FAIL): flagged on the result and the
+        line; a plain status (SILENT_502) is not; a chip naming a host is flagged on the line. I2: no
+        excerpt on the line, it is in failure.json."""
+        drv, recette, A, page = self.start()
+        for word, shown in (("SILENT_FAIL", True), ("SILENT_502", False)):
+            cid = f"t-{word.lower()}"
+            self.message_case(recette, cid, f"Bonjour {word}")
+            self.act(A, "nouvelle_conversation")
+            res, ev = self.act(A, "poser_question", {"case": cid})
+            self.assertIs(res["internal_error_shown"], shown, word)
+            self.assertTrue(self.evidence_json(ev, "failure.json")["excerpt"], word)
+            self.act(A, "verdict_oracle", {"case": cid})
+            line = journal_lines(recette.work)[-1]
+            self.assertIs(line["internal_error_shown"], shown, word)
+            self.assertNotIn("error_excerpt", line, word)
+        recette.cases["t-faildb"] = {**recette.cases["fixture-case-1"], "id": "t-faildb",
+                                     "file": "fixture/corpus/faildb.txt"}
+        self.act(A, "nouvelle_conversation")
+        self.refused(drv, A, "joindre_document", {"case": "t-faildb"})
+        self.act(A, "verdict_oracle", {"case": "t-faildb"})
+        line = journal_lines(recette.work)[-1]
+        self.assertIs(line["internal_error_shown"], True)
+        self.assertIs(line["attach"]["internal_error_shown"], True)
+
+    def test_i4_the_search_fallback_never_presses_a_control_it_did_not_identify(self):
+        """I4: the entry is a plain div, the dictation button carries a <kbd> hint, ⌘K is not bound: the
+        search refuses `precondition` before any click, and the probe too presses nothing. An entry that is
+        a link is identified; the page it leads to is left, back to where the search started."""
+        drv, recette, A, page = self.start("?searchentry=div&kbdmic=1&nokbd=1")
+        self.list_case(recette, "t-search", action="lister_conversations", question="Recette")
+        err = self.refused(drv, A, "lister_conversations", {"case": "t-search"})
+        self.assertEqual(err.reason, "precondition")
+        self.assertNotIn("@list", recette.observations, "no verdict on an entry the driver could not identify")
+        self.act(A, "sonder_interface")
+        self.assertEqual(page.evaluate("() => [window.__mic_clicks, window.__palette_opens]"), [0, 0])
+        recette.browser.close()
+        drv, recette, A, page = self.start("?searchentry=link&nokbd=1")
+        self.first_message(recette, A)
+        start = drv.urlsplit(page.url).path
+        self.list_case(recette, "t-search", action="lister_conversations", question="Recette")
+        err = self.refused(drv, A, "lister_conversations", {"case": "t-search"})
+        self.assertEqual(err.reason, "precondition")
+        self.assertEqual(drv.urlsplit(page.url).path, start, "back where the search started")
+        search = self.evidence_json(err.evidence, "search.json")
+        self.assertEqual(drv.urlsplit(search["moved_to"]).path, "/search")
+
+    def test_i5_the_feedback_entry_is_never_guessed(self):
+        """I5: the documented « Send feedback » button is relabelled and the answer card carries 👍/👎:
+        ouvrir_avis refuses `precondition` before any click, listing what it saw."""
+        drv, recette, A, page = self.start("?feedbacklabel=Envoyer%20un%20retour&ratings=1")
+        self.first_message(recette, A)
+        self.assertEqual(page.evaluate("() => document.querySelectorAll('[aria-label=\"Positive feedback\"]').length"), 1)
+        err = self.refused(drv, A, "ouvrir_avis", {"case": "M8-8"})
+        self.assertEqual(err.reason, "precondition")
+        self.assertIn("Envoyer un retour", err.detail, "the candidates are listed, not clicked")
+        self.assertEqual(page.evaluate("() => [window.__rating_clicks, window.__feedback_opens, window.__survey_shown]"),
+                         [0, 0, 0])
+
+    def test_i5_a_candidate_that_names_a_conversation_is_never_quoted(self):
+        """I4, I5, found while writing the fix report: a row button labelled after its conversation
+        (« Options de « Avis juridique Dupont » ») matches the feedback words; it was quoted among the
+        candidates of the refusal. A candidate that holds a listed title is left out."""
+        drv, recette, A, page = self.start("?feedbacklabel=Envoyer%20un%20retour&rowlabels=1")
+        page.evaluate("() => window.__seed('Avis juridique Dupont')")
+        err = self.refused(drv, A, "ouvrir_avis", {"case": "M8-8"})
+        self.assertEqual(err.reason, "precondition")
+        self.assertIn("Envoyer un retour", err.detail, "the candidates are still listed")
+        self.assertNotIn("Dupont", err.detail)
+        self.assertNotIn("Dupont", json.dumps(err.extra, ensure_ascii=False))
+        self.assertEqual(page.evaluate("() => window.__menu_opens"), [], "nothing was clicked")
+
+    def test_i6_a_row_that_shows_up_during_a_question_is_never_registered(self):
+        """I6: the question creates nothing (the page stays on /new) while another row appears: the
+        registry stays empty, so rename and delete have nothing to act on."""
+        drv, recette, A, page = self.start()
+        self.message_case(recette, "t-nocreate", "Bonjour NOCREATE")
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "poser_question", {"case": "t-nocreate"})
+        self.assertEqual(len(page.evaluate(self.HREFS)), 1, "a row showed up")
+        self.assertEqual(recette.registry, [])
+        self.assertIsNone(recette._registered("t-nocreate"))
+
+    def test_i7_a_group_menu_or_a_wide_confirmation_never_deletes(self):
+        """I7: a row without its own trigger in a headed group (whose menu deletes the group): no trigger is
+        taken; a confirmation that speaks of « tous les chats »: cancelled, never confirmed."""
+        for name, query in (("group", "?grouped=1"),
+                            ("wide confirmation", "?confirmtext=Supprimer%20tous%20les%20chats%20du%20dossier%20%3F")):
+            with self.subTest(name):
+                drv, recette, A, page = self.start(query)
+                try:
+                    self.first_message(recette, A)
+                    self.list_case(recette, "t-del", action="supprimer_conversation", same_conversation_as="t-a")
+                    err = self.refused(drv, A, "supprimer_conversation", {"case": "t-del"})
+                    self.assertEqual(err.reason, "precondition")
+                    self.assertEqual(page.evaluate("() => [window.__deleted, window.__group_menu_opens]"), [[], 0])
+                    self.assertTrue(page.evaluate("() => document.getElementById('confirm-delete').hidden"))
+                finally:
+                    recette.browser.close()
+
+    def test_m1_a_confirmation_that_was_open_before_the_click_is_never_taken(self):
+        """m1: the delete entry opens nothing, while an unrelated « Supprimer cette conversation ? » dialog
+        appeared when the menu opened: it is never clicked."""
+        drv, recette, A, page = self.start("?decoydialog=1&noconfirm=1")
+        self.first_message(recette, A)
+        self.list_case(recette, "t-del", action="supprimer_conversation", same_conversation_as="t-a")
+        err = self.refused(drv, A, "supprimer_conversation", {"case": "t-del"})
+        self.assertIn("pas de confirmation", err.detail)
+        self.assertEqual(page.evaluate("() => [window.__decoy_confirms, window.__deleted.length]"), [0, 0])
+        page.evaluate("() => { document.getElementById('decoy').hidden = true; }")
+
+    def test_a_cancel_button_that_says_non_is_the_cancel_button(self):
+        """Fix round 1, found while binding the confirmation to the click (m1): the cancel rule `^non\\b` of
+        the page's script had become a backspace (an escape in a plain string), so « Non, ne pas supprimer »
+        counted as a second delete button and the confirmation was cancelled as ambiguous. Read as « non »,
+        it is the cancel button: the one delete button confirms, once."""
+        drv, recette, A, page = self.start("?canceltext=Non%2C%20ne%20pas%20supprimer")
+        self.first_message(recette, A)
+        self.list_case(recette, "t-del", action="supprimer_conversation", same_conversation_as="t-a",
+                       must=["plus listee"], must_not=["encore listee"])
+        res, ev = self.act(A, "supprimer_conversation", {"case": "t-del"})
+        record = self.evidence_json(ev, "conversation.json")
+        self.assertEqual((record["confirmation"]["buttons"], record["confirmation"]["hits"]),
+                         (["Non, ne pas supprimer", "Supprimer"], 1))
+        self.assertEqual(len(page.evaluate("() => window.__deleted")), 1)
+        self.assertNotIn("\x08", drv._CONFIRM_FIND, "no backspace in the page's regex")
+
+    def test_m2_a_confirmed_delete_is_never_clicked_twice(self):
+        """m2: the confirmation was clicked, the row is still listed (a stale sidebar): the registry says
+        « suppression confirmée », and a second run clicks nothing."""
+        drv, recette, A, page = self.start("?staledelete=1")
+        self.first_message(recette, A)
+        self.list_case(recette, "t-del", action="supprimer_conversation", same_conversation_as="t-a")
+        self.refused(drv, A, "supprimer_conversation", {"case": "t-del"})
+        self.assertEqual(recette._registered("t-a")["state"], "suppression confirmée")
+        opens = page.evaluate("() => window.__menu_opens.length")
+        try:
+            self.act(A, "supprimer_conversation", {"case": "t-del"})
+        except drv.DriverRefusal:
+            pass
+        self.assertEqual(page.evaluate("() => [window.__menu_opens.length, window.__deleted.length]"), [opens, 1])
+
+    def test_m3_the_timeout_line_and_the_concurrent_line_name_their_conversations(self):
+        """m3: a question abandoned at its deadline names the conversation it created; the concurrent line
+        names the two it created."""
+        drv, recette, A, page = self.start()
+        recette.cases["t-slow"] = {"id": "t-slow", "level": "N8", "kind": "message", "question": "SLOW",
+                                   "budget_s": 1, "nfr": ["disponibilite"], "must": [], "must_not": [], "pii": []}
+        self.act(A, "nouvelle_conversation")
+        self.refused(drv, A, "poser_question", {"case": "t-slow"})
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual((line["case"], line["conversation"]["created_by"]), ("t-slow", "t-slow"))
+        self.act(A, "charge_concurrente", {"cases": ["fixture-case-1", "fixture-case-2"]})
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual(len(line["conversations"]), 2, line)
+
+    def m4_dialog_during_a_rename(self, js: str) -> None:
+        """A dialog that `js` opens from the « Renommer » entry's click: refused `dialog`, then the line is KO
+        sécurité and says so."""
+        drv, recette, A, page = self.start()
+        self.first_message(recette, A)
+        self.list_case(recette, "t-ren", action="renommer_conversation", same_conversation_as="t-a",
+                       question="Titre nouveau", must=["titre relu . titre nouveau"])
+        page.evaluate("""() => document.querySelector('#conv-menu [data-action="rename"]')
+            .addEventListener('click', () => %s)""" % js)
+        err = self.refused(drv, A, "renommer_conversation", {"case": "t-ren"})
+        self.assertEqual(err.reason, "dialog")
+        recette.browser.pending()["dialog"].dismiss()
+        res, _ = self.act(A, "verdict_oracle", {"case": "t-ren"})
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual((res["verdict"], line["case"]), ("KO", "t-ren"))
+        self.assertIn("securite", line["nfr"])
+        self.assertIn("dialogue inattendu (confirm) : pendant le renommage", line["evidence"])
+
+    def test_m4_a_dialog_during_a_rename_reaches_the_line(self):
+        """m4: a JavaScript dialog during renommer_conversation makes its line KO sécurité. Opened on the tick
+        after the click: a page call in flight when it opens never returned (the driver hung in four runs out
+        of six); the driver now looks before reading the page again (Browser.settled)."""
+        self.m4_dialog_during_a_rename("setTimeout(() => confirm('pendant le renommage'), 0)")
+
+    def test_m4_a_dialog_inside_the_click_handler_reaches_the_line(self):
+        """m4: the same dialog opened inside the click handler: the click waits for its own timeout, the
+        handle is released, then the dialog is seen."""
+        self.m4_dialog_during_a_rename("confirm('pendant le renommage')")
+
+    def test_m10_the_probe_keeps_no_title_the_menu_shows(self):
+        """m10: a menu whose entries name their conversation: probe.json keeps none of it."""
+        drv, recette, A, page = self.start("?menunames=1")
+        page.evaluate("() => { window.__seed('Mon dossier privé numéro un'); window.__seed('Mon dossier privé numéro deux'); }")
+        res, ev = self.act(A, "sonder_interface")
+        probe = self.evidence_json(ev, "probe.json")
+        self.assertEqual(len(probe["menu"]["menu"]["items"]), 3)
+        self.assertNotIn("Mon dossier privé", json.dumps(probe, ensure_ascii=False))
+        self.assertNotIn("Mon dossier privé", res["text"])
+
+    def test_m10_a_title_that_is_only_an_ellipsis_never_hangs_the_probe(self):
+        """m10, found while writing the fix report: the scrub replaced the title's first twelve characters
+        until none was left, so a conversation titled « … » (a placeholder title) whose menu entries hold
+        « … » made it loop for ever in the page. One pass now: the probe ends and reads the menu."""
+        drv, recette, A, page = self.start("?menunames=1")
+        page.evaluate("() => { window.__seed('Mon dossier privé numéro un'); window.__seed('…'); }")
+        t0 = time.monotonic()
+        res, ev = self.act(A, "sonder_interface")
+        probe = self.evidence_json(ev, "probe.json")
+        self.assertEqual(probe["errors"], [])
+        self.assertEqual([i["label"] for i in probe["menu"]["menu"]["items"]],
+                         ["Renommer « … »", "Partager « … »", "Supprimer « … »"])
+        self.assertLess(time.monotonic() - t0, 30)
+
+    def test_m11_an_answer_that_shows_an_internal_error_reaches_the_line_sanitised_and_flagged(self):
+        """m11: an answer card ending with a stack frame and a host name."""
+        drv, recette, A, page = self.start()
+        self.message_case(recette, "t-trace", "Bonjour ANSWER_TRACE")
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "poser_question", {"case": "t-trace"})
+        self.act(A, "verdict_oracle", {"case": "t-trace"})
+        line = journal_lines(recette.work)[-1]
+        self.assertEqual(line["verdict"], "OK", "judged on the answer as it is")
+        for bad in ("Traceback", "/srv/", "render.py", "db-answer"):
+            self.assertNotIn(bad, line["evidence"])
+        self.assertIs(line["internal_error_shown"], True)
+
+    def test_m13_a_conversation_the_upload_created_is_registered(self):
+        """m13: the upload creates the conversation, before the question: still the run's."""
+        drv, recette, A, page = self.start("?convonupload=1")
+        self.act(A, "nouvelle_conversation")
+        self.act(A, "joindre_document", {"case": "fixture-case-1"})
+        self.act(A, "poser_question", {"case": "fixture-case-1"})
+        entry = recette._registered("fixture-case-1")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["href"], drv.urlsplit(page.url).path)
+
+    def test_m14_a_field_that_was_there_before_never_takes_the_title(self):
+        """m14: « Renommer » opens no field, a « Filtrer… » field sits in the sidebar: nothing is typed."""
+        drv, recette, A, page = self.start("?renamenofield=1&filterfield=1")
+        self.first_message(recette, A)
+        self.list_case(recette, "t-ren", action="renommer_conversation", same_conversation_as="t-a",
+                       question="Titre nouveau")
+        err = self.refused(drv, A, "renommer_conversation", {"case": "t-ren"})
+        self.assertIn("pas de champ", err.detail)
+        self.assertIsNone(page.evaluate("() => window.__filter_value"))
+
+    def test_m15_a_row_button_that_is_no_menu_is_never_pressed(self):
+        """m15: a « Pin action » button inside each row's link: the probe and the rename open the row's own
+        menu, never press it."""
+        drv, recette, A, page = self.start("?pinbutton=1")
+        self.first_message(recette, A)
+        self.act(A, "sonder_interface")
+        self.list_case(recette, "t-ren", action="renommer_conversation", same_conversation_as="t-a",
+                       question="Titre nouveau")
+        self.act(A, "renommer_conversation", {"case": "t-ren"})
+        self.assertEqual(page.evaluate("() => window.__pin_clicks"), 0)
+        self.assertEqual(len(page.evaluate("() => window.__menu_opens")), 2)
 
 
 if __name__ == "__main__":
