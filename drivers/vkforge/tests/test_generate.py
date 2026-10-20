@@ -103,6 +103,20 @@ def started_by_com(exes: set, before: set) -> set:
             if pid not in before and launcher is not None and parent == launcher}
 
 
+def appeared(exes: set, before: set) -> dict:
+    """{pid: parent} of the processes of `exes` new since `before`: what a failure names, for the operator
+    to show the founder, when the test cannot tie them to itself (ruling PF-20: it kills none of them)."""
+    return {pid: parent for pid, parent in (com.pids_of(exes) or {}).items() if pid not in before}
+
+
+def snapshot(test: unittest.TestCase, exes: set) -> set:
+    """The processes of `exes` now; a missing snapshot fails the test — never read as "none running", so a
+    node check never passes without observing (ruling PF-19)."""
+    pids = running(exes)
+    test.assertIsNotNone(pids, "no snapshot: not observed")
+    return pids
+
+
 def end_mine(exes: set, mine: set) -> None:
     """The processes of `exes` a node test started itself — `mine`, recorded when it started them — killed
     by their PID when still running, then waited for, 10 s at most; never any other (ruling PF-20)."""
@@ -419,12 +433,13 @@ class GenerateTest(unittest.TestCase):
             started = started_by_com(exes, before)
             s.close()
             self.assertTrue(ans["ok"], ans)
-            self.assertEqual(len(started), 1, f"the driver started one Word: {started}")
+            self.assertEqual(len(started), 1, f"the driver started one Word: {started}; new since the check, "
+                                              f"with their parents: {appeared(exes, before)}")
             deadline = time.monotonic() + 30
-            while started & (running(exes) or set()) and time.monotonic() < deadline:
+            while started & snapshot(self, exes) and time.monotonic() < deadline:
                 time.sleep(0.5)
-            self.assertEqual(started & (running(exes) or set()), set(), f"the Word this run started, {started}, "
-                                                                        "is still running")
+            self.assertEqual(started & snapshot(self, exes), set(), f"the Word this run started, {started}, "
+                                                                    "is still running")
         finally:
             if s.p.poll() is None:
                 s.p.kill()
@@ -445,15 +460,17 @@ class GenerateTest(unittest.TestCase):
         s = Session(self.gen(), fake=False, extra_env={"VK_DRIVER_APPLICATIONS": "WINWORD.EXE"})
         started = set()
         try:
-            s.act("appliquer_style_maison", {"document": str(doc), "pdf": str(doc.with_suffix(".pdf"))})
+            ans = s.act("appliquer_style_maison", {"document": str(doc), "pdf": str(doc.with_suffix(".pdf"))})
+            self.assertTrue(ans["ok"], ans)                         # a refused Job answers `precondition` (PF-16)
             started = started_by_com(exes, before)
-            self.assertEqual(len(started), 1, f"the driver started one Word: {started}")
+            self.assertEqual(len(started), 1, f"the driver started one Word: {started}; new since the check, "
+                                              f"with their parents: {appeared(exes, before)}")
             (word,) = started
             os.kill(driver_pid(s.p), signal.SIGTERM)                  # TerminateProcess: no _quit, no atexit
             deadline = time.monotonic() + 10
-            while word in (running(exes) or set()) and time.monotonic() < deadline:
+            while word in snapshot(self, exes) and time.monotonic() < deadline:
                 time.sleep(0.2)
-            self.assertNotIn(word, running(exes) or set(), f"the Word the driver started, process {word}, outlived it")
+            self.assertNotIn(word, snapshot(self, exes), f"the Word the driver started, process {word}, outlived it")
         finally:
             s.p.kill()
             s.p.wait(timeout=10)
@@ -500,7 +517,7 @@ class GenerateTest(unittest.TestCase):
                 finally:
                     app.quit()
             time.sleep(2)
-            self.assertLessEqual(ours, running(exes) or set(), "the user's PowerPoint was quit or killed")
+            self.assertLessEqual(ours, snapshot(self, exes), "the user's PowerPoint was quit or killed")
         finally:
             mine = ours | started_by_com(exes, before)
             if mine and running(exes) == mine:                      # PF-20: the one PowerPoint running is the test's
@@ -527,14 +544,15 @@ class GenerateTest(unittest.TestCase):
         try:
             said = proc.stdout.readline().strip()
             mine = {int(said)} if said.isdigit() else started_by_com(exes, before)
-            self.assertTrue(said.isdigit(), f"the adapter did not identify the PowerPoint it started: {said!r}")
+            self.assertTrue(said.isdigit(), f"the adapter did not identify the PowerPoint it started: {said!r}; new "
+                                            f"since the check, with their parents: {appeared(exes, before)}")
             started = int(said)
-            self.assertIn(started, running(exes) or set())
+            self.assertIn(started, snapshot(self, exes))
             os.kill(driver_pid(proc), signal.SIGTERM)               # TerminateProcess: no quit, no atexit
             deadline = time.monotonic() + 10
-            while started in (running(exes) or set()) and time.monotonic() < deadline:
+            while started in snapshot(self, exes) and time.monotonic() < deadline:
                 time.sleep(0.2)
-            self.assertNotIn(started, running(exes) or set(), "the PowerPoint the driver started outlived it")
+            self.assertNotIn(started, snapshot(self, exes), "the PowerPoint the driver started outlived it")
         finally:
             proc.kill()
             proc.wait(timeout=10)

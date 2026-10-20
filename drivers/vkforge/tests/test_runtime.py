@@ -361,12 +361,14 @@ class RuntimeTest(unittest.TestCase):
         guid = inventory.APPS["word"]["typelib"]
         self.assertEqual(com.live_typelib_sha256(guid), canon.sha256_file(inventory.typelib_path(guid)),
                          "the probe reads the file inventory hashed (L-P22)")
-        app = com.Application(self.binding)
+        app, err = com.Application(self.binding), io.StringIO()
         try:
             checks, wrong = self.house_style(app, doc)
         finally:
-            app.quit()
+            with contextlib.redirect_stderr(err):
+                app.quit()
         self.assertEqual((checks, wrong), ([True, True, True, True], False))
+        self.assertNotIn("not handed over", err.getvalue(), "the end read the real Word's inventory and quit it")
         obs = mine.mine_file(doc)["obs"]
         self.assertIn({"kind": "paragraph_style", "where": "first", "value": {"builtin": "Heading1"}}, obs)
 
@@ -394,8 +396,11 @@ class RuntimeTest(unittest.TestCase):
             finally:
                 com.guarded(lambda: users.Close(SaveChanges=False), "user's close")
         finally:
-            app.quit()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                app.quit()
         self.assertEqual(doc.read_bytes(), before)
+        self.assertNotIn("not handed over", err.getvalue(), "the end read the real Word's inventory and quit it")
 
     def test_the_adapter_walks_the_binding_over_a_stub_object_model(self):
         # The verbs' object-model code (heads, selectors, bands, styles, export) through Application.call,
@@ -1044,11 +1049,11 @@ class RuntimeTest(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "win32", "the adapter's start is Windows' (comtypes)")
     def test_a_start_windows_will_not_hold_ends_at_once_and_refuses(self):
-        # Rulings PF-16 and PF-23 (review spec-1): D-04 has no exception. A start positively identified
-        # whose Job Windows refuses is quit at once — no document is in it yet — and the session refuses
-        # `precondition`: no instance of the driver's runs outside a Job, and Owned.job is never None. A
-        # quit that fails leaves its process to be ended by its PID, once checked to be the one identified;
-        # one line of driver.log says how the instance ended.
+        # Rulings PF-16, PF-23 and PF-25 (review spec-1): a start positively identified whose Job Windows
+        # refuses is quit at once — no document is in it yet — and the session refuses `precondition`;
+        # Owned.job is never None. A quit that fails leaves its process to be ended by its PID, once
+        # checked to be the one identified; one line of driver.log says how the instance ended. The one
+        # instance left outside a Job is one whose PID check fails or cannot be made (`not ended: …`).
         def nothing_running(progid):
             raise OSError("operation unavailable")
 
@@ -1241,3 +1246,93 @@ class RuntimeTest(unittest.TestCase):
         finally:
             sleeper.kill()
             sleeper.wait(timeout=10)
+
+    def abandoned_start(self, attach, create, now, err, dialogs=lambda exes: []):
+        """com._start with stubs only (ruling PF-24): `attach` and `create` for comtypes' calls, the
+        snapshots read from `now["pids"]`, the DcomLaunch service's process 900, a 0.3 s deadline, every
+        process it identifies given the identity ("WINWORD.EXE", 900, 1234), and the Jobs it holds kept."""
+        held, jobs = [], []
+
+        def hold(pid):
+            held.append(pid)
+            return StubJob()
+
+        with mock.patch.dict(os.environ, {"VK_DRIVER_APPLICATIONS": "WINWORD.EXE"}), \
+                mock.patch.object(com, "pids_of", lambda exes: dict(now["pids"]) if exes else None), \
+                mock.patch.object(com, "dcom_launcher_pid", lambda: 900), \
+                mock.patch.object(com, "identity", lambda pid: ("WINWORD.EXE", 900, 1234)), \
+                mock.patch.object(com, "dialogs", dialogs), mock.patch.object(com, "close_window", lambda hwnd: None), \
+                mock.patch.object(com, "_hold", hold), mock.patch.object(com, "_HELD", jobs), \
+                contextlib.redirect_stderr(err), self.assertRaises(DriverRefusal) as cm:
+            com._start("Word.Application", attach, create, (OSError,), 0.3)
+        return cm.exception, held, jobs
+
+    def test_an_attach_that_fails_once_the_start_is_given_up_starts_nothing(self):
+        # Ruling PF-24 (re-review new-office-safety-1, cases B and C): the start's branch is latched once,
+        # under the lock the guard marks the start abandoned with; the refusal uses that value. An attach
+        # that fails while the guard looks for boxes (B), or after the refusal (C), finds the start
+        # abandoned: CreateObject is never called, nothing is held — not even a DcomLaunch child another
+        # client started meanwhile.
+        for case in ("B", "C"):
+            release, created, done, now, err = (threading.Event(), threading.Event(), threading.Event(),
+                                                {"pids": {1: 4}}, io.StringIO())
+
+            def attach(progid, release=release, done=done, now=now):
+                try:
+                    release.wait(30)
+                    now["pids"] = {1: 4, 7: 900}               # another client's Word, meanwhile
+                    raise OSError("the user's Word went away")
+                finally:
+                    done.set()
+
+            def create(progid, created=created):
+                created.set()
+                return StubWord()
+
+            def boxes(exes, release=release, created=created):
+                release.set()                                   # B: the attach fails during the scan
+                created.wait(1)
+                return [(70, 7)]
+
+            try:
+                refusal, held, jobs = self.abandoned_start(attach, create, now, err,
+                                                           **({"dialogs": boxes} if case == "B" else {}))
+            finally:
+                release.set()                                   # C: the attach fails after the refusal
+            done.wait(5)
+            time.sleep(0.2)
+            self.assertFalse(created.is_set(), f"{case}: an abandoned start called CreateObject")
+            self.assertEqual((held, jobs, err.getvalue()), ([], [], ""), case)
+            self.assertEqual(refusal.reason, "dialog" if case == "B" else "timeout", case)
+
+    def test_a_create_in_flight_when_the_start_is_given_up_is_quit_when_it_returns(self):
+        # Ruling PF-24: a CreateObject already called when the guard gives up is the driver's start: its
+        # process, identified, is held; when the call returns after all, the worker quits what it got back
+        # (no document is in it), and failing that ends it by its PID with PF-23's check; one line says so.
+        for quits, said in ((True, "quit"),
+                            (False, "not quit (the application is not answering); ended by its PID")):
+            release, now, err, word, seen = threading.Event(), {"pids": {1: 4}}, io.StringIO(), StubWord(), []
+            if not quits:
+                word.Quit = lambda: (_ for _ in ()).throw(OSError("the application is not answering"))
+
+            def nothing(progid):
+                raise OSError("operation unavailable")
+
+            def create(progid, release=release, now=now, word=word):
+                now["pids"] = {1: 4, 7: 900}
+                release.wait(30)
+                return word
+
+            try:
+                with mock.patch.object(com, "end_by_pid", lambda pid, known, seen=seen: seen.append((pid, known))), \
+                        contextlib.redirect_stderr(err):
+                    refusal, held, jobs = self.abandoned_start(nothing, create, now, err)
+                    release.set()
+                    deadline = time.monotonic() + 5
+                    while "start: abandoned" not in err.getvalue() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+            finally:
+                release.set()
+            self.assertEqual((refusal.reason, held, len(jobs)), ("timeout", [7], 1), said)
+            self.assertEqual((word.quits, seen), (1, []) if quits else (0, [(7, ("WINWORD.EXE", 900, 1234))]))
+            self.assertEqual(err.getvalue(), f"start: abandoned at its deadline; process 7 {said}\n")

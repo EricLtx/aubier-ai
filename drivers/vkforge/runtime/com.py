@@ -232,7 +232,9 @@ class Job:
     handles. Any failure before that disarm leaves the Job armed. Never made for an instance the adapter
     attached to or could not identify (PF-4); and when Windows refuses it, the instance just started is
     quit, or ended by its PID once checked to be the process identified, and the session refused
-    (rulings PF-16, PF-23): no instance of the driver's runs outside a Job."""
+    (rulings PF-16, PF-23). No instance of the driver's is left outside a Job, save one (PF-25): one
+    whose PID check fails or cannot be made — nothing is then terminated, it outlives the driver, and
+    driver.log's `job: process … not held` line says `not ended: …`."""
 
     def __init__(self, job, process, pid: int):
         self.job, self.process, self.pid = job, process, pid
@@ -338,7 +340,7 @@ def identity(pid: int):
 
 
 def end_by_pid(pid: int, known):
-    """Process `pid` terminated by its PID (TerminateProcess; ruling PF-23, D-04 to the letter), only while
+    """Process `pid` terminated by its PID (TerminateProcess; rulings PF-23, PF-25), only while
     it is still the process identified: `known`, its identity taken then, is read again — the same image,
     the same parent, the same creation time — through the very handle that ends it, which pins the
     process, so a PID reused since is never hit. None when it was ended; else why nothing was terminated:
@@ -412,26 +414,61 @@ def _start(progid: str, get_active, create, errors: tuple, deadline_s: float) ->
     """The instance a session runs on and what the adapter owns of it, (application, Owned or None)
     (D-03, D-04; rulings PF-4, PF-16, PF-17): the running instance when `get_active(progid)` finds one —
     attached, nothing started — else `create(progid)`, a start, owned only when its one new process is
-    positively identified (`own`), and then held in a Job. Which call the start reached is written down
-    before `create` is called: held past `deadline_s` before that, the start started nothing of the
-    driver's, so no box is closed and no process held (PF-17); past it, a box of the new process
-    positively identified is closed, and that process held in _HELD, to end at the next start or with
-    this driver (LF-8). A start identified whose Job Windows refuses is quit at once — no document is in
-    it yet — or, with no reference to quit it (a start past its deadline) or a quit that fails, ended by
-    its PID once checked to be the process identified; the session refuses `precondition` (PF-16,
-    PF-23). `get_active` and `create` are comtypes' in a driver, stubs in the tests; `errors`, what a
-    COM call raises."""
+    positively identified (`own`), and then held in a Job. Which call the start reached is latched once,
+    under a lock shared with the guard, which marks the start abandoned when it gives it up (PF-24): held
+    past `deadline_s` before `create`, the start started nothing of the driver's and never will — an
+    attach that fails after that calls nothing — so no box is closed and no process held (PF-17); past
+    it, a box of the new process positively identified is closed, that process is held in _HELD, to end
+    at the next start or with this driver (LF-8), and what a CreateObject still in flight returns is
+    quit, or ended by its PID once checked (PF-23). A start identified whose Job Windows refuses is quit
+    at once — no document is in it yet — or, with no reference to quit it (a start past its deadline) or
+    a quit that fails, ended by its PID once checked to be the process identified; the session refuses
+    `precondition` (PF-16, PF-23). `get_active` and `create` are comtypes' in a driver, stubs in the
+    tests; `errors`, what a COM call raises."""
     exes, launcher = executables(), dcom_launcher_pid()
     _end_held(exes)
     before = pids_of(exes)                              # before get_active: an attach starts nothing
-    reached = {"create": False}
+    # PF-24: the branch the start reached, latched once under the lock the guard gives the start up with.
+    lock, state = threading.Lock(), {"create": False, "abandoned": False, "pid": None, "known": None}
 
     def run():
         try:
             return get_active(progid), False
         except errors:
-            reached["create"] = True                    # PF-17: from here on, a start of the driver's
-            return create(progid), True
+            with lock:
+                if state["abandoned"]:
+                    return None, None                   # given up: an abandoned start starts nothing
+                state["create"] = True                  # PF-17: from here on, a start of the driver's
+        app = create(progid)
+        with lock:
+            late = state["abandoned"]
+        if late:
+            ended(app)                                  # it came back after the guard gave it up
+            return None, None
+        return app, True
+
+    def abandon():
+        """The guard gives the start up (its owner callable): marked abandoned, the branch latched, and —
+        past CreateObject — the new process identified and its identity taken, there and then."""
+        with lock:
+            if not state["abandoned"]:
+                state["abandoned"] = True
+                if state["create"]:
+                    state["pid"] = identified(before, pids_of(exes), launcher)[0]
+                    state["known"] = identity(state["pid"]) if state["pid"] is not None else None
+            return state["pid"]
+
+    def ended(app) -> None:
+        """A CreateObject already in flight when the start was given up returned: what it got back holds no
+        document, and is quit; failing that, ended by its PID with PF-23's check (PF-24). One line."""
+        pid = state["pid"]
+        try:
+            guarded(lambda: app.Quit(), f"quit {progid}", CLEANUP_DEADLINE_S, owner=pid)
+            how = "quit"
+        except (DriverRefusal, *errors) as q:
+            why = end_by_pid(pid, state["known"]) if pid is not None else "not identified"
+            how = f"not quit ({q}); " + ("ended by its PID" if why is None else f"not ended: {why}")
+        sys.stderr.write(f"start: abandoned at its deadline; process {pid} {how}\n")
 
     def owned(started: bool, after):
         if started and not exes:
@@ -439,11 +476,8 @@ def _start(progid: str, get_active, create, errors: tuple, deadline_s: float) ->
             return None
         return own(started, before, after, launcher, _hold)
 
-    def started_pid():
-        return identified(before, pids_of(exes), launcher)[0] if reached["create"] else None
-
     def unheld(e: JobRefused, app=None) -> DriverRefusal:
-        """The instance Windows will not hold ends at once (D-04 to the letter): quit through the
+        """The instance Windows will not hold ends at once (D-04; PF-25's one residual aside): quit through the
         reference its start returned (PF-16); with none — a start past its deadline — or a quit that
         fails, ended by its PID once checked to be the process identified (PF-23). One line says how;
         the session refuses `precondition`."""
@@ -464,10 +498,11 @@ def _start(progid: str, get_active, create, errors: tuple, deadline_s: float) ->
     try:
         # A box raised while the instance starts (a first-run prompt) is closed only when the start
         # reached CreateObject and its new process is positively identified by then (D-03, PF-4, PF-17).
-        app, started = guarded(run, f"start {progid}", deadline_s, owner=started_pid)
+        app, started = guarded(run, f"start {progid}", deadline_s, owner=abandon)
     except DriverRefusal:
+        abandon()                                       # given up, if the guard has not already said so
         try:
-            held = owned(reached["create"], pids_of(exes))     # LF-8: a positively owned start only
+            held = owned(state["create"], pids_of(exes))      # LF-8: the latched branch, never read again
         except JobRefused as e:                         # PF-23: no Job, and no reference to quit it with
             raise unheld(e) from e
         if held is not None:
