@@ -352,7 +352,9 @@ du driver sur l'observation gardée, à blanc par défaut.
   d'alerte sont des formes d'une seule conversation, et « Tous ses messages » y vise cette conversation.
   Depuis le quatrième tour, un nombre ou un quantificateur devant un nom de conversation au pluriel
   (« 3 de vos conversations », « some of your chats », « d'autres / certaines / plusieurs / la plupart de
-  vos conversations ») la fait refuser, jugé avant que les idiomes de lieu soient mis de côté.
+  vos conversations ») la fait refuser, jugé avant que les idiomes de lieu soient mis de côté ; depuis le
+  cinquième, « autre(s) » / « other(s) » comme nom ou après un nombre ou un déterminant aussi (« et les deux
+  autres », « and 2 others », « and the others », « une autre conversation »).
   La sonde ne clique aucune entrée : ce texte ne se lit qu'au clic de M8-6, et un refus laisse la
   conversation en place, son texte dans `conversation.json`, et le cas NON TESTÉ ;
 - M8-5 et M8-6 se jugent sur l'état de la conversation de M8-1, relu à son adresse (« titre relu
