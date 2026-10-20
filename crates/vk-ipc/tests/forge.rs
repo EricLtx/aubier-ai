@@ -58,6 +58,39 @@ impl VaultWatch {
     }
 }
 
+/// Follows the private vault of a learn from a thread of its own while a request runs, and keeps the
+/// last bytes it read from it. The kernel deletes the vault when `learn` returns, so those bytes are
+/// what the last stage to read it, `generate`, was given. A poll every 2 ms, as [`VaultWatch`]'s.
+struct VaultTail {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<Option<Vec<u8>>>,
+}
+
+impl VaultTail {
+    fn start(vault: PathBuf) -> VaultTail {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut last = None;
+            while !flag.load(Ordering::SeqCst) {
+                if let Ok(bytes) = std::fs::read(&vault) {
+                    last = Some(bytes);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            last
+        });
+        VaultTail { stop, thread }
+    }
+
+    /// The last bytes read from the vault; `None` if it was never read.
+    fn stop(self) -> Option<Vec<u8>> {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.thread.join().unwrap()
+    }
+}
+
 async fn learn_refusal(node: &Node, params: Value) -> String {
     let e = node.call_human("driver.learn", params).await.unwrap_err();
     call_error(&e).message.clone()
@@ -1184,33 +1217,19 @@ async fn a_second_learn_of_the_name_draws_a_new_salt_and_the_first_driver_no_lon
     node.shutdown().await;
 }
 
-/// Ten contracts whose footers all differ — a client's name in each — written with
-/// `drivers/vkforge/tests/ooxml_fixtures.py` (founder decision D-02's case).
-const FOOTER_CORPUS: &str = r#"import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from vkforge.tests import ooxml_fixtures
-d = Path(sys.argv[2])
-d.mkdir(parents=True, exist_ok=True)
-for n in range(10):
-    ooxml_fixtures.docx(d / f"c{n}.docx", footer=f"Contrat client {n}", pdf=True)
-"#;
-
+/// Ten contracts whose footers all differ — a client's name in each (founder decision D-02's case):
+/// `ooxml_fixtures.py DIR footers`, the command line `test_mine` pins together with the count.
 fn footer_corpus(dir: &Path) -> PathBuf {
-    let ok = std::process::Command::new(forge_python())
-        .args(["-I", "-c", FOOTER_CORPUS])
-        .arg(repo_root().join("drivers"))
-        .arg(dir)
-        .status()
-        .expect("run the vkforge interpreter")
-        .success();
-    assert!(ok, "the footer corpus {}", dir.display());
+    ooxml_script(&[dir.as_os_str(), "footers".as_ref()]);
     dir.to_path_buf()
 }
 
 /// Founder decision D-02, ruling LF-4: the kernel hands `plan` the vault, which it rewrites in place
 /// before `generate` reads it. Ten footers that all differ are one ambiguity of ten token
-/// candidates; with no arch it is purged, and the vault `generate` reads holds none of them.
+/// candidates; with no arch it is purged. Two things are asserted here: the `plan` stage says it cut
+/// ten entries down to none (so the kernel passed `--vault`), and the last bytes the vault held
+/// before the kernel deleted it, which are what `generate` read, are the empty object. What the
+/// stage keeps, and why, is `VaultTest`'s (`drivers/vkforge/tests/test_plan.py`).
 #[tokio::test]
 async fn learn_leaves_no_purged_candidate_in_the_vault_before_generate() {
     if !forge_available() {
@@ -1219,25 +1238,24 @@ async fn learn_leaves_no_purged_candidate_in_the_vault_before_generate() {
     let node = Node::start().await;
     let corpus = footer_corpus(&node.dir().join("corpus"));
     let out = node.dir().join("word-maison");
+    let forge = node.dir().join("forge").join("word-maison");
+    let tail = VaultTail::start(forge.join(".vault.json"));
     let r = node
         .call_human("driver.learn", learn_params(&corpus, &out))
         .await
         .unwrap();
+    let last = tail.stop();
     assert_eq!(
         r["ambiguities"],
         json!([{"invariant": "footer_text", "resolved_by": "purged"}])
     );
-    let said = std::fs::read_to_string(
-        node.dir()
-            .join("forge")
-            .join("word-maison")
-            .join("forge-plan.out"),
-    )
-    .unwrap();
+    let said = std::fs::read_to_string(forge.join("forge-plan.out")).unwrap();
     assert!(said.contains("; vault kept 0 of 10 -> "), "{said}");
-    assert!(
-        !out.join("driver").join("secrets.json").exists(),
-        "no secret left to resolve"
+    assert_eq!(
+        last.as_deref(),
+        Some(&b"{}\n"[..]),
+        "the last bytes of the vault before the kernel deleted it: {:?}",
+        last.as_deref().map(String::from_utf8_lossy)
     );
     node.shutdown().await;
 }

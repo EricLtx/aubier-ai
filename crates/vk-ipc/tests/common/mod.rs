@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use serde_json::{json, Value};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -91,20 +92,28 @@ pub fn forge_available() -> bool {
     true
 }
 
-/// A corpus of fixture contracts (drivers/vkforge/tests/ooxml_fixtures.py): `garamond` bodies in
-/// Garamond 11 then `calibri` in Calibri 12, each with the house title, footer and a sibling PDF.
-pub fn ooxml_corpus(dir: &Path, garamond: u32, calibri: u32) -> PathBuf {
+/// Runs the fixture script `drivers/vkforge/tests/ooxml_fixtures.py` with `args`, under the vkforge
+/// interpreter and `-I`: the one place the Rust tests spawn it, whatever corpus they ask for.
+pub fn ooxml_script(args: &[&OsStr]) {
     let script = repo_root().join("drivers/vkforge/tests/ooxml_fixtures.py");
     let ok = Command::new(forge_python())
         .arg("-I")
         .arg(&script)
-        .arg(dir)
-        .arg(garamond.to_string())
-        .arg(calibri.to_string())
+        .args(args)
         .status()
         .expect("run ooxml_fixtures.py")
         .success();
-    assert!(ok, "ooxml_fixtures.py {}", dir.display());
+    assert!(ok, "ooxml_fixtures.py {args:?}");
+}
+
+/// A corpus of fixture contracts (drivers/vkforge/tests/ooxml_fixtures.py): `garamond` bodies in
+/// Garamond 11 then `calibri` in Calibri 12, each with the house title, footer and a sibling PDF.
+pub fn ooxml_corpus(dir: &Path, garamond: u32, calibri: u32) -> PathBuf {
+    ooxml_script(&[
+        dir.as_os_str(),
+        garamond.to_string().as_ref(),
+        calibri.to_string().as_ref(),
+    ]);
     dir.to_path_buf()
 }
 
