@@ -4563,5 +4563,54 @@ class FixRound9OnFixture(FixtureBench):
                          ({"surgeon": 1, "steps_masked": None, "chips": None}, False))
 
 
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class FixRound10OnFixture(FixtureBench):
+    """Round 10 (re-review I-1, I-2): the anonymiser entry is identified by an exact word or an /anonymi… path only,
+    whether or not the search entry is identified; the sentence prints the entry's own path, never the page's."""
+
+    bench = FixRound2OnFixture.bench
+    start = FixRound2OnFixture.start
+    q = staticmethod(FixRound2OnFixture.q)
+    probe = FixRound8OnFixture.probe
+
+    def test_a_toggle_that_only_contains_anonymis_is_a_candidate_never_clicked(self):
+        drv, recette, A, page = self.bench(self.q(anontoggle="1"))
+        res, probe = self.probe(A)
+        anon = probe["anonymiser"]
+        self.assertIs(anon["found"], False)
+        self.assertIn("Anonymisation automatique", [c.get("text") for c in anon["candidates"] if c.get("candidate")])
+        self.assertIsNone(page.evaluate("() => sessionStorage.getItem('bench-anon-toggle-clicks')"))
+        self.assertIn("anonymiseur : non trouvé", res["text"])
+
+    def test_an_exact_word_is_found_even_above_the_search_entry(self):
+        drv, recette, A, page = self.bench(self.q(anonymiser="1", anontext="ANONYMIZER", anonfirst="1"))
+        res, probe = self.probe(A)
+        anon = probe["anonymiser"]
+        self.assertIs(anon["found"], True)
+        self.assertIs(anon["entry"]["below_search"], False)
+        self.assertIn("anonymiseur : trouvé (/anonymiser)", res["text"])
+
+    def test_a_link_with_another_text_is_found_by_its_path(self):
+        drv, recette, A, page = self.bench(self.q(anonymiser="1", anontext="Outils", anonhref="/anonymiseur"))
+        res, probe = self.probe(A)
+        anon = probe["anonymiser"]
+        self.assertIs(anon["found"], True)
+        self.assertEqual(anon["path"], "/anonymiseur")
+        self.assertIs(anon["entry"]["below_search"], True)
+        self.assertIn("anonymiseur : trouvé (/anonymiseur)", res["text"])
+
+    def test_a_button_that_lands_on_a_conversation_never_prints_its_address(self):
+        drv, recette, A, page = self.bench(self.q(anonbutton="/conversation/x-secret"))
+        res, probe = self.probe(A)
+        anon = probe["anonymiser"]
+        self.assertIs(anon["found"], True)
+        self.assertIs(anon["final_path_redacted"], True)
+        self.assertIsNone(anon["path"])
+        self.assertIn("anonymiseur : trouvé (chemin non confirmé)", res["text"])
+        self.assertNotIn("x-secret", json.dumps(probe) + res["text"])
+        self.assertIs(anon["restored"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

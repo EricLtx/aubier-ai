@@ -1298,12 +1298,16 @@ NEW_CONV_EL_JS = "(a) => {" + _VISIBLE + r"""
 
 # Round 8 (la demande du fondateur, découverte seule) : les entrées de navigation de la barre latérale sous l'entrée de
 # la recherche (liens et boutons, jamais une ligne ni la liste des conversations), dans l'ordre ; l'entrée de
-# l'anonymiseur (texte ou libellé « anonymis », ou chemin « anonymi ») ; puis, la page suivie, ses titres, ses
-# commandes, ses zones de sortie et un échantillon expurgé de son formulaire. Rien n'est tapé ni pressé.
+# l'anonymiseur ; puis, la page suivie, ses titres, ses commandes, ses zones de sortie et un échantillon expurgé de
+# son formulaire. Rien n'est tapé ni pressé. Round 10 (re-review I-1) : toute la zone de navigation de la barre
+# latérale hors de la liste des conversations, que l'entrée de la recherche soit identifiée ou non (`below_search`
+# le dit) ; l'entrée n'est identifiée que par un mot exact, texte ou libellé replié (« anonymiseur », « anonymizer »,
+# « anonymiser »), ou par un chemin qui commence par /anonymi ; un texte qui contient seulement « anonymis »
+# (« Anonymisation automatique », « Désanonymiser ») est un candidat relevé, jamais cliqué.
 _ANON_FIND = _CONV_ROWS + r"""
   const navOf = (a) => {
     const side = a.sidebar ? [...document.querySelectorAll(a.sidebar)].find(visible) : null;
-    if (!side) return { after: [], search: false };
+    if (!side) return { entries: [], search: false };
     const links = convLinks();
     const words = new RegExp(a.searchWords, 'i');
     const text = (el) => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80);
@@ -1312,28 +1316,32 @@ _ANON_FIND = _CONV_ROWS + r"""
       .filter((el) => !(el.closest('a[href]') && convRe && convRe.test(pathOf(el.closest('a[href]')) || ''))
                       && !inConversations(el, links));
     const search = cands.find((el) => words.test(text(el) + ' ' + label(el)));
-    const after = search ? cands.filter((el) => el !== search && !search.contains(el)
-                                         && (search.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) : cands;
-    const isAnon = (el) => {
-      if (/anonymis/i.test(text(el) + ' ' + label(el))) return true;
-      if (!el.matches('a[href]')) return false;
-      try { return /anonymi/i.test(new URL(el.getAttribute('href'), location.href).pathname); } catch (e) { return false; }
+    const entries = cands.filter((el) => el !== search && !(search && search.contains(el)));
+    const below = (el) => !!search && !!(search.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const fold = (s) => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim().replace(/\s+/g, ' ');
+    const exact = new Set(['anonymiseur', 'anonymizer', 'anonymiser']);
+    const hrefPath = (el) => {
+      if (!el.matches('a[href]')) return '';
+      try { return new URL(el.getAttribute('href'), location.href).pathname; } catch (e) { return ''; }
     };
-    return { after: after.slice(0, 30), search: !!search, text, label, isAnon };
+    const isAnon = (el) => exact.has(fold(text(el))) || exact.has(fold(label(el))) || /^\/anonymi/i.test(hrefPath(el));
+    const isCand = (el) => !isAnon(el) && (/anonymi[sz]/.test(fold(text(el)) + ' ' + fold(label(el)))
+                                           || /anonymi/i.test(hrefPath(el)));
+    return { entries: entries.slice(0, 30), search: !!search, text, label, isAnon, isCand, below };
   };"""
 ANON_NAV_JS = "(a) => {" + _VISIBLE + _ANON_FIND + r"""
   const n = navOf(a);
-  return { search: n.search, entries: n.after.map((el, i) => {
+  return { search: n.search, entries: n.entries.map((el, i) => {
     let path = null, host = null;
     if (el.matches('a[href]')) { try { const u = new URL(el.getAttribute('href'), location.href); path = u.pathname; host = u.hostname; }
                                  catch (e) {} }
     return { index: i, tag: el.tagName.toLowerCase(), text: n.text(el), label: n.label(el) || null, href_path: path,
-             host, anonymiser: n.isAnon(el) };
+             host, anonymiser: n.isAnon(el), candidate: n.isCand(el), below_search: n.below(el) };
   }) };
 }"""
 ANON_EL_JS = "(a) => {" + _VISIBLE + _ANON_FIND + r"""
   const n = navOf(a);
-  return [n.after.find((el) => n.isAnon(el)) || null];
+  return [n.entries.find((el) => n.isAnon(el)) || null];
 }"""
 ANON_PAGE_JS = "(a) => {" + _VISIBLE + r"""
   const t = (el) => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120);
@@ -5894,11 +5902,11 @@ class Recette:
         hit = next((e for e in entries if e.get("anonymiser")), None)
         record = {"found": hit is not None, "search_entry": nav.get("search"), "host_refused": False,
                   "entries": [{k: v for k, v in e.items() if k != "host"} for e in entries]}
+        record["candidates"] = [e for e in record["entries"] if e.get("candidate")]  # round 10: listed, never clicked
         if hit is None:
-            record["candidates"] = record["entries"]
             return record
-        record.update(entry={k: hit.get(k) for k in ("tag", "text", "label", "href_path")},
-                      href_path=hit.get("href_path"))
+        record.update(entry={k: hit.get(k) for k in ("tag", "text", "label", "href_path", "below_search")},
+                      href_path=hit.get("href_path"), path=None)
         if hit.get("host") and not b.allowed(f"https://{hit['host']}/"):
             record["host_refused"] = True  # never followed off the host list
             return record
@@ -5917,7 +5925,17 @@ class Recette:
             if b.pending():
                 raise
         page.wait_for_timeout(500)
-        record.update(b.call(ANON_PAGE_JS, {"sidebar": SELECTORS["sidebar"]}, page=page, timeout_ms=3000) or {})
+        # Round 10 (re-review I-2): the path printed is the link's own href path, or, for a button, the final path
+        # only when it is the tool's (/anonymi…); any other final page (a conversation's, say) is never read nor
+        # printed: `final_path_redacted`.
+        final = urlsplit(page.url).path or ""
+        tool = final.lower().startswith("/anonymi")
+        record["final_path_redacted"] = not tool
+        record["path"] = hit.get("href_path") if hit.get("tag") == "a" else (final if tool else None)
+        if tool:
+            seen = b.call(ANON_PAGE_JS, {"sidebar": SELECTORS["sidebar"]}, page=page, timeout_ms=3000) or {}
+            seen.pop("path", None)
+            record.update(seen)
         self._goto(page, self.entry)
         record["restored"] = bool(b.call(COMPOSER_SHOWN_JS, {"sel": SELECTORS["textarea"]}, page=page, timeout_ms=3000))
         return record
@@ -5929,7 +5947,7 @@ class Recette:
             return "anonymiseur : non trouvé"
         if anon.get("host_refused"):
             return f"anonymiseur : trouvé ({anon.get('href_path') or '?'}), hôte hors liste : non suivi"
-        return f"anonymiseur : trouvé ({anon.get('path') or anon.get('href_path') or '?'})"
+        return f"anonymiseur : trouvé ({anon.get('path') or 'chemin non confirmé'})"
 
     def _probe_selectors(self, page) -> dict:
         """Chaque entrée de SELECTORS qui est une adresse dans la page (SELECTOR_PATTERNS exceptés), chaque

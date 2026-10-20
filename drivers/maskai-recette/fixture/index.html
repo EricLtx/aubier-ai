@@ -132,7 +132,10 @@
      la conversation » on the live site), `destructive` (the entries as shadcn destructive items, a trash
      icon on the delete one); round 8: `anonymiser` (a sidebar link « Anonymiseur » under the search entry, to
      /anonymiser: a title, a textarea, a file input, a button « Anonymiser » and an output pre),
-     `anonymiserhost` (the same entry, to another host); round 9: `card20=pasted|chips` (the answer card seen
+     `anonymiserhost` (the same entry, to another host); round 10: `anontext=…` (the entry's text),
+     `anonhref=…` (its path), `anonbutton=…` (the entry is a button that goes to that path), `anonfirst=1` (the
+     entry above the search entry), `anontoggle=1` (a switch « Anonymisation automatique », clicks counted);
+     the tool's page answers on any path that starts with /anonymi; round 9: `card20=pasted|chips` (the answer card seen
      live on 20/10: `<article aria-label="Réponse MASKAI">`, a `section[data-slot="anonymized"]` with one
      `pii-chip` button per token, the guard's verdicts, the reveal toggle « Révéler les originaux » and an
      empty collapsible content; `pasted` adds the 18/10 trigger with `aria-controls`, whose panel reads
@@ -264,11 +267,13 @@ for (const k of ["nodetails", "revealed", "controls", "nostructure", "renamedial
                  "surveyonrename", "surveyother", "recents", "echo", "searchfail", "searchfilter", "nonewlink",
                  "clearbutton", "senddisabled", "micdictation", "themetoggle", "sidebarselect", "modeldialog",
                  "feedbackincomposer", "menuspanhint", "searchsnippet", "searchunknown", "searchentrydead",
-                 "nativedelay", "slowrollback", "telemetry", "destructive", "anonymiser", "anonymiserhost"]) {
+                 "nativedelay", "slowrollback", "telemetry", "destructive", "anonymiser", "anonymiserhost", "anonfirst",
+                 "anontoggle"]) {
   if (new URLSearchParams(location.search).get(k) === "1") sessionStorage.setItem("bench-" + k, "1");
 }
 for (const k of ["menuitems", "searchentry", "feedbacklabel", "confirmtext", "canceltext", "confirmlabel",
-                 "grouplabel", "groupitems", "menutitle", "triggerlabel", "card20"]) {  // valued flags
+                 "grouplabel", "groupitems", "menutitle", "triggerlabel", "card20", "anontext", "anonhref",
+                 "anonbutton"]) {  // valued flags
   const v = new URLSearchParams(location.search).get(k);
   if (v !== null) sessionStorage.setItem("bench-" + k, v);
 }
@@ -864,14 +869,29 @@ $("palette").querySelector("[cmdk-input]").addEventListener("input", (e) => {
   paletteTimer = setTimeout(() => renderPalette(q), flag("recents") ? 1500 : 300);  // a debounced search
 });
 if (SEARCHENTRY !== "link" && !flag("searchentrydead")) $("search-entry").onclick = openPalette;
-if (flag("anonymiser") || flag("anonymiserhost")) {  // round 8: MaskAI's standalone tool, under the search entry
-  const a = document.createElement("a");
+if (flag("anonymiser") || flag("anonymiserhost") || value("anonbutton")) {  // round 8: MaskAI's standalone tool
+  const target = value("anonbutton");
+  const a = document.createElement(target ? "button" : "a");
   a.id = "anon-entry";
-  a.href = flag("anonymiserhost") ? "https://outils.example.invalid/anonymiser?src=sidebar" : "/anonymiser";
-  a.textContent = "Anonymiseur";
-  $("search-entry").after(a);
+  if (target) {  // round 10: a button that goes somewhere
+    a.type = "button";
+    a.onclick = () => { location.assign(target); };
+  } else {
+    a.href = flag("anonymiserhost") ? "https://outils.example.invalid/anonymiser?src=sidebar" : (value("anonhref") || "/anonymiser");
+  }
+  a.textContent = value("anontext") || "Anonymiseur";
+  if (flag("anonfirst")) $("search-entry").before(a); else $("search-entry").after(a);
 }
-if (location.pathname === "/anonymiser") {  // round 8: the tool's page; its counters survive the way back
+if (flag("anontoggle")) {  // round 10: a switch whose text only contains « anonymis »: never clicked
+  const t = document.createElement("button");
+  t.type = "button";
+  t.setAttribute("role", "switch");
+  t.setAttribute("aria-checked", "false");
+  t.textContent = "Anonymisation automatique";
+  t.onclick = () => sessionStorage.setItem("bench-anon-toggle-clicks", "1");
+  $("search-entry").after(t);
+}
+if (location.pathname.startsWith("/anonymi")) {  // round 8: the tool's page; its counters survive the way back
   sessionStorage.setItem("bench-anon-visits", String(+(sessionStorage.getItem("bench-anon-visits") || 0) + 1));
   document.querySelector("main").style.display = "none";  // the page's CSS sets main's display: hidden is not enough
   document.querySelector("main").insertAdjacentHTML("afterend", '<section id="anon-page"><h1>Anonymiseur</h1>'
