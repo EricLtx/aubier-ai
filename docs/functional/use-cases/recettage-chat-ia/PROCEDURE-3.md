@@ -170,6 +170,16 @@ seule qui le peut) et sont joués.
   l'action finit par son propre refus ; la confirmation native ouverte tard, pendant une lecture, reste
   celle de l'application (NON TESTÉ). « plus listée » ne compte qu'une écriture 2xx des hôtes de
   l'application, d'abord la requête qui nomme la conversation.
+- **Quatrième tour (20/10).** Un nombre ou un quantificateur devant un nom de conversation au pluriel
+  refuse la confirmation, jugé sur le texte entier avant que les idiomes de lieu soient mis de côté :
+  « … et 3 de vos conversations ? », « and 2 of your chats? », « some of your chats », « d'autres,
+  certaines, plusieurs, la plupart de vos conversations », « the rest of your chats » sont annulées par
+  Échap, NON TESTÉ ; « Cette conversation sera retirée de vos conversations » reste acceptée. Un titre
+  de conversation de 3 à 7 caractères (« Devis », « Contrat »), cité en entier par un dialogue ou une
+  fenêtre, ne va jamais au harnais ; un titre coupé se reconnaît à un début de 8 caractères ou plus.
+  Un abandon pendant lequel un dialogue s'est ouvert n'écrit plus de ligne KO disponibilité : le cas
+  est KO sécurité « dialogue inattendu », et le refus garde `internal_error_shown` et le profil
+  d'abandon.
 - **Types de fichiers.** Une pièce jointe par famille, comptée sur toute la recette. La liste
   `accept` du champ de fichier n'était pas relevée avant le pilote v2.3 : E6 la fait lire. Chaque
   ligne de pièce jointe la porte (`attach.accept`), et la sonde de M0 la relève ; une famille
@@ -340,6 +350,9 @@ du driver sur l'observation gardée, à blanc par défaut.
   (dossier, projet, espace, groupe, sélection) ; « de votre historique », « vos conversations » seuls, le
   titre à la place du nom, « Continuer » ou « Oui » comme seul bouton qui n'annule pas d'une fenêtre
   d'alerte sont des formes d'une seule conversation, et « Tous ses messages » y vise cette conversation.
+  Depuis le quatrième tour, un nombre ou un quantificateur devant un nom de conversation au pluriel
+  (« 3 de vos conversations », « some of your chats », « d'autres / certaines / plusieurs / la plupart de
+  vos conversations ») la fait refuser, jugé avant que les idiomes de lieu soient mis de côté.
   La sonde ne clique aucune entrée : ce texte ne se lit qu'au clic de M8-6, et un refus laisse la
   conversation en place, son texte dans `conversation.json`, et le cas NON TESTÉ ;
 - M8-5 et M8-6 se jugent sur l'état de la conversation de M8-1, relu à son adresse (« titre relu
