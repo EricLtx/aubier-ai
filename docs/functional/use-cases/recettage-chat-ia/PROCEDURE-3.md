@@ -337,7 +337,12 @@ du driver sur l'observation gardée, à blanc par défaut.
   ligne recopie la requête en tête, et l'oracle proposé le 18/10 (`recette trois`) passait même sans
   aucun résultat ;
 - un menu n'est celui d'une conversation que si ses entrées de renommage et de suppression sont en
-  liste blanche, sur leur texte entier, seules de leur sorte, et qu'aucune entrée ne vise plus d'une
+  liste blanche, sur leur texte entier, seules de leur sorte (sixième tour, le menu vu en direct le 20/10 :
+  sous un déclencheur de la ligne dont le libellé nomme les actions de la conversation, « Actions de la
+  conversation », « Conversation actions », « Options de la conversation », « Chat actions », « Chat
+  options », « Plus d'options », « More options », chaque entrée doit être en liste blanche, une seule de
+  suppression, au plus une de renommage : l'entrée de renommage n'est plus exigée, et M8-5 sans elle est
+  NON TESTÉ « refus du pilote : pas d'entrée de renommage … »), et qu'aucune entrée ne vise plus d'une
   conversation (« tous », « all », « every », « sélection », « historique ») : sinon rien n'est
   cliqué. Ce refus peut tomber sur le vrai menu de MaskAI : la sonde de M0 le dit avant M8 (« M8-5/M8-6 :
   menu refusé »), et le runbook (§8.3) ne lance pas M8 sur un menu refusé ; depuis le deuxième tour de la
@@ -420,7 +425,8 @@ Elles sont inchangées depuis la recette 2.
   se note une fois avec `vk_log`, sans recopier le message ; depuis la revue du 20/10, chaque niveau
   qui pose des questions (M1 à M9) note de même, une fois, un résultat qui porte
   `"internal_error_shown": true`. Depuis le deuxième tour de la revue : en M0, la note de la sonde dit le
-  verdict du menu pour M8-5 et M8-6, sans entrée ni titre ; en M8, un résultat ou un refus qui porte
+  verdict du menu pour M8-5 et M8-6, sans entrée ni titre (« M8-5/M8-6 : menu accepté », « M8-5 : menu
+  sans entrée de renommage ; M8-6 : menu accepté » depuis le sixième tour, ou « menu refusé ») ; en M8, un résultat ou un refus qui porte
   `cascade_delete` se note aussitôt avec `vk_log` « SUPPRESSION EN CASCADE », sans titre (R2-2).
 - Le runbook (`docs/technical/runbooks/recette-maskai.md`, §6 à §12) s'applique tel quel. La tâche
   a seize lignes : plan, dix harnais, juge, signature, rédaction, signature, publication. La
