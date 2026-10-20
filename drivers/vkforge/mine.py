@@ -381,8 +381,8 @@ def write_invariants(inv: dict, vault: dict, out: Path, vault_path: Path | None 
 
 def read_vault(path) -> dict:
     """The vault `write_invariants` wrote: a JSON object of clear strings, or the refusal (one line,
-    L-P15). The one reader of its shape: `plan` reads it to cut it down (D-02), `generate` to resolve
-    the plan's secrets, and both refuse a file that is not that alike."""
+    L-P15). The one reader of its shape: `plan` reads it to cut it down (D-02) and `generate` to
+    resolve the plan's secrets, and both refuse a malformed file in the same words."""
     vault, _ = ontology.read_json(path, "vault", "run vkforge mine again")
     if not (isinstance(vault, dict) and all(isinstance(v, str) for v in vault.values())):
         raise Refusal(f"vault {path} is not an object of clear strings", "run vkforge mine again")
