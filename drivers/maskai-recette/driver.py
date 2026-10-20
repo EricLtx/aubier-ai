@@ -158,7 +158,9 @@ exactement une conversation, sans nom de conversation au pluriel hors de ce nom 
 se lit par une seule règle des deux côtés, `MENU_TAIL` (I-1) ; une entrée ou un bouton acceptés puis introuvables, une
 palette non reconnue, des résultats non reconnus sont NON TESTÉ, le registre intact (I-1, M-1, M-3) ; un dialogue
 relevé avant le propre refus d'une action reste KO sécurité, et la confirmation native ouverte tard reste celle de
-l'application (I-3) ; « plus listée » ne compte qu'une écriture 2xx de l'application (M-5).
+l'application (I-3) ; « plus listée » ne compte qu'une écriture 2xx de l'application (M-5). Le quatrième tour : un
+nombre ou un quantificateur devant un nom de conversation au pluriel refuse, sur le texte entier ; un titre court cité
+en entier est expurgé ; un abandon avec un dialogue relevé est KO sécurité, le refus garde son `extra`.
 
 Environnement (posé par l'hôte) : VK_DRIVER_PROFILE_DIR, VK_DRIVER_WORK_DIR,
 VK_DRIVER_HEADLESS, VK_DRIVER_CHANNEL, VK_DRIVER_HOSTS ; MASKAI_ENTRY_URL
@@ -1993,6 +1995,10 @@ def harness_text(text: str | None, titles=(), n: int = HARNESS_TEXT_MAX, keep=()
             key = whole[:k]
             if len(re.findall(r"\w", key)) >= 3 and key in folded:
                 return "…", internal
+        # round 4, R-1: a title of 3 to 7 characters, quoted whole (word boundaries, any case)
+        if 3 <= len(whole) < 8 and len(re.findall(r"\w", whole)) >= 3 and re.search(
+                rf"(?<!\w){re.escape(whole)}(?!\w)", folded):
+            return "…", internal
     return sanitise(raw, n, keep=tuple(keep)), internal
 
 
@@ -2114,6 +2120,15 @@ CONFIRM_DELETE_RE = r"\b(?:supprim\w*|suppression|delete\w*|deletion|effac\w*|re
 # conversation au pluriel hors de ce nom, et sans nombre devant un nom de conversation ; seuls les idiomes de lieu
 # (« dans vos conversations », « from your chats », « de votre historique ») ne comptent pas.
 CONFIRM_PLURAL_RE = r"\b(?:conversations|discussions|chats|threads)\b"
+# Round 4 (coordinator's ruling 1) : un nombre ou un quantificateur devant un nom de conversation au pluriel, jugé sur
+# le texte entier, avant que les idiomes de lieu soient mis de côté : « et 3 de vos conversations », « and 2 of your
+# chats », « some of your chats », « d'autres / la plupart / certaines / plusieurs de vos conversations ».
+_CONV_PLURAL = r"(?:conversations|discussions|chats|threads)"
+_PARTITIVE = (r"(?:\s+(?:de|des|du|of|d['’])\s*)?(?:(?:vos|tes|mes|nos|leurs|ces|your|my|our|their|the|these|those)\s+)?"
+              r"(?:\w+\s+)?")
+CONFIRM_COUNTED_RE = (rf"\b\d+{_PARTITIVE}{_CONV_PLURAL}\b"
+                      rf"|\b(?:some|most|any|several|many|few|others?|the\s+rest|certaine?s|plusieurs|d['’]\s*autres"
+                      rf"|autres|la\s+plupart|le\s+reste|une\s+partie){_PARTITIVE}{_CONV_PLURAL}\b")
 CONFIRM_NUMBER_RE = r"\b\d+\s+(?:\w+\s+)?(?:conversation|discussion|chat|thread)s?\b"
 CONFIRM_PLACE_RE = (r"\b(?:dans|de|des|parmi|from|in|of|out\s+of)\s+(?:la\s+liste\s+de\s+)?"
                     r"(?:vos|votre|tes|ton|ta|mes|mon|ma|your|my|the)\s+"
@@ -2190,8 +2205,8 @@ def confirms_one_deletion(text: str | None, title: str | None = None) -> bool:
         return False
     own = evaluer.fold(title or "").strip()
     named = bool(re.search(CONFIRM_ONE_RE, folded)) or (len(own) >= 3 and own in folded)
-    if not named or re.search(CONFIRM_TOO_WIDE, folded):
-        return False
+    if not named or re.search(CONFIRM_TOO_WIDE, folded) or re.search(CONFIRM_COUNTED_RE, folded):
+        return False  # round 4: counted or quantified on the whole text, before any place idiom is set aside
     rest = folded.replace(own, " ") if len(own) >= 3 else folded  # the title may say « conversations »
     rest = re.sub(CONFIRM_PLACE_RE, " ", rest)  # round 3, I-2: where it disappears from is no target
     return not (re.search(CONFIRM_PLURAL_RE, rest) or re.search(CONFIRM_NUMBER_RE, rest))
@@ -2860,7 +2875,7 @@ class Recette:
                     seen = self.browser.pending() or self._new_dialog()
                     if seen and seen.get("seq") not in self._app_dialogs:
                         refusal = self._dialog_refusal(ev, seen)
-                        refusal.extra = {**(refusal.extra or {}), "refused_first": r.reason}
+                        refusal.extra = {**(r.extra or {}), **(refusal.extra or {}), "refused_first": r.reason}
                         refusal.evidence = ev.items
                         raise refusal from r
                 r.evidence = r.evidence or ev.items
@@ -3040,6 +3055,12 @@ class Recette:
             return None
         seen = [d for d in self.browser.dialog_log if d["seq"] > self._mark and d["seq"] not in self._app_dialogs]
         return seen[-1] if seen else None
+
+    def _dialog_seen(self) -> bool:
+        """Round 4, R-2 : un dialogue en attente, ou relevé depuis le début de l'action (fermé peut-être par
+        l'humain), qui n'est pas la confirmation native de l'application."""
+        d = self.browser.pending() or self._new_dialog()
+        return bool(d) and d.get("seq") not in self._app_dialogs
 
     def _close_window(self, cid: str | None) -> None:
         """Round 2, verdicts-5 : dès qu'un autre cas est en jeu (une action qui le nomme, verdict_oracle d'un autre
@@ -4187,8 +4208,10 @@ class Recette:
                 seen["internal_error_shown"] = self.observations[cid]["internal_error_shown"] = True
             if t.notices.get("raw"):
                 ev.json("notices.json", t.notices["raw"])
-            line = self._timeout_line(cid, case["nfr"], t, t.why, extra=self._line_extra(cid, seen))
             flag = {"internal_error_shown": True} if seen.get("internal_error_shown") else {}  # round 3, M-9
+            if self._dialog_seen():  # round 4, R-2: no timeout line; _wrap makes it `dialog`, the judge KO sécurité
+                raise DriverRefusal("timeout", t.why, extra={"abort": t.profile, **flag}) from None
+            line = self._timeout_line(cid, case["nfr"], t, t.why, extra=self._line_extra(cid, seen))
             raise DriverRefusal("timeout", t.why, extra={"journal": line, "abort": t.profile, **flag}) from None
         failure = obs.pop("failure_raw", None)
         notices = obs.pop("notices_raw", None)
@@ -6093,11 +6116,14 @@ class Recette:
                     seen["internal_error_shown"] = self.observations[cid]["internal_error_shown"] = True
                 if t.notices.get("raw"):
                     ev.json("notices.json", t.notices["raw"])
-                line = self._timeout_line(cid, case["nfr"], t, why, extra=self._line_extra(cid, seen))
                 ev.json("turns.json", {"case": cid, "asked_turns": n, "turns": turns, "timeout": timeout})
                 if failure:
                     ev.json("failure.json", failure)
                 flag = {"internal_error_shown": True} if seen.get("internal_error_shown") else {}  # round 3, M-9
+                if self._dialog_seen():  # round 4, R-2: no timeout line; the judge makes it KO sécurité
+                    raise DriverRefusal("timeout", why, extra={"abort": t.profile, "turns": len(turns), **flag},
+                                        evidence=ev.items) from None
+                line = self._timeout_line(cid, case["nfr"], t, why, extra=self._line_extra(cid, seen))
                 raise DriverRefusal("timeout", why, extra={"journal": line, "abort": t.profile, "turns": len(turns),
                                                            **flag}, evidence=ev.items) from None
             failure = obs.pop("failure_raw", None) or failure  # the last turn left without answer (E10)

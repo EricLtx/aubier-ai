@@ -4070,5 +4070,89 @@ class FixRound3OnFixture(FixtureBench):
         self.assertIs(err.extra.get("internal_error_shown"), True)
 
 
+# -- Fix round 4 (.superpowers/rereview-v2.3-fix3.md) ----------------------------------------------------------------
+# I-2 residual (coordinator's ruling 1): a number or a quantifier before a plural conversation noun refuses, tested on
+# the whole text before any place idiom is set aside. One test per shape.
+R4_CONFIRMS_REFUSED = {
+    "three_of_your_conversations": "Supprimer cette conversation et 3 de vos conversations ?",
+    "two_of_your_chats_en": "Delete this chat and 2 of your chats?",
+    "some_of_your_chats_en": "Delete this chat and some of your chats?",
+    "others_of_your_conversations": "Supprimer cette conversation et d'autres de vos conversations ?",
+    "most_of_your_conversations": "Supprimer cette conversation et la plupart de vos conversations ?",
+    "the_rest_of_your_chats_en": "Delete this chat and the rest of your chats?",
+    "some_of_your_conversations_fr": "Supprimer cette conversation et certaines de vos conversations ?",
+    "several_of_your_conversations": "Supprimer cette conversation et plusieurs de vos conversations ?",
+}
+R4_CONFIRMS_ACCEPTED = {
+    "removed_from_your_conversations": "Cette conversation sera retirée de vos conversations.",
+}
+
+
+class FixRound4Units(unittest.TestCase):
+    """Re-review of fix round 3 (.superpowers/rereview-v2.3-fix3.md): what needs no browser."""
+
+    def check_confirm_refused(self, text):
+        self.assertFalse(load_driver().confirms_one_deletion(text, "Recette trois renommée"), text)
+
+    def check_confirm_accepted(self, text):
+        self.assertTrue(load_driver().confirms_one_deletion(text, "Recette trois renommée"), text)
+
+    def test_r1_a_short_whole_title_is_redacted(self):
+        """R-1 (R2-4): a listed title of 3 to 7 characters, quoted whole by a dialog, never reaches the harness."""
+        drv = load_driver()
+        self.assertEqual(drv.harness_text("Supprimer « Devis » ?", titles=("Devis",))[0], "…")
+        self.assertEqual(drv.harness_text("Le contrat est prêt.", titles=("Contrat",))[0], "…")
+
+    def test_r1_an_ordinary_dialog_without_the_title_is_untouched(self):
+        """R-1: a dialog that quotes no listed title, nor a word that merely holds one, is left as it is."""
+        drv = load_driver()
+        for text in ("Voulez-vous quitter la page ?", "Devisez librement", "late"):
+            self.assertEqual(drv.harness_text(text, titles=("Devis", "Contrat", "Bonjour LATE_DIALOG"))[0], text)
+
+
+def _r4_generate():
+    def add(name, fn):
+        fn.__name__ = name
+        setattr(FixRound4Units, name, fn)
+    for key, text in R4_CONFIRMS_REFUSED.items():
+        add(f"test_i2_residual_confirmation_refused_{key}", lambda self, text=text: self.check_confirm_refused(text))
+    for key, text in R4_CONFIRMS_ACCEPTED.items():
+        add(f"test_i2_residual_confirmation_accepted_{key}", lambda self, text=text: self.check_confirm_accepted(text))
+
+
+_r4_generate()
+
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class FixRound4OnFixture(FixtureBench):
+    """Re-review of fix round 3 on the bench: R-2 (a timeout with a dialog in the journal)."""
+
+    refused = FixRound2OnFixture.refused
+    line = FixRound2OnFixture.line
+    bench = FixRound2OnFixture.bench
+    start = FixRound2OnFixture.start
+
+    def test_r2_a_timeout_with_a_dialog_in_the_journal_is_ko_securite(self):
+        """R-2: a question abandoned at 3 × its budget while a confirm opened and the human closed it: the
+        refusal is `dialog` and keeps the timeout's extra (internal_error_shown, the abort profile,
+        refused_first); the line is KO sécurité « dialogue inattendu », never KO disponibilité."""
+        drv, recette, A, page = self.bench()
+        self.message_case(recette, "t-slow", "Bonjour TOAST_HOST SLOW")
+        recette.cases["t-slow"]["budget_s"] = 1
+        self.act(A, "nouvelle_conversation")
+        recette.browser.context.on("dialog", lambda d: d.dismiss())  # the human, at once
+        page.evaluate("() => setTimeout(() => confirm('pendant la question'), 1800)")
+        err = self.refused(drv, A, "poser_question", {"case": "t-slow"})
+        self.assertEqual(err.reason, "dialog")
+        self.assertEqual(err.extra.get("refused_first"), "timeout")
+        self.assertIs(err.extra.get("internal_error_shown"), True)
+        self.assertIn("abort", err.extra)
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "t-slow"})[0]["verdict"], "KO")
+        line = self.line(recette, "t-slow")
+        self.assertIn("securite", line["nfr"])
+        self.assertIn("dialogue inattendu", line["evidence"])
+        self.assertIs(line.get("internal_error_shown"), True)
+
+
 if __name__ == "__main__":
     unittest.main()
