@@ -203,6 +203,10 @@ class Handler(BaseHTTPRequestHandler):
     do_DELETE = conversation_write
 
     def do_POST(self):
+        if self.path.startswith("/api/telemetry"):  # round 3, M-5: another host's write, answered 2xx
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.reply(204)
+            return
         if not self.path.startswith("/chat/stream"):
             self.send_error(404)
             return

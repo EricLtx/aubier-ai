@@ -123,7 +123,12 @@
      the dictation button reads « Stop dictation »), `themetoggle` (a button[data-mode] theme toggle before
      the composer), `sidebarselect` (a listbox button in the sidebar), `modeldialog` (the model button
      opens a confirm on the next tick), `feedbackincomposer` (the « Send feedback » button moved into the
-     composer, after its send button). Words: TOAST_HOST (a toast naming an internal host 0.8 s into
+     composer, after its send button); round 3: `menuspanhint` (the entries' shortcut hints « F2 », « ⌘⌫ » in
+     a plain span), `searchsnippet` (a palette item shows the title and a snippet, its data-value the title),
+     `searchunknown` (the palette's items lead nowhere the pilot knows), `searchentrydead` (the ⌘K entry opens
+     nothing), `nativedelay` (with confirmnative, the confirm opens 600 ms after the click), `slowrollback`
+     (with deletefail, the row comes back 4 s after the refusal), `telemetry` (each delete also POSTs to
+     another host, which answers 204). Words: TOAST_HOST (a toast naming an internal host 0.8 s into
      the question), ALERT_HOST (an alert naming one at the end of the stream), UNKNOWN_MODAL_TITLES (a
      window that lists the sidebar's titles). Counters: `__theme_clicks`, `__sidebar_select_clicks`,
      `__clear_clicks`, `__sidebar_filter_value`. -->
@@ -246,7 +251,8 @@ for (const k of ["nodetails", "revealed", "controls", "nostructure", "renamedial
                  "nodeleterequest", "slowrename", "rowtrigger", "rowbadge", "rowtime", "menushortcut", "surveyinput",
                  "surveyonrename", "surveyother", "recents", "echo", "searchfail", "searchfilter", "nonewlink",
                  "clearbutton", "senddisabled", "micdictation", "themetoggle", "sidebarselect", "modeldialog",
-                 "feedbackincomposer"]) {
+                 "feedbackincomposer", "menuspanhint", "searchsnippet", "searchunknown", "searchentrydead",
+                 "nativedelay", "slowrollback", "telemetry"]) {
   if (new URLSearchParams(location.search).get(k) === "1") sessionStorage.setItem("bench-" + k, "1");
 }
 for (const k of ["menuitems", "searchentry", "feedbacklabel", "confirmtext", "canceltext", "confirmlabel",
@@ -320,6 +326,11 @@ if (value("menuitems")) {  // the conversation menu's own entries
     $("conv-menu").appendChild(it);
   }
 }
+if (flag("menuspanhint"))  // round 3, I-1: the hints in a plain span, no kbd, no data-slot
+  for (const it of $("conv-menu").querySelectorAll("[role=menuitem]")) {
+    const hint = it.dataset.action === "rename" ? "F2" : it.dataset.action === "delete" ? "⌘⌫" : "";
+    if (hint) it.insertAdjacentHTML("beforeend", ' <span class="ml-auto">' + hint + '</span>');
+  }
 for (const it of $("conv-menu").querySelectorAll("[role=menuitem]")) it.dataset.base = it.textContent;
 if (flag("menushortcut"))  // shadcn's DropdownMenuShortcut inside the delete entry (robustness-1)
   for (const it of $("conv-menu").querySelectorAll('[role=menuitem][data-action="delete"]'))
@@ -663,6 +674,8 @@ for (const item of $("conv-menu").querySelectorAll("[role=menuitem]")) item.oncl
       const ul = $("conversations"), kept = [...ul.children];
       for (const x of kept) x.remove();
       setTimeout(() => { for (const x of kept) ul.appendChild(x); }, 4000);
+    } else if (flag("confirmnative") && flag("nativedelay")) {  // round 3, I-3: the confirm comes late
+      setTimeout(() => { if (confirm("Supprimer cette conversation ?")) doDelete(li); }, 600);
     } else if (flag("confirmnative")) {  // the app asks through window.confirm (robustness-6)
       if (confirm("Supprimer cette conversation ?")) doDelete(li);
     } else if (flag("deletedirect")) {
@@ -765,11 +778,15 @@ function doDelete(li) {
       history.pushState({}, "", "/new");
     }
   };
+  if (flag("telemetry"))  // round 3, M-5: another host's write, answered 2xx
+    fetch(location.protocol + "//localhost:" + location.port + "/api/telemetry", { method: "POST", mode: "no-cors", body: "x" })
+      .catch(() => null);
   if (flag("deletefail")) {  // optimistic: gone at once, back when the server refuses (registry-5)
     const parent = li.parentElement, next = li.nextSibling;
     li.remove();
     req.then((r) => {
-      if (!r.ok) setTimeout(() => { parent.insertBefore(li, next); window.__deleted = window.__deleted.filter((x) => x !== id); }, 300);
+      if (!r.ok) setTimeout(() => { parent.insertBefore(li, next); window.__deleted = window.__deleted.filter((x) => x !== id); },
+                            flag("slowrollback") ? 4000 : 300);
     });
     return;
   }
@@ -800,12 +817,21 @@ function renderPalette(q) {  // the conversations whose title holds the query, a
   const rows = [...document.querySelectorAll("#conversations .conv-item")];
   const hits = !q && flag("recents") ? rows.slice(0, 5)  // recent conversations before any typing (robustness-7)
     : rows.filter((li) => q && li.querySelector("a").textContent.toLowerCase().includes(q.toLowerCase()));
-  for (const li of hits) {
+  for (const [i, li] of hits.entries()) {
     const it = document.createElement("div");
     it.setAttribute("cmdk-item", "");
     it.setAttribute("role", "option");
-    it.dataset.value = li.dataset.id;
-    it.textContent = li.querySelector("a").textContent;
+    const title = li.querySelector("a").textContent;
+    if (flag("searchunknown")) {  // round 3, M-1: items the pilot cannot tie to a conversation
+      it.dataset.value = "r-" + i;
+      it.textContent = "Résultat " + (i + 1);
+    } else if (flag("searchsnippet")) {  // round 3, M-1: the title, then a snippet; the value is the title
+      it.dataset.value = title;
+      it.textContent = title + " — extrait : … fiche pratique …";
+    } else {
+      it.dataset.value = li.dataset.id;
+      it.textContent = title;
+    }
     items.appendChild(it);
   }
   $("palette").querySelector("[cmdk-empty]").hidden = !q || hits.length > 0;
@@ -817,7 +843,7 @@ $("palette").querySelector("[cmdk-input]").addEventListener("input", (e) => {
   if (flag("searchfail")) return;  // the list never follows the typing
   paletteTimer = setTimeout(() => renderPalette(q), flag("recents") ? 1500 : 300);  // a debounced search
 });
-if (SEARCHENTRY !== "link") $("search-entry").onclick = openPalette;
+if (SEARCHENTRY !== "link" && !flag("searchentrydead")) $("search-entry").onclick = openPalette;
 if (flag("nonewlink")) document.querySelector('a[href="/new"]').remove();  // click-targets-8
 document.addEventListener("keydown", (e) => {
   if (NOKBD || !(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "k") return;

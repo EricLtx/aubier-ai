@@ -194,6 +194,19 @@ class CorrectTest(unittest.TestCase):
         items, code = self.correct.run(self.work, ["M9-1"], "essai", out=io.StringIO())
         self.assertEqual((code, items[0]["status"]), (0, "inchangé : rien à corriger"))
 
+    def test_m8_an_unstamped_observation_of_this_pilot_is_never_taken_for_an_older_one(self):
+        """M-8 (review of round 2): an observation set aside at a resumption, never judged, that carries this
+        pilot's keys (`notices`) and the very timing of the line in force: refused, never replayed."""
+        aside = os.path.join(self.work, "observations-essai1.json")
+        with open(os.path.join(self.work, "observations.json"), encoding="utf-8") as f:
+            before = json.load(f)
+        before["N3-1"] = {"answer": "Je ne sais pas.", "timing_s": 2.0, "new_answer": True, "notices": None}
+        with open(aside, "w", encoding="utf-8") as f:
+            json.dump(before, f, ensure_ascii=False)
+        items, code = self.correct.run(self.work, ["N3-1"], "essai", observations=aside, out=io.StringIO())
+        self.assertEqual(code, 1)
+        self.assertIn("pas celle de la ligne en vigueur", items[0]["status"])
+
     def test_the_command_line(self):
         before = self.bytes()
         out = subprocess.run([sys.executable, "-I", os.path.join(HERE, "correct.py"), self.work, "--cases", "N1-1",

@@ -3805,5 +3805,270 @@ class FixRound2OnFixture(FixtureBench):
         self.assertEqual(page.evaluate("() => [window.__theme_clicks, window.__sidebar_select_clicks]"), [0, 0])
 
 
+# -- Fix round 3 (.superpowers/review-v2.3-fix2.md) ------------------------------------------------------------------
+# I-2 (R2-3, binding): a confirmation is accepted only when it names exactly one conversation and holds no plural
+# conversation noun outside that name (the « dans vos conversations » idioms aside); M-6: a possessive is no
+# quantifier. One test per shape.
+R3_CONFIRMS_REFUSED = {
+    "related_conversations": "Supprimer cette conversation et les conversations liées ?",
+    "three_of_this_thread": "Les 3 conversations de ce fil seront supprimées.",
+    "pinned_too": "Supprimer la conversation ? Les conversations épinglées seront aussi supprimées.",
+    "related_chats_en": "Delete this chat and its related chats?",
+    "shared_from_it_en": "Delete chat? Conversations shared from it will also be removed.",
+    "a_number_before_the_noun": "Supprimer 2 conversations ?",
+}
+R3_CONFIRMS_ACCEPTED = {
+    "no_longer_in_your_conversations": "Supprimer la conversation ? Elle n'apparaîtra plus dans vos conversations.",
+    "possessive_all_messages_en": "Delete conversation? All of the conversation's messages will be deleted.",
+    "from_your_chats_en": "Delete chat? It will be removed from your chats.",
+}
+
+
+class FixRound3Units(unittest.TestCase):
+    """Review of the fix round 2 (.superpowers/review-v2.3-fix2.md): what needs no browser."""
+
+    recette = FixRound1Units.recette
+
+    def check_confirm_refused(self, text):
+        self.assertFalse(load_driver().confirms_one_deletion(text, "Recette trois renommée"), text)
+
+    def check_confirm_accepted(self, text):
+        self.assertTrue(load_driver().confirms_one_deletion(text, "Recette trois renommée"), text)
+
+    def test_i1_one_tail_rule_for_both_sides(self):
+        """I-1: the menu entry's tail (an ellipsis, a keyboard hint, a function key) is stripped by one rule,
+        which the page's script receives as is."""
+        drv = load_driver()
+        for label, want in (("Supprimer ⌘⌫", "supprimer"), ("Renommer F2", "renommer"),
+                            ("Supprimer Ctrl+Suppr", "supprimer"), ("Renommer…", "renommer")):
+            self.assertEqual(drv.menu_text(label), want, label)
+        self.assertEqual(drv.MENU_TAIL_RE.pattern, drv.MENU_TAIL)
+        self.assertIn("a.tail", drv._MENU_FIND)
+
+    def test_m2_the_flag_keeps_the_case_s_names_and_a_cut_title_is_never_quoted(self):
+        """M-2: a dialog naming the attached file or the app's host shows no internal error; a dialog quoting a
+        cut title is replaced whole (the probe's word rule)."""
+        drv = load_driver()
+        self.assertIs(drv.harness_text("Le fichier facture-3.pdf n'a pas pu être lu", keep=("facture-3.pdf",))[1], False)
+        self.assertIs(drv.harness_text("Impossible de joindre app.maskai.fr", keep=("app.maskai.fr",))[1], False)
+        self.assertEqual(drv.harness_text("Supprimer « Avis juridi… » ?", titles=("Avis juridique Dupont",))[0], "…")
+        recette = self.recette(drv)
+        recette.browser.hosts = ("app.maskai.fr",)  # the application's own host, as on the live node
+        self.assertEqual(recette._harness_text("Impossible de joindre app.maskai.fr", "M8-6"),
+                         "Impossible de joindre app.maskai.fr")
+        self.assertNotIn("internal_error_shown", recette.observations.get("M8-6") or {})
+
+
+class FixRound3AfterUnits(unittest.TestCase):
+    """M-7: the check after an action writes the raw message of the dialog it refuses."""
+
+    recette = FixRound1Units.recette
+
+    def test_m7_the_check_after_the_action_writes_the_raw_message(self):
+        drv = load_driver()
+        recette = self.recette(drv)
+        d = {"seq": 9, "type": "alert", "message": "connect ECONNREFUSED pii-guard:8443", "t": "2026-10-20T12:00"}
+
+        class Stand:  # a dialog pending when the action ends, as the browser reports it
+            dialog_log, hosts = [d], ("app.maskai.fr",)
+
+            def drain(self, ms):
+                pass
+
+            def pending(self):
+                return d
+        recette.browser, recette._mark, recette._action_case = Stand(), 0, "t-alert"
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        ev = drv.Evidence(folder)
+        with self.assertRaises(drv.DriverRefusal) as refused:
+            recette._after(ev)
+        self.assertEqual(refused.exception.reason, "dialog")
+        self.assertNotIn("pii-guard", refused.exception.detail)
+        self.assertIn("pii-guard", self.evidence_json(ev.items, "dialog.json")["message"])
+
+    evidence_json = staticmethod(FixtureBench.evidence_json)
+
+
+def _r3_generate():
+    """One test per I-2 shape (R2-3: « one test each »)."""
+    def add(name, fn):
+        fn.__name__ = name
+        setattr(FixRound3Units, name, fn)
+    for key, text in R3_CONFIRMS_REFUSED.items():
+        add(f"test_i2_confirmation_refused_{key}", lambda self, text=text: self.check_confirm_refused(text))
+    for key, text in R3_CONFIRMS_ACCEPTED.items():
+        add(f"test_i2_confirmation_accepted_{key}", lambda self, text=text: self.check_confirm_accepted(text))
+
+
+_r3_generate()
+
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class FixRound3OnFixture(FixtureBench):
+    """Review of the fix round 2 on the bench (.superpowers/review-v2.3-fix2.md, I-1 … I-3, M-1 … M-9). Round 2's
+    helpers, borrowed (an inheritance would run round 2's tests a second time)."""
+
+    HREFS = FixRound2OnFixture.HREFS
+    start = FixRound2OnFixture.start
+    play_m8_1 = FixRound2OnFixture.play_m8_1
+    refused = FixRound2OnFixture.refused
+    verdict_after = FixRound2OnFixture.verdict_after
+    list_case = staticmethod(FixRound2OnFixture.list_case)
+    first_message = FixRound2OnFixture.first_message
+    q = staticmethod(FixRound2OnFixture.q)
+    line = FixRound2OnFixture.line
+    bench = FixRound2OnFixture.bench
+
+    def hide(self, drv, recette, js):
+        """The element lookup `js` finds nothing (an entry or a button gone after the pilot accepted it)."""
+        real = recette.browser.element
+
+        def element(script, arg, **kw):
+            return None if script is js else real(script, arg, **kw)
+        recette.browser.element = element
+
+    # I-1 ----------------------------------------------------------------------------------------------------
+    def test_i1_a_plain_text_hint_menu_is_accepted_and_clicked(self):
+        """I-1: « Renommer F2 | Partager | Supprimer ⌘⌫ » in plain text: the probe accepts it, and the actions
+        click those very entries: M8-5 and M8-6 OK."""
+        drv, recette, A, page = self.bench(self.q(menuitems="Renommer F2,Partager,Supprimer ⌘⌫"))
+        self.play_m8_1(A)
+        self.assertIn("M8-5/M8-6 : menu accepté", self.act(A, "sonder_interface")[0]["text"])
+        for cid, action in (("M8-5", "renommer_conversation"), ("M8-6", "supprimer_conversation")):
+            self.act(A, action, {"case": cid})
+            self.assertEqual(self.act(A, "verdict_oracle", {"case": cid})[0]["verdict"], "OK", cid)
+        self.assertEqual(len(page.evaluate("() => window.__deleted")), 1)
+
+    def test_i1_a_span_hint_menu_is_accepted_and_clicked(self):
+        """I-1: the hints in a plain span (no kbd, no data-slot): the same entries are clicked."""
+        drv, recette, A, page = self.bench(self.q(menuspanhint="1"))
+        self.play_m8_1(A)
+        self.assertIn("M8-5/M8-6 : menu accepté", self.act(A, "sonder_interface")[0]["text"])
+        for cid, action in (("M8-5", "renommer_conversation"), ("M8-6", "supprimer_conversation")):
+            self.act(A, action, {"case": cid})
+            self.assertEqual(self.act(A, "verdict_oracle", {"case": cid})[0]["verdict"], "OK", cid)
+
+    def test_i1_an_entry_gone_after_acceptance_is_non_teste_and_the_registry_untouched(self):
+        """I-1 (R2-1): the menu was accepted, its entry cannot be found to click: nothing clicked, NON TESTÉ, and
+        the registry never says « suppression demandée »."""
+        drv, recette, A, page = self.bench()
+        self.play_m8_1(A)
+        self.hide(drv, recette, drv.MENU_ITEM_EL_JS)
+        err = self.refused(drv, A, "supprimer_conversation", {"case": "M8-6"})
+        self.assertTrue(err.detail.startswith("refus du pilote"), err.detail)
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-6"})[0]["verdict"], "NON TESTÉ")
+        entry = recette._registered("M8-1")
+        self.assertEqual((entry["state"], [h["state"] for h in entry["history"]]), ("créée", ["créée"]))
+        self.assertEqual(page.evaluate("() => window.__deleted"), [])
+
+    # I-2 ----------------------------------------------------------------------------------------------------
+    def test_i2_a_confirmation_that_widens_with_a_plural_is_never_confirmed(self):
+        """I-2: « Supprimer cette conversation et les conversations liées ? »: cancelled, NON TESTÉ, nothing
+        deleted."""
+        drv, recette, A, page = self.bench(self.q(confirmtext="Supprimer cette conversation et les conversations liées ?"))
+        self.play_m8_1(A)
+        self.refused(drv, A, "supprimer_conversation", {"case": "M8-6"})
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-6"})[0]["verdict"], "NON TESTÉ")
+        self.assertEqual(page.evaluate("() => window.__deleted"), [])
+
+    # I-3 ----------------------------------------------------------------------------------------------------
+    def test_i3_a_dialog_closed_before_the_action_s_own_refusal_is_ko_securite(self):
+        """I-3 (robustness-2): the rename click opens a confirm, the human dismisses it at once, then no field
+        opens: refused `dialog`, KO sécurité, never KO disponibilité."""
+        drv, recette, A, page = self.bench()
+        self.first_message(recette, A)
+        self.list_case(recette, "t-ren", action="renommer_conversation", same_conversation_as="t-a",
+                       question="Titre nouveau", must=["titre relu . titre nouveau"])
+        page.evaluate("""() => document.querySelector('#conv-menu [data-action="rename"]').addEventListener('click',
+            (e) => { e.stopImmediatePropagation(); setTimeout(() => confirm('pendant le renommage'), 0); }, true)""")
+        recette.browser.context.on("dialog", lambda d: d.dismiss())  # the human, at once
+        err = self.refused(drv, A, "renommer_conversation", {"case": "t-ren"})
+        self.assertEqual(err.reason, "dialog")
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "t-ren"})[0]["verdict"], "KO")
+        self.assertIn("securite", self.line(recette, "t-ren")["nfr"])
+
+    def test_i3_a_late_native_confirmation_is_the_app_s_and_non_teste(self):
+        """I-3 (robustness-6, async): the app's confirm opens 600 ms after the delete click, inside a read, and
+        the human dismisses it: still the application's confirmation, NON TESTÉ, nothing deleted."""
+        drv, recette, A, page = self.bench(self.q(confirmnative="1", nativedelay="1"))
+        self.first_message(recette, A)
+        self.list_case(recette, "t-del", action="supprimer_conversation", same_conversation_as="t-a", budget_s=2,
+                       must=["plus listee"], must_not=["t-a : encore listee"])
+        recette.browser.context.on("dialog", lambda d: d.dismiss())  # the human cancels it
+        err = self.refused(drv, A, "supprimer_conversation", {"case": "t-del"})
+        self.assertIn("confirmation native", err.detail)
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "t-del"})[0]["verdict"], "NON TESTÉ")
+        self.assertEqual(page.evaluate("() => window.__deleted"), [])
+
+    # M-1 ----------------------------------------------------------------------------------------------------
+    def test_m1_a_palette_item_with_a_snippet_is_a_result(self):
+        """M-1: the item shows the title then a snippet, its value the title: counted, M8-4 OK."""
+        drv, recette, A, page = self.bench(self.q(searchsnippet="1"))
+        self.play_m8_1(A)
+        res, _ = self.act(A, "lister_conversations", {"case": "M8-4"})
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-4"})[0]["verdict"], "OK")
+
+    def test_m1_items_the_pilot_cannot_tie_to_a_conversation_are_non_teste(self):
+        """M-1 (R2-1): the palette lists items that lead nowhere the pilot knows: « résultats non reconnus »,
+        NON TESTÉ; the probe keeps the palette's item count."""
+        drv, recette, A, page = self.bench(self.q(searchunknown="1"))
+        self.play_m8_1(A)
+        _, ev = self.act(A, "sonder_interface")
+        self.assertIn("items", self.evidence_json(ev, "probe.json")["search"])
+        try:
+            self.act(A, "lister_conversations", {"case": "M8-4"})
+        except drv.DriverRefusal:
+            pass
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-4"})[0]["verdict"], "NON TESTÉ")
+        self.assertIn("résultats non reconnus", self.line(recette, "M8-4")["evidence"])
+
+    # M-3 ----------------------------------------------------------------------------------------------------
+    def test_m3_a_confirm_button_gone_is_non_teste_and_the_registry_reverted(self):
+        """M-3: the confirmation was accepted, its button is gone before the click: cancelled, NON TESTÉ, the
+        registry back to « créée »."""
+        drv, recette, A, page = self.bench()
+        self.play_m8_1(A)
+        self.hide(drv, recette, drv.CONFIRM_EL_JS)
+        self.refused(drv, A, "supprimer_conversation", {"case": "M8-6"})
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-6"})[0]["verdict"], "NON TESTÉ")
+        self.assertEqual(recette._registered("M8-1")["state"], "créée")
+        self.assertEqual(page.evaluate("() => window.__deleted"), [])
+
+    def test_m3_an_entry_that_opens_no_palette_is_non_teste(self):
+        """M-3: ⌘K unbound, the identified entry is clicked and opens nothing the pilot recognises: NON TESTÉ."""
+        drv, recette, A, page = self.bench(self.q(nokbd="1", searchentrydead="1"))
+        self.list_case(recette, "t-search", action="lister_conversations", question="Recette")
+        try:
+            self.act(A, "lister_conversations", {"case": "t-search"})
+        except drv.DriverRefusal:
+            pass
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "t-search"})[0]["verdict"], "NON TESTÉ")
+
+    # M-5 ----------------------------------------------------------------------------------------------------
+    def test_m5_a_write_to_another_host_is_no_proof_of_the_delete(self):
+        """M-5: the delete fails (500) and the row comes back 4 s later; a POST to another host answered 204
+        meanwhile: never « plus listée », KO, the registry never « supprimée »."""
+        drv, recette, A, page = self.bench(self.q(deletedirect="1", deletefail="1", slowrollback="1", telemetry="1"))
+        self.first_message(recette, A)
+        self.list_case(recette, "t-del", action="supprimer_conversation", same_conversation_as="t-a", budget_s=2,
+                       must=["plus listee"], must_not=["t-a : encore listee"])
+        self.assertEqual(self.verdict_after(drv, A, "supprimer_conversation", "t-del"), "KO")
+        self.assertNotEqual(recette._registered("t-a")["state"], "supprimée")
+
+    # M-7, M-9 -----------------------------------------------------------------------------------------------
+    def test_m9_a_timeout_refusal_carries_the_flag_at_its_top(self):
+        """M-9: a toast naming a host during a question abandoned at 3 × its budget: the refusal's extra says
+        internal_error_shown, for the harness's rule."""
+        drv, recette, A, page = self.bench()
+        self.message_case(recette, "t-slow", "Bonjour TOAST_HOST SLOW")
+        recette.cases["t-slow"]["budget_s"] = 1
+        self.act(A, "nouvelle_conversation")
+        err = self.refused(drv, A, "poser_question", {"case": "t-slow"})
+        self.assertEqual(err.reason, "timeout")
+        self.assertIs(err.extra.get("internal_error_shown"), True)
+
+
 if __name__ == "__main__":
     unittest.main()

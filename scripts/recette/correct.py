@@ -98,6 +98,10 @@ def line_sha256(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# Round 3 (M-8): keys that only an observation of the pilot since its review's round 2 carries; such an
+# observation without the stamp of a line was never judged, it is never « older ».
+THIS_PILOT_KEYS = ("notices", "untested")
+
 NOT_THE_LINE = ("erreur : l'observation gardée du cas n'est pas celle de la ligne en vigueur ({why}) : rien n'est "
                 "rejoué ; à une reprise, rejouer sur le fichier d'observations qui la porte (--observations)")
 
@@ -142,6 +146,10 @@ def plan(recette, drv, cases: list, reason: str, reread: bool = False, evidence:
         stamp = ((recette.observations.get(cid) or {}).get("verdict") or {}).get("line_sha256")
         if stamp is not None and (idx >= len(texts) or stamp != line_sha256(texts[idx])):
             item["status"] = NOT_THE_LINE.format(why="son verdict porte l'empreinte d'une autre ligne")
+            continue
+        own = recette.observations.get(cid) or {}
+        if stamp is None and any(k in own or k in (own.get("observed") or {}) for k in THIS_PILOT_KEYS):
+            item["status"] = NOT_THE_LINE.format(why="observation de ce pilote jamais jugée : sans empreinte de ligne")
             continue
         if reread:
             item["header_reread"] = reread_header(recette, drv, cid)

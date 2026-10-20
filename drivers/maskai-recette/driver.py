@@ -153,6 +153,13 @@ Ce que le deuxième tour de la revue change (20/10, `.superpowers/fix-round-2.md
   dont le délai est `timing_s` ; « suppression demandée » notée avant le clic ; `correct.py` ne rejoue
   que l'observation de la ligne en vigueur (`line_sha256`) (R2-6).
 
+Le troisième tour (20/10, `.superpowers/review-v2.3-fix2.md`) : une confirmation n'est acceptée que si elle nomme
+exactement une conversation, sans nom de conversation au pluriel hors de ce nom (I-2) ; la queue d'une entrée de menu
+se lit par une seule règle des deux côtés, `MENU_TAIL` (I-1) ; une entrée ou un bouton acceptés puis introuvables, une
+palette non reconnue, des résultats non reconnus sont NON TESTÉ, le registre intact (I-1, M-1, M-3) ; un dialogue
+relevé avant le propre refus d'une action reste KO sécurité, et la confirmation native ouverte tard reste celle de
+l'application (I-3) ; « plus listée » ne compte qu'une écriture 2xx de l'application (M-5).
+
 Environnement (posé par l'hôte) : VK_DRIVER_PROFILE_DIR, VK_DRIVER_WORK_DIR,
 VK_DRIVER_HEADLESS, VK_DRIVER_CHANNEL, VK_DRIVER_HOSTS ; MASKAI_ENTRY_URL
 remplace `ENTRY_URL` (le banc d'essai sur un autre port).
@@ -968,16 +975,24 @@ SEARCH_JS = "(a) => {" + _VISIBLE + _SEARCH_FIND + """
   const leads = (el) => {
     const link = el.matches('a[href]') ? el : el.querySelector('a[href]');
     if (link && conv && conv.test(pathOf(link) || '')) return true;
-    for (const at of ['data-value', 'value', 'id']) { const v = el.getAttribute(at); if (v && ids.has(v)) return true; }
-    return titles.has(norm(el.textContent));
+    for (const at of ['data-value', 'value', 'id']) {
+      const v = el.getAttribute(at);
+      if (v && (ids.has(v) || titles.has(norm(v)))) return true;  // round 3, M-1: a value that is a title
+    }
+    const t = norm(el.textContent);
+    return titles.has(t) || [...titles].some((x) => x.length >= 6 && t.startsWith(x));  // M-1: title, then a snippet
   };
-  let results = [], resultSel = null, items = 0;
+  // round 3, M-1: an item that neither leads to a conversation nor echoes the query is one the pilot cannot read
+  const q = norm(f.input.value);
+  const echoes = (el) => q.length > 0 && norm(el.textContent).includes(q) && !leads(el);
+  let results = [], resultSel = null, items = 0, unknown = 0;
   for (const s of a.results) {
     const els = [...f.root.querySelectorAll(s)].filter(visible);
     if (els.length) {
       resultSel = s;
       items = els.length;
       results = els.filter(leads).map((el) => (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 120)).filter(Boolean);
+      unknown = els.filter((el) => !leads(el) && !echoes(el)).length;
       break;
     }
   }
@@ -990,7 +1005,7 @@ SEARCH_JS = "(a) => {" + _VISIBLE + _SEARCH_FIND + """
   }
   return { input: f.sel, root: f.root.getAttribute('role') || f.root.tagName.toLowerCase(), value: f.input.value || '',
            focused: document.activeElement === f.input, results: a.redact ? [] : results.slice(0, 50),
-           result: resultSel, count: results.length, items, empty, html: (copy.outerHTML || '').slice(0, 5000) };
+           result: resultSel, count: results.length, items, unknown, empty, html: (copy.outerHTML || '').slice(0, 5000) };
 }"""
 
 SEARCH_INPUT_EL_JS = "(a) => {" + _VISIBLE + _SEARCH_FIND + " const f = findSearch(a); return [f ? f.input : null]; }"
@@ -1101,9 +1116,14 @@ _MENU_FIND = r"""
   const fold = (s) => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
   // round 2, robustness-1: an entry's own text, without its keyboard hint (kbd, data-slot*=shortcut) nor a final
   // ellipsis; the entry is then matched whole, as the Python side does (menu_text)
+  // round 3, I-1: the tail rule is Python's own (MENU_TAIL, passed as a.tail): a plain-text hint « ⌘⌫ »,
+  // « Ctrl+Suppr », « F2 » or one in a plain span is stripped here as on the Python side
   const itemText = (el) => { const c = el.cloneNode(true);
     for (const k of c.querySelectorAll('kbd, [data-slot*="shortcut"]')) k.remove();
-    return (c.textContent || '').replace(/\s+/g, ' ').trim().replace(/\s*(?:…|\.\.\.)\s*$/, ''); };
+    let t = (c.textContent || '').replace(/\s+/g, ' ').trim();
+    const tail = new RegExp(a.tail || '\\s*(?:…|\\.\\.\\.)\\s*$', 'i');
+    for (let i = 0; i < 4; i++) { const u = t.replace(tail, '').trim(); if (u === t) break; t = u; }
+    return t; };
   const findMenu = (a) => {
     let menu = a.controls ? document.getElementById(a.controls) : null, how = 'aria-controls';
     if (!menu || !visible(menu) || !menu.matches(a.menu)) {
@@ -1958,18 +1978,22 @@ def notices_internal(notices: list, keep=()) -> bool:
     return any(text_shows_internal(text, keep) for _, text in error_notices(notices))
 
 
-def harness_text(text: str | None, titles=(), n: int = HARNESS_TEXT_MAX) -> tuple[str, bool]:
+def harness_text(text: str | None, titles=(), n: int = HARNESS_TEXT_MAX, keep=()) -> tuple[str, bool]:
     """Un texte de la page qui va au harnais (le message d'un dialogue, le texte d'une fenêtre inconnue ;
     round 2, leakage-2, R2-4) : expurgé (sanitise), et remplacé en entier par « … » quand il porte les douze
     premiers caractères du titre d'une conversation listée ; et s'il montre une erreur interne."""
     raw = text or ""
-    internal = text_shows_internal(raw)
+    internal = text_shows_internal(raw, keep)  # round 3, M-2: the case's file names, the app's hosts kept
     folded = evaluer.fold(raw)
     for title in titles or ():
-        key = evaluer.fold(title or "").strip()[:12]
-        if len(re.findall(r"\w", key)) >= 3 and key in folded:
-            return "…", internal
-    return sanitise(raw, n), internal
+        whole = evaluer.fold(title or "").strip()
+        # round 3, M-2: the title's first twelve characters, or a cut title (« Avis juridi… »): any prefix of it
+        # of eight characters or more, three of them letters or digits
+        for k in range(min(12, len(whole)), 7, -1):
+            key = whole[:k]
+            if len(re.findall(r"\w", key)) >= 3 and key in folded:
+                return "…", internal
+    return sanitise(raw, n, keep=tuple(keep)), internal
 
 
 def sha256_text(text: str) -> str:
@@ -2079,13 +2103,21 @@ _CONV_NOUN = r"(?:conversations?|discussions?|chats?|threads?)"
 _THIS_ONE = r"(?!\s+(?:de\s+(?:la|cette)\s+(?:conversation|discussion)|du\s+(?:chat|fil)|of\s+(?:this|the)\s+(?:chat|conversation|thread)))"
 CONFIRM_TOO_WIDE = (rf"\btou(?:te)?s\s+(?:les|vos|tes|nos|ces|leurs|mes|ses)\s+(?:\w+\s+)?{_CONV_NOUN}\b"
                     rf"|\btoute\s+{_CONV_NOUN}\b"
-                    rf"|\b(?:all|every|each)\s+(?:(?:of\s+)?(?:the|your|my|these|those)\s+)?(?:\w+\s+)?{_CONV_NOUN}\b"
+                    rf"|\b(?:all|every|each)\s+(?:(?:of\s+)?(?:the|your|my|these|those)\s+)?(?:\w+\s+)?{_CONV_NOUN}\b(?!['’]s\b)"
                     rf"|\b(?:chaque|plusieurs|several)\s+(?:\w+\s+)?{_CONV_NOUN}\b"
                     rf"|\btout\s+l['’]?\s*historique{_THIS_ONE}"
                     rf"|\b(?:all|clear)\s+(?:all\s+)?(?:of\s+)?(?:your\s+|the\s+|my\s+)?(?:chat\s+)?history{_THIS_ONE}"
                     r"|\bvider\b|\b(?:dossiers?|folders?|projets?|projects?|espaces?|workspaces?|groupes?|groups?)\b"
                     r"|selection|\bselected\b|\bbulk\b")
 CONFIRM_DELETE_RE = r"\b(?:supprim\w*|suppression|delete\w*|deletion|effac\w*|remov\w*|retir\w*)\b"
+# Round 3 (I-2, binding) : une confirmation n'est acceptée que si elle nomme exactement une conversation, sans nom de
+# conversation au pluriel hors de ce nom, et sans nombre devant un nom de conversation ; seuls les idiomes de lieu
+# (« dans vos conversations », « from your chats », « de votre historique ») ne comptent pas.
+CONFIRM_PLURAL_RE = r"\b(?:conversations|discussions|chats|threads)\b"
+CONFIRM_NUMBER_RE = r"\b\d+\s+(?:\w+\s+)?(?:conversation|discussion|chat|thread)s?\b"
+CONFIRM_PLACE_RE = (r"\b(?:dans|de|des|parmi|from|in|of|out\s+of)\s+(?:la\s+liste\s+de\s+)?"
+                    r"(?:vos|votre|tes|ton|ta|mes|mon|ma|your|my|the)\s+"
+                    r"(?:conversations|discussions|chats|threads|historique|chat\s+history|history)\b")
 CONFIRM_ONE_RE = r"\b(?:conversation|discussion|chat|thread)\b"
 # Les boutons d'une confirmation (round 2, registry-1) : une annulation (« Ne pas supprimer », « Don't
 # delete », « Garder »…), une confirmation forte (le motif de KNOWN_MODALS « suppression »), et une faible
@@ -2101,8 +2133,11 @@ MENU_RENAME_WORDS = r"renomm|rename|\btitre\b|\btitle\b"
 MENU_DELETE_WORDS = r"supprim|delete|effac|erase|trash|corbeille"
 # Round 2 (robustness-1) : la queue d'une entrée qui n'en change pas le sens : des points de suspension, un
 # indice de raccourci (« ⌘⌫ », « Ctrl+Suppr »).
-MENU_TAIL_RE = re.compile(r"\s*(?:…|\.\.\.)\s*$|\s+(?:[⌘⇧⌥⌃⌫⌦↵⏎]+[\w⌫⌦]*|(?:ctrl|cmd|alt|shift|maj)(?:\s*\+\s*[\w⌫⌦]+)+)\s*$",
-                          re.I)
+# Round 3 (I-1) : une seule règle, que le script de la page reçoit telle quelle (a.tail) ; une touche de fonction
+# (« Renommer F2 ») aussi.
+MENU_TAIL = (r"\s*(?:…|\.\.\.)\s*$|\s+(?:[⌘⇧⌥⌃⌫⌦↵⏎]+[\w⌫⌦]*|(?:ctrl|cmd|alt|shift|maj)(?:\s*\+\s*[\w⌫⌦]+)+"
+             r"|f\d{1,2})\s*$")
+MENU_TAIL_RE = re.compile(MENU_TAIL, re.I)
 # Round 2 (m10) : les mots d'une entrée de menu, que la sonde ne prend jamais pour un mot de titre.
 ENTRY_WORDS = ("renommer", "rename", "supprimer", "delete", "partager", "share", "archiver", "archive", "epingler",
                "conversation", "discussion", "chat", "modifier", "titre", "title", "deplacer", "corbeille", "trash",
@@ -2155,7 +2190,11 @@ def confirms_one_deletion(text: str | None, title: str | None = None) -> bool:
         return False
     own = evaluer.fold(title or "").strip()
     named = bool(re.search(CONFIRM_ONE_RE, folded)) or (len(own) >= 3 and own in folded)
-    return named and not re.search(CONFIRM_TOO_WIDE, folded)
+    if not named or re.search(CONFIRM_TOO_WIDE, folded):
+        return False
+    rest = folded.replace(own, " ") if len(own) >= 3 else folded  # the title may say « conversations »
+    rest = re.sub(CONFIRM_PLACE_RE, " ", rest)  # round 3, I-2: where it disappears from is no target
+    return not (re.search(CONFIRM_PLURAL_RE, rest) or re.search(CONFIRM_NUMBER_RE, rest))
 
 
 def pick_confirm(dlg: dict) -> tuple[int | None, str | None]:
@@ -2704,6 +2743,10 @@ class Browser:
                 "console": self.since(self.console, mark)}
 
 
+class EntryGone(Exception):
+    """Round 3, I-1 (R2-1) : l'entrée acceptée n'est plus là au moment du clic : rien n'est cliqué."""
+
+
 class AskTimeout(Exception):
     def __init__(self, seconds: float, why: str):
         super().__init__(why)
@@ -2804,13 +2847,22 @@ class Recette:
                     self._mark = self.browser.mark()
                 result = fn(args, ev)
                 if browser:
-                    self._after()
+                    self._after(ev)
                     if fn.__name__ in NEEDS_APP and self._action_case:  # the app answered: no maintenance
                         (self.observations.get(self._action_case) or {}).pop("maintenance", None)
                 if ev.dropped:
                     result["evidence_dropped"] = ev.dropped
                 return result, ev.items
             except DriverRefusal as r:
+                if browser and r.reason not in ("dialog", "host") and self.browser.started():
+                    # round 3, I-3 (robustness-2): a dialog seen during the action, even closed by the human, is
+                    # the action's, whatever refusal the action then gave
+                    seen = self.browser.pending() or self._new_dialog()
+                    if seen and seen.get("seq") not in self._app_dialogs:
+                        refusal = self._dialog_refusal(ev, seen)
+                        refusal.extra = {**(refusal.extra or {}), "refused_first": r.reason}
+                        refusal.evidence = ev.items
+                        raise refusal from r
                 r.evidence = r.evidence or ev.items
                 raise
             except Exception as e:
@@ -2970,14 +3022,14 @@ class Recette:
         else:
             page.locator(k["dismiss"]).first.click(timeout=5000)
 
-    def _after(self) -> None:
+    def _after(self, ev: Evidence | None = None) -> None:
         b = self.browser
         b.drain(50)
-        if b.pending():
-            raise self._dialog_refusal()
+        if b.pending():  # round 3, M-7: with the evidence, so that dialog.json holds the raw message
+            raise self._dialog_refusal(ev)
         seen = self._new_dialog()
         if seen:  # round 2, robustness-2: a dialog the human closed before the driver looked is still the action's
-            raise self._dialog_refusal(d=seen)
+            raise self._dialog_refusal(ev, seen)
         self._check_host()
 
     def _new_dialog(self) -> dict | None:
@@ -3056,7 +3108,7 @@ class Recette:
     def _harness_text(self, text: str | None, cid: str | None = None) -> str:
         """Un texte de la page pour le harnais (harness_text) : expurgé, sans titre listé ; une erreur interne
         qu'il montre est notée sur le cas `cid` (round 2, leakage-2)."""
-        shown, internal = harness_text(text, self._titles)
+        shown, internal = harness_text(text, self._titles, keep=self._keep_names())
         if internal and cid:
             self.observations.setdefault(cid, {})["internal_error_shown"] = True
         return shown
@@ -4136,7 +4188,8 @@ class Recette:
             if t.notices.get("raw"):
                 ev.json("notices.json", t.notices["raw"])
             line = self._timeout_line(cid, case["nfr"], t, t.why, extra=self._line_extra(cid, seen))
-            raise DriverRefusal("timeout", t.why, extra={"journal": line, "abort": t.profile}) from None
+            flag = {"internal_error_shown": True} if seen.get("internal_error_shown") else {}  # round 3, M-9
+            raise DriverRefusal("timeout", t.why, extra={"journal": line, "abort": t.profile, **flag}) from None
         failure = obs.pop("failure_raw", None)
         notices = obs.pop("notices_raw", None)
         conversation = self._note_conversation(cid, conv_before, page, "poser_question")
@@ -4435,7 +4488,7 @@ class Recette:
         if dialog:  # un dialogue inattendu (pendant l'action ou après la réponse) : KO sécurité
             r["verdict"] = "KO"
             when = f" (après la réponse, +{dialog['after_s']:g} s)" if "after_s" in dialog else ""
-            message = harness_text(dialog["message"], self._titles)[0]  # round 2, leakage-2: an older raw message
+            message = harness_text(dialog["message"], self._titles, keep=self._keep_names())[0]  # round 2, leakage-2: an older raw message
             r["notes"].insert(0, f"dialogue inattendu ({dialog['type']}) : {message}{when}")
             nfr = nfr_union(nfr, ["securite"])
         gone = obs.get("others_gone")
@@ -4860,8 +4913,10 @@ class Recette:
                     error = ("la recherche ne s'ouvre pas au clavier (ControlOrMeta+K) et son entrée n'est pas "
                              f"identifiée dans la barre latérale : rien n'est cliqué ; {len(seen)} candidat(s) dans "
                              "search.json")
-                else:
-                    error = "la recherche ne s'ouvre pas (ni ControlOrMeta+K, ni l'entrée de la barre latérale)"
+                else:  # round 3, M-3 (R2-1): the identified entry opened nothing the pilot recognises
+                    unidentified = True
+                    error = ("la recherche ne s'ouvre pas (ni ControlOrMeta+K, ni l'entrée de la barre latérale) : "
+                             "aucune palette reconnue")
             else:
                 before = b.call(SEARCH_JS, arg, page=page, timeout_ms=2000) or {}
                 record["before"] = {"count": before.get("count"), "items": before.get("items"),
@@ -4880,7 +4935,7 @@ class Recette:
                         error = "la recherche s'est refermée avant ses résultats"
                     else:
                         record.update({k: got[k] for k in ("input", "results", "result", "empty", "focused", "value",
-                                                           "html", "items")})
+                                                           "html", "items", "unknown")})
                         if evaluer.fold(got["value"]).strip() != evaluer.fold(q).strip():
                             error = "le champ de recherche ne porte pas la question"
                         ev.screenshot(page, "screen.png")  # the palette and its results, before it closes
@@ -4898,6 +4953,10 @@ class Recette:
         if notices:
             record["notices"] = notices["raw"]
         n = len(record["results"])
+        if not error and n == 0 and (record.get("unknown") or 0) > 0:  # round 3, M-1 (R2-1): the pilot's limit
+            unidentified = True
+            error = (f"résultats non reconnus ({record['unknown']} élément{'s' if record['unknown'] > 1 else ''}) : "
+                     "le pilote ne les relie à aucune conversation")
         if error:
             text = f"recherche « {q} » : {error}"
         elif record.get("changed") is False:
@@ -5038,17 +5097,29 @@ class Recette:
                             # m1, m14: what is open before the click (a dialog, a field) is never what it opened
                             b.call(MARK_BEFORE_JS, {}, page=page)
                             previous = entry["state"]
-                            if how == "supprimer":  # registry-6: before the click, never clicked twice
-                                self._set_state(entry, "suppression demandée", cid)
-                            mark, clicked, clicked_at = b.mark(), True, time.monotonic()
-                            if self._click_menu_entry(page, menu, how, title):
-                                native, untested = True, NATIVE_CONFIRMATION  # robustness-6
-                            elif how == "renommer":
-                                outcome, error, seconds = self._rename(page, arg, case["question"].strip(), record,
-                                                                        budget, listed)
+
+                            def before():  # registry-6: noted just before the click, never clicked twice
+                                nonlocal clicked
+                                if how == "supprimer":
+                                    self._set_state(entry, "suppression demandée", cid)
+                                clicked = True
+                            mark, clicked_at = b.mark(), time.monotonic()
+                            try:
+                                app_native = self._click_menu_entry(page, menu, how, title, before)
+                            except EntryGone as gone:  # round 3, I-1 (R2-1): nothing was clicked
+                                record["closed_menu"] = self._close_menu(page)
+                                untested = str(gone)
                             else:
-                                outcome, error, untested, seconds = self._confirm_delete(
-                                    page, arg, record, entry, cid, title, previous, clicked_at, budget, listed, mark)
+                                if app_native:
+                                    native, untested = True, NATIVE_CONFIRMATION  # robustness-6
+                                elif how == "renommer":
+                                    outcome, error, seconds = self._rename(page, arg, case["question"].strip(),
+                                                                           record, budget, listed)
+                                else:
+                                    outcome, error, untested, seconds = self._confirm_delete(
+                                        page, arg, record, entry, cid, title, previous, clicked_at, budget, listed,
+                                        mark)
+                                    native = untested == NATIVE_CONFIRMATION  # round 3, I-3: opened late
                 except PWTimeout:
                     if b.pending() or self._new_dialog():
                         raise
@@ -5066,7 +5137,7 @@ class Recette:
             ev.json("conversation.json", record)
             self._refuse_untested(cid, untested, kind="dialog" if native else "precondition")
         reqs = self._requests_since(mark) if clicked else []
-        ok2xx = any(200 <= (r.get("status") or 0) < 300 for r in reqs)
+        ok2xx = self._delete_proved(reqs, entry["href"])  # round 3, M-5
         record["requests"] = reqs
         after = b.call(ITEM_JS, arg, page=page)
         record["item_after"] = {k: after.get(k) for k in ("found", "title", "count")}
@@ -5163,11 +5234,20 @@ class Recette:
         if want == "gone":
             others = listed - {href}
             return href not in items and (not others or bool(others & set(items))
-                                          or (mark is not None and self._write_2xx_since(mark)))
+                                          or (mark is not None and self._write_2xx_since(mark, href)))
         return href in items and same_title(items[href], title)
 
-    def _write_2xx_since(self, mark: int) -> bool:
-        return any(200 <= (r.get("status") or 0) < 300 for r in self._requests_since(mark))
+    def _write_2xx_since(self, mark: int, href: str | None = None) -> bool:
+        return self._delete_proved(self._requests_since(mark), href)
+
+    def _delete_proved(self, reqs: list, href: str | None) -> bool:
+        """Round 3, M-5 : une écriture 2xx des hôtes de l'application ; si une requête nomme la conversation (son
+        identifiant dans l'URL), c'est elle qui doit avoir abouti. Jamais une écriture d'un autre hôte (mesure
+        d'audience, service tiers)."""
+        mine = [r for r in reqs if self.browser.allowed(r.get("url") or "")]
+        ident = (href or "").rstrip("/").rsplit("/", 1)[-1]
+        named = [r for r in mine if ident and ident in (r.get("url") or "")]
+        return any(200 <= (r.get("status") or 0) < 300 for r in (named or mine))
 
     def _await_state(self, page, href: str, want: str, listed: set, start: float, deadline: float,
                      title: str | None = None, mark: int | None = None) -> tuple[bool, float | None]:
@@ -5228,7 +5308,8 @@ class Recette:
         # m10: the menu of a conversation the run did not create (the probe) keeps no word of its title
         margs = {"menu": SELECTORS["menu"], "item": SELECTORS["menu_item"], "controls": controls,
                  "sidebar": SELECTORS["sidebar"], "convPath": SELECTORS["conversation_path"],
-                 "redactHref": arg["href"] if arg.get("redact") else None, "entryWords": list(ENTRY_WORDS)}
+                 "redactHref": arg["href"] if arg.get("redact") else None, "entryWords": list(ENTRY_WORDS),
+                 "tail": MENU_TAIL}
         menu = self._wait_for(page, lambda: b.call(MENU_JS, margs, page=page, timeout_ms=2000), UI_WAIT_S)
         if not menu:
             page.keyboard.press("Escape")
@@ -5241,14 +5322,16 @@ class Recette:
             return None
         return {**menu, "arg": margs}
 
-    def _click_menu_entry(self, page, menu: dict, how: str, title: str | None = None) -> bool:
+    def _click_menu_entry(self, page, menu: dict, how: str, title: str | None = None, before=None) -> bool:
         """Cliquer l'entrée de renommage ou de suppression du menu ouvert : la seule, active, dont le texte
         suit son motif (MENU_ITEM_EL_JS), jamais un rang. Rend True quand le clic sur « Supprimer » a ouvert la
         confirmation native de l'application (round 2, robustness-6) : jamais répondue, laissée à l'humain."""
         pattern = SELECTORS["menu_rename"] if how == "renommer" else SELECTORS["menu_delete"]
         el = self.browser.element(MENU_ITEM_EL_JS, {**menu["arg"], "pattern": pattern}, page=page, timeout_ms=3000)
-        if el is None:
-            raise PWError("l'entrée du menu a disparu")
+        if el is None:  # round 3, I-1 (R2-1): accepted, then not found to click: nothing is clicked
+            raise EntryGone("l'entrée du menu acceptée n'est plus là au moment du clic : rien n'est cliqué")
+        if before is not None:
+            before()
         try:
             el.click(timeout=5000)
         except PWTimeout:  # a native dialog opened inside the click: the click waits for it
@@ -5260,6 +5343,18 @@ class Recette:
         if self._app_confirmation(how, title, page):
             return True
         self._after_click(page)
+        return False
+
+    def _app_confirm_since(self, mark: int | None, title: str | None) -> bool:
+        """Round 3, I-3 : la confirmation native de l'application ouverte tard, pendant une lecture de la page, et
+        peut-être déjà fermée par l'humain : un `confirm` du journal des dialogues depuis le clic sur « Supprimer »
+        qui parle de supprimer cette seule conversation. Notée à part (`_app_dialogs`), jamais répondue."""
+        if mark is None:
+            return False
+        for d in self.browser.since(self.browser.dialog_log, mark):
+            if d.get("type") == "confirm" and confirms_one_deletion(d.get("message"), title):
+                self._app_dialogs.add(d["seq"])
+                return True
         return False
 
     def _app_confirmation(self, how: str, title: str | None, page=None) -> bool:
@@ -5364,38 +5459,50 @@ class Recette:
             return not b.call(CONFIRM_JS, carg, page=page, timeout_ms=2000)
 
         def window_or_gone():
+            if self._app_confirm_since(mark, title):  # round 3, I-3: the app's confirm, opened late
+                return {"native": True}
             d = b.call(CONFIRM_JS, carg, page=page, timeout_ms=2000)
             if d:
                 return {"dialog": d}
             return {"gone": True} if self._state_now(page, href, "gone", listed, mark=mark) else None
 
         got = self._wait_for(page, window_or_gone, UI_WAIT_S)
+        if (got or {}).get("native") or (not (got or {}).get("dialog") and self._app_confirm_since(mark, title)):
+            record["confirmation"] = "native"
+            return None, None, NATIVE_CONFIRMATION, None
         dlg = (got or {}).get("dialog")
         if not dlg:
             record["confirmation"] = "aucune"
             reached, seconds = self._await_state(page, href, "gone", listed, clicked_at, clicked_at + limit, mark=mark)
             if reached:
                 return "supprimée sans confirmation", None, None, seconds
+            if self._app_confirm_since(mark, title):  # round 3, I-3: inside a read, closed by the human
+                record["confirmation"] = "native"
+                return None, None, NATIVE_CONFIRMATION, None
             return None, "pas de confirmation de suppression (aucune fenêtre ouverte par le clic)", None, None
         record["confirmation"] = dlg
         if dlg["role"] == "alertdialog":
             b.own_modal = "suppression"
-        why = confirmation_refusal(dlg, title)
-        if why:
-            self._harness_text(dlg.get("full") or dlg.get("text"), cid)  # leakage-2: an internal error it showed
-            page.keyboard.press("Escape")  # cancelled, never confirmed blind
+        def cancel():  # cancelled by Escape, never confirmed blind; registry-6: withdrawn if still listed
+            page.keyboard.press("Escape")
             if self._wait_for(page, closed, 1.5) and b.own_modal == "suppression":
                 b.own_modal = None
-            if (b.call(ITEM_JS, arg, page=page, timeout_ms=2000) or {}).get("found"):  # registry-6: withdrawn
+            if (b.call(ITEM_JS, arg, page=page, timeout_ms=2000) or {}).get("found"):
                 entry["state"] = previous
                 entry.setdefault("history", []).append({"t": now_iso(), "state": "suppression annulée", "case": cid})
                 self._save_registry()
+
+        why = confirmation_refusal(dlg, title)
+        if why:
+            self._harness_text(dlg.get("full") or dlg.get("text"), cid)  # leakage-2: an internal error it showed
+            cancel()
             return None, None, why, None
         index, _ = pick_confirm(dlg)
         el = b.element(CONFIRM_EL_JS, {**carg, "index": index, "expect": dlg["buttons"][index]}, page=page,
                        timeout_ms=3000)
-        if el is None:
-            return None, "le bouton de confirmation a disparu", None, None
+        if el is None:  # round 3, M-3 (R2-1): accepted, then gone before the click: nothing confirmed
+            cancel()
+            return None, None, "le bouton de confirmation n'est plus là au moment du clic : annulée, rien n'est confirmé", None
         self._set_state(entry, "suppression confirmée", cid)  # registry-6: before the click, never twice
         confirmed_at = time.monotonic()
         try:
@@ -5593,7 +5700,8 @@ class Recette:
         try:
             if self._open_search(page, arg, record):
                 got = b.call(SEARCH_JS, arg, page=page, timeout_ms=2000) or {}
-                record.update({k: got.get(k) for k in ("input", "root", "count", "result", "empty", "focused", "html")})
+                record.update({k: got.get(k) for k in ("input", "root", "count", "items", "unknown", "result", "empty",
+                                                       "focused", "html")})
         finally:
             if record["opened_by"] and not b.pending():
                 record["closed"] = self._close_search(page, arg)
@@ -5989,8 +6097,9 @@ class Recette:
                 ev.json("turns.json", {"case": cid, "asked_turns": n, "turns": turns, "timeout": timeout})
                 if failure:
                     ev.json("failure.json", failure)
-                raise DriverRefusal("timeout", why, extra={"journal": line, "abort": t.profile, "turns": len(turns)},
-                                    evidence=ev.items) from None
+                flag = {"internal_error_shown": True} if seen.get("internal_error_shown") else {}  # round 3, M-9
+                raise DriverRefusal("timeout", why, extra={"journal": line, "abort": t.profile, "turns": len(turns),
+                                                           **flag}, evidence=ev.items) from None
             failure = obs.pop("failure_raw", None) or failure  # the last turn left without answer (E10)
             raw_notices = obs.pop("notices_raw", None)
             if raw_notices:  # round 2, leakage-1: each turn's error notices, in the evidence only
