@@ -296,6 +296,27 @@ impl Drop for Vault {
     }
 }
 
+/// The learn's salt (founder decision D-01): `<state_dir>/forge/<name>/.salt`, 32 random bytes beside
+/// the vault, in the same private directory. It keys every `<redacted:hmac-sha256:…>` token of
+/// `invariants.json`. Unlike the vault it is not deleted after `generate` (ruling LF-1): `qualify`
+/// re-mines the replayed copies under it. The next `learn` of the name clears it with the directory.
+const SALT_FILE: &str = ".salt";
+
+/// The salt's bytes from the OS generator, written to a new file at `path` (the learn cleared the
+/// directory first, so the file is new).
+fn write_salt(path: &Path) -> Result<(), RpcError> {
+    use rand::RngCore;
+    use std::io::Write;
+    let mut salt = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(&salt))
+        .map_err(|e| io_failed("write the learn's salt", &e))
+}
+
 /// `driver.learn {family, app, corpus, out, threshold?, arch?}` — or, with `deliberate`, `{family,
 /// app, out, arch, deliberate}` (see [`deliberate`]) — for a principal `dispatch` has
 /// already proved human (I1). Both take the `Ctx` their pre-lock arm built as the `driver.pack`
@@ -462,9 +483,12 @@ pub fn learn(
             arg(&out),
         ],
     )?;
-    // 3. The invariants of the corpus. From here the vault may exist, and goes on every way out.
-    // It is written under the daemon's forge directory, which `run_stage` made private before
-    // the stage started (I-2): the operator's `--out` never holds a clear string.
+    // 3. The invariants of the corpus, under this learn's salt (D-01). From here the vault may exist,
+    // and goes on every way out. Both live under the daemon's forge directory, which `run_stage`
+    // made private before the first stage started (I-2): the operator's `--out` never holds a clear
+    // string, nor the key to its tokens.
+    let salt = logs.join(SALT_FILE);
+    write_salt(&salt)?;
     let vault = Vault(logs.join(".vault.json"));
     stage(
         "mine",
@@ -475,6 +499,8 @@ pub fn learn(
             arg(&out),
             "--vault".into(),
             arg(&vault.0),
+            "--salt-file".into(),
+            arg(&salt),
             "--threshold".into(),
             threshold.to_string(),
         ],
@@ -839,7 +865,8 @@ struct QualifyParams {
 /// that is not `<learn out>/driver` with `plan.json` and `invariants.json` beside it, a driver
 /// this node did not learn, a name another `learn` or `qualify` is working on (L-P55). The
 /// stage's work directory is the daemon's own scratch,
-/// `<state_dir>/drivers/<name>/work/qualify`, emptied first; its logs go under
+/// `<state_dir>/drivers/<name>/work/qualify`, emptied first; it re-mines the copies under the
+/// learn's salt, `<state_dir>/forge/<name>/.salt` (D-01); its logs go under
 /// `<state_dir>/forge/qualify-<name>/`; its deadline is a minute and 130 s per document.
 pub fn qualify(
     kernel: &Shared,
@@ -900,6 +927,9 @@ pub fn qualify(
             .map_err(|e| io_failed("empty the qualification's work directory", &e))?;
     }
     let logs = state_dir.join("forge").join(format!("qualify-{name}"));
+    // The learn's salt (D-01): the stage re-mines the copies under it, and refuses one that does not
+    // give back the plan's tokens (ruling LF-3) — or that is gone — in its own line.
+    let salt = state_dir.join("forge").join(&name).join(SALT_FILE);
     let mut args = vec![
         "--driver".into(),
         arg(&driver),
@@ -911,6 +941,8 @@ pub fn qualify(
         arg(&invariants),
         "--work".into(),
         arg(&work),
+        "--salt-file".into(),
+        arg(&salt),
     ];
     if cfg.fixtures {
         args.push("--fake".into());

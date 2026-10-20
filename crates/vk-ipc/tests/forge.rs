@@ -120,6 +120,17 @@ async fn learn_runs_the_five_stages_and_writes_driver_learned() {
     plan.validate().unwrap();
     let inv_bytes = std::fs::read(out.join("invariants.json")).unwrap();
     let inv: Value = serde_json::from_slice(&inv_bytes).unwrap();
+    // Founder decision D-01: the tokens are keyed by this learn's salt, which stays in the private
+    // forge directory after the vault is gone (ruling LF-1); no bare SHA-256 a guess could confirm.
+    let text = std::str::from_utf8(&inv_bytes).unwrap();
+    assert!(text.contains("<redacted:hmac-sha256:"), "{text}");
+    assert!(!text.contains("<redacted:sha256:"), "{text}");
+    let salt = node.dir().join("forge").join("word-maison").join(".salt");
+    assert_eq!(
+        std::fs::read(&salt).unwrap().len(),
+        32,
+        "the salt stays beside the deleted vault"
+    );
     assert_eq!(
         plan.invariants_sha256,
         hash_bytes(&inv_bytes),
@@ -1014,6 +1025,53 @@ async fn debrief_refuses_a_run_without_journal_and_a_used_out_before_spawning() 
     assert!(
         !node.dir().join("forge").join(".debrief").exists(),
         "all refused before a process was spawned"
+    );
+    node.shutdown().await;
+}
+
+/// Founder decision D-01, rulings LF-1 and LF-3: `driver.qualify` hands the stage the salt the learn
+/// drew. A salt replaced since, or gone, is refused in the stage's one line before any copy, and no
+/// `driver.qualified` is written; the learn's own salt qualifies.
+#[tokio::test]
+async fn qualify_reads_the_learns_salt_and_fails_closed_without_it() {
+    if !forge_available() {
+        return;
+    }
+    let node = Node::start().await;
+    let corpus = ooxml_corpus(&node.dir().join("corpus"), 10, 0);
+    let out = node.dir().join("word-maison");
+    node.call_human("driver.learn", learn_params(&corpus, &out))
+        .await
+        .unwrap();
+    let params = json!({"driver": out.join("driver"), "corpus": corpus});
+    let salt = node.dir().join("forge").join("word-maison").join(".salt");
+    let drawn = std::fs::read(&salt).unwrap();
+    std::fs::write(&salt, [7u8; 32]).unwrap();
+    let e = node
+        .call("driver.qualify", params.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        call_error(&e).message,
+        "vkforge qualify: the salt does not give back the footer_text token of invariants.json; \
+         remedy: vk driver learn again: the salt and invariants.json are one learn's"
+    );
+    std::fs::remove_file(&salt).unwrap();
+    let e = node
+        .call("driver.qualify", params.clone())
+        .await
+        .unwrap_err();
+    let m = call_error(&e).message.clone();
+    assert!(
+        m.starts_with("vkforge qualify: salt file ") && m.contains(" cannot be read ("),
+        "{m}"
+    );
+    assert!(node.events("driver.qualified").is_empty());
+    std::fs::write(&salt, &drawn).unwrap();
+    let q = node.call("driver.qualify", params).await.unwrap();
+    assert_eq!(
+        (q["passes"].as_u64(), q["failures"].as_u64()),
+        (Some(10), Some(0))
     );
     node.shutdown().await;
 }

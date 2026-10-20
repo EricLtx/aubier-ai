@@ -6,12 +6,15 @@ work directory — on a copy of every document the miner mined; the originals ar
 The corpus documents already carry the invariants (that is how they were mined), so each copy is first
 PERTURBED on every post id of the plan (L-P52: the title's style removed, the fonts changed, the footer
 and header text replaced, no PDF beside it), with lxml and ooxml.write_parts, never Office: only a real
-repair can then pass. After each `ok` answer the miner reads the copy again: a postcondition holds when
-the observation of its (kind, where) has the invariant's value (spec §5.2: checked in code, never taken
-from the driver's word), `pdf_exists` when the PDF beside the copy starts with `%PDF`; a copy whose
-bytes are still the perturbed ones was not saved. `qualification.json` records, per pass, the
-document's hash, the duration, each postcondition and the reason, and no file name (spec §5.5: a name
-is content); the kernel hashes its bytes into `qualification_sha256`, which the mount gate checks.
+repair can then pass. After each `ok` answer the miner reads the copy again, under the learn's salt
+(`--salt-file`, founder decision D-01: the tokens of `invariants.json` are keyed by it, LF-1): a
+postcondition holds when the observation of its (kind, where) has the invariant's value (spec §5.2:
+checked in code, never taken from the driver's word), `pdf_exists` when the PDF beside the copy starts
+with `%PDF`; a copy whose bytes are still the perturbed ones was not saved. A salt that does not give
+back the plan's tokens from the corpus is refused before any copy (LF-3). `qualification.json`
+records, per pass, the document's hash, the duration, each postcondition and the reason, and no file
+name (spec §5.5: a name is content); the kernel hashes its bytes into `qualification_sha256`, which
+the mount gate checks.
 
 A pass's reason is protocol 1's refusal word, or this stage's own: `postcondition` (the driver said ok,
 the re-mined copy disagrees, L-P50) and `unsaved` (the driver said ok, the copy is byte for byte the
@@ -57,6 +60,7 @@ _NOT_THIS_PLAN = "pass the plan.json the driver was generated from, or generate 
 _CORPUS_CHANGED = ("corpus changed since vkforge mine",
                    "qualify on the corpus the driver was learned from, or learn again")
 _PERTURB_REMEDY = "teach drivers/vkforge/qualify.py to perturb it, so that only a real repair passes (L-P52)"
+_SALT_REMEDY = "vk driver learn again: the salt and invariants.json are one learn's"
 # CT_RPr's sequence up to w:sz: a child the perturbation adds goes after its predecessors (Word's schema)
 _RPR_ORDER = ("rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline",
               "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing",
@@ -182,9 +186,9 @@ def _start(command: list, work: Path, env: dict, log, driver_dir: Path, plan_sha
 
 # --- the checks before any copy ---------------------------------------------------------------------
 
-def _check(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: Path) -> tuple:
+def _check(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: Path, salt: bytes | None) -> tuple:
     """Every refusal before any copy, in this order; (the manifest, the plan's action, the manifest's
-    entry for it, the corpus files sorted by name — the one survey of the corpus)."""
+    entry for it, the corpus files sorted by name — the one survey of the corpus, under the salt)."""
     if work.exists() and (not work.is_dir() or any(work.iterdir())):
         raise Refusal(f"work {work} is not empty", "a new directory: a qualification never reuses one")
     if not (driver_dir / "vendor" / "vkdriver" / "protocol.py").is_file():
@@ -199,7 +203,7 @@ def _check(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: P
                       "generate it again: a learned driver's files are never edited")
     if canon.sha256(invariants) != plan.get("invariants_sha256"):
         raise Refusal("plan and invariants do not belong together", "pass the invariants.json the plan was built from")
-    mined, _ = mine.survey(corpus)
+    mined, _ = mine.survey(corpus, salt)
     files = sorted((p for p, _ in mined), key=lambda p: p.name)
     if _content_sha256(canon.sha256_file(p) for p in files) != _learned_content(invariants):
         raise Refusal(*_CORPUS_CHANGED)
@@ -211,7 +215,23 @@ def _check(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: P
     unknown = next((ident for ident in action["post"] if ident not in PERTURBABLE), None)
     if unknown is not None:
         raise Refusal(f"cannot perturb {unknown} for qualification", _PERTURB_REMEDY)
+    _salt_gives_back(mined, action["post"], _expected(plan, invariants))
     return manifest, action, entry, files
+
+
+def _salt_gives_back(mined: list, post: list, expected: dict) -> None:
+    """Ruling LF-3 (founder decision D-01): every token a postcondition must find is one the miner
+    gives back from the corpus under this salt. The corpus is the learned one (checked just above),
+    so a token it does not give back means the salt is not the learn's — missing, replaced, another
+    learn's of the same name. Refused before any copy, rather than every pass failing on a token no
+    repair could ever reach."""
+    seen = {(o["kind"], o["where"], canon.dumps(o["value"])) for _, result in mined for o in result["obs"]}
+    for ident in post:
+        value = expected.get(ident)
+        if ident in _WHERE and next(mine.tokens(value), None) is not None:
+            kind, where = _WHERE[ident]
+            if (kind, where, canon.dumps(value)) not in seen:
+                raise Refusal(f"the salt does not give back the {ident} token of invariants.json", _SALT_REMEDY)
 
 
 def _content_sha256(hashes) -> str:
@@ -382,7 +402,8 @@ def _perturb(copy: Path, post: list, expected: dict) -> None:
         os.chmod(copy, mode)
 
 
-def _prepare(files: list, work: Path, post: list, expected: dict, learned_content: str) -> list:
+def _prepare(files: list, work: Path, post: list, expected: dict, learned_content: str,
+             salt: bytes | None = None) -> list:
     """Before the first pass: every document copied to work/<i>/ with its attributes, the copies'
     bytes checked against the corpus the driver was learned from, then each copy perturbed and read
     again — a post id still held is refused (L-P52)."""
@@ -397,7 +418,7 @@ def _prepare(files: list, work: Path, post: list, expected: dict, learned_conten
         raise Refusal(*_CORPUS_CHANGED)             # a document edited after the check, before its copy
     for c in copies:
         _perturb(c["copy"], post, expected)
-        held = next((ident for ident, v in _post(post, c["copy"], expected).items() if v), None)
+        held = next((ident for ident, v in _post(post, c["copy"], expected, salt).items() if v), None)
         if held is not None:
             raise Refusal(f"cannot perturb {held} for qualification", _PERTURB_REMEDY)
         c["perturbed_sha256"] = canon.sha256_file(c["copy"])
@@ -421,11 +442,11 @@ def _sha_or_none(path: Path):
         return None
 
 
-def _post(post: list, copy: Path, expected: dict) -> dict:
-    """Each post id of the plan, held or not on the copy as the miner reads it again (values compared
-    in canonical form, as the planner compares candidates)."""
+def _post(post: list, copy: Path, expected: dict, salt: bytes | None = None) -> dict:
+    """Each post id of the plan, held or not on the copy as the miner reads it again under the
+    learn's salt (values compared in canonical form, as the planner compares candidates)."""
     try:
-        obs = mine.mine_file(copy)["obs"]
+        obs = mine.mine_file(copy, salt)["obs"]
     except (Refusal, OSError):                      # the action left no OOXML package behind it
         obs = []
     held = {}
@@ -443,7 +464,7 @@ def _post(post: list, copy: Path, expected: dict) -> dict:
 
 
 def _pass(driver: _Driver, index: int, c: dict, action: dict, entry: dict, expected: dict,
-          deadline_s: float) -> tuple[dict, bool]:
+          deadline_s: float, salt: bytes | None = None) -> tuple[dict, bool]:
     """(the run of corpus file `index`, whether the driver process must be ended): the action asked
     once on the perturbed copy, then the copy read again."""
     copy = c["copy"]
@@ -459,7 +480,7 @@ def _pass(driver: _Driver, index: int, c: dict, action: dict, entry: dict, expec
     if fault is not None:
         post, ok, reason = none, False, fault
     elif answer.get("ok") is True:
-        post = _post(action["post"], copy, expected)
+        post = _post(action["post"], copy, expected, salt)
         unsaved = c["perturbed_sha256"] != c["file_sha256"] and _sha_or_none(copy) == c["perturbed_sha256"]
         ok = not unsaved and bool(post) and all(post.values())
         reason = "unsaved" if unsaved else None if ok else "postcondition"     # L-P52, L-P50
@@ -472,16 +493,16 @@ def _pass(driver: _Driver, index: int, c: dict, action: dict, entry: dict, expec
 
 
 def qualify(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: Path, fake: bool,
-            deadline_s: float = PASS_DEADLINE_S) -> dict:
+            deadline_s: float = PASS_DEADLINE_S, salt: bytes | None = None) -> dict:
     """The record, also written as <work>/qualification.json (canon.write)."""
     driver_dir, corpus, work = Path(os.path.abspath(driver_dir)), Path(corpus), Path(os.path.abspath(work))
-    manifest, action, entry, files = _check(driver_dir, corpus, plan, invariants, work)
+    manifest, action, entry, files = _check(driver_dir, corpus, plan, invariants, work, salt)
     plan_sha256, expected = canon.sha256(plan), _expected(plan, invariants)
     work.mkdir(parents=True, exist_ok=True)
     if fake:
         canon.write({"vkforge_root": str(VKFORGE_ROOT)}, work / "fake.json")
     (work / "profile").mkdir()
-    copies = _prepare(files, work, action["post"], expected, _learned_content(invariants))
+    copies = _prepare(files, work, action["post"], expected, _learned_content(invariants), salt)
     env = {**os.environ, "VK_DRIVER_WORK_DIR": str(work), "VK_DRIVER_PROFILE_DIR": str(work / "profile"),
            "VK_DRIVER_APPLICATIONS": ",".join(manifest.get("applications") or [])}
     # The vkforge interpreter: the virtualenv the manifest's .venv links to (L-P12).
@@ -492,7 +513,7 @@ def qualify(driver_dir: Path, corpus: Path, plan: dict, invariants: dict, work: 
             for index, c in enumerate(copies):
                 if driver is None:                  # the first pass, or the last process was ended
                     driver = _start(command, work, env, log, driver_dir, plan_sha256)
-                run, ended = _pass(driver, index, c, action, entry, expected, deadline_s)
+                run, ended = _pass(driver, index, c, action, entry, expected, deadline_s, salt)
                 runs.append(run)
                 if ended:
                     driver.end()
@@ -515,6 +536,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--invariants", required=True, type=Path, help="invariants.json the plan was built from")
     parser.add_argument("--work", required=True, type=Path,
                         help="new or empty directory that receives the copies and qualification.json")
+    parser.add_argument("--salt-file", required=True, type=Path,
+                        help="the salt the learn drew (D-01): the copies are re-mined under it")
     parser.add_argument("--fake", action="store_true",
                         help="the repository's fake application instead of Office (L-P19)")
 
@@ -528,7 +551,8 @@ def run(ns: argparse.Namespace) -> int:
         raise Refusal("invariants.json is not in canonical form", "run vkforge mine again")
     if not (isinstance(p, dict) and isinstance(invariants, dict)):
         raise Refusal("plan and invariants must each be a JSON object", "run vkforge learn again")
-    rec = qualify(ns.driver, ns.corpus, p, invariants, ns.work, ns.fake)
+    salt = mine.read_salt(ns.salt_file)
+    rec = qualify(ns.driver, ns.corpus, p, invariants, ns.work, ns.fake, salt=salt)
     print(f"qualify: {rec['passes']}/{rec['passes'] + rec['failures']} passes ({rec['failures']} failures), "
           f"fake {'true' if rec['fake'] else 'false'} -> {Path(ns.work) / 'qualification.json'}")
     return 0

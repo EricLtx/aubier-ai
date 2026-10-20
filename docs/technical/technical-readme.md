@@ -707,10 +707,10 @@ and that line is the refusal, verbatim.
 |---|---|---|
 | `inventory` | the application's type library (Office's COM registration), or a recorded catalogue under the test seam | `catalogue.json`: types, members, enums, the type library's hash |
 | `bind` | the ontology (`drivers/vkforge/ontology/office-document.json`) and the catalogue | `binding-<app>.json`: each verb bound or `unbound`, with its projection |
-| `mine` | the corpus, as zip files, formatting parts only | `invariants.json` (values with their support, no text of the documents); the clear values a footer needs go to the vault, `<state_dir>/forge/<name>/.vault.json` (`mine --vault`), under the daemon's private forge directory and the state directory's ACL, never under `--out` |
+| `mine` | the corpus, as zip files, formatting parts only | `invariants.json` (values with their support, no text of the documents: a footer, a header or a custom style's name is a `<redacted:hmac-sha256:…>` token keyed by the learn's salt, `<state_dir>/forge/<name>/.salt`, which the kernel draws for each learn and `qualify` reads back); the clear values a footer needs go to the vault, `<state_dir>/forge/<name>/.vault.json` (`mine --vault`), under the daemon's private forge directory and the state directory's ACL, never under `--out` |
 | `plan` | invariants, binding, and the arch's answers if any | `plan.json` (the `DriverPlan`: one action, its steps, `pre`, `post`, `qualification` thresholds: `min_passes` ten, or the number of documents mined when fewer, `min_rate` 1), `plan-excluded.json` |
 | `generate` | the plan, the binding, the vault | `driver/`: `driver.py`, `manifest.json` (`kind: com`), `vendor/` (the protocol and the COM adapter, vendored), `.venv` (a junction to the vkforge virtualenv) |
-| `qualify` | the driver, the corpus, the plan | `<state_dir>/drivers/<name>/work/qualify/qualification.json` |
+| `qualify` | the driver, the corpus, the plan, and the learn's salt, `<state_dir>/forge/<name>/.salt` (`qualify --salt-file`), under which it re-mines the copies | `<state_dir>/drivers/<name>/work/qualify/qualification.json` |
 
 `learn` runs the first five. The kernel does only what a kernel does: a short lock phase
 for the human act `driver.learned` and its row in the `learned` table, and, when `--arch`

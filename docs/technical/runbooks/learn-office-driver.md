@@ -26,6 +26,7 @@ Apprendre un driver, c'est générer un pilote de périphérique à partir de la
 | `learned` (table du noyau) | Le dossier de fabrication de l'image : les hashes de tout ce dont elle est issue. |
 | La porte du montage | La ROM de boot qui refuse une image sans rapport de test signé, ou dont le rapport n'est plus celui que l'usine a classé. |
 | `.vault.json` | La mémoire de travail du mineur (le texte clair d'un pied de page), en RAM protégée : sous le répertoire privé du démon (`<état>\forge\<nom>\`), jamais dans le dossier `--out`. Elle est effacée dès que `generate` rend la main. |
+| `.salt` | Le sel de l'apprentissage : 32 octets tirés au sort par `learn`, posés à côté du coffre (`<état>\forge\<nom>\.salt`). Les jetons de `invariants.json` en dépendent : sans lui, on ne peut pas vérifier un pied de page deviné. Il survit à `generate`, parce que `qualify` en a besoin. |
 
 ---
 
@@ -85,7 +86,7 @@ excluded: none
 - `ambiguities` : `<invariant> purged` (aucun arch) ou `<invariant> arch:<id>`.
 - `excluded` : ce que le plan a laissé de côté et pourquoi, par exemple `title_style (a custom style has no built-in anchor (v1))`.
 
-Le grand-livre reçoit `driver.learned` ; le fichier `.vault.json` n'existe plus (il n'a jamais été dans `--out`).
+Le grand-livre reçoit `driver.learned` ; le fichier `.vault.json` n'existe plus (il n'a jamais été dans `--out`) ; le sel `.salt` reste à côté, pour `qualify`.
 
 Avec moins de dix documents, le plan demande autant de passes de qualification que de documents (`min_passes` = le nombre de documents, au plus dix) : un corpus de six documents se qualifie à 6/6.
 
@@ -171,6 +172,8 @@ Toute étape qui refuse parle d'une ligne, `vkforge <étape>: <ce qui ne va pas>
 | `--deliberate needs --arch: a proposal is drafted by an arch; remedy: --arch NAME` | pas d'arch | donner `--arch` |
 | `out <dir> holds no catalogue.json; remedy: --out names a learned driver's output` | `--deliberate` hors d'un apprentissage | le `--out` d'un `learn` |
 | `corpus changed since vkforge mine; remedy: qualify on the corpus the driver was learned from, or learn again` | le corpus a bougé depuis le `learn` | rejouer sur le même dossier, ou réapprendre |
+| `salt file <…>\.salt cannot be read (…); remedy: vk driver learn again: …` | le sel de l'apprentissage a disparu (répertoire `forge` vidé à la main), ou le driver a été appris avant le sel | réapprendre (§3), puis requalifier |
+| `the salt does not give back the footer_text token of invariants.json; remedy: vk driver learn again: …` | le sel n'est plus celui de cet apprentissage : un autre `learn` du même nom l'a remplacé | réapprendre, puis requalifier |
 | `cannot perturb <id> for qualification` | une postcondition que la qualification ne sait pas dégrader | c'est un défaut de vkforge, pas du cabinet |
 | l'action rend `dialog` | une boîte de dialogue a retenu l'appel (connexion, écrasement) ; elle est fermée, jamais acceptée | traiter la cause (se connecter à Office, fermer les documents ouverts), puis requalifier |
 | `document opened read-only (locked elsewhere)` | une copie en lecture seule, ou un document tenu ouvert ailleurs | fermer le document ; une copie lecture seule reste lecture seule |

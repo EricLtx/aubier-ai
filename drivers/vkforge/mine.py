@@ -3,10 +3,13 @@
 The miner is deterministic and reads structure only: styles, fonts, footers and headers, page
 setup, as OOXML declares them. It never opens Office and never reads the body text of a document.
 What it does read of the text — a footer, a header, a custom style's name — is free text that can
-carry a name or an address: it leaves `invariants.json` as a `<redacted:sha256:…>` token and its
-clear value goes to the vault (`--vault FILE`, by default `<out>/.vault.json`), which stays on the
-node. The daemon names a vault under its own private forge directory, never under `--out`
-(final review I-2): on Windows a mode is no ACL, so the directory's ACL is the protection.
+carry a name or an address: it leaves `invariants.json` as a token, `<redacted:hmac-sha256:…>`,
+the HMAC-SHA256 of the text keyed by the learn's salt (`--salt-file`, founder decision D-01), so a
+guessed footer cannot be confirmed from `invariants.json` without that salt; its clear value goes
+to the vault (`--vault FILE`, by default `<out>/.vault.json`), which stays on the node. The daemon
+names the salt and the vault under its own private forge directory, never under `--out` (final
+review I-2): on Windows a mode is no ACL, so the directory's ACL is the protection. The vault is
+deleted after `generate`; the salt is not, because `qualify` re-mines the copies under it (LF-1).
 
 A value is an invariant when the share of mined files carrying it (its support) reaches the
 threshold; below it, two values or more are an ambiguity listed with their candidates, and a lone
@@ -14,6 +17,7 @@ value is purged (spec §6: what the firm does not do consistently is not a rule)
 """
 import argparse
 import hashlib
+import hmac
 import os
 from pathlib import Path
 
@@ -31,12 +35,36 @@ INVARIANT_IDS = {("paragraph_style", "first"): "title_style", ("paragraph_style"
                  ("margins", None): "margins", ("orientation", None): "orientation",
                  ("numbering_present", None): "numbering_present"}
 REMEDY = "more documents of one kind"
-_TOKEN = "<redacted:sha256:"
+SALT_BYTES = 32                      # one learn's salt (D-01): `vk driver learn` draws it, mine and qualify read it
+_TOKEN = "<redacted:sha256:"         # no salt: the fixtures pinned before D-01, the fake application's reading (LF-2)
+_SALTED = "<redacted:hmac-sha256:"   # under a learn's salt (D-01)
+_TOKENS = (_TOKEN, _SALTED)
+_SALT_REMEDY = "vk driver learn again: the learn writes its salt beside its vault, and qualify reads that file back"
 _CHAIN = 32          # a basedOn chain is followed this far at most (a cycle in styles.xml)
 
 
-def redact(text: str) -> str:
-    return _TOKEN + hashlib.sha256(text.encode("utf-8")).hexdigest() + ">"
+def redact(text: str, salt: bytes | None = None) -> str:
+    """Free text as invariants.json carries it (founder decision D-01). Under a learn's salt,
+    `<redacted:hmac-sha256:HEX>`: the HMAC-SHA256 of the text's UTF-8 bytes keyed by the salt, so
+    the same text gives the same token within one learn and another token in the next, and a
+    guess cannot be checked against invariants.json without the salt. With no salt,
+    `<redacted:sha256:HEX>`: the bare SHA-256 the fixtures pinned before D-01 carry (LF-2), and the
+    reading the fake application compares like with like."""
+    data = text.encode("utf-8")
+    if salt is None:
+        return _TOKEN + hashlib.sha256(data).hexdigest() + ">"
+    return _SALTED + hmac.new(salt, data, hashlib.sha256).hexdigest() + ">"
+
+
+def read_salt(path) -> bytes:
+    """The learn's salt: exactly SALT_BYTES bytes read from `path`, or the one-line refusal (L-P15)."""
+    try:
+        salt = Path(path).read_bytes()
+    except OSError as e:
+        raise Refusal(f"salt file {path} cannot be read ({e.strerror or type(e).__name__})", _SALT_REMEDY) from None
+    if len(salt) != SALT_BYTES:
+        raise Refusal(f"salt file {path} holds {len(salt)} bytes, not {SALT_BYTES}", _SALT_REMEDY)
+    return salt
 
 
 def _int(value):
@@ -106,16 +134,17 @@ class _Styles:
         return font, size
 
 
-def _style_value(sid: str, styles: _Styles, vault: dict) -> dict | None:
+def _style_value(sid: str, styles: _Styles, vault: dict, salt: bytes | None) -> dict | None:
     """The built-in anchor of a style, found by its English w:name and never by its styleId. A custom
-    style is its w:name (what Word's Styles(name) takes) as a token, the name going to the vault; the
-    styleId is never stored. A style that styles.xml does not declare has no name: None."""
+    style is its w:name (what Word's Styles(name) takes) as a token under the learn's salt, the name
+    going to the vault; the styleId is never stored. A style that styles.xml does not declare has no
+    name: None."""
     name = styles.name(sid)
     if not name:
         return None
     if name.lower() in BUILTIN_STYLES:
         return {"builtin": BUILTIN_STYLES[name.lower()]}
-    token = redact(name)
+    token = redact(name, salt)
     vault[token] = name
     return {"custom": token}
 
@@ -140,7 +169,7 @@ def _joined_text(roots, p_tag: str, t_tag: str) -> str:
     return "\n".join(lines)
 
 
-def _docx(zf, obs: list, vault: dict) -> None:
+def _docx(zf, obs: list, vault: dict, salt: bytes | None) -> None:
     doc = ooxml.part(zf, "word/document.xml")
     styles = _Styles(ooxml.part(zf, "word/styles.xml"))
     paragraphs = [] if doc is None else list(doc.iter(q("w", "p")))
@@ -151,14 +180,14 @@ def _docx(zf, obs: list, vault: dict) -> None:
 
     if paragraphs:
         first = style_id(paragraphs[0]) or styles.default
-        value = None if first is None else _style_value(first, styles, vault)
+        value = None if first is None else _style_value(first, styles, vault, salt)
         if value is not None:
             obs.append({"kind": "paragraph_style", "where": "first", "value": value})
         rest = paragraphs[1:]
         explicit = [style_id(p) for p in rest]
         if rest and all(explicit):
-            values = {canon.dumps(_style_value(sid, styles, {})) for sid in explicit}
-            value = _style_value(explicit[0], styles, vault)
+            values = {canon.dumps(_style_value(sid, styles, {}, salt)) for sid in explicit}
+            value = _style_value(explicit[0], styles, vault, salt)
             if len(values) == 1 and value is not None:
                 obs.append({"kind": "paragraph_style", "where": "all", "value": value})
         pairs = []
@@ -177,8 +206,9 @@ def _docx(zf, obs: list, vault: dict) -> None:
         roots = [ooxml.part(zf, n) for n in ooxml.parts(zf, pattern)]
         text = _joined_text(roots, q("w", "p"), q("w", "t"))
         if text:
-            vault[redact(text)] = text
-            obs.append({"kind": kind, "where": None, "value": redact(text)})
+            token = redact(text, salt)
+            vault[token] = text
+            obs.append({"kind": kind, "where": None, "value": token})
     sect = None
     if doc is not None:
         sect = doc.find("w:body/w:sectPr", NS)
@@ -203,7 +233,7 @@ def _docx(zf, obs: list, vault: dict) -> None:
         obs.append({"kind": "numbering_present", "where": None, "value": True})
 
 
-def _pptx(zf, obs: list, vault: dict) -> None:
+def _pptx(zf, obs: list, vault: dict, salt: bytes | None) -> None:
     masters = ooxml.parts(zf, "ppt/slideMasters/slideMaster*.xml")
     master = ooxml.part(zf, masters[0]) if masters else None
     if master is None:
@@ -232,25 +262,27 @@ def _pptx(zf, obs: list, vault: dict) -> None:
     footers = placeholder("ftr")
     text = _joined_text(footers[:1], q("a", "p"), q("a", "t"))
     if text:
-        vault[redact(text)] = text
-        obs.append({"kind": "footer", "where": None, "value": redact(text)})
+        token = redact(text, salt)
+        vault[token] = text
+        obs.append({"kind": "footer", "where": None, "value": token})
 
 
-def mine_file(path: Path) -> dict:
-    """One document's observations; `vault` maps each token it used to its clear value. Refusal when it is not OOXML."""
+def mine_file(path: Path, salt: bytes | None = None) -> dict:
+    """One document's observations, its free text redacted under `salt` (D-01); `vault` maps each
+    token it used to its clear value. Refusal when it is not OOXML."""
     path = Path(path)
     obs, vault = [], {}
     with ooxml.open_package(path) as zf:
         kind = ooxml.kind_of(zf)
-        (_docx if kind == "docx" else _pptx)(zf, obs, vault)
+        (_docx if kind == "docx" else _pptx)(zf, obs, vault, salt)
     if _pdf_of(path) is not None:
         obs.append({"kind": "export_format", "where": None, "value": {"format": "pdf"}})
     return {"kind": kind, "obs": obs, "vault": vault}
 
 
-def survey(corpus: Path) -> tuple[list, int]:
-    """(the mined files with their observations, the number of files skipped). A .pdf beside a mined
-    document is that document's export_format, not a skipped file."""
+def survey(corpus: Path, salt: bytes | None = None) -> tuple[list, int]:
+    """(the mined files with their observations under `salt`, the number of files skipped). A .pdf
+    beside a mined document is that document's export_format, not a skipped file."""
     corpus = Path(corpus)
     if not corpus.is_dir():
         raise Refusal(f"corpus {corpus} is not a folder", "--corpus names a folder of .docx or .pptx files")
@@ -260,7 +292,7 @@ def survey(corpus: Path) -> tuple[list, int]:
         if p.suffix.lower() not in (".docx", ".pptx") or p.name.startswith("~$") or ooxml.is_encrypted(p):
             continue
         try:
-            mined.append((p, mine_file(p)))
+            mined.append((p, mine_file(p, salt)))
         except Refusal:
             continue                                    # not a package after all: skipped, never an abort
     pdfs = {pdf for p, _ in mined if (pdf := _pdf_of(p)) is not None}
@@ -272,20 +304,21 @@ def content_sha256(corpus: Path) -> str:
     return canon.sha256(sorted(canon.sha256_file(p) for p, _ in mined))
 
 
-def _tokens(value):
+def tokens(value):
+    """Every redaction token at any depth of `value`, salted or not (LF-2), in document order."""
     if isinstance(value, str):
-        if value.startswith(_TOKEN):
+        if value.startswith(_TOKENS):
             yield value
     elif isinstance(value, dict):
         for v in value.values():
-            yield from _tokens(v)
+            yield from tokens(v)
     elif isinstance(value, list):
         for v in value:
-            yield from _tokens(v)
+            yield from tokens(v)
 
 
-def mine_corpus(corpus: Path, threshold: float = 0.8) -> tuple[dict, dict]:
-    mined, skipped = survey(corpus)
+def mine_corpus(corpus: Path, threshold: float = 0.8, salt: bytes | None = None) -> tuple[dict, dict]:
+    mined, skipped = survey(corpus, salt)
     kinds = sorted({result["kind"] for _, result in mined})
     if len(kinds) > 1:
         raise Refusal("corpus mixes .docx and .pptx files", REMEDY)
@@ -323,7 +356,7 @@ def mine_corpus(corpus: Path, threshold: float = 0.8) -> tuple[dict, dict]:
                       "content_sha256": canon.sha256(sorted(canon.sha256_file(p) for p, _ in mined)),
                       "schema_sha256": canon.sha256(invariants)},
            "threshold": threshold, "invariants": invariants, "ambiguities": ambiguities}
-    used = set(_tokens(invariants)) | set(_tokens(ambiguities))
+    used = set(tokens(invariants)) | set(tokens(ambiguities))
     return inv, {t: vault[t] for t in sorted(used) if t in vault}
 
 
@@ -350,6 +383,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vault", type=Path,
                         help="file that receives the clear values (default <out>/.vault.json; the daemon names "
                              "one under its private forge directory)")
+    parser.add_argument("--salt-file", required=True, type=Path,
+                        help=f"the learn's salt, {SALT_BYTES} random bytes (vk driver learn writes it; D-01)")
     parser.add_argument("--threshold", type=float, default=0.8, help="support an invariant needs (default 0.8)")
 
 
@@ -361,7 +396,8 @@ def run(ns: argparse.Namespace) -> int:
         raise Refusal(f"out {ns.out} is inside the corpus", "write elsewhere")
     if ns.vault is not None and corpus in Path(ns.vault).resolve().parents:
         raise Refusal(f"vault {ns.vault} is inside the corpus", "write elsewhere")
-    inv, vault = mine_corpus(ns.corpus, ns.threshold)
+    salt = read_salt(ns.salt_file)
+    inv, vault = mine_corpus(ns.corpus, ns.threshold, salt)
     write_invariants(inv, vault, ns.out, ns.vault)
     print(f"mine: {len(inv['invariants'])} invariants, {len(inv['ambiguities'])} ambiguities over "
           f"{inv['corpus']['files']} files ({inv['corpus']['skipped']} skipped) -> {Path(ns.out) / 'invariants.json'}")

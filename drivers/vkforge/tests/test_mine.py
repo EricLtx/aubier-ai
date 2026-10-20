@@ -1,4 +1,6 @@
 import contextlib
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -13,6 +15,24 @@ from vkforge import canon, mine
 from vkforge.errors import Refusal
 from vkforge.tests import ooxml_fixtures
 from vkforge.tests.ooxml_fixtures import FOOTER
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+SALT = bytes(range(32))
+OTHER_SALT = bytes(range(1, 33))
+
+
+def salt_file(salt: bytes = SALT) -> Path:
+    """A learn's salt as `vk driver learn` leaves it: the bytes in a file of their own."""
+    path = Path(tempfile.mkdtemp()) / ".salt"
+    path.write_bytes(salt)
+    return path
+
+
+def a_corpus(n: int, **kw) -> Path:
+    d = Path(tempfile.mkdtemp())
+    for i in range(n):
+        ooxml_fixtures.docx(d / f"c{i}.docx", **kw)
+    return d
 
 
 class MineTest(unittest.TestCase):
@@ -155,9 +175,13 @@ class MineTest(unittest.TestCase):
         out = Path(tempfile.mkdtemp()) / "out"
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
-            self.assertEqual(entry.main(["mine", "--corpus", str(d), "--out", str(out)]), 0)
+            self.assertEqual(entry.main(["mine", "--corpus", str(d), "--out", str(out),
+                                         "--salt-file", str(salt_file())]), 0)
         self.assertEqual(sorted(p.name for p in out.iterdir()), [".vault.json", "invariants.json"])
         self.assertEqual(printed.getvalue(), f"mine: 3 invariants, 0 ambiguities over 5 files (0 skipped) -> {out / 'invariants.json'}\n")
+        blob = (out / "invariants.json").read_text(encoding="utf-8")
+        self.assertIn(mine.redact(FOOTER, SALT), blob, "the CLI mines under the salt it is given (D-01)")
+        self.assertNotIn("<redacted:sha256:", blob)
 
     def test_the_cli_writes_the_vault_where_vault_names_it_and_nothing_clear_in_out(self):
         """The daemon's form (final review I-2): `--vault` under its private forge directory."""
@@ -165,14 +189,15 @@ class MineTest(unittest.TestCase):
         out = Path(tempfile.mkdtemp()) / "out"
         vault = Path(tempfile.mkdtemp()) / "forge" / "word-maison" / ".vault.json"
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(entry.main(["mine", "--corpus", str(d), "--out", str(out), "--vault", str(vault)]), 0)
+            self.assertEqual(entry.main(["mine", "--corpus", str(d), "--out", str(out), "--vault", str(vault),
+                                         "--salt-file", str(salt_file())]), 0)
         self.assertEqual(sorted(p.name for p in out.iterdir()), ["invariants.json"])
-        self.assertEqual(json.loads(vault.read_text(encoding="utf-8")), {mine.redact(FOOTER): FOOTER})
+        self.assertEqual(json.loads(vault.read_text(encoding="utf-8")), {mine.redact(FOOTER, SALT): FOOTER})
         self.assertNotIn(FOOTER.encode("utf-8"), (out / "invariants.json").read_bytes())
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             self.assertEqual(entry.main(["mine", "--corpus", str(d), "--out", str(Path(tempfile.mkdtemp()) / "o"),
-                                         "--vault", str(d / "v" / ".vault.json")]), 2)
+                                         "--vault", str(d / "v" / ".vault.json"), "--salt-file", str(salt_file())]), 2)
         self.assertIn("is inside the corpus; remedy: write elsewhere", err.getvalue())
 
     def test_the_fixture_script_builds_the_rust_tests_corpus(self):
@@ -230,7 +255,8 @@ class MineRobustnessTest(unittest.TestCase):
         for out in (d, d / "out"):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
-                self.assertEqual(entry.main(["mine", "--corpus", str(d), "--out", str(out)]), 2)
+                self.assertEqual(entry.main(["mine", "--corpus", str(d), "--out", str(out),
+                                             "--salt-file", str(salt_file())]), 2)
             self.assertIn("is inside the corpus; remedy: write elsewhere", err.getvalue())
         self.assertEqual(sorted(p.name for p in d.iterdir()), [f"c{i}.docx" for i in range(5)])
 
@@ -262,3 +288,52 @@ class MineRobustnessTest(unittest.TestCase):
             for info in zf.infolist():
                 self.assertEqual((info.date_time, info.create_system, info.compress_type, info.external_attr >> 16),
                                  ((1980, 1, 1, 0, 0, 0), 3, zipfile.ZIP_STORED, 0o644), info.filename)
+
+
+class SaltTest(unittest.TestCase):
+    """Founder decision D-01: a learn's salt keys every token; with no salt, the pre-D-01 form the
+    pinned fixtures carry (ruling LF-2)."""
+
+    def test_a_salt_keys_the_token_and_two_salts_give_two_tokens(self):
+        a = mine.redact(FOOTER, SALT)
+        self.assertEqual(a, "<redacted:hmac-sha256:"
+                         + hmac.new(SALT, FOOTER.encode("utf-8"), hashlib.sha256).hexdigest() + ">")
+        self.assertEqual(a, mine.redact(FOOTER, SALT), "one salt, one token: the vault and qualify agree")
+        self.assertNotEqual(a, mine.redact(FOOTER, OTHER_SALT), "another learn, another token")
+        self.assertNotEqual(a, mine.redact(FOOTER))
+        self.assertNotIn(hashlib.sha256(FOOTER.encode("utf-8")).hexdigest(), a,
+                         "the bare hash a guessed footer would confirm is not in the token")
+
+    def test_unsalted_tokens_are_the_pinned_fixtures_own(self):
+        self.assertEqual(mine.redact(FOOTER),
+                         "<redacted:sha256:" + hashlib.sha256(FOOTER.encode("utf-8")).hexdigest() + ">")
+        fixture = json.loads((FIXTURES / "invariants-word-maison.json").read_text(encoding="utf-8"))
+        footer = next(i for i in fixture["invariants"] if i["id"] == "footer_text")
+        self.assertEqual(footer["value"], mine.redact(FOOTER), "invariants-word-maison.json stays byte-identical")
+
+    def test_mining_under_a_salt_writes_salted_tokens_only(self):
+        d = a_corpus(5, title_style="Clause Dupont", style_id="ClauseId7", footer=FOOTER)
+        inv, vault = mine.mine_corpus(d, salt=SALT)
+        by_id = {i["id"]: i for i in inv["invariants"]}
+        self.assertEqual(by_id["footer_text"]["value"], mine.redact(FOOTER, SALT))
+        self.assertEqual(by_id["title_style"]["value"], {"custom": mine.redact("Clause Dupont", SALT)})
+        self.assertEqual(vault, {mine.redact(FOOTER, SALT): FOOTER,
+                                 mine.redact("Clause Dupont", SALT): "Clause Dupont"})
+        self.assertNotIn("<redacted:sha256:", json.dumps(inv))
+        self.assertEqual(sorted(mine.tokens(inv)), sorted(vault), "tokens() sees the salted form")
+        self.assertEqual(mine.mine_file(d / "c0.docx", SALT)["vault"], vault, "one file, the same tokens")
+
+    def test_a_salt_file_is_read_whole_or_refused_in_one_line(self):
+        self.assertEqual(mine.read_salt(salt_file()), SALT)
+        for path, said in ((salt_file(SALT[:31]), "holds 31 bytes, not 32"),
+                           (Path(tempfile.mkdtemp()) / "absent.salt", "cannot be read")):
+            with self.assertRaises(Refusal) as cm:
+                mine.read_salt(path)
+            self.assertIn(f"salt file {path} {said}", str(cm.exception))
+            self.assertIn("; remedy: vk driver learn again", str(cm.exception))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = entry.main(["mine", "--corpus", str(a_corpus(5)), "--out", str(Path(tempfile.mkdtemp()) / "out"),
+                               "--salt-file", str(salt_file(b"short"))])
+        self.assertEqual(code, 2)
+        self.assertIn("vkforge mine: salt file ", err.getvalue())
