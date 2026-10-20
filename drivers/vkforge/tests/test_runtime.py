@@ -807,3 +807,56 @@ class RuntimeTest(unittest.TestCase):
                 p.wait(timeout=10)
             for h in holders:
                 h.stdout.close()
+
+    def test_the_instance_handed_over_is_the_users_and_its_boxes_are_left_open(self):
+        # Task 3 self-review, D-03 with D-35 (4): once handed over, the started instance is the user's — a
+        # box that holds the DisplayAlerts restore (a Save As the user opened, say) is left open, never
+        # closed, the restore's refusal goes to stderr, and the hand-over stands: its Job stays disarmed.
+        wedged, closed = threading.Event(), []
+
+        class Busy(StubWord):
+            def __setattr__(self, name, value):
+                if name == "DisplayAlerts" and value == -1 and "Documents" in vars(self):
+                    wedged.wait(30)                         # the user's box holds the restore
+                super().__setattr__(name, value)
+
+        word, job = Busy(), StubJob()
+        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
+        app.cleanup_deadline_s = 0.3
+        app.open("C:/stub/own.docx")
+        word.Documents.items.append(StubDocument(word, "C:/stub/the-users.docx"))
+        err = io.StringIO()
+        try:
+            with mock.patch.object(com, "dialogs", lambda exes: [(7, 4242)]), \
+                    mock.patch.object(com, "close_window", closed.append), contextlib.redirect_stderr(err):
+                app.quit()
+        finally:
+            wedged.set()
+        self.assertEqual((closed, job.calls), ([], ["disarm", "close"]), "the box left open, the Job disarmed")
+        self.assertEqual(err.getvalue(),
+                         "quit: process 4242 handed to the user, 1 foreign document(s) open in it; its Job disarmed\n"
+                         "quit: DisplayAlerts: a dialog box of the application is open; left open: the instance is "
+                         "not one the driver owns\n")
+
+    def test_an_instance_no_job_holds_is_never_said_to_end_through_one(self):
+        # Task 3 self-review, D-35 (5): when Windows refused the Job (`job: process … not held`, D-04), the
+        # end's line says no Job ends the instance, or none was disarmed — never the contrary.
+        word = StubWord()
+        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242)))
+        stuck = app.open("C:/stub/stuck.docx")
+        stuck.Close = lambda **kw: (_ for _ in ()).throw(OSError("the document is in use"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            app.quit()
+        self.assertEqual((word.quits, err.getvalue()),
+                         (0, "quit: process 4242 not handed over (the document is in use); no Job ends it\n"))
+        word = StubWord()
+        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242)))
+        app.open("C:/stub/own.docx")
+        word.Documents.items.append(StubDocument(word, "C:/stub/the-users.docx"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            app.quit()
+        self.assertEqual((word.quits, word.DisplayAlerts, err.getvalue()),
+                         (0, -1, "quit: process 4242 handed to the user, 1 foreign document(s) open in it; "
+                                 "no Job to disarm\n"))

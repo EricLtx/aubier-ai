@@ -604,7 +604,8 @@ class Application:
         quit and gets its DisplayAlerts back. The instance the adapter started and identified ends with
         the driver unless D-35's five bounds all hold (`_end_started`, inside the clean-end window that
         starts here); one handed to the user gets its DisplayAlerts back too, best effort, after the
-        disarm (PF-2, PF-12). Every COM reference the adapter holds — the application, and any document
+        disarm (PF-2, PF-12), and a box that holds that call is left open: the instance is the user's
+        from then on (D-03). Every COM reference the adapter holds — the application, and any document
         of its own still listed — is then released, and the Job's handles closed: armed, the Job ends
         what is left of the instance — after a Quit, once its process has had what is left of the
         window; disarmed, the instance is the user's: visible, outside any Job, no automation reference
@@ -616,8 +617,9 @@ class Application:
         ending = "attached" if owned is None else self._end_started(owned, end)
         try:
             if ending in ("attached", "kept") and self.alerts_before is not None:
-                self._guard(lambda: setattr(self.app, "DisplayAlerts", self.alerts_before), "DisplayAlerts",
-                            self.cleanup_deadline_s)
+                # the user's instance now, attached or handed over: no owner, a box that holds it stays (D-03)
+                guarded(lambda: setattr(self.app, "DisplayAlerts", self.alerts_before), "DisplayAlerts",
+                        self.cleanup_deadline_s)
         except (DriverRefusal, *_com_errors()) as e:
             sys.stderr.write(f"quit: {e}\n")
         finally:
@@ -651,7 +653,9 @@ class Application:
         or "ended": a failure, a timeout or a doubt before the disarm — an open the driver never named,
         a document of its own that will not close, a listing that fails, a Visible that cannot be set
         or reads back false, the window over — means no disarm, and the Job, closed, takes the instance
-        (D-04)."""
+        (D-04). When Windows refused that Job (`job: process … not held`), the line says so — no Job ends
+        it, or none was there to disarm — and an instance that ends that way is not quit: it outlives
+        the driver."""
         try:
             if self.unnamed_opens:
                 raise DriverRefusal("internal",
@@ -672,10 +676,12 @@ class Application:
             if owned.job is not None:
                 owned.job.disarm()
         except Exception as e:  # noqa: BLE001 — any failure before the disarm: no disarm (PF-2)
-            sys.stderr.write(f"quit: process {owned.pid} not handed over ({e}); its Job ends it\n")
+            fate = "its Job ends it" if owned.job is not None else "no Job ends it"    # job: … not held (D-04)
+            sys.stderr.write(f"quit: process {owned.pid} not handed over ({e}); {fate}\n")
             return "ended"
+        fate = "its Job disarmed" if owned.job is not None else "no Job to disarm"
         sys.stderr.write(f"quit: process {owned.pid} handed to the user, {foreign} foreign document(s) "
-                         "open in it; its Job disarmed\n")                                # (5)
+                         f"open in it; {fate}\n")                                         # (5)
         return "kept"
 
     def _close_job(self, owned, end: float, ending: str) -> None:
