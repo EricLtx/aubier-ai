@@ -335,3 +335,16 @@ class VaultTest(unittest.TestCase):
         self.assertEqual(err.getvalue(), f"vkforge plan: vault {path} is not an object of clear strings; "
                                          "remedy: run vkforge mine again\n")
         self.assertFalse((self.dir / "out").exists(), "refused before the plan was written")
+
+    def test_without_the_flag_the_vault_is_left_as_mine_wrote_it(self):
+        # contracts/tcb.md: the flag is optional, and a plan run by hand without it reduces nothing.
+        canon.write(self.inv, self.dir / "invariants.json")
+        path = self.written_vault()
+        before = path.read_bytes()
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(entry.main(["plan", "--invariants", str(self.dir / "invariants.json"),
+                                         "--binding", str(FIXTURES / "binding-word.json"),
+                                         "--out", str(self.dir / "out")]), 0)
+        self.assertNotIn("; vault kept", printed.getvalue())
+        self.assertEqual(path.read_bytes(), before, "no --vault, no rewrite: the ten candidates are all still there")
