@@ -69,4 +69,10 @@ pilote. La revue du 20/10 en a durci les gardes avant le passage réel : une ent
 n'identifie pas (recherche, « Votre avis ») n'est jamais cliquée, le menu d'une conversation et sa
 confirmation de suppression sont lus en liste blanche, M8-5 et M8-6 se jugent sur l'état de la
 conversation de M8-1 et non sur la liste entière, et chaque ligne dit si une erreur interne a été
-montrée à l'utilisateur (`internal_error_shown`), l'extrait restant dans les preuves.
+montrée à l'utilisateur (`internal_error_shown`), l'extrait restant dans les preuves. Son deuxième
+tour sépare les refus du pilote des défauts de MaskAI : ce que le pilote refuse par sa propre garde,
+avant tout clic irréversible, est NON TESTÉ, jamais KO ; une suppression qui emporte une autre
+conversation est KO sécurité, signalée tout de suite ; les menus et confirmations légitimes d'une
+seule conversation sont acceptés, toute formule qui en vise plusieurs refusée ; aucun texte de la
+page, titre de conversation compris, n'atteint le harnais sans expurgation ; et le pilote ne répond
+toujours à aucune boîte du navigateur : c'est le fondateur qui l'annule (runbook §8.4).
