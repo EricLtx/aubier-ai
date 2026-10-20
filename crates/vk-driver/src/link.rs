@@ -29,7 +29,8 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// How long a running driver whose stdin the host closed — the protocol's end
 /// — gets to exit on its own before its tree is killed (ruling L-P49): a
-/// learned driver quits the Office instance it started on its way out (L-P46).
+/// learned driver ends the Office instance it started on its way out, within
+/// founder decision D-35's bounds (L-P46).
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// What a link needs to start a driver: the command line, where it runs, the
@@ -160,8 +161,9 @@ impl LocalLink {
     ///
     /// A leader still running is first stopped the way the protocol ends
     /// (ruling L-P49): its stdin is closed and it gets [`STOP_GRACE`] to exit
-    /// on its own — a learned driver quits the Office instance it started on
-    /// its way out (L-P46), which a kill would leave running. Its exit is
+    /// on its own — a learned driver ends the Office instance it started on its
+    /// way out, within founder decision D-35's bounds (L-P46), where a kill
+    /// leaves that instance to the driver's Job object (D-04). Its exit is
     /// observed as above, without reaping it; one that is still running when
     /// the grace is over is killed as before.
     fn terminate(&mut self) {

@@ -50,7 +50,7 @@ from .ooxml import NS, q
 # 130 s per document the kernel gives the stage (Task 9).
 PASS_DEADLINE_S = 90.0
 HELLO_TIMEOUT_S = 10.0
-END_WAIT_S = 5.0        # stdin closed, the driver's own end (it quits the Office it started, L-P46) before a kill
+END_WAIT_S = 5.0        # stdin closed, the driver's own end (its Office ends within D-35's bounds) before a kill
 VKFORGE_ROOT = Path(__file__).resolve().parent.parent       # drivers/: what fake.json names (L-P19)
 REASONS = ("dialog", "timeout", "host", "precondition", "internal")    # protocol 1's refusal words
 PERTURBABLE = frozenset({"title_style", "body_font", "title_font", "header_text", "footer_text", "pdf_exists"})
@@ -152,7 +152,8 @@ class _Driver:
 
     def end(self) -> None:
         """On every path: stdin closed, then END_WAIT_S for the driver's own end (serve returns, _quit
-        quits the instance it started, L-P46/L-P49); only past that wait, the kill, with the tree."""
+        ends the instance it started within D-35's bounds, L-P46/L-P49); only past that wait, the kill,
+        with the tree — and a killed driver's Office ends through its Job (D-04)."""
         try:
             self.proc.stdin.close()
         except OSError:

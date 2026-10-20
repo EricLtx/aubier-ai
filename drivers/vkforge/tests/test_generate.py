@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import ctypes
 import io
 import json
 import os
@@ -21,7 +22,7 @@ from vkforge import canon, generate, inventory, mine, ontology, plan
 from vkforge.errors import Refusal
 from vkforge.runtime import com
 from vkforge.runtime.fake import FakeApplication
-from vkforge.tests import ooxml_fixtures
+from vkforge.tests import NODE_STEP, node_office, ooxml_fixtures
 from vkforge.tests.ooxml_fixtures import FOOTER
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -80,12 +81,6 @@ def recording_root() -> Path:
     return root
 
 
-def winword_pids() -> set:
-    listing = subprocess.run(["tasklist", "/FO", "CSV", "/NH", "/FI", "IMAGENAME eq WINWORD.EXE"],
-                             capture_output=True, text=True, errors="replace").stdout
-    return {line.split('","')[1] for line in listing.splitlines() if line.startswith('"WINWORD.EXE"')}
-
-
 def driver_pid(proc: subprocess.Popen) -> int:
     """The process that runs driver.py: `proc` itself, or — `sys.executable` being a virtualenv's
     launcher on Windows — the interpreter the launcher started, its one python child."""
@@ -93,9 +88,54 @@ def driver_pid(proc: subprocess.Popen) -> int:
     return children[0] if children else proc.pid
 
 
-def running(exes: set) -> set:
-    """The ids of the processes running one of `exes` now; empty when there is no snapshot."""
-    return set(com.pids_of(exes) or ())
+def running(exes: set):
+    """The ids of the processes running one of `exes` now; None when there is no snapshot, never read as
+    "none running" (ruling PF-19)."""
+    pids = com.pids_of(exes)
+    return None if pids is None else set(pids)
+
+
+def started_by_com(exes: set, before: set) -> set:
+    """The processes of `exes` that appeared since `before` as children of the DcomLaunch service: what a
+    COM start of the test's made, never a start from the shell (rulings PF-4, PF-20)."""
+    launcher = com.dcom_launcher_pid()
+    return {pid for pid, parent in (com.pids_of(exes) or {}).items()
+            if pid not in before and launcher is not None and parent == launcher}
+
+
+def end_mine(exes: set, mine: set) -> None:
+    """The processes of `exes` a node test started itself — `mine`, recorded when it started them — killed
+    by their PID when still running, then waited for, 10 s at most; never any other (ruling PF-20)."""
+    for pid in mine & (running(exes) or set()):
+        try:
+            os.kill(pid, signal.SIGTERM)                    # TerminateProcess, this PID alone
+        except OSError:
+            pass
+    deadline = time.monotonic() + 10
+    while mine & (running(exes) or set()) and time.monotonic() < deadline:
+        time.sleep(0.2)
+
+
+def has_window(pid: int) -> bool:
+    """Whether process `pid` shows a visible top-level window: an application the shell started is up."""
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = (enum_proc, wintypes.LPARAM)
+    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+    seen = []
+
+    def each(hwnd, _lparam):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd):
+            seen.append(hwnd)
+        return True
+
+    user32.EnumWindows(enum_proc(each), 0)
+    return bool(seen)
 
 
 # The PowerPoint of the node steps (ruling PF-5): the ontology's applications block, no verb.
@@ -267,6 +307,7 @@ class GenerateTest(unittest.TestCase):
             s.close()
             self.assertLess(time.monotonic() - started, 30, "the guard's deadline, not the host's")
             self.assertEqual((ans["ok"], ans["reason"]), (False, "dialog"), ans)
+            self.assertIn(words, ans["detail"])
             self.assertEqual(doc.read_bytes(), before, "nothing saved behind the box")
             self.assertFalse(doc.with_suffix(".pdf").exists())
 
@@ -361,77 +402,89 @@ class GenerateTest(unittest.TestCase):
         Session(driver, fake=True, fake_extra={"vkforge_root": str(root), "quit_marker": str(idle)}).close()
         self.assertFalse(idle.exists())
 
-    @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("word"), "Word not installed")
+    @unittest.skipUnless(node_office("word"), NODE_STEP)
     def test_no_word_the_driver_started_outlives_its_run(self):
-        # L-P46 on the real Word: the instance the driver started (none when the user's was running) is
-        # gone once the driver has ended.
-        before = winword_pids()
-        doc = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "c.docx", title_style="Normal", body_font=("Calibri", 12))
-        s = Session(self.gen(), fake=False, extra_env={"VK_DRIVER_APPLICATIONS": "WINWORD.EXE"})
-        ans = s.act("appliquer_style_maison", {"document": str(doc), "pdf": str(doc.with_suffix(".pdf"))})
-        s.close()
-        self.assertTrue(ans["ok"], ans)
-        deadline = time.monotonic() + 30
-        while winword_pids() - before and time.monotonic() < deadline:
-            time.sleep(0.5)
-        self.assertEqual(winword_pids() - before, set(), "a Word this run started is still running")
-
-    @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("word"), "Word not installed")
-    def test_a_killed_driver_takes_the_word_it_started_and_no_other(self):
-        # D-03/D-04 on the real Word: the driver starts Word (no Word of the user's to attach to),
-        # identifies it (PF-4), holds it in its Job, and is killed with TerminateProcess — no `_quit`,
-        # no atexit. The Word it started ends within 10 s; every WINWORD that ran before still runs.
-        import comtypes
-        import comtypes.client
-        try:
-            comtypes.client.GetActiveObject("Word.Application")
-        except (OSError, comtypes.COMError):
-            pass
-        else:
-            self.skipTest("a running Word would be attached to, not started: close Word to run this test")
+        # L-P46 under D-04 and D-35 on the real Word: the instance the driver started is gone once the
+        # driver has ended. A node step (PF-19): it skips when a Word runs, which it would attach to, and
+        # ends only the Word its driver started (PF-20).
         exes = {"WINWORD.EXE"}
         before = running(exes)
+        if before != set():
+            self.skipTest("a Word runs, or there is no snapshot: never touched (ruling PF-19)")
         doc = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "c.docx", title_style="Normal", body_font=("Calibri", 12))
         s = Session(self.gen(), fake=False, extra_env={"VK_DRIVER_APPLICATIONS": "WINWORD.EXE"})
+        started = set()
+        try:
+            ans = s.act("appliquer_style_maison", {"document": str(doc), "pdf": str(doc.with_suffix(".pdf"))})
+            started = started_by_com(exes, before)
+            s.close()
+            self.assertTrue(ans["ok"], ans)
+            self.assertEqual(len(started), 1, f"the driver started one Word: {started}")
+            deadline = time.monotonic() + 30
+            while started & (running(exes) or set()) and time.monotonic() < deadline:
+                time.sleep(0.5)
+            self.assertEqual(started & (running(exes) or set()), set(), f"the Word this run started, {started}, "
+                                                                        "is still running")
+        finally:
+            if s.p.poll() is None:
+                s.p.kill()
+                s.p.wait(timeout=10)
+            end_mine(exes, started)
+
+    @unittest.skipUnless(node_office("word"), NODE_STEP)
+    def test_a_killed_driver_takes_the_word_it_started_and_no_other(self):
+        # D-03/D-04 on the real Word: the driver starts Word (none runs: a node step skips otherwise,
+        # PF-19), identifies it (PF-4), holds it in its Job, and is killed with TerminateProcess — no
+        # `_quit`, no atexit. The Word it started ends within 10 s. The test ends nothing else: on a
+        # failure, the Word its driver started and nothing more (PF-20).
+        exes = {"WINWORD.EXE"}
+        before = running(exes)
+        if before != set():
+            self.skipTest("a Word runs, or there is no snapshot: never touched (ruling PF-19)")
+        doc = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "c.docx", title_style="Normal", body_font=("Calibri", 12))
+        s = Session(self.gen(), fake=False, extra_env={"VK_DRIVER_APPLICATIONS": "WINWORD.EXE"})
+        started = set()
         try:
             s.act("appliquer_style_maison", {"document": str(doc), "pdf": str(doc.with_suffix(".pdf"))})
-            started = running(exes) - before
+            started = started_by_com(exes, before)
             self.assertEqual(len(started), 1, f"the driver started one Word: {started}")
             (word,) = started
             os.kill(driver_pid(s.p), signal.SIGTERM)                  # TerminateProcess: no _quit, no atexit
             deadline = time.monotonic() + 10
-            while word in running(exes) and time.monotonic() < deadline:
+            while word in (running(exes) or set()) and time.monotonic() < deadline:
                 time.sleep(0.2)
-            self.assertNotIn(word, running(exes), "the Word the driver started outlived it")
-            self.assertLessEqual(before, running(exes), "a Word that ran before the test was touched")
+            self.assertNotIn(word, running(exes) or set(), f"the Word the driver started, process {word}, outlived it")
         finally:
             s.p.kill()
             s.p.wait(timeout=10)
             s.p.stdout.close()
+            end_mine(exes, started)
 
-    @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("powerpoint"), "PowerPoint not installed")
+    @unittest.skipUnless(node_office("powerpoint"), NODE_STEP)
     def test_the_users_powerpoint_is_attached_never_quit_never_held_its_box_left_open(self):
         # D-03, D-04, ruling PF-4, node step PF-5 (a): a PowerPoint the user started — here the test, from
         # the shell, on a fictitious deck — is attached: no process of the driver's, no Job, never quit;
         # a dialog box it raises during a call (its Open dialog, a #32770 window) is left open and the
-        # call refused `dialog`.
+        # call refused `dialog`. The attach comes through GetActiveObject or, PowerPoint being single
+        # instance, through CreateObject handing back that very instance (0 new processes, PF-4): no
+        # wait on the Running Object Table, where Office registers only once its window loses focus.
+        # The test ends only the PowerPoint it started, by its PID (PF-20).
         import comtypes
         import comtypes.client
         exes = {"POWERPNT.EXE"}
-        if running(exes):
-            self.skipTest("a PowerPoint is running: never touched; close it to run this node step")
+        before = running(exes)
+        if before != set():
+            self.skipTest("a PowerPoint runs, or there is no snapshot: never touched (ruling PF-19)")
         deck = ooxml_fixtures.pptx(Path(tempfile.mkdtemp()) / "fictif.pptx")
         os.startfile(deck)                                          # the user's PowerPoint: the shell starts it
+        ours = set()
         try:
             deadline = time.monotonic() + 60
-            while True:
-                try:
-                    comtypes.client.GetActiveObject("PowerPoint.Application")
-                    break
-                except (OSError, comtypes.COMError):
-                    self.assertLess(time.monotonic(), deadline, "the PowerPoint the shell started never registered")
-                    time.sleep(0.5)
-            users = running(exes)
+            while not any(has_window(pid) for pid in ours):
+                self.assertLess(time.monotonic(), deadline, "the PowerPoint the shell started never showed a window")
+                time.sleep(0.5)
+                ours = (running(exes) or set()) - before
+            time.sleep(2)                                           # its start settled before COM reaches it
             with mock.patch.dict(os.environ, {"VK_DRIVER_APPLICATIONS": "POWERPNT.EXE"}):
                 app = com.Application(PPT)
                 try:
@@ -440,53 +493,53 @@ class GenerateTest(unittest.TestCase):
                         com.guarded(lambda: app.app.FileDialog(1).Show(), "file dialog", 5, owner=app.pid)
                     self.assertEqual(cm.exception.reason, "dialog")
                     self.assertIn("left open", cm.exception.detail)
-                    boxes = com.dialogs(exes)
+                    boxes = [(hwnd, pid) for hwnd, pid in com.dialogs(exes) if pid in ours]
                     self.assertTrue(boxes, "the box is still open")
                     for hwnd, _ in boxes:                           # the user closes it
                         com.close_window(hwnd)
                 finally:
                     app.quit()
             time.sleep(2)
-            self.assertLessEqual(users, running(exes), "the user's PowerPoint was quit or killed")
+            self.assertLessEqual(ours, running(exes) or set(), "the user's PowerPoint was quit or killed")
         finally:
-            try:
-                comtypes.client.GetActiveObject("PowerPoint.Application").Quit()
-            except (OSError, comtypes.COMError):
-                pass
-            deadline = time.monotonic() + 10
-            while running(exes) and time.monotonic() < deadline:
-                time.sleep(0.5)
-            for pid in running(exes):                               # this test's own: none ran before it
-                os.kill(pid, signal.SIGTERM)
+            mine = ours | started_by_com(exes, before)
+            if mine and running(exes) == mine:                      # PF-20: the one PowerPoint running is the test's
+                try:
+                    com.guarded(lambda: comtypes.client.GetActiveObject("PowerPoint.Application").Quit(), "quit", 10)
+                except (DriverRefusal, OSError, comtypes.COMError):
+                    pass
+            end_mine(exes, mine)
 
-    @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("powerpoint"), "PowerPoint not installed")
+    @unittest.skipUnless(node_office("powerpoint"), NODE_STEP)
     def test_a_killed_driver_takes_the_powerpoint_it_started(self):
         # D-04, ruling PF-4, node step PF-5 (b): no PowerPoint running, the adapter starts one, identifies
         # it — one new POWERPNT.EXE, its parent the DcomLaunch service — and holds it in its Job; the
         # process that holds the Job is killed with TerminateProcess (no quit, no atexit), and the
-        # POWERPNT.EXE ends within 10 s.
+        # POWERPNT.EXE ends within 10 s. The test ends only what its starter started (PF-20).
         exes = {"POWERPNT.EXE"}
-        if running(exes):
-            self.skipTest("a PowerPoint is running: never touched; close it to run this node step")
+        before = running(exes)
+        if before != set():
+            self.skipTest("a PowerPoint runs, or there is no snapshot: never touched (ruling PF-19)")
         proc = subprocess.Popen([sys.executable, "-I", "-c", STARTER, str(DRIVERS), json.dumps(PPT["application"])],
                                 stdout=subprocess.PIPE, text=True,
                                 env={**os.environ, "VK_DRIVER_APPLICATIONS": "POWERPNT.EXE"})
+        mine = set()
         try:
             said = proc.stdout.readline().strip()
+            mine = {int(said)} if said.isdigit() else started_by_com(exes, before)
             self.assertTrue(said.isdigit(), f"the adapter did not identify the PowerPoint it started: {said!r}")
             started = int(said)
-            self.assertIn(started, running(exes))
+            self.assertIn(started, running(exes) or set())
             os.kill(driver_pid(proc), signal.SIGTERM)               # TerminateProcess: no quit, no atexit
             deadline = time.monotonic() + 10
-            while started in running(exes) and time.monotonic() < deadline:
+            while started in (running(exes) or set()) and time.monotonic() < deadline:
                 time.sleep(0.2)
-            self.assertNotIn(started, running(exes), "the PowerPoint the driver started outlived it")
+            self.assertNotIn(started, running(exes) or set(), "the PowerPoint the driver started outlived it")
         finally:
             proc.kill()
             proc.wait(timeout=10)
             proc.stdout.close()
-            for pid in running(exes):                               # this test's own: none ran before it
-                os.kill(pid, signal.SIGTERM)
+            end_mine(exes, mine)
 
     def test_a_failed_generation_leaves_no_out(self):
         parent, venv = Path(tempfile.mkdtemp()), fake_venv()

@@ -104,8 +104,9 @@ def app():
 
 def _quit():
     """The end of the session (L-P46), once, whether serve returned or the interpreter is exiting: the
-    adapter quits the instance it started if it holds no document, and puts DisplayAlerts back on any
-    instance it leaves running (L-P47)."""
+    adapter ends the instance it started within founder decision D-35's bounds — quit, handed to the
+    user, or ended by its Job (D-04) — and puts DisplayAlerts back on an instance it leaves to the user
+    (L-P47)."""
     global _app
     if _app is not None:
         ending, _app = _app, None

@@ -765,10 +765,10 @@ if "stubborn" in sys.argv: time.sleep(60)
 
 /// Ruling L-P49: the host stops a running driver the way the protocol ends —
 /// its stdin closed — and gives it five seconds to exit on its own (a learned
-/// driver quits the Office instance it started on its way out, L-P46) before
-/// the tree is killed. The driver that exits at EOF wrote its marker, which a
-/// process killed first could not have; the one that stays on is killed once
-/// the grace is over, and not before.
+/// driver ends the Office instance it started on its way out, within D-35's
+/// bounds, L-P46) before the tree is killed. The driver that exits at EOF wrote
+/// its marker, which a process killed first could not have; the one that stays
+/// on is killed once the grace is over, and not before.
 #[test]
 fn a_driver_is_stopped_by_closing_its_stdin_before_any_kill() {
     if !python_available() {

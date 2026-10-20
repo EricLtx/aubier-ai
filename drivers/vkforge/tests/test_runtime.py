@@ -18,7 +18,7 @@ from vkforge import canon, inventory, mine, plan
 from vkforge.errors import Refusal
 from vkforge.runtime import com, fake
 from vkforge.runtime.fake import FakeApplication
-from vkforge.tests import ooxml_fixtures
+from vkforge.tests import NODE_STEP, node_office, ooxml_fixtures
 from vkforge.tests.ooxml_fixtures import FOOTER
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -70,11 +70,18 @@ class Bands:
 
 class StubDocument:
     def __init__(self, word, path):
-        self.word, self.FullName, self.ReadOnly = word, path, False
+        self.word, self.path, self.ReadOnly = word, path, False
         self.Styles = Styles()
         self.Paragraphs = Collection(Paragraph(self) for _ in range(4))
         self.Sections = Collection([types.SimpleNamespace(Footers=Bands(), Headers=Bands())])
         self.saved, self.exported, self.closed = 0, [], None
+
+    @property
+    def FullName(self):
+        """Its path; each read written into its Word's `log` when that Word keeps one (an OrderedWord:
+        the inventory's reads, ruling PF-18)."""
+        getattr(self.word, "log", []).append(f"FullName {Path(self.path).name}")
+        return self.path
 
     def Save(self):
         self.saved += 1
@@ -86,7 +93,7 @@ class StubDocument:
     def Close(self, **kw):
         self.closed = kw
         self.word.Documents.items.remove(self)
-        getattr(self.word, "log", []).append(f"Close {Path(self.FullName).name}")
+        getattr(self.word, "log", []).append(f"Close {Path(self.path).name}")
 
 
 class StubDocuments(Collection):
@@ -108,6 +115,7 @@ class StubWord:
     def __init__(self):
         self.DisplayAlerts = -1                 # the user's own setting (wdAlertsAll)
         self.Documents = StubDocuments(self)
+        self.ProtectedViewWindows = Collection()  # ruling PF-21: what Documents does not list
         self.missing, self.quits = set(), 0
 
     def Quit(self):
@@ -159,6 +167,14 @@ class StubJob:
         self.calls.append("close")
 
 
+class RefusingJob(StubJob):
+    """A Job whose disarm Windows refuses (D-35 (4)): the hand-over must not stand (review tests-4)."""
+
+    def disarm(self) -> None:
+        super().disarm()
+        raise OSError("the Job cannot be changed")
+
+
 class SilentWord(StubWord):
     """A Word whose DisplayAlerts cannot be read: a session that cannot begin (ruling LF-8)."""
 
@@ -171,10 +187,21 @@ class SilentWord(StubWord):
         raise OSError("the application is not answering")
 
 
+class OrderedDocuments(StubDocuments):
+    """An OrderedWord's documents: each walk of the collection — its Count read — written into the log as
+    `list` (ruling PF-18)."""
+
+    @property
+    def Count(self):
+        self.word.log.append("list")
+        return len(self.items)
+
+
 class OrderedWord(StubWord):
     """A Word started by automation, as the end of a session finds it (founder decision D-35, rulings
     PF-2 and PF-12): hidden until the hand-over. It writes into `log`, in order, what that end asks of
-    it: each document closed (StubDocument.Close), each property set, each read of Visible, each Quit.
+    it: each document closed (StubDocument.Close), each walk of its documents (`list`) and each FullName
+    read (ruling PF-18), each property set, each read of Visible, each Quit.
     Set true, Visible reads back `shows`: True as comtypes gives Word's VARIANT_BOOL, -1 as it gives
     PowerPoint's msoTrue, False or 0 for a window that will not show. The property `refuses` names
     cannot be set; UserControl reads False and cannot be set at all, as the pinned type library has
@@ -182,6 +209,7 @@ class OrderedWord(StubWord):
 
     def __init__(self, log: list, shows=True):
         super().__init__()
+        self.Documents = OrderedDocuments(self)
         self.shown, self.shows, self.refuses, self.log = False, shows, None, log
 
     @property
@@ -208,6 +236,33 @@ class OrderedWord(StubWord):
 
     def Quit(self):
         self.log.append("Quit")
+        super().Quit()
+
+
+class StallingWord(StubWord):
+    """A Word one call of whose end does not come back until `until` is set (D-35 (1), review tests-3):
+    Quit, the Visible put or the Visible get, as `at` names it ("Quit", "Visible", "Visible?"); any
+    other `at` leaves them alone (the test then hangs the driver's own close, or the listing)."""
+
+    def __init__(self, at: str, until: threading.Event):
+        super().__init__()
+        self.at, self.until, self.shown = at, until, False
+
+    @property
+    def Visible(self):
+        if self.at == "Visible?":
+            self.until.wait(30)
+        return self.shown
+
+    @Visible.setter
+    def Visible(self, value):
+        if self.at == "Visible":
+            self.until.wait(30)
+        self.shown = value
+
+    def Quit(self):
+        if self.at == "Quit":
+            self.until.wait(30)
         super().Quit()
 
 
@@ -297,9 +352,11 @@ class RuntimeTest(unittest.TestCase):
                          ("precondition", "office version changed; remedy: vk driver learn again"))
         self.assertIsNone(FakeApplication(self.binding).probe(), "no type library behind the fake")
 
-    @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("word"), "Word not installed")
+    @unittest.skipUnless(node_office("word"), NODE_STEP)
     @mock.patch.dict(os.environ, {"VK_DRIVER_APPLICATIONS": "WINWORD.EXE"})
     def test_the_adapter_applies_the_house_style_on_the_real_word(self):
+        if com.pids_of({"WINWORD.EXE"}) != {}:
+            self.skipTest("a Word runs, or there is no snapshot: never touched (ruling PF-19)")
         doc = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "c.docx", title_style="Normal", body_font=("Calibri", 12))
         guid = inventory.APPS["word"]["typelib"]
         self.assertEqual(com.live_typelib_sha256(guid), canon.sha256_file(inventory.typelib_path(guid)),
@@ -313,12 +370,15 @@ class RuntimeTest(unittest.TestCase):
         obs = mine.mine_file(doc)["obs"]
         self.assertIn({"kind": "paragraph_style", "where": "first", "value": {"builtin": "Heading1"}}, obs)
 
-    @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("word"), "Word not installed")
+    @unittest.skipUnless(node_office("word"), NODE_STEP)
     @mock.patch.dict(os.environ, {"VK_DRIVER_APPLICATIONS": "WINWORD.EXE"})
     def test_a_document_already_open_in_the_users_word_is_refused_and_left_open(self):
         # The plan's precondition "not open elsewhere", in the instance the adapter attaches to (spike
         # verdict 3): there Documents.Open hands back the user's own document, unsaved edits included,
         # which a save would write and a close would shut. Refused, and the user's document left as it was.
+        # A node step (PF-19): run with no Word open, the test plays the user in a Word the adapter starts.
+        if com.pids_of({"WINWORD.EXE"}) != {}:
+            self.skipTest("a Word runs, or there is no snapshot: never touched (ruling PF-19)")
         doc = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "c.docx", title_style="Normal")
         before = doc.read_bytes()
         app = com.Application(self.binding)
@@ -589,18 +649,21 @@ class RuntimeTest(unittest.TestCase):
 
     def test_quit_waits_for_the_started_process_then_closes_its_job(self):
         # D-04, D-35: a clean end with nothing foreign quits the instance the adapter started, gives its
-        # process what is left of the clean-end window, then closes the Job, which ends whatever is
-        # left; an attached instance has no Job at all.
+        # process what is left of the clean-end window — not the whole window: here Quit took 0.3 s of a
+        # 1.0 s window (review tests-3) — then closes the Job, which ends whatever is left; an attached
+        # instance has no Job at all.
         late = "quit: process 4242 still running at the end of the clean-end window; its Job ends it\n"
         for exits, said in ((True, ""), (False, late)):
             word, job = StubWord(), StubJob(exits)
+            quits = word.Quit
+            word.Quit = lambda: (time.sleep(0.3), quits())
             app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
             self.assertEqual(app.pid, 4242)
             err = io.StringIO()
-            with contextlib.redirect_stderr(err):
+            with mock.patch.object(com, "QUIT_WAIT_S", 1.0), contextlib.redirect_stderr(err):
                 app.quit()
             self.assertEqual((word.quits, job.calls, err.getvalue()), (1, ["wait", "close"], said))
-            self.assertTrue(0 < job.waited <= com.QUIT_WAIT_S, job.waited)
+            self.assertTrue(0 < job.waited <= 0.75, job.waited)
             self.assertIsNone(app.pid, "the session let go of what it held")
         self.assertEqual(com.QUIT_WAIT_S, 3.0, "under the 5 s a host (L-P49) and qualify give a driver")
         user = StubWord()
@@ -609,34 +672,46 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual((user.quits, user.DisplayAlerts, attached.pid), (0, -1, None))
 
     def test_the_instance_survives_only_a_clean_end_inside_the_window(self):
-        # Founder decision D-35, bound (1): what may keep the started instance runs inside the clean-end
-        # window, QUIT_WAIT_S, under the host's 5 s grace (L-P49) — never on a call's 30 s. Past it (here
-        # a listing that hangs) there is no disarm, and the Job, closed, takes the instance. An unclean
-        # death never reaches this code: the Job takes the instance by itself
-        # (test_a_held_process_dies_with_its_holder_and_a_disarmed_one_lives).
-        word, job, hang = StubWord(), StubJob(), threading.Event()
-        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
-        word.Documents.items.append(Hung(hang))
-        err, began = io.StringIO(), time.monotonic()
-        try:
-            with mock.patch.object(com, "QUIT_WAIT_S", 0.5), contextlib.redirect_stderr(err):
-                app.quit()
-        finally:
-            hang.set()
-        self.assertLess(time.monotonic() - began, 2.0, "the window bounds the end, not a call's deadline")
-        self.assertEqual((job.calls, word.quits), (["close"], 0), "no disarm, no Quit: the Job takes it")
-        self.assertIn("quit: process 4242 not handed over (inventory: no answer within", err.getvalue())
+        # Founder decision D-35, bound (1): every call that may keep the started instance runs inside the
+        # clean-end window, QUIT_WAIT_S, under the host's 5 s grace (L-P49), never on a call's deadline
+        # (here 5 s, the window patched to 0.5 s): the driver's own document's close, the inventory (a
+        # listing that hangs), Quit, Visible set and Visible read back (review tests-3). Past the window
+        # there is no disarm, and the Job, closed, takes the instance. An unclean death never reaches this
+        # code: the Job takes the instance by itself (test_a_held_process_dies_with_its_holder_and_a_disarmed_one_lives).
+        for stall, what in (("close", "close"), ("inventory", "inventory"), ("Quit", "quit"),
+                            ("Visible", "hand-over"), ("Visible?", "hand-over")):
+            hang = threading.Event()
+            word, job = StallingWord(stall, hang), StubJob()
+            app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
+            app.deadline_s = app.cleanup_deadline_s = 5.0
+            own = app.open("C:/stub/own.docx")
+            if stall == "close":
+                own.Close = lambda **kw: hang.wait(30)
+            elif stall == "inventory":
+                word.Documents.items.append(Hung(hang))
+            elif stall.startswith("Visible"):
+                word.Documents.items.append(StubDocument(word, "C:/stub/the-users.docx"))
+            err, began = io.StringIO(), time.monotonic()
+            try:
+                with mock.patch.object(com, "QUIT_WAIT_S", 0.5), contextlib.redirect_stderr(err):
+                    app.quit()
+            finally:
+                hang.set()
+            self.assertLess(time.monotonic() - began, 2.0, f"{stall}: the window bounds the end, not a call's deadline")
+            self.assertEqual(job.calls, ["close"], f"{stall}: no disarm, no wait: the Job takes it")
+            self.assertIn(f"quit: process 4242 not handed over ({what}: no answer within", err.getvalue(), stall)
 
     def test_the_drivers_own_documents_are_closed_first_and_never_keep_the_instance(self):
         # Founder decision D-35, bound (2): the driver first closes, without saving, every document it
-        # opened and still holds (its close after the action failed); holding nothing else, the instance
-        # is quit. A document of its own that will not close does not keep the instance: no Quit, no
-        # disarm, and the Job, closed, takes it.
+        # opened and still holds (here two, whose closes after the action failed — review tests-3);
+        # holding nothing else, the instance is quit. A document of its own that will not close does not
+        # keep the instance: no Quit, no disarm, and the Job, closed, takes it.
         word, job = StubWord(), StubJob()
         app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
-        left = app.open("C:/stub/left.docx")
+        left = [app.open("C:/stub/left.docx"), app.open("C:/stub/also-left.docx")]
         app.quit()
-        self.assertEqual((left.closed, len(word.Documents.items), word.quits), ({"SaveChanges": False}, 0, 1))
+        self.assertEqual(([d.closed for d in left], len(word.Documents.items), word.quits),
+                         ([{"SaveChanges": False}] * 2, 0, 1))
         self.assertEqual(job.calls, ["wait", "close"])
         word, job = StubWord(), StubJob()
         app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
@@ -686,17 +761,20 @@ class RuntimeTest(unittest.TestCase):
         # Founder decision D-35, bound (4), as ruling PF-12 reads it: with a foreign document identified,
         # the instance is handed to the user, visible and under the user's control — Visible set true
         # and read back true (True as comtypes gives Word's VARIANT_BOOL, -1 as it gives PowerPoint's
-        # msoTrue), its own Job alone disarmed, DisplayAlerts put back, every reference released — and
-        # stays, the user's document in it, the driver's closed. UserControl is never touched: Word's
-        # has no setter, and neither has OrderedWord's. A Visible that cannot be set, or that reads back
-        # false: no disarm, nothing put back, and the Job, closed, takes the instance. Another started
-        # instance, holding nothing foreign, is quit and its Job closed armed.
+        # msoTrue, and nothing else: not msoCTrue's 1, not msoTriStateMixed's -2), its own Job alone
+        # disarmed, DisplayAlerts put back, every reference released — and stays, the user's document in
+        # it, the driver's closed. UserControl is never touched: Word's has no setter, and neither has
+        # OrderedWord's. A Visible that cannot be set, or that reads back anything else, or a disarm
+        # Windows refuses (review tests-4): nothing put back, and the Job, closed, takes the instance.
+        # Another started instance, holding nothing foreign, is quit and its Job closed armed.
         self.assertEqual(com.COM_TRUE, -1, "VARIANT_TRUE, and PowerPoint's msoTrue")
         for refuses, shows, why in [(None, True, None),                     # Word's Visible, read back
                                     (None, com.COM_TRUE, None),             # PowerPoint's, read back
                                     ("Visible", True, "Visible cannot be set"),
                                     (None, False, "hand-over: Visible reads back False"),
-                                    (None, 0, "hand-over: Visible reads back 0")]:      # msoFalse
+                                    (None, 0, "hand-over: Visible reads back 0"),       # msoFalse
+                                    (None, 1, "hand-over: Visible reads back 1"),       # msoCTrue
+                                    (None, -2, "hand-over: Visible reads back -2")]:    # msoTriStateMixed
             word, job = OrderedWord([], shows), StubJob()
             app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
             own = app.open("C:/stub/own.docx")
@@ -712,6 +790,17 @@ class RuntimeTest(unittest.TestCase):
             else:
                 self.assertEqual((word.DisplayAlerts, job.calls), (0, ["close"]), "no disarm, nothing put back")
                 self.assertEqual(err.getvalue(), f"quit: process 4242 not handed over ({why}); its Job ends it\n")
+        word, refusing = OrderedWord([]), RefusingJob()
+        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, refusing)))
+        app.open("C:/stub/own.docx")
+        word.Documents.items.append(StubDocument(word, "C:/stub/the-users.docx"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            app.quit()
+        self.assertEqual((refusing.calls, word.DisplayAlerts), (["disarm", "close"], 0),
+                         "a refused disarm: no hand-over")
+        self.assertEqual(err.getvalue(),
+                         "quit: process 4242 not handed over (the Job cannot be changed); its Job ends it\n")
         other, armed = StubWord(), StubJob()
         idle = com.Application(self.binding, connect=lambda: (other, com.Owned(4343, armed)))
         idle.quit()
@@ -732,26 +821,30 @@ class RuntimeTest(unittest.TestCase):
                          "quit: process 4242 handed to the user, 2 foreign document(s) open in it; its Job disarmed\n")
 
     def test_the_end_closes_then_lists_then_hands_over_then_disarms(self):
-        # Rulings PF-2 and PF-12: inside QUIT_WAIT_S and before any other call — the driver's own
-        # documents closed, the instance's listed, Visible set true and read back, then the disarm;
-        # DisplayAlerts and the release come after it, best effort. A failure before the disarm (here
-        # Visible refused, or read back false): no disarm, nothing put back, and the Job, closed, takes
-        # the instance.
-        for refuses, shows, want in [
-                (None, True, ["Close own.docx", f"Visible {com.COM_TRUE}", "Visible? True", "disarm",
-                              "DisplayAlerts -1", "close"]),
-                ("Visible", True, ["Close own.docx", "close"]),
-                (None, False, ["Close own.docx", f"Visible {com.COM_TRUE}", "Visible? False", "close"])]:
+        # Rulings PF-2, PF-12 and PF-18: inside QUIT_WAIT_S and before any other call — the driver's own
+        # documents closed, the instance's listed (the walk, `list`, and each FullName read), Visible set
+        # true and read back, then the disarm; DisplayAlerts and the release come after it, best effort.
+        # Nothing foreign listed: Quit, and Visible never touched — the instance stays hidden. A failure
+        # before the disarm (here Visible refused, or read back false): no disarm, nothing put back, and
+        # the Job, closed, takes the instance.
+        users = ["list", "FullName the-users.docx"]
+        for refuses, shows, foreign, want in [
+                (None, True, True, ["Close own.docx", *users, f"Visible {com.COM_TRUE}", "Visible? True", "disarm",
+                                    "DisplayAlerts -1", "close"]),
+                ("Visible", True, True, ["Close own.docx", *users, "close"]),
+                (None, False, True, ["Close own.docx", *users, f"Visible {com.COM_TRUE}", "Visible? False", "close"]),
+                (None, True, False, ["Close own.docx", "list", "Quit", "wait", "close"])]:
             log = []
             word, job = OrderedWord(log, shows), StubJob(log=log)
             app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
             app.open("C:/stub/own.docx")                              # its close after the action failed
-            word.Documents.items.append(StubDocument(word, "C:/stub/the-users.docx"))
+            if foreign:
+                word.Documents.items.append(StubDocument(word, "C:/stub/the-users.docx"))
             word.refuses = refuses
             log.clear()                                               # the session's start is not the subject
             with contextlib.redirect_stderr(io.StringIO()):
                 app.quit()
-            self.assertEqual(log, want, (refuses, shows))
+            self.assertEqual(log, want, (refuses, shows, foreign))
 
     def test_a_session_that_cannot_begin_ends_the_instance_it_started(self):
         # Ruling LF-8: DisplayAlerts cannot be read — the session refuses `precondition`, and the Job of
@@ -838,25 +931,193 @@ class RuntimeTest(unittest.TestCase):
                          "quit: DisplayAlerts: a dialog box of the application is open; left open: the instance is "
                          "not one the driver owns\n")
 
-    def test_an_instance_no_job_holds_is_never_said_to_end_through_one(self):
-        # Task 3 self-review, D-35 (5): when Windows refused the Job (`job: process … not held`, D-04), the
-        # end's line says no Job ends the instance, or none was disarmed — never the contrary.
-        word = StubWord()
-        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242)))
-        stuck = app.open("C:/stub/stuck.docx")
-        stuck.Close = lambda **kw: (_ for _ in ()).throw(OSError("the document is in use"))
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            app.quit()
-        self.assertEqual((word.quits, err.getvalue()),
-                         (0, "quit: process 4242 not handed over (the document is in use); no Job ends it\n"))
-        word = StubWord()
-        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242)))
-        app.open("C:/stub/own.docx")
-        word.Documents.items.append(StubDocument(word, "C:/stub/the-users.docx"))
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            app.quit()
-        self.assertEqual((word.quits, word.DisplayAlerts, err.getvalue()),
-                         (0, -1, "quit: process 4242 handed to the user, 1 foreign document(s) open in it; "
-                                 "no Job to disarm\n"))
+    def test_a_document_in_protected_view_is_foreign_unless_the_driver_opened_it(self):
+        # Ruling PF-21 (review office-safety-5): the inventory reads the instance's Protected View windows
+        # too, which its document collection does not list. A document there is foreign when its FullName
+        # is not one the driver opened — the instance is handed over — and the driver's own, reopened
+        # there, is not: bound (3) decides by name.
+        for name, kept in (("C:/stub/downloaded.docx", True), ("C:/stub/own.docx", False)):
+            word, job = StubWord(), StubJob()
+            app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
+            app.close(app.open("C:/stub/own.docx"))
+            word.ProtectedViewWindows.items.append(types.SimpleNamespace(Document=StubDocument(word, name)))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                app.quit()
+            if kept:
+                self.assertEqual((word.quits, job.calls), (0, ["disarm", "close"]), name)
+                self.assertEqual(err.getvalue(), "quit: process 4242 handed to the user, 1 foreign document(s) "
+                                                 "open in it; its Job disarmed\n")
+            else:
+                self.assertEqual((word.quits, job.calls, err.getvalue()), (1, ["wait", "close"], ""), name)
+
+    def test_a_snapshot_cut_short_is_no_snapshot(self):
+        # Review quality-4, PF-4's fail-closed rule: a walk of the Toolhelp32 snapshot that stops on an
+        # error other than ERROR_NO_MORE_FILES is no snapshot (None), never a short list a start would
+        # read as complete — a process already running would then pass for a new one.
+        class Kernel:
+            def __init__(self, rows, error):
+                self.rows, self.error, self.at = rows, error, 0
+
+            def CreateToolhelp32Snapshot(self, flags, pid):
+                return 77
+
+            def walk(self, snap, ref):
+                if self.at >= len(self.rows):
+                    return 0
+                ref._obj.th32ProcessID, ref._obj.th32ParentProcessID, ref._obj.szExeFile = self.rows[self.at]
+                self.at += 1
+                return 1
+
+            Process32FirstW = Process32NextW = walk
+
+            def CloseHandle(self, handle):
+                pass
+
+        rows = [(4, 0, "System"), (1234, 4, "winword.exe")]
+        for kernel, want in ((Kernel(rows, 18), [(4, 0, "SYSTEM"), (1234, 4, "WINWORD.EXE")]),   # ERROR_NO_MORE_FILES
+                             (Kernel(rows[:1], 5), None),          # cut short after one row: access denied
+                             (Kernel([], 5), None)):               # the first row refused
+            with mock.patch.object(sys, "platform", "win32"), mock.patch.object(com, "_kernel32", lambda: kernel), \
+                    mock.patch.object(com.ctypes, "get_last_error", lambda: kernel.error, create=True):
+                self.assertEqual(com.processes(), want, kernel.error)
+
+    def office_start(self, attach, create, now, err, **patches):
+        """com.Application on its own start, comtypes' GetActiveObject and CreateObject replaced by `attach`
+        and `create`, every snapshot read from `now["pids"]`, the DcomLaunch service's process 900, and the
+        start's deadline 0.3 s (rulings PF-4, PF-16, PF-17). Windows only: the start loads comtypes."""
+        import comtypes.client
+
+        with contextlib.ExitStack() as stack:
+            exes = patches.pop("exes", "WINWORD.EXE")
+            stack.enter_context(mock.patch.dict(os.environ, {"VK_DRIVER_APPLICATIONS": exes}))
+            stack.enter_context(mock.patch.object(comtypes.client, "GetActiveObject", attach))
+            stack.enter_context(mock.patch.object(comtypes.client, "CreateObject", create))
+            stack.enter_context(mock.patch.object(com, "pids_of", lambda exes: dict(now["pids"]) if exes else None))
+            stack.enter_context(mock.patch.object(com, "dcom_launcher_pid", lambda: 900))
+            stack.enter_context(mock.patch.object(com, "CALL_DEADLINE_S", 0.3))
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(com, name, value))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            return com.Application(self.binding)
+
+    @unittest.skipUnless(sys.platform == "win32", "the adapter's start is Windows' (comtypes)")
+    def test_a_start_owns_and_holds_only_what_it_started(self):
+        # Rulings PF-17 and PF-4 (review office-safety-1, quality-2, tests-5): a start held past its
+        # deadline closes a box, and holds a process, only when the start reached CreateObject and its one
+        # new process is a child of the DcomLaunch service. Held in GetActiveObject — an attach, which
+        # starts nothing — it owns nothing, even when such a process appeared meanwhile (another client's
+        # start): its box is left open, nothing held. A new process of another parent is never held either.
+        def nothing_running(progid):
+            raise OSError("operation unavailable")           # MK_E_UNAVAILABLE: no instance to attach to
+
+        for attach_hangs, parent, words, closed_want, held_want, said in [
+                (True, 900, "left open", [], [], ""),
+                (False, 900, "closed, never answered", [70], [7], ""),
+                (False, 33, "left open", [], [], "start: treated as attached: process 7 was not started by the DCOM "
+                                                 "launcher\n")]:
+            hang, now, closed, held, jobs, err = threading.Event(), {"pids": {1: 4}}, [], [], [], io.StringIO()
+
+            # Each case's own objects, bound now: a worker an earlier case left blocked must not reach them.
+            def appear_then_hang(progid, parent=parent, now=now, hang=hang):
+                now["pids"] = {1: 4, 7: parent}                # one new WINWORD.EXE appears meanwhile
+                hang.wait(30)
+                raise OSError("never answered")
+
+            def hold(pid, held=held):
+                held.append(pid)
+                return StubJob()
+
+            try:
+                with self.assertRaises(DriverRefusal) as cm:
+                    self.office_start(appear_then_hang if attach_hangs else nothing_running, appear_then_hang, now,
+                                      err, dialogs=lambda exes: [(70, 7)], close_window=closed.append, _hold=hold,
+                                      _HELD=jobs)
+            finally:
+                hang.set()
+            self.assertEqual((cm.exception.reason, closed, held, len(jobs)),
+                             ("dialog", closed_want, held_want, len(held_want)), (attach_hangs, parent))
+            self.assertIn(words, cm.exception.detail)
+            self.assertEqual(err.getvalue(), said)
+
+    @unittest.skipUnless(sys.platform == "win32", "the adapter's start is Windows' (comtypes)")
+    def test_a_start_windows_will_not_hold_ends_at_once_and_refuses(self):
+        # Ruling PF-16 (review spec-1): D-04 has no exception. A start positively identified whose Job
+        # Windows refuses is quit at once — no document is in it yet — and the session refuses
+        # `precondition`: no instance of the driver's runs outside a Job, and Owned.job is never None.
+        word, now, err = StubWord(), {"pids": {1: 4}}, io.StringIO()
+
+        def nothing_running(progid):
+            raise OSError("operation unavailable")
+
+        def start(progid):
+            now["pids"] = {1: 4, 7: 900}
+            return word
+
+        with mock.patch.object(com.Job, "hold", side_effect=OSError("[WinError 5] Access is denied")), \
+                self.assertRaises(DriverRefusal) as cm:
+            self.office_start(nothing_running, start, now, err)
+        self.assertEqual((cm.exception.reason, cm.exception.detail),
+                         ("precondition", "Word.Application cannot be started: process 7 cannot be held in a Job: "
+                                          "[WinError 5] Access is denied"))
+        self.assertEqual((word.quits, word.DisplayAlerts), (1, -1), "quit at once, before the session began")
+        self.assertEqual(err.getvalue(), "job: process 7 not held: [WinError 5] Access is denied\n")
+
+    @unittest.skipUnless(sys.platform == "win32", "the adapter's start is Windows' (comtypes)")
+    def test_a_new_start_first_ends_the_instance_a_refused_start_left(self):
+        # Review quality-3, LF-8: the instance a start refused at its deadline left held ends at the next
+        # start, before that start's snapshot: a retry never meets the driver's own half-started instance
+        # and takes it for the user's (PowerPoint hands its running instance to CreateObject).
+        now, err, user = {"pids": {1: 4, 5: 900}}, io.StringIO(), StubWord()
+        left, seen = StubJob(), []
+        left.pid = 5
+
+        def end_it():
+            left.calls.append("close")
+            now["pids"].pop(5)                                 # closed armed, the Job ends process 5
+
+        def attach(progid):
+            seen.append(sorted(now["pids"]))                   # what the start's own snapshot sees
+            return user
+
+        left.close = end_it
+        jobs = [left]
+        app = self.office_start(attach, None, now, err, _HELD=jobs)
+        self.assertEqual((left.calls, jobs, seen, app.pid), (["close"], [], [[1]], None))
+
+    @unittest.skipUnless(sys.platform == "win32", "the adapter's start is Windows' (comtypes)")
+    def test_a_start_with_no_executable_named_says_so(self):
+        # Review quality-7: with VK_DRIVER_APPLICATIONS empty (a manifest without `applications`) no start
+        # can be identified; driver.log names that cause, not a failed snapshot.
+        word, err = StubWord(), io.StringIO()
+
+        def nothing_running(progid):
+            raise OSError("operation unavailable")
+
+        app = self.office_start(nothing_running, lambda progid: word, {"pids": {1: 4}}, err, exes="")
+        self.assertEqual((app.pid, err.getvalue()),
+                         (None, "start: treated as attached: no executable named (VK_DRIVER_APPLICATIONS is empty)\n"))
+
+    @unittest.skipUnless(sys.platform == "win32", "Job objects are Windows'")
+    def test_a_job_waits_for_its_process_and_says_when_it_cannot(self):
+        # Reviews quality-5 and tests-5: wait() tells a living process from an ended one, takes a negative
+        # timeout as no wait at all (never some 49 days), and a wait Windows refuses — the handle closed —
+        # raises, instead of reading as "still running".
+        base = getattr(sys, "_base_executable", sys.executable)
+        sleeper = subprocess.Popen([base, "-I", "-c", "import time; time.sleep(120)"])
+        try:
+            job = com.Job.hold(sleeper.pid)
+            self.assertFalse(job.wait(0.1), "alive")
+            waited = []
+            negative = threading.Thread(target=lambda: waited.append(job.wait(-0.5)), daemon=True)
+            negative.start()
+            negative.join(5)
+            self.assertEqual(waited, [False], "a negative timeout waits nothing")
+            sleeper.kill()
+            self.assertTrue(job.wait(10), "ended")
+            job.close()
+            with self.assertRaises(OSError):
+                job.wait(0)
+        finally:
+            sleeper.kill()
+            sleeper.wait(timeout=10)
