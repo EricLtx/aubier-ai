@@ -3,8 +3,10 @@ vendored: a generated driver reaches it only when `vkforge qualify --fake` (or a
 in its work directory. Word .docx only (L-P31). Its verbs are com.VERBS' keys: they edit the
 package's parts in memory, `save` writes them with ooxml.write_parts, and every check re-reads the
 saved file through the miner, the reading the qualification makes. Its dialog box (fake.json's
-"dialog_on") is closed by com.guarded, the guard the real driver runs (L-P33). Its refusals are the
-adapter's: a failure while opening is `precondition`, a failure inside a verb `internal`."""
+"dialog_on") goes through com.guarded, the guard the real driver runs (L-P33): closed in the instance
+the driver started, left open — and refused all the same — when fake.json says "attached" (D-03). Its
+refusals are the adapter's: a failure while opening is `precondition`, a failure inside a verb
+`internal`."""
 import os
 import posixpath
 import threading
@@ -21,6 +23,7 @@ from vkforge.runtime import com    # the repository's adapter: its guard is the 
 FAKE_CALL_DEADLINE_S = 1.0   # the guard's deadline when the fake raises its dialog box: a test waits 1 s, not 30
 FAKE_PDF = b"%PDF-1.4 fake\n" + b"%" * 1185 + b"\n"      # 1 200 bytes: a header and one comment line
 READ_ONLY = "document opened read-only (locked elsewhere)"
+FAKE_PROCESS = "the fake's instance"   # the process the fake's dialog box belongs to (D-03): there is no real one
 
 _REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 _CT = "http://schemas.openxmlformats.org/package/2006/content-types"
@@ -68,6 +71,7 @@ class FakeApplication:
         self.binding = binding
         self.verbs = {v["verb"]: v for v in binding["verbs"]}
         self.dialog_on = (config or {}).get("dialog_on")   # <work>/fake.json's, handed over by the driver (L-P33)
+        self.attached = bool((config or {}).get("attached"))   # fake.json's: the box is not the driver's instance's (D-03)
 
     def probe(self) -> None:
         """No type library behind the fake: nothing to compare (L-P22)."""
@@ -97,12 +101,14 @@ class FakeApplication:
 
     def __dialog__(self, verb: str):
         """fake.json's `dialog_on` (L-P33): the call blocks behind a modal box, as Word's does behind a
-        sign-in or an overwrite prompt, until the adapter's own guard closes the box — so the refusal
-        `dialog` comes from com.guarded, the code the real driver runs."""
+        sign-in or an overwrite prompt. In the instance the driver started — the default — com.guarded
+        closes it and the refusal is `dialog`; with fake.json's `"attached": true` the box belongs to an
+        instance the driver did not start, so the guard leaves it open and refuses `dialog` all the
+        same (D-03) — the code the real driver runs, either way."""
         closed = threading.Event()
         return com.guarded(lambda: closed.wait(60), verb, deadline_s=FAKE_CALL_DEADLINE_S,
-                           find_dialogs=lambda: [] if closed.is_set() else ["the fake's dialog box"],
-                           close=lambda hwnd: closed.set())
+                           find_dialogs=lambda: [] if closed.is_set() else [("the fake's dialog box", FAKE_PROCESS)],
+                           close=lambda hwnd: closed.set(), owner=None if self.attached else FAKE_PROCESS)
 
     def close(self, doc) -> None:
         """Closed without saving, as the adapter's Close(**close): what `save` did not write is gone."""

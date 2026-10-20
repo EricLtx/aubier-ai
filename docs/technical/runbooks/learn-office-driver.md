@@ -104,7 +104,7 @@ Attendu : l'action (`<nom> (reversible: no)`), ses étapes numérotées (`1. ope
 
 ## 5. Qualifier, puis monter
 
-**5.1 Qualifier.** Le driver est rejoué sur des copies du corpus d'apprentissage (le même dossier, inchangé). Chaque copie est d'abord dégradée, pour que seule une vraie réparation fasse passer la postcondition. Le driver lance Word lui-même, ou s'attache à l'instance Word que vous avez déjà ouverte (d'où la réserve 3 du §8).
+**5.1 Qualifier.** Le driver est rejoué sur des copies du corpus d'apprentissage (le même dossier, inchangé). Chaque copie est d'abord dégradée, pour que seule une vraie réparation fasse passer la postcondition. Le driver lance Word lui-même, ou s'attache à l'instance Word que vous avez déjà ouverte (d'où la réserve 3 du §8). Le Word qu'il lance, il le reconnaît à son processus (un seul nouveau WINWORD.EXE, lancé par le service DcomLaunch) et le tient dans un Job « tuer à la fermeture » : ce Word ne survit pas au driver, sauf l'exception bornée de la réserve 2.
 ```powershell
 vk driver qualify --driver C:\drivers-appris\word-maison\driver --corpus C:\cabinet\contrats
 ```
@@ -114,7 +114,7 @@ qualified word-maison: 10/10 passes (0 failures), fake false -> C:\Users\<vous>\
 ```
 `fake false` : le rejeu a eu lieu sur le vrai Office. `fake true` n'a de sens qu'en CI. Le noyau enregistre `driver.qualified` (le hash de `qualification.json`, les passes et les échecs). Un rejeu sous les seuils du plan est enregistré tout de même : c'est la porte du §5.2 qui le refuse.
 
-Pendant le rejeu, ne touchez pas à Word et n'ouvrez pas les documents du corpus. Le driver ferme les boîtes de dialogue sans jamais répondre (le §8 en dit les limites).
+Pendant le rejeu, ne touchez pas à Word et n'ouvrez pas les documents du corpus. Le driver ferme, sans jamais répondre, les boîtes de dialogue du Word qu'il a lancé et reconnu, et seulement celles-là (le §8 en dit les limites).
 
 **5.2 Monter** (acte humain, comme tout montage de driver) :
 ```powershell
@@ -190,7 +190,7 @@ Toute étape qui refuse parle d'une ligne, `vkforge <étape>: <ce qui ne va pas>
 **Les cinq réserves de l'opérateur** (elles figurent aussi dans `contracts/tcb.md`) :
 
 1. **Le démon ne meurt pas entre `mine` et `generate`.** S'il meurt, `<état>\forge\<nom>\.vault.json` reste sur le disque avec du texte clair, sous l'ACL privée du répertoire d'état (jamais dans `--out`) : avant ou pendant `plan` (avec `--arch`, chaque appel au modèle, un par ambiguïté, tombe dans cette fenêtre), il contient tous les candidats du mineur, par exemple le nom d'un client dans chacun de dix pieds de page ; après `plan`, seulement les valeurs que le plan garde. Ni la réduction que `plan` fait (le fichier est tronqué puis réécrit sur place, dans le répertoire privé), ni l'effacement qui suit `generate`, ne sont un effacement sécurisé : les octets écartés quittent le fichier mais peuvent rester dans les blocs libres du disque jusqu'à leur réutilisation. Le prochain `learn` du même nom vide ce répertoire ; sinon on le supprime à la main.
-2. **Un rejeu tué à son délai laisse Office ouvert.** Le driver qu'on tue n'exécute pas son `_quit` : l'instance Word qu'il avait lancée reste dans le gestionnaire de tâches. On la ferme à la main (sans enregistrer) avant de requalifier.
-3. **Les boîtes de dialogue de votre propre Word peuvent être annulées.** L'adaptateur ferme les fenêtres `#32770` de **tout** processus de l'exécutable de l'application, pas seulement de celui qu'il a lancé. Pendant un rejeu, on n'a donc pas de travail non enregistré dans Word.
+2. **Un rejeu tué à son délai n'abandonne plus le Word qu'il a lancé.** Le driver reconnaît le Word qu'il lance (un seul nouveau `WINWORD.EXE`, lancé par le service `DcomLaunch`) et le tient dans un Job « tuer à la fermeture » : tué, il l'emporte ; à une fin normale, il le ferme aussi. Si Windows a refusé de le mettre dans le Job (`driver.log` : `job: process … not held`), ou si le driver n'a pas pu le reconnaître (`start: treated as attached: …`), il le traite comme le vôtre et ce Word reste : on le ferme à la main, sans enregistrer. Un Word que vous aviez ouvert vous-même n'est jamais dans ce Job. Une seule exception, bornée (décision D-35) : à une fin normale, si le driver trouve dans son Word un document que vous y avez ouvert vous-même, il ferme d'abord les siens sans enregistrer, vous rend ce Word visible et le laisse ouvert ; `driver.log` le dit (`quit: process N handed to the user, K foreign document(s) open in it; its Job disarmed`), sans nom de document. Au moindre doute, ou si le driver meurt, ce Word part avec votre document. Un driver appris avant cette version garde l'ancien adaptateur, sans Job, jusqu'à ce qu'on le réapprenne (§3).
+3. **Les boîtes de dialogue de votre propre Word ne sont jamais fermées.** Le driver ne ferme que celles du Word qu'il a lancé et reconnu. Attaché à votre Word, il refuse `dialog` et laisse la boîte ouverte : on y répond soi-même, puis on requalifie.
 4. **L'appel de modèle d'une ambiguïté tient le verrou du noyau**, comme `task.step`. Un arch lent suspend les autres appels du démon pendant sa réponse.
 5. **Le noyau ne contrôle aucune capacité à l'`infer`** : seules les vérifications de `learn` (l'arch sait `Plan`) et de `--deliberate` (l'arch sait `Generate`) font barrière, avant tout étage.

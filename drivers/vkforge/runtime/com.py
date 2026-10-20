@@ -1,22 +1,42 @@
 """The COM adapter of a learned driver (L-P1): the only module that touches COM. Vendored into every
 generated driver as vendor/vkforge_runtime/com.py (L-P19): the stdlib, vkdriver.protocol and, lazily
 and on Windows only, comtypes. It names no application (L-P31): what differs between Word and
-PowerPoint at this level is binding["application"], the ontology's applications block for the app."""
+PowerPoint at this level is binding["application"], the ontology's applications block for the app.
+The instance it starts, it identifies by its process — the one new process of the application's
+executable between a Toolhelp32 snapshot before the start and one after, its parent the DcomLaunch
+service's process (D-03, PF-4) — and holds in a kill-on-close Job of its own (D-04): that instance's
+dialog boxes are the only ones it closes, and it ends with the driver however the driver ends, save
+the one strictly bounded exception of a clean end that hands it to the user (D-35). An instance it
+attached to, or could not identify, it never quits, holds, or closes a box of."""
 import ctypes
 import gc
 import hashlib
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 from vkdriver.protocol import DriverRefusal
 
 CALL_DEADLINE_S = 30.0   # one COM call (L-P33); a qualification pass has 90 s (qualify.PASS_DEADLINE_S)
 CLEANUP_DEADLINE_S = 5.0  # the close that ends an action, and the end of the session: often after a timeout
+QUIT_WAIT_S = 3.0        # the clean-end window (D-35 (1)), under the 5 s grace of a host (L-P49) and of qualify
+COM_TRUE = -1            # VARIANT_TRUE, also PowerPoint's msoTrue: true for a bool and an MsoTriState alike (L-P31)
 DIALOG_CLASS = "#32770"  # the Win32 dialog box class: a sign-in, an overwrite, a repair prompt
 WM_CLOSE = 0x0010
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+PROCESS_TERMINATE = 0x0001
+PROCESS_SET_QUOTA = 0x0100
+SYNCHRONIZE = 0x00100000
+TH32CS_SNAPPROCESS = 0x00000002
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9           # JOBOBJECTINFOCLASS
+WAIT_OBJECT_0 = 0x00000000
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+SC_MANAGER_CONNECT = 0x0001
+SERVICE_QUERY_STATUS = 0x0004
+SC_STATUS_PROCESS_INFO = 0                          # SC_STATUS_TYPE
 
 
 def executables() -> set:
@@ -25,8 +45,250 @@ def executables() -> set:
     return {e.strip().upper() for e in os.environ.get("VK_DRIVER_APPLICATIONS", "").split(",") if e.strip()}
 
 
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32), ("th32ProcessID", ctypes.c_uint32),
+                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", ctypes.c_uint32),
+                ("cntThreads", ctypes.c_uint32), ("th32ParentProcessID", ctypes.c_uint32),
+                ("pcPriClassBase", ctypes.c_long), ("dwFlags", ctypes.c_uint32),
+                ("szExeFile", ctypes.c_wchar * 260)]
+
+
+class _BASIC_LIMIT(ctypes.Structure):               # JOBOBJECT_BASIC_LIMIT_INFORMATION
+    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", ctypes.c_uint32), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t), ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32)]
+
+
+class _EXTENDED_LIMIT(ctypes.Structure):            # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    _fields_ = [("BasicLimitInformation", _BASIC_LIMIT), ("IoInfo", ctypes.c_uint64 * 6),
+                ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+class _SERVICE_STATUS_PROCESS(ctypes.Structure):    # SERVICE_STATUS_PROCESS: nine DWORDs
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "dwServiceType", "dwCurrentState", "dwControlsAccepted", "dwWin32ExitCode", "dwServiceSpecificExitCode",
+        "dwCheckPoint", "dwWaitHint", "dwProcessId", "dwServiceFlags")]
+
+
+_K32 = None
+
+
+def _kernel32():
+    """kernel32 with the signatures the snapshot and the Job use, made once (Windows only)."""
+    global _K32
+    if _K32 is None:
+        from ctypes import wintypes
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        k.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W))
+        k.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W))
+        k.CreateJobObjectW.restype = wintypes.HANDLE
+        k.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        k.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        k.WaitForSingleObject.restype = wintypes.DWORD
+        k.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k.CloseHandle.argtypes = (wintypes.HANDLE,)
+        _K32 = k
+    return _K32
+
+
+def processes():
+    """Every process of the machine as (id, parent id, executable name in upper case), from one
+    Toolhelp32 snapshot (ctypes, no psutil); None off Windows or when the snapshot fails."""
+    if sys.platform != "win32":
+        return None
+    k = _kernel32()
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID_HANDLE_VALUE:
+        return None
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        found = []
+        ok = k.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            found.append((entry.th32ProcessID, entry.th32ParentProcessID, entry.szExeFile.upper()))
+            ok = k.Process32NextW(snap, ctypes.byref(entry))
+        return found
+    finally:
+        k.CloseHandle(snap)
+
+
+def pids_of(exes: set):
+    """{process id: parent process id} of the processes running one of `exes`; None when there is no
+    executable to look for or no snapshot — the process the adapter starts cannot then be identified
+    (PF-4)."""
+    listed = processes() if exes else None
+    return None if listed is None else {pid: parent for pid, parent, exe in listed if exe in exes}
+
+
+def dcom_launcher_pid():
+    """The process id of the DcomLaunch service — the parent of every local server COM starts, hence of
+    the instance a CreateObject starts (ruling PF-4) — read with QueryServiceStatusEx; None off
+    Windows, when the service cannot be queried, or when it reports no process."""
+    if sys.platform != "win32":
+        return None
+    from ctypes import wintypes
+
+    a = ctypes.WinDLL("advapi32", use_last_error=True)
+    a.OpenSCManagerW.restype = wintypes.HANDLE
+    a.OpenSCManagerW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+    a.OpenServiceW.restype = wintypes.HANDLE
+    a.OpenServiceW.argtypes = (wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD)
+    a.QueryServiceStatusEx.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                       ctypes.POINTER(wintypes.DWORD))
+    a.CloseServiceHandle.argtypes = (wintypes.HANDLE,)
+    manager = a.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+    if not manager:
+        return None
+    try:
+        service = a.OpenServiceW(manager, "DcomLaunch", SERVICE_QUERY_STATUS)
+        if not service:
+            return None
+        try:
+            status, needed = _SERVICE_STATUS_PROCESS(), wintypes.DWORD()
+            if not a.QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, ctypes.byref(status),
+                                          ctypes.sizeof(status), ctypes.byref(needed)):
+                return None
+            return status.dwProcessId or None
+        finally:
+            a.CloseServiceHandle(service)
+    finally:
+        a.CloseServiceHandle(manager)
+
+
+def identified(before, after, launcher) -> tuple:
+    """The process a start added, positively identified (D-03, ruling PF-4): (pid, None) when exactly
+    one process of the executable is in `after` and not in `before` (snapshots {pid: parent}) and its
+    parent is `launcher`, the DcomLaunch service's process; (None, why) for anything else — no
+    snapshot, no launcher, none or several new (another start at the same moment), a parent that is
+    not the launcher (a start from the shell: the user's)."""
+    if before is None or after is None:
+        return None, "no snapshot of the application's processes"
+    if launcher is None:
+        return None, "the DcomLaunch service's process is unknown"
+    new = sorted(set(after) - set(before))
+    if len(new) != 1:
+        return None, f"{len(new)} new processes of the application"
+    if after[new[0]] != launcher:
+        return None, f"process {new[0]} was not started by the DCOM launcher"
+    return new[0], None
+
+
+def _limit(job, flags: int) -> None:
+    info = _EXTENDED_LIMIT()
+    info.BasicLimitInformation.LimitFlags = flags
+    if not _kernel32().SetInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                                               ctypes.byref(info), ctypes.sizeof(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+class Job:
+    """A Job object of the adapter's own holding the Office process it started and identified (founder
+    decisions D-04 and D-35): created with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, its handle not
+    inheritable (no security attributes) and held by this driver process alone. However this process
+    ends — a qualification pass killed at its deadline, the host's kill (a STOP, an act's deadline, an
+    umount during an act, the end of its 5 s grace), a crash — the OS closes the handle and the process
+    in the Job ends with it; a clean end closes it too, after Quit, and what is left of the process
+    ends the same way. The one exception is D-35's: at a clean end inside the clean-end window, the
+    driver's own documents closed and a foreign one positively identified, the instance is handed to
+    the user and `disarm` clears the limit of this instance's Job alone — its process then outlives the
+    handles. Any failure before that disarm leaves the Job armed. Never made for an instance the adapter
+    attached to or could not identify (PF-4)."""
+
+    def __init__(self, job, process, pid: int):
+        self.job, self.process, self.pid = job, process, pid
+
+    @classmethod
+    def hold(cls, pid: int) -> "Job":
+        """Process `pid` assigned to a new kill-on-close Job; OSError when Windows refuses a step."""
+        if sys.platform != "win32":
+            raise OSError("Job objects are Windows'")
+        k = _kernel32()
+        job = k.CreateJobObjectW(None, None)
+        if not job:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            _limit(job, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+            process = k.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+            if not process:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not k.AssignProcessToJobObject(job, process):
+                error = ctypes.WinError(ctypes.get_last_error())
+                k.CloseHandle(process)
+                raise error
+        except BaseException:
+            k.CloseHandle(job)
+            raise
+        return cls(job, process, pid)
+
+    def wait(self, timeout_s: float) -> bool:
+        """Whether the held process ended within `timeout_s`."""
+        return _kernel32().WaitForSingleObject(self.process, int(timeout_s * 1000)) == WAIT_OBJECT_0
+
+    def disarm(self) -> None:
+        """The kill-on-close limit cleared, on this Job alone: its process outlives the handles (D-35 (4))."""
+        _limit(self.job, 0)
+
+    def close(self) -> None:
+        """Both handles closed, once; an armed Job then ends what is left in it."""
+        k = _kernel32()
+        for name in ("process", "job"):
+            handle = getattr(self, name)
+            if handle:
+                setattr(self, name, None)
+                k.CloseHandle(handle)
+
+
+class Owned:
+    """The instance this adapter started and identified (D-03, PF-4): its process id, and the Job that
+    ends it with the driver (D-04) — None when Windows refused the assignment (logged, tolerated)."""
+
+    def __init__(self, pid: int, job=None):
+        self.pid, self.job = pid, job
+
+
+_HELD = []    # the Jobs of identified instances whose start was refused (LF-8, PF-4): they end with this process
+
+
+def _hold(pid: int):
+    """The Job that ends `pid` with this driver (D-04), or None: the failure goes to stderr (the
+    driver's driver.log) and is tolerated — the instance then outlives a killed driver, as before."""
+    try:
+        return Job.hold(pid)
+    except OSError as e:
+        sys.stderr.write(f"job: process {pid} not held: {e}\n")
+        return None
+
+
+def own(started: bool, before, after, launcher, hold=_hold):
+    """What the adapter owns of the instance it has (D-03; rulings LF-5 and PF-4): Owned(pid, hold(pid))
+    only when it started the instance and identified its process positively (`identified`); None —
+    attached — otherwise: an instance it found running (GetActiveObject), or one it cannot tell from the
+    user's (CreateObject handed back a running PowerPoint, several new processes, a parent other than
+    the DcomLaunch service, no snapshot, no launcher). An attached instance is never quit, never held in
+    a Job, its dialog boxes never closed; a start that cannot be told apart is one stderr line."""
+    if not started:
+        return None
+    pid, why = identified(before, after, launcher)
+    if pid is None:
+        sys.stderr.write(f"start: treated as attached: {why}\n")
+        return None
+    return Owned(pid, hold(pid))
+
+
 def dialogs(exes: set) -> list:
-    """The visible top-level dialog boxes (class #32770) of the processes running one of `exes`."""
+    """The visible top-level dialog boxes (class #32770) of the processes running one of `exes`, each as
+    (window, process id): the guard closes only those of the instance the adapter started and identified
+    (D-03, PF-4)."""
     if sys.platform != "win32" or not exes:
         return []
     from ctypes import wintypes
@@ -63,7 +325,7 @@ def dialogs(exes: set) -> list:
             pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if image_of(pid.value) in exes:
-                found.append(hwnd)
+                found.append((hwnd, pid.value))
         return True
 
     user32.EnumWindows(enum_proc(each), 0)
@@ -79,11 +341,16 @@ def close_window(hwnd) -> None:
     user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
 
 
-def guarded(fn, what: str, deadline_s: float = CALL_DEADLINE_S, find_dialogs=None, close=None):
-    """fn() on its own thread, joined for `deadline_s` (L-P33). Past it, the application's dialog boxes
-    are closed and the action refuses `dialog`, the box never answered (spec §6); with none open it
-    refuses `timeout`. A thread that finds comtypes loaded joins the multithreaded apartment that
-    Application keeps alive, so the proxies one call's thread made serve the next."""
+def guarded(fn, what: str, deadline_s: float = CALL_DEADLINE_S, find_dialogs=None, close=None, owner=None):
+    """fn() on its own thread, joined for `deadline_s` (L-P33). Past it, the dialog boxes of the
+    application's executables are listed with their process (D-03): those of `owner` — the process of
+    the instance the adapter started, or a callable naming it at that moment — are closed, never
+    answered, and the action refuses `dialog`. A box of any other process is never touched (LF-6):
+    with no owner known (an attached instance: the user's, or one the adapter could not identify) a box of the
+    application still means `dialog`, said to be left open; with an owner known, a box elsewhere did
+    not hold this call, and the action refuses `timeout`, as it does with none open. A thread that
+    finds comtypes loaded joins the multithreaded apartment that Application keeps alive, so the
+    proxies one call's thread made serve the next."""
     find_dialogs = find_dialogs or (lambda: dialogs(executables()))
     close = close or close_window
     box = {}
@@ -104,12 +371,17 @@ def guarded(fn, what: str, deadline_s: float = CALL_DEADLINE_S, find_dialogs=Non
     worker.start()
     worker.join(deadline_s)
     if worker.is_alive():
-        boxes = find_dialogs()
-        for hwnd in boxes:
+        pid = owner() if callable(owner) else owner
+        seen = find_dialogs()
+        ours = [hwnd for hwnd, process in seen if pid is not None and process == pid]
+        for hwnd in ours:
             close(hwnd)
-        if boxes:
-            raise DriverRefusal("dialog", f"{what}: a dialog box of the application held the call; "
+        if ours:
+            raise DriverRefusal("dialog", f"{what}: a dialog box of the instance the driver started held the call; "
                                           "closed, never answered")
+        if seen and pid is None:
+            raise DriverRefusal("dialog", f"{what}: a dialog box of the application is open; left open: "
+                                          "the instance is not one the driver owns")
         raise DriverRefusal("timeout", f"{what}: no answer within {deadline_s:g} s")
     if "error" in box:
         raise box["error"]
@@ -182,24 +454,45 @@ def probe(binding: dict) -> None:
 
 
 class Application:
-    """The application binding["application"] names, the user's own instance (spike verdict 3). The
-    adapter changes only its DisplayAlerts, read first and put back by quit() whenever the instance is
-    left running (L-P47); an instance the adapter started itself and that holds no document, quit()
-    ends (L-P46). `connect` returns (application, started); the default is the running instance, else
-    a new one."""
+    """The application binding["application"] names: the user's own instance when one is running
+    (spike verdict 3), else one the adapter starts. The adapter changes only its DisplayAlerts, read
+    first and put back by quit() whenever the instance is left running (L-P47), and the Visible of the
+    instance it hands to the user (D-35, PF-12). An instance it started and identified by its process
+    (D-03, PF-4) is the only one whose dialog boxes it closes, and is held in a kill-on-close Job of
+    the adapter's (D-04): quit() ends it — save D-35's bounded exception — and a driver that dies
+    takes it along. Any other instance is attached: never quit, never held. `connect` returns
+    (application, owned), owned an Owned or None; the default is the running instance, else a new
+    one. What the driver opens is written down for the end (D-35): `opened`, the FullName of every
+    document it opened; `mine`, those it has not closed; `unnamed_opens`, its opens whose document it
+    never named."""
 
     def __init__(self, binding: dict, connect=None):
         self.binding, self.spec = binding, binding["application"]
         self.verbs = {v["verb"]: v for v in binding["verbs"]}
         self.deadline_s, self.cleanup_deadline_s = CALL_DEADLINE_S, CLEANUP_DEADLINE_S
-        self.app, self.started, self.alerts_before, self.failed = None, False, None, None
+        self.app, self.owned, self.alerts_before, self.failed = None, None, None, None
+        self.opened, self.mine, self.unnamed_opens = set(), [], 0   # what the driver opened (D-35)
         progid = self.spec["progid"]
         try:
-            self.app, self.started = (connect or self._connect)()
-            self.alerts_before = guarded(lambda: self.app.DisplayAlerts, "DisplayAlerts")
-            guarded(lambda: setattr(self.app, "DisplayAlerts", self.spec["alerts_off"]), "DisplayAlerts")
-        except _com_errors() as e:
-            raise DriverRefusal("precondition", f"{progid} cannot be started: {e}") from e
+            self.app, self.owned = (connect or self._connect)()
+            self.alerts_before = self._guard(lambda: self.app.DisplayAlerts, "DisplayAlerts")
+            self._guard(lambda: setattr(self.app, "DisplayAlerts", self.spec["alerts_off"]), "DisplayAlerts")
+        except BaseException as e:
+            if self.owned is not None and self.owned.job is not None:
+                self.owned.job.close()                  # LF-8: the instance started for a session that cannot begin
+            if isinstance(e, _com_errors()):
+                raise DriverRefusal("precondition", f"{progid} cannot be started: {e}") from e
+            raise
+
+    @property
+    def pid(self):
+        """The process of the instance this adapter started and identified (D-03, PF-4); None otherwise."""
+        return None if self.owned is None else self.owned.pid
+
+    def _guard(self, fn, what: str, deadline_s: float | None = None):
+        """guarded() with this session's call deadline by default, and the started process as the one
+        whose dialog boxes it may close (D-03)."""
+        return guarded(fn, what, self.deadline_s if deadline_s is None else deadline_s, owner=self.pid)
 
     def _connect(self) -> tuple:
         progid = self.spec["progid"]
@@ -210,13 +503,26 @@ class Application:
         import comtypes
         import comtypes.client
 
+        exes, launcher = executables(), dcom_launcher_pid()
+        before = pids_of(exes)                          # before GetActiveObject: an attach starts nothing
+
         def start():
             try:
                 return comtypes.client.GetActiveObject(progid), False
             except (OSError, comtypes.COMError):
                 return comtypes.client.CreateObject(progid), True
 
-        return guarded(start, f"start {progid}")
+        try:
+            # A box raised while the instance starts (a first-run prompt) is closed only when the new
+            # process is positively identified by then (D-03, PF-4).
+            app, started = guarded(start, f"start {progid}",
+                                   owner=lambda: identified(before, pids_of(exes), launcher)[0])
+        except DriverRefusal:
+            held = own(True, before, pids_of(exes), launcher)   # LF-8: a positively owned process only (PF-4)
+            if held is not None:
+                _HELD.append(held.job)                  # it ends with this driver
+            raise
+        return app, own(started, before, pids_of(exes) if started else None, launcher)
 
     def _documents(self):
         return getattr(self.app, self.spec["collection"])
@@ -228,13 +534,27 @@ class Application:
         """The document, opened. A failure while opening (no such file, a damaged one, the application's
         refusal) is `precondition`, as the fake's; a failure inside a verb is `internal` in both. The
         plan's "not open elsewhere" holds in this very instance too: there Open hands back a document the
-        user already has open, unsaved edits included; refused, and that document is not closed."""
+        user already has open, unsaved edits included; refused, and that document is not closed. What
+        the driver opens is written down for the end of the session (D-35): its FullName, read back after
+        the Open, in `opened`, and the document in `mine` until it is closed; an Open whose document is
+        never named — refused by its guard, or its name unreadable — stays counted in `unnamed_opens`,
+        a doubt that keeps the instance from being handed over."""
         self.failed = None                                  # a new action begins with its document
         try:
-            open_before = guarded(lambda: {d.FullName for d in _items(self._documents())}, "open", self.deadline_s)
-            doc = guarded(lambda: self._documents().Open(path, **self.spec["open"]), "open", self.deadline_s)
-            already = guarded(lambda: doc.FullName, "open", self.deadline_s) in open_before
-            read_only = not already and guarded(lambda: bool(doc.ReadOnly), "open", self.deadline_s)
+            open_before = self._guard(lambda: {d.FullName for d in _items(self._documents())}, "open")
+            self.unnamed_opens += 1                         # D-35 (3): until its document is named
+            try:
+                doc = self._guard(lambda: self._documents().Open(path, **self.spec["open"]), "open")
+            except _com_errors():
+                self.unnamed_opens -= 1                     # the application refused: it opened nothing
+                raise
+            name = self._guard(lambda: doc.FullName, "open")
+            self.unnamed_opens -= 1
+            already = name in open_before
+            if not already:
+                self.opened.add(name)                       # D-35 (3): the driver's exact list
+                self.mine.append(doc)                       # D-35 (2): closed at the end if still open
+            read_only = not already and self._guard(lambda: bool(doc.ReadOnly), "open")
         except _com_errors() as e:
             raise DriverRefusal("precondition", f"document cannot be opened: {e}") from e
         if already:
@@ -247,7 +567,7 @@ class Application:
 
     def call(self, verb: str, doc, **args):
         try:
-            return guarded(lambda: VERBS[verb](self, doc, **args), verb, self.deadline_s)
+            return self._guard(lambda: VERBS[verb](self, doc, **args), verb)
         except BaseException as e:
             self.failed = verb                              # the action refuses: its close is a cleanup
             if isinstance(e, _com_errors()):
@@ -259,50 +579,117 @@ class Application:
         application that may be wedged: the short cleanup deadline, its own refusal written to stderr,
         never raised, so the action's first refusal is the one the host gets. After a successful action,
         the normal deadline, and a failure is `internal` "close failed: …": a document the driver opened
-        must not stay open, hidden, in the user's instance without the host hearing of it."""
+        must not stay open, hidden, in the user's instance without the host hearing of it. One that did
+        not close stays in `mine`, closed again at the end of the session (D-35 (2))."""
         if self.failed is not None:
             try:
-                guarded(lambda: doc.Close(**self.spec["close"]), "close", self.cleanup_deadline_s)
+                self._guard(lambda: doc.Close(**self.spec["close"]), "close", self.cleanup_deadline_s)
             except (DriverRefusal, *_com_errors()) as e:
                 sys.stderr.write(f"close: {e}\n")
-            return
-        try:
-            guarded(lambda: doc.Close(**self.spec["close"]), "close", self.deadline_s)
-        except (DriverRefusal, *_com_errors()) as e:
-            raise DriverRefusal("internal", f"close failed: {e}") from e
+                return
+        else:
+            try:
+                self._guard(lambda: doc.Close(**self.spec["close"]), "close")
+            except (DriverRefusal, *_com_errors()) as e:
+                raise DriverRefusal("internal", f"close failed: {e}") from e
+        self._closed(doc)
+
+    def _closed(self, doc) -> None:
+        """`doc` is closed: no longer the driver's to close at the end (D-35 (2))."""
+        self.mine = [d for d in self.mine if d is not doc]
 
     def quit(self) -> None:
-        """The end of the session (L-P46, L-P47), once. An instance this adapter started and that holds
-        no document (after the references this process dropped are collected) is quit. Any other is left
-        running with its DisplayAlerts put back: the user's own instance, or a started one still holding a
-        document (one the user opened there, or one a failed close left; nothing is closed, stderr says
-        so). Every reference to the application is released at the end. A failure is written to stderr,
-        never raised: this runs when serve returns and at exit."""
+        """The end of the session, once (L-P46, L-P47; founder decisions D-04 and D-35). An attached
+        instance — the user's, or one whose process the adapter could not identify (PF-4) — is never
+        quit and gets its DisplayAlerts back. The instance the adapter started and identified ends with
+        the driver unless D-35's five bounds all hold (`_end_started`, inside the clean-end window that
+        starts here); one handed to the user gets its DisplayAlerts back too, best effort, after the
+        disarm (PF-2, PF-12). Every COM reference the adapter holds — the application, and any document
+        of its own still listed — is then released, and the Job's handles closed: armed, the Job ends
+        what is left of the instance — after a Quit, once its process has had what is left of the
+        window; disarmed, the instance is the user's: visible, outside any Job, no automation reference
+        left (PF-12). A failure is written to stderr, never raised: this runs when serve returns and at
+        exit."""
         if self.app is None:
             return
-        left_running = True
+        owned, end = self.owned, time.monotonic() + QUIT_WAIT_S
+        ending = "attached" if owned is None else self._end_started(owned, end)
         try:
-            if self.started:
-                guarded(gc.collect, "quit", self.cleanup_deadline_s)
-                if guarded(lambda: self._documents().Count, "quit", self.cleanup_deadline_s):
-                    sys.stderr.write(f"quit: {self.spec['progid']} still holds documents; left running\n")
-                else:
-                    guarded(lambda: self.app.Quit(), "quit", self.deadline_s)
-                    left_running = False
-        except (DriverRefusal, *_com_errors()) as e:
-            sys.stderr.write(f"quit: {e}\n")
-        try:
-            if left_running and self.alerts_before is not None:
-                guarded(lambda: setattr(self.app, "DisplayAlerts", self.alerts_before), "DisplayAlerts",
-                        self.cleanup_deadline_s)
+            if ending in ("attached", "kept") and self.alerts_before is not None:
+                self._guard(lambda: setattr(self.app, "DisplayAlerts", self.alerts_before), "DisplayAlerts",
+                            self.cleanup_deadline_s)
         except (DriverRefusal, *_com_errors()) as e:
             sys.stderr.write(f"quit: {e}\n")
         finally:
-            held, self.app = [self.app], None
-            try:      # the last reference dropped in the apartment it was made in
-                guarded(lambda: (held.clear(), gc.collect()), "release", self.cleanup_deadline_s)
+            held, self.app, self.owned, self.mine = [self.app, *self.mine], None, None, []
+            try:      # every reference the adapter holds, dropped in the apartment it was made in (PF-12)
+                self._guard(lambda: (held.clear(), gc.collect()), "release", self.cleanup_deadline_s)
             except DriverRefusal as e:
                 sys.stderr.write(f"quit: {e}\n")
+            if owned is not None and owned.job is not None:
+                self._close_job(owned, end, ending)
+
+    def _bounded(self, fn, what: str, end: float):
+        """fn() under the guard, given what is left of the clean-end window that ends at `end` (D-35
+        (1)): the window over is refused like any timeout."""
+        left = end - time.monotonic()
+        if left <= 0:
+            raise DriverRefusal("timeout", f"{what}: the clean-end window is over")
+        return self._guard(fn, what, left)
+
+    def _end_started(self, owned, end: float) -> str:
+        """The bounded end of the instance this adapter started and identified (founder decision D-35,
+        rulings PF-2 and PF-12): inside the clean-end window, before any other call, in this order —
+        (2) every document the driver opened and still holds is closed without saving (the binding's
+        close: Word's SaveChanges=False; PowerPoint's Close saves nothing); (3) the instance's documents
+        are listed by FullName, one foreign only when its FullName is not in `opened`; (4) with a
+        foreign document, the instance is handed to the user — Visible set to COM_TRUE and read back
+        true: True, as comtypes gives Word's VARIANT_BOOL, or COM_TRUE, PowerPoint's msoTrue; never
+        UserControl, which Word's Application cannot set and PowerPoint's does not have — and then,
+        only then, this instance's Job alone is disarmed; (5) one stderr line says so, the process id
+        and the count, never a name. Returns "kept" (handed over), "quit" (nothing foreign: Quit sent)
+        or "ended": a failure, a timeout or a doubt before the disarm — an open the driver never named,
+        a document of its own that will not close, a listing that fails, a Visible that cannot be set
+        or reads back false, the window over — means no disarm, and the Job, closed, takes the instance
+        (D-04)."""
+        try:
+            if self.unnamed_opens:
+                raise DriverRefusal("internal",
+                                    f"{self.unnamed_opens} open(s) whose document the driver never named")
+            for doc in list(self.mine):                                                  # (2)
+                self._bounded(lambda d=doc: d.Close(**self.spec["close"]), "close", end)
+                self._closed(doc)
+            self._bounded(gc.collect, "quit", end)
+            names = self._bounded(lambda: [d.FullName for d in _items(self._documents())], "inventory", end)
+            foreign = sum(1 for name in names if name not in self.opened)                # (3)
+            if not foreign:
+                self._bounded(lambda: self.app.Quit(), "quit", end)
+                return "quit"
+            self._bounded(lambda: setattr(self.app, "Visible", COM_TRUE), "hand-over", end)      # (4)
+            shown = self._bounded(lambda: self.app.Visible, "hand-over", end)
+            if shown is not True and shown != COM_TRUE:     # Word's reads back True, PowerPoint's -1 (PF-12)
+                raise DriverRefusal("internal", f"hand-over: Visible reads back {shown!r}")
+            if owned.job is not None:
+                owned.job.disarm()
+        except Exception as e:  # noqa: BLE001 — any failure before the disarm: no disarm (PF-2)
+            sys.stderr.write(f"quit: process {owned.pid} not handed over ({e}); its Job ends it\n")
+            return "ended"
+        sys.stderr.write(f"quit: process {owned.pid} handed to the user, {foreign} foreign document(s) "
+                         "open in it; its Job disarmed\n")                                # (5)
+        return "kept"
+
+    def _close_job(self, owned, end: float, ending: str) -> None:
+        """The started instance's Job, once every reference is released (D-04): after a Quit, its
+        process waited for what is left of the clean-end window; then both handles closed — armed, the
+        Job ends what is left of the process; disarmed (D-35), the process is the user's."""
+        try:
+            if ending == "quit" and not owned.job.wait(max(0.0, end - time.monotonic())):
+                sys.stderr.write(f"quit: process {owned.pid} still running at the end of the clean-end "
+                                 "window; its Job ends it\n")
+        except OSError as e:
+            sys.stderr.write(f"quit: {e}\n")
+        finally:
+            owned.job.close()
 
 
 # --- the verbs (L-P40) -------------------------------------------------------------------------------

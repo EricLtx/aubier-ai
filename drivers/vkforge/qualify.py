@@ -21,7 +21,9 @@ the re-mined copy disagrees, L-P50) and `unsaved` (the driver said ok, the copy 
 perturbed one). With `fake`, `<work>/fake.json` makes the driver load the repository's fake application
 (L-P19). The driver is this stage's child, inside the stage's Job (the governor), not a job step under
 the harness: the deviation from spec §5.2's "under the harness, supervised" that L-P32 declares. A pass
-killed at its deadline never runs the driver's `_quit`: the Office instance it started stays running.
+killed at its deadline never runs the driver's `_quit`; the Office instance the driver started and
+identified ends with it all the same, through the kill-on-close Job the adapter holds it in (D-04),
+while an instance it attached to — or could not identify (PF-4) — is left as the kill found it.
 """
 import argparse
 import json
@@ -72,7 +74,9 @@ _LATE = object()
 
 def _kill_tree(proc: subprocess.Popen) -> None:
     """The driver and every process it started: taskkill /T on Windows, its session elsewhere. An
-    Office instance a COM call started is not in the tree (DCOM launches it): never killed here."""
+    Office instance a COM call started is not in the tree (DCOM launches it): never killed here — once
+    the adapter has identified it (PF-4), it ends through the adapter's own Job when the driver does
+    (D-04)."""
     if sys.platform == "win32":
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, check=False)
