@@ -162,6 +162,8 @@ l'application (I-3) ; « plus listée » ne compte qu'une écriture 2xx de l'app
 nombre ou un quantificateur devant un nom de conversation au pluriel refuse, sur le texte entier ; un titre court cité
 en entier est expurgé ; un abandon avec un dialogue relevé est KO sécurité, le refus garde son `extra`. Le
 cinquième : « autre(s) » / « other(s) » comme nom, ou après un nombre ou un déterminant, refuse la confirmation.
+Le sixième (le menu vu en direct) : sous un déclencheur qui nomme les actions de la conversation, une seule entrée de
+suppression en liste blanche suffit ; renommer sans entrée de renommage est un refus du pilote (NON TESTÉ).
 
 Environnement (posé par l'hôte) : VK_DRIVER_PROFILE_DIR, VK_DRIVER_WORK_DIR,
 VK_DRIVER_HEADLESS, VK_DRIVER_CHANNEL, VK_DRIVER_HOSTS ; MASKAI_ENTRY_URL
@@ -2154,6 +2156,12 @@ CONFIRM_WEAK_RE = r"^(?:continuer|continue|oui|yes|ok|valider)$"
 # doit être la seule de sa sorte dans le menu (« Supprimer » à côté de « Supprimer définitivement » : refusé).
 MENU_RENAME_WORDS = r"renomm|rename|\btitre\b|\btitle\b"
 MENU_DELETE_WORDS = r"supprim|delete|effac|erase|trash|corbeille"
+# Round 6 (le menu vu en direct le 20/10, M0, 17:57) : le libellé du déclencheur de la ligne qui nomme les actions de
+# la conversation, texte entier replié. Sous un tel déclencheur, l'entrée de renommage n'est plus exigée, mais chaque
+# entrée doit être en liste blanche (une seule de suppression, au plus une de renommage).
+MENU_TRIGGER_LABELS = ("actions de la conversation", "conversation actions", "options de la conversation",
+                       "chat actions", "chat options", "plus d'options", "more options")
+NO_RENAME_ENTRY = "pas d'entrée de renommage dans le menu de la conversation (entrées dans conversation.json)"
 # Round 2 (robustness-1) : la queue d'une entrée qui n'en change pas le sens : des points de suspension, un
 # indice de raccourci (« ⌘⌫ », « Ctrl+Suppr »).
 # Round 3 (I-1) : une seule règle, que le script de la page reçoit telle quelle (a.tail) ; une touche de fonction
@@ -2179,7 +2187,7 @@ def menu_text(text: str | None) -> str:
         out = cut
 
 
-def menu_entry(items: list, want: str) -> tuple[dict | None, str | None]:
+def menu_entry(items: list, want: str, label: str | None = None) -> tuple[dict | None, str | None]:
     """L'entrée du menu d'une conversation à cliquer pour `want` (« renommer » ou « supprimer »). Les
     entrées cliquées sont en liste blanche, sur leur texte replié entier (`menu_rename`, `menu_delete` :
     « Supprimer », « Supprimer la conversation », « Delete chat »… ; revue de la v2.3, I7 ; round 2 : sans
@@ -2191,6 +2199,17 @@ def menu_entry(items: list, want: str) -> tuple[dict | None, str | None]:
     texts = [menu_text(i.get("text")) for i in items]
     if any(re.search(MENU_TOO_WIDE, t) for t in texts):
         return None, "menu refusé, une entrée viserait plus d'une conversation (entrées dans conversation.json)"
+    folded = " ".join(evaluer.fold(label or "").split()).replace("’", "'")
+    if folded in MENU_TRIGGER_LABELS:  # round 6: the trigger names the conversation's actions
+        renames = [i for i, t in zip(items, texts) if re.search(SELECTORS["menu_rename"], t)]
+        deletes = [i for i, t in zip(items, texts) if re.search(SELECTORS["menu_delete"], t)]
+        if (len(renames) + len(deletes) != len(items) or len(deletes) != 1 or len(renames) > 1
+                or any(i.get("disabled") for i in items)):
+            return None, ("pas le menu d'une conversation (sous « actions de la conversation », chaque entrée en liste "
+                          "blanche, une seule de suppression, au plus une de renommage ; entrées dans conversation.json)")
+        if want == "renommer" and not renames:
+            return None, NO_RENAME_ENTRY
+        return (renames or deletes)[0] if want == "renommer" else deletes[0], None
     found = {}
     for how, alike_re, exact_re in (("renommer", MENU_RENAME_WORDS, SELECTORS["menu_rename"]),
                                     ("supprimer", MENU_DELETE_WORDS, SELECTORS["menu_delete"])):
@@ -5120,7 +5139,8 @@ class Recette:
                         else:
                             error = record.get("error") or "le menu de la conversation ne s'ouvre pas"
                     else:
-                        pick, why = menu_entry(menu["items"], how)
+                        pick, why = menu_entry(menu["items"], how,  # round 6: the trigger's own label
+                                               label=(record.get("trigger") or {}).get("trigger_label"))
                         if pick is None:
                             record["closed_menu"] = self._close_menu(page)
                             untested = why
@@ -5677,7 +5697,10 @@ class Recette:
         entries = len((menu.get("menu") or {}).get("items") or [])
         if verdict is not None:  # R2-4: the verdict and the count, the entries in probe.json only
             refused = verdict.get("renommer") or verdict.get("supprimer")
-            menu_text = ("M8-5/M8-6 : menu accepté" if not refused else f"M8-5/M8-6 : menu refusé ({refused})")
+            if verdict.get("renommer") == NO_RENAME_ENTRY and not verdict.get("supprimer"):  # round 6
+                menu_text = "M8-5 : menu sans entrée de renommage ; M8-6 : menu accepté"
+            else:
+                menu_text = ("M8-5/M8-6 : menu accepté" if not refused else f"M8-5/M8-6 : menu refusé ({refused})")
             menu_text += f", {entries} entrée{'s' if entries != 1 else ''}"
         else:
             menu_text = f"menu de la première conversation : {menu.get('error') or 'non lu'}"
@@ -5754,7 +5777,8 @@ class Recette:
         if menu is not None:
             record["closed"] = self._close_menu(page)
             # robustness-1: what renommer_conversation and supprimer_conversation would decide on this menu
-            record["verdict"] = {how: menu_entry(menu["items"], how)[1] for how in ("renommer", "supprimer")}
+            label = (record.get("trigger") or {}).get("trigger_label")  # round 6
+            record["verdict"] = {how: menu_entry(menu["items"], how, label=label)[1] for how in ("renommer", "supprimer")}
         record["trigger"] = {k: v for k, v in (record.get("trigger") or {}).items() if k != "html"} or None
         return record
 

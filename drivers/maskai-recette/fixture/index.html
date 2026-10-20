@@ -128,7 +128,9 @@
      `searchunknown` (the palette's items lead nowhere the pilot knows), `searchentrydead` (the ⌘K entry opens
      nothing), `nativedelay` (with confirmnative, the confirm opens 600 ms after the click), `slowrollback`
      (with deletefail, the row comes back 4 s after the refusal), `telemetry` (each delete also POSTs to
-     another host, which answers 204). Words: TOAST_HOST (a toast naming an internal host 0.8 s into
+     another host, which answers 204); round 6: `triggerlabel=…` (the row trigger's aria-label, « Actions de
+     la conversation » on the live site), `destructive` (the entries as shadcn destructive items, a trash
+     icon on the delete one). Words: TOAST_HOST (a toast naming an internal host 0.8 s into
      the question), ALERT_HOST (an alert naming one at the end of the stream), UNKNOWN_MODAL_TITLES (a
      window that lists the sidebar's titles). Counters: `__theme_clicks`, `__sidebar_select_clicks`,
      `__clear_clicks`, `__sidebar_filter_value`. -->
@@ -252,11 +254,11 @@ for (const k of ["nodetails", "revealed", "controls", "nostructure", "renamedial
                  "surveyonrename", "surveyother", "recents", "echo", "searchfail", "searchfilter", "nonewlink",
                  "clearbutton", "senddisabled", "micdictation", "themetoggle", "sidebarselect", "modeldialog",
                  "feedbackincomposer", "menuspanhint", "searchsnippet", "searchunknown", "searchentrydead",
-                 "nativedelay", "slowrollback", "telemetry"]) {
+                 "nativedelay", "slowrollback", "telemetry", "destructive"]) {
   if (new URLSearchParams(location.search).get(k) === "1") sessionStorage.setItem("bench-" + k, "1");
 }
 for (const k of ["menuitems", "searchentry", "feedbacklabel", "confirmtext", "canceltext", "confirmlabel",
-                 "grouplabel", "groupitems", "menutitle"]) {  // valued flags
+                 "grouplabel", "groupitems", "menutitle", "triggerlabel"]) {  // valued flags
   const v = new URLSearchParams(location.search).get(k);
   if (v !== null) sessionStorage.setItem("bench-" + k, v);
 }
@@ -323,6 +325,13 @@ if (value("menuitems")) {  // the conversation menu's own entries
     it.setAttribute("role", "menuitem");
     it.dataset.action = /renomm|rename/i.test(label) ? "rename" : /suppr|delete/i.test(label) ? "delete" : "share";
     it.textContent = label;
+    if (flag("destructive")) {  // round 6: as on the live site, a shadcn destructive item with a trash icon
+      it.dataset.slot = "dropdown-menu-item";
+      if (it.dataset.action === "delete") {
+        it.dataset.variant = "destructive";
+        it.insertAdjacentHTML("afterbegin", '<svg class="lucide lucide-trash2" aria-hidden="true"></svg>');
+      }
+    }
     $("conv-menu").appendChild(it);
   }
 }
@@ -555,7 +564,7 @@ function addConversation(id, title) {
   t.className = "conv-menu";
   t.setAttribute("aria-haspopup", "menu");
   t.setAttribute("aria-expanded", "false");
-  t.setAttribute("aria-label", flag("rowlabels") ? "Options de « " + title + " »" : "Options");
+  t.setAttribute("aria-label", value("triggerlabel") || (flag("rowlabels") ? "Options de « " + title + " »" : "Options"));
   if (flag("rowlabels")) t.style.display = "inline-block";  // shown without hover, as some sidebars do
   t.textContent = "⋯";
   t.onclick = (e) => { e.stopPropagation(); openMenu(li, t); };

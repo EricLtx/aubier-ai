@@ -4195,5 +4195,93 @@ def _r5_generate():
 _r5_generate()
 
 
+# -- Fix round 6 (the live M0 probe of 2026-10-20 17:57): a menu with a single delete entry under a trigger labelled
+# « Actions de la conversation » is the conversation's menu; the rename entry is no longer required there.
+class FixRound6Units(unittest.TestCase):
+    """Round 6: the menu rule (coordinator's ruling)."""
+
+    @staticmethod
+    def items(drv, labels):
+        return [{"text": drv.evaluer.fold(label), "label": label, "disabled": False} for label in labels]
+
+    def test_a_single_delete_entry_under_a_conversation_actions_trigger(self):
+        drv = load_driver()
+        items = self.items(drv, ["Supprimer"])
+        pick, why = drv.menu_entry(items, "supprimer", label="Actions de la conversation")
+        self.assertEqual((pick["label"], why), ("Supprimer", None))
+        pick, why = drv.menu_entry(items, "renommer", label="Actions de la conversation")
+        self.assertIsNone(pick)
+        self.assertIn("pas d'entrée de renommage dans le menu de la conversation", why)
+
+    def test_the_trigger_labels_allowed(self):
+        drv = load_driver()
+        items = self.items(drv, ["Supprimer"])
+        for label in ("Actions de la conversation", "Conversation actions", "Options de la conversation",
+                      "Chat actions", "Chat options", "Plus d'options", "More options", "  actions DE LA conversation "):
+            self.assertIsNotNone(drv.menu_entry(items, "supprimer", label=label)[0], label)
+        for label in ("Options", "Actions", None, "Actions de la conversation « Recette »"):
+            self.assertIsNone(drv.menu_entry(items, "supprimer", label=label)[0], label)
+
+    def test_an_entry_outside_the_allow_list_is_refused(self):
+        drv = load_driver()
+        for labels in (["Archiver"], ["Supprimer", "Partager"], ["Supprimer", "Supprimer définitivement"],
+                       ["Renommer", "Renommer", "Supprimer"]):
+            self.assertIsNone(drv.menu_entry(self.items(drv, labels), "supprimer", label="Actions de la conversation")[0],
+                              labels)
+
+    def test_a_single_entry_that_targets_several_conversations_is_refused(self):
+        drv = load_driver()
+        self.assertIsNone(drv.menu_entry(self.items(drv, ["Supprimer toutes les conversations"]), "supprimer",
+                                         label="Actions de la conversation")[0])
+
+
+@unittest.skipUnless(HAVE_PLAYWRIGHT, NO_PLAYWRIGHT)
+class FixRound6OnFixture(FixtureBench):
+    """Round 6 on the bench: the live menu's shape."""
+
+    refused = FixRound2OnFixture.refused
+    line = FixRound2OnFixture.line
+    bench = FixRound2OnFixture.bench
+    start = FixRound2OnFixture.start
+    play_m8_1 = FixRound2OnFixture.play_m8_1
+    q = staticmethod(FixRound2OnFixture.q)
+
+    def test_the_live_menu_deletes_and_never_renames(self):
+        """A single destructive « Supprimer » under « Actions de la conversation »: the probe says M8-5 has no
+        rename entry and M8-6 is accepted; M8-5 is NON TESTÉ, nothing clicked; M8-6 confirms and deletes."""
+        drv, recette, A, page = self.bench(self.q(triggerlabel="Actions de la conversation", menuitems="Supprimer",
+                                                  destructive="1"))
+        self.play_m8_1(A)
+        self.assertIn("M8-5 : menu sans entrée de renommage ; M8-6 : menu accepté",
+                      self.act(A, "sonder_interface")[0]["text"])
+        picks = page.evaluate("() => window.__menu_picks.length")
+        err = self.refused(drv, A, "renommer_conversation", {"case": "M8-5"})
+        self.assertIn("refus du pilote : pas d'entrée de renommage dans le menu de la conversation", err.detail)
+        self.assertEqual(page.evaluate("() => window.__menu_picks.length"), picks, "nothing clicked")
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-5"})[0]["verdict"], "NON TESTÉ")
+        self.act(A, "supprimer_conversation", {"case": "M8-6"})
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-6"})[0]["verdict"], "OK")
+        self.assertEqual(len(page.evaluate("() => window.__deleted")), 1)
+
+    def test_a_single_entry_outside_the_allow_list_is_refused(self):
+        """The single entry reads « Archiver »: the probe says refused; M8-6 is NON TESTÉ, nothing deleted."""
+        drv, recette, A, page = self.bench(self.q(triggerlabel="Actions de la conversation", menuitems="Archiver",
+                                                  destructive="1"))
+        self.play_m8_1(A)
+        self.assertIn("menu refusé", self.act(A, "sonder_interface")[0]["text"])
+        self.refused(drv, A, "supprimer_conversation", {"case": "M8-6"})
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-6"})[0]["verdict"], "NON TESTÉ")
+        self.assertEqual(page.evaluate("() => window.__deleted"), [])
+
+    def test_a_single_entry_for_every_conversation_is_refused(self):
+        """« Supprimer toutes les conversations » alone: refused, NON TESTÉ, nothing deleted (a pin)."""
+        drv, recette, A, page = self.bench(self.q(triggerlabel="Actions de la conversation",
+                                                  menuitems="Supprimer toutes les conversations", destructive="1"))
+        self.play_m8_1(A)
+        self.refused(drv, A, "supprimer_conversation", {"case": "M8-6"})
+        self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-6"})[0]["verdict"], "NON TESTÉ")
+        self.assertEqual(page.evaluate("() => window.__deleted"), [])
+
+
 if __name__ == "__main__":
     unittest.main()
