@@ -112,10 +112,10 @@ The pre-flight scan of this plan (2026-10-20, at `6ac4480`) led to two founder d
 - **PF-17** (Task 3's review, the Critical): a start refused at its deadline holds a process only if the start reached `CreateObject`; held in the attach branch, it holds nothing and closes no box. Task 3.
 - **PF-18** (Task 3's review): the PF-2 order test logs the inventory, so a `quit()` that skips or reorders it fails. Task 3.
 - **PF-19** (Task 3's review): every real-Office test runs only with the opt-in `VK_FORGE_NODE_OFFICE=1`, set only in the node-step commands; the attaching real-Word tests skip when a Word runs. Task 3.
-- **PF-20** (Task 3's review): the node tests stop only the PIDs they started, never every PowerPoint or Word. Task 3.
+- **PF-20** (Task 3's review): the node tests stop only the PIDs they started, never every PowerPoint or Word; test (a) quits only a PowerPoint it started; while Steps 8 and 9 run, no PowerPoint may be started and the founder opens no Office document. Task 3.
 - **PF-21** (Task 3's review): the TCB and the runbook say that PowerPoint is single-instance, so a presentation the user opens while a learned PowerPoint driver runs joins the driver's instance and shares its fate; the inventory lists the documents of Protected View windows. Whether a PowerPoint driver ends its instance after each act is the founder's (register D-37). Task 3.
 - **PF-22** (Task 3's review): the template `_quit` docstring, the `END_WAIT_S` comment and the `link.rs` comment say what D-04 and D-35 do; the pinned golden moves with them. Task 3.
-- **PF-23** (Task 3's fix round): a start that times out and whose Job Windows refuses leaves no COM reference to quit: the adapter then ends that one process by its PID, after checking again that the PID still names the process it identified (same image, same DcomLaunch parent, same creation time), and the session refuses `precondition`. D-04 to the letter. Task 3.
+- **PF-23** (Task 3's fix round): a start that times out and whose Job Windows refuses leaves no COM reference to quit: the adapter then ends that one process by its PID, after checking again that the PID still names the process it identified (same image, same DcomLaunch parent, same creation time), and the session refuses `precondition`; the same end by PID follows a PF-16 quit that fails. One exception remains (PF-25): an instance whose PID check fails or cannot be made is not terminated, outlives the driver, and its `job: … not held` line says `not ended: …` — to put to the founder with the batched questions. Task 3.
 - **PF-12, precision** (Task 3's review, quality-6): Windows cannot take a process out of a Job; the instance handed over stays in its Job, disarmed (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` cleared), and no handle of the adapter reaches it any more: "outside any Job" in PF-12 reads "in a disarmed Job no handle reaches".
 
 ## File Structure
@@ -2634,12 +2634,14 @@ Expected: all pass. On Windows `test_the_snapshot_sees_this_process_by_its_execu
 
 - [ ] **Step 8: On the node, the real Word (controller, when the founder's session allows; it starts and kills a Word of its own)**
 
-Close every Word window first (a running Word would be attached to, and the test skips saying so). Then:
+Close every Word window first (a running Word would be attached to, and the test skips saying so). The tests are node steps: they run only with `VK_FORGE_NODE_OFFICE=1` (ruling PF-19), set for these commands alone — the commands to run are those of the Task 3 report's node steps; no PowerPoint is started and the founder opens no Office document while Steps 8 and 9 run (PF-20). Then:
 
 ```powershell
+$env:VK_FORGE_NODE_OFFICE = "1"
 & $PY -I -m unittest discover -s drivers/vkforge/tests -t . -p test_generate.py -k takes_the_word_it_started -v
 & $PY -I -m unittest discover -s drivers/vkforge/tests -t . -p test_generate.py -k outlives_its_run -v
 & $PY -I -m unittest discover -s drivers/vkforge/tests -t . -p test_runtime.py -k real_word -v
+Remove-Item Env:VK_FORGE_NODE_OFFICE
 Get-Process WINWORD -ErrorAction SilentlyContinue
 ```
 
@@ -2653,10 +2655,12 @@ The founder's own PowerPoint is never touched. First:
 Get-Process POWERPNT -ErrorAction SilentlyContinue
 ```
 
-If it lists a `POWERPNT`, both steps are skipped and the skip is reported in the chantier's ledger (the two tests skip too, saying so). Otherwise:
+If it lists a `POWERPNT`, both steps are skipped and the skip is reported in the chantier's ledger (the two tests skip too, saying so). The tests run only with `VK_FORGE_NODE_OFFICE=1` (ruling PF-19), set for this command alone, and no PowerPoint may be started while it runs (PF-20). Otherwise:
 
 ```powershell
+$env:VK_FORGE_NODE_OFFICE = "1"
 & $PY -I -m unittest discover -s drivers/vkforge/tests -t . -p test_generate.py -k powerpoint -v
+Remove-Item Env:VK_FORGE_NODE_OFFICE
 Get-Process POWERPNT -ErrorAction SilentlyContinue
 ```
 
