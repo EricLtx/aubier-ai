@@ -196,10 +196,13 @@ jobs:
   driver-browser:
     # The MaskAI driver against its local fixture page, headless Chromium: the
     # eleven actions, the dialog guard and the host allow-list, then the
-    # recette scripts (evaluator). Every push, like `test`: the
-    # fixture tests take about 90 s, nothing here pulls a model or a container.
+    # recette scripts (evaluator). Every push, like `test`: nothing here pulls a
+    # model or a container. The fixture bench takes about 25 min on a laptop
+    # since the v2.3 review's round 2 (214 tests; the M8 actions wait for a state
+    # held 2 s, up to 3 × a case's budget), hence the bound below; the step is
+    # verbose, and a run past its own bound dumps every thread's stack.
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -215,7 +218,7 @@ jobs:
       - name: The driver contract tests (hello, framing, hash_dir)
         run: python -I -m unittest discover -s drivers -p "test_*.py" -t .
       - name: The MaskAI driver against its fixture page
-        run: python -I -m unittest discover -s drivers/maskai-recette/tests -t .
+        run: timeout --signal=ABRT 40m python -I -X faulthandler -m unittest discover -s drivers/maskai-recette/tests -t . -v
       - name: The learning pipeline (vkforge), recorded catalogues and the fake application
         run: python -I -m unittest discover -s drivers/vkforge/tests -t .
       - name: vkforge runs as the kernel spawns it (the script path under -I, never -m)
