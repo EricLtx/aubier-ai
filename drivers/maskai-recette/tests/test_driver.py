@@ -33,6 +33,56 @@ NO_PLAYWRIGHT = ("playwright is not importable here: run drivers/maskai-recette/
 _instances = 0
 
 
+def declared_evidence(manifest: str) -> dict:
+    """Round 7: the evidence names a manifest of this driver declares, per action."""
+    path = manifest if os.path.isabs(manifest) else os.path.join(DRIVER_DIR, manifest)
+    with open(path, encoding="utf-8") as f:
+        return {a["name"]: set(a.get("evidence") or []) for a in json.load(f)["actions"]}
+
+
+def evidence_reachable() -> dict:
+    """Round 7: every evidence name the driver can write, per action, read from its source: the literal name of each
+    `ev.json`, `ev.add`, `ev.html`, `ev.screenshot` call, followed through the methods each action calls; a page
+    action adds what the common envelope can write (`_wrap`, `_guard`, `_after`: the dialog's raw message)."""
+    import ast
+    with open(os.path.join(DRIVER_DIR, "driver.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Recette")
+    methods = {f.name: f for f in cls.body if isinstance(f, ast.FunctionDef)}
+    names, calls = {}, {}
+    for mname, fn in methods.items():
+        found, called = set(), set()
+        for node in ast.walk(fn):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)):
+                continue
+            if node.func.value.id in ("ev", "evidence") and node.func.attr in ("json", "add", "html", "screenshot"):
+                lits = [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+                found.update(lits[:1])
+            if node.func.value.id == "self" and node.func.attr in methods:
+                called.add(node.func.attr)
+        names[mname], calls[mname] = found, called
+
+    def reach(*starts):
+        seen, todo, out = set(), list(starts), set()
+        while todo:
+            m = todo.pop()
+            if m in seen:
+                continue
+            seen.add(m)
+            out |= names[m]
+            todo.extend(calls[m])
+        return out
+    actions_fn = methods["actions"]
+    page_actions = next(ast.literal_eval(n.value) for n in ast.walk(actions_fn)
+                        if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", None) == "browser")
+    local_actions = next(ast.literal_eval(n.value) for n in ast.walk(actions_fn)
+                         if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", None) == "local")
+    out = {a: reach(a, "_wrap", "_guard", "_after") for a in page_actions}
+    out.update({a: reach(a) for a in local_actions})
+    return out
+
+
 def load_driver():
     """A fresh module instance of driver.py: what a relaunched driver process would load."""
     global _instances
@@ -535,10 +585,23 @@ class FixtureBench(unittest.TestCase):
                               "budget_s": 5, "nfr": ["veracite"], "must": ["bonjour"], "must_not": [], "pii": []}
 
     def act(self, actions, name, args=None):
-        result, evidence = actions[name](args or {}, self.tmp())
+        """The fake kernel (round 7): as the real one, it refuses an evidence name the manifest does not declare
+        for the action, on a result and on a refusal alike."""
+        try:
+            result, evidence = actions[name](args or {}, self.tmp())
+        except Exception as refusal:
+            if hasattr(refusal, "reason"):
+                self.check_declared(name, getattr(refusal, "evidence", None) or [])
+            raise
+        self.check_declared(name, evidence)
         for e in evidence:
             self.assertTrue(os.path.isfile(e["path"]), e)
         return result, evidence
+
+    def check_declared(self, action, evidence):
+        undeclared = sorted({e["name"] for e in evidence} - declared_evidence("manifest-fixture.json")[action])
+        self.assertEqual(undeclared, [], f"evidence not declared: {undeclared} is not a name the manifest allows "
+                                         f"for {action}")
 
     @staticmethod
     def evidence_json(evidence, name):
@@ -4281,6 +4344,34 @@ class FixRound6OnFixture(FixtureBench):
         self.refused(drv, A, "supprimer_conversation", {"case": "M8-6"})
         self.assertEqual(self.act(A, "verdict_oracle", {"case": "M8-6"})[0]["verdict"], "NON TESTÉ")
         self.assertEqual(page.evaluate("() => window.__deleted"), [])
+
+
+class FixRound7Units(unittest.TestCase):
+    """Round 7: every evidence name the driver can write is declared for its action, in both manifests and in the
+    two contract examples (the live act M1-J6a was refused « evidence not declared: notices.json »)."""
+
+    def test_the_audit_sees_the_known_writes(self):
+        reach = evidence_reachable()
+        self.assertIn("notices.json", reach["poser_question"])
+        self.assertIn("dialog.json", reach["renommer_conversation"])
+        self.assertIn("journal.jsonl", reach["verdict_oracle"])
+        self.assertNotIn("dialog.json", reach["verdict_oracle"])
+
+    def check(self, manifest):
+        declared = declared_evidence(manifest)
+        missing = {a: sorted(names - declared.get(a, set())) for a, names in evidence_reachable().items()}
+        self.assertEqual({a: m for a, m in missing.items() if m}, {}, manifest)
+
+    def test_the_live_manifest_declares_every_name(self):
+        self.check("manifest.json")
+
+    def test_the_fixture_manifest_declares_every_name(self):
+        self.check("manifest-fixture.json")
+
+    def test_the_contract_examples_declare_every_name(self):
+        repo = os.path.dirname(os.path.dirname(DRIVER_DIR))
+        for name in ("valid/maskai.json", "invalid/memory_below_floor.json"):
+            self.check(os.path.join(repo, "contracts", "examples", "driver_manifest", *name.split("/")))
 
 
 if __name__ == "__main__":
