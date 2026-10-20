@@ -68,7 +68,8 @@ class CorrectTest(unittest.TestCase):
         recette._save_observations()
         with open(self.journal, "a", encoding="utf-8") as f:  # lines 3, 4 and 5
             f.write(hand_line("N7-1", "OK", "valeurs attendues présentes"))
-            f.write(hand_line("M3-B1", "KO", "réponse signée « sans bannière », modèle choisi « claude-haiku-4-5 »"))
+            f.write(hand_line("M3-B1", "KO", "réponse signée « sans bannière », modèle choisi « claude-haiku-4-5 »",
+                              timing_s=4.0))  # the observation's timing: the line it judged (robustness-5)
             # the same verdict and NFR as today's judgement, another evidence (m8)
             f.write(hand_line("N3-1", "OK", "une preuve d'hier", nfr=["veracite"], timing_s=2.0))
 
@@ -162,6 +163,36 @@ class CorrectTest(unittest.TestCase):
         self.assertIn("--observations", items[0]["status"])
         items, code = self.correct.run(self.work, ["N1-1"], "reprise", out=io.StringIO(), observations=aside)
         self.assertEqual((code, items[0]["status"], items[0]["line"]["verdict"]), (0, "à corriger", "OK"))
+
+    def test_robustness_5_an_observation_that_is_not_the_line_s_is_never_replayed(self):
+        """robustness-5 (review of v2.3, round 2): a resumption, M9-1 asked again and journaled OK by the driver
+        (its observation stamped with that line); the observation set aside at the resumption is the attempt
+        before, never judged: refused, never a KO correction. The stamped one replays unchanged."""
+        drv = self.correct.load_driver(self.correct.DEFAULT_DRIVER)
+        aside = os.path.join(self.work, "observations-essai1.json")
+        with open(os.path.join(self.work, "observations.json"), encoding="utf-8") as f:
+            before = json.load(f)
+        before["M9-1"] = {"answer": "Je ne sais pas.", "timing_s": 5.0, "new_answer": True}  # never judged
+        with open(aside, "w", encoding="utf-8") as f:
+            json.dump(before, f, ensure_ascii=False)
+        profile = tempfile.mkdtemp(prefix="correct-profile-")
+        self.addCleanup(shutil.rmtree, profile, True)
+        recette = drv.Recette(env={"VK_DRIVER_WORK_DIR": self.work, "VK_DRIVER_PROFILE_DIR": profile,
+                                   "VK_DRIVER_HOSTS": "app.maskai.fr"})
+        recette.observations["M9-1"] = {"answer": "Le dépôt de garantie est limité à un mois de loyer hors charges "
+                                                  "(loi du 6 juillet 1989, article 22).", "timing_s": 2.8, "new_answer": True}
+        evidence = tempfile.mkdtemp(prefix="correct-ev-")
+        self.addCleanup(shutil.rmtree, evidence, True)
+        recette.actions()["verdict_oracle"]({"case": "M9-1"}, evidence)
+        self.assertEqual(self.lines()[-1]["verdict"], "OK")
+        out = io.StringIO()
+        items, code = self.correct.run(self.work, ["M9-1"], "essai", observations=aside, out=out)
+        self.assertEqual(code, 1)
+        self.assertTrue(items[0]["status"].startswith("erreur"), items[0]["status"])
+        self.assertIn("pas celle de la ligne en vigueur", items[0]["status"])
+        self.assertIsNone(items[0]["line"])
+        items, code = self.correct.run(self.work, ["M9-1"], "essai", out=io.StringIO())
+        self.assertEqual((code, items[0]["status"]), (0, "inchangé : rien à corriger"))
 
     def test_the_command_line(self):
         before = self.bytes()

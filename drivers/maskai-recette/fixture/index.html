@@ -99,7 +99,34 @@
      « Filtrer… » field in the sidebar), `pinbutton` (a « Pin action » button inside each row's link),
      `rowlabels` (each row's menu button shown without hover and labelled « Options de « <its title> » »). The
      counters `__rating_clicks`, `__decoy_confirms`, `__pin_clicks`, `__group_menu_opens`, `__filter_value`
-     say what was touched. -->
+     say what was touched.
+     Fix round 2 of v2.3 (.superpowers/fix-round-2.md): a rename sends PATCH and a delete DELETE
+     /api/conversation/<id> before the screen changes. Valued flags `?confirmlabel=…` (the confirm button's
+     label), `?grouplabel=div` (a shadcn group label, div[data-sidebar=group-label], instead of an <h3>),
+     `?groupitems=A,B` (the group menu's entries), `?menutitle=trunc|split|upper` (with `menunames`: the
+     title cut, split across nodes, or upper-cased by CSS); `?confirmtext=…` may hold « {title} ». Boolean
+     flags: `confirmnative` (the delete entry asks through window.confirm), `confirmalert` (the confirm
+     button's handler opens an alert), `deletedirect` (the delete entry deletes at once, no window),
+     `cascade` (the delete takes another row with it), `deleteempties` (the delete entry empties the
+     list for 4 s and deletes nothing), `deletefail` (an optimistic removal the server refuses: the row comes
+     back), `slowdelete` (the row goes 3.4 s after the confirm), `nodeleterequest` (the row goes with no
+     request), `slowrename` (the inline field stays 3 s after Enter), `rowtrigger` (grouped rows get their own
+     span[role=button] menu trigger), `rowbadge` (a hidden « Épinglée » before each title), `rowtime` (« 2 h »
+     after each title, in its link), `menushortcut` (a ⌘⌫ hint in the delete entry), `surveyinput` (the
+     survey has a text input, focused when it opens), `surveyonrename` (« Renommer » brings the survey, the
+     inline field 1 s later), `surveyother` (the feedback entry opens a window that is not the known
+     survey), `recents` (the palette lists five recent conversations before any typing, and searches in
+     1.5 s), `echo` (the palette's only item echoes the query), `searchfail` (typing never changes the
+     palette's list), `searchfilter` (a cmdk filter in the sidebar, visible before any key), `nonewlink` (no
+     /new link), `clearbutton` (a « Effacer et démarrer une nouvelle conversation » button in the page),
+     `senddisabled` (the composer's send disabled, Enter sends nothing), `micdictation` (1 s after a send,
+     the dictation button reads « Stop dictation »), `themetoggle` (a button[data-mode] theme toggle before
+     the composer), `sidebarselect` (a listbox button in the sidebar), `modeldialog` (the model button
+     opens a confirm on the next tick), `feedbackincomposer` (the « Send feedback » button moved into the
+     composer, after its send button). Words: TOAST_HOST (a toast naming an internal host 0.8 s into
+     the question), ALERT_HOST (an alert naming one at the end of the stream), UNKNOWN_MODAL_TITLES (a
+     window that lists the sidebar's titles). Counters: `__theme_clicks`, `__sidebar_select_clicks`,
+     `__clear_clicks`, `__sidebar_filter_value`. -->
 <aside data-slot="sidebar">
   <nav aria-label="Main navigation">
     <a href="/new" data-slot="button" aria-label="Nouvelle conversation">Nouvelle conversation</a>
@@ -140,6 +167,11 @@
   <button type="button" data-slot="popover-close" aria-label="Fermer">&times;</button>
 </div>
 <div id="mystery" role="dialog" hidden>Une fenêtre que personne n'a annoncée. <button type="button">OK</button></div>
+<div id="survey2" role="dialog" data-slot="dialog-content" aria-modal="true" hidden>
+  <h2>Votre avis</h2>
+  <p>Dites-nous tout.</p>
+  <button type="button" id="survey2-close" aria-label="Fermer">&times;</button>
+</div>
 <div id="avis" role="dialog" data-slot="dialog-content" aria-modal="true" hidden>
   <h2>Votre avis</h2>
   <div role="radiogroup" data-slot="radio-group">
@@ -209,17 +241,24 @@ Object.assign(window, { __menu_opens: [], __menu_picks: [], __renamed: {}, __del
 // ?nomic=1: kept in sessionStorage, the page pushes /conversation/<id> URLs that drop the query.
 for (const k of ["nodetails", "revealed", "controls", "nostructure", "renamedialog", "nokbd", "nomic",
                  "kbdmic", "ratings", "menunames", "grouped", "noconfirm", "decoydialog", "staledelete",
-                 "convonupload", "renamenofield", "filterfield", "pinbutton", "rowlabels"]) {
+                 "convonupload", "renamenofield", "filterfield", "pinbutton", "rowlabels", "confirmnative",
+                 "confirmalert", "deletedirect", "cascade", "deleteempties", "deletefail", "slowdelete",
+                 "nodeleterequest", "slowrename", "rowtrigger", "rowbadge", "rowtime", "menushortcut", "surveyinput",
+                 "surveyonrename", "surveyother", "recents", "echo", "searchfail", "searchfilter", "nonewlink",
+                 "clearbutton", "senddisabled", "micdictation", "themetoggle", "sidebarselect", "modeldialog",
+                 "feedbackincomposer"]) {
   if (new URLSearchParams(location.search).get(k) === "1") sessionStorage.setItem("bench-" + k, "1");
 }
-for (const k of ["menuitems", "searchentry", "feedbacklabel", "confirmtext", "canceltext"]) {  // valued flags
+for (const k of ["menuitems", "searchentry", "feedbacklabel", "confirmtext", "canceltext", "confirmlabel",
+                 "grouplabel", "groupitems", "menutitle"]) {  // valued flags
   const v = new URLSearchParams(location.search).get(k);
   if (v !== null) sessionStorage.setItem("bench-" + k, v);
 }
 const flag = (k) => sessionStorage.getItem("bench-" + k) === "1";
 const value = (k) => sessionStorage.getItem("bench-" + k);
 Object.assign(window, { __rating_clicks: 0, __decoy_confirms: 0, __pin_clicks: 0, __group_menu_opens: 0,
-                        __group_picks: [], __filter_value: null });
+                        __group_picks: [], __filter_value: null, __theme_clicks: 0, __sidebar_select_clicks: 0,
+                        __clear_clicks: 0, __sidebar_filter_value: null });
 const SEARCHENTRY = value("searchentry");
 if (SEARCHENTRY === "div" || SEARCHENTRY === "link") {  // the ⌘K entry as a plain div, or as a link
   const entry = document.createElement(SEARCHENTRY === "div" ? "div" : "a");
@@ -239,6 +278,38 @@ if (flag("filterfield")) {  // a field of the sidebar that is no rename field an
 if (value("feedbacklabel")) $("feedback").setAttribute("aria-label", value("feedbacklabel"));
 if (value("confirmtext")) $("confirm-delete").querySelector("p").textContent = value("confirmtext");
 if (value("canceltext")) $("delete-cancel").textContent = value("canceltext");
+if (value("confirmlabel")) $("delete-confirm").textContent = value("confirmlabel");
+if (flag("surveyinput"))  // a text field in the survey, which Radix focuses when the survey opens (registry-7)
+  $("avis-text").insertAdjacentHTML("beforebegin", '<input type="text" id="avis-subject" aria-label="Sujet">');
+if (value("groupitems")) value("groupitems").split(",").forEach((t, i) => {
+  const it = $("group-menu").querySelectorAll("[role=menuitem]")[i];
+  if (it) it.textContent = t;
+});
+if (flag("searchfilter")) {  // a cmdk filter in the sidebar, visible before any key (click-targets-7)
+  $("search-entry").insertAdjacentHTML("afterend", '<div cmdk-root id="sidebar-filter"><input cmdk-input type="text" '
+    + 'placeholder="Filtrer les conversations" id="sidebar-filter-input"></div>');
+  $("sidebar-filter-input").addEventListener("input", (e) => { window.__sidebar_filter_value = e.target.value; });
+}
+if (flag("themetoggle")) {  // a data-mode button before the composer that is no web toggle (click-targets-5)
+  $("messages").insertAdjacentHTML("beforebegin", '<button type="button" id="theme" data-mode="light" '
+    + 'aria-label="Activer le mode sombre">◐</button>');
+  $("theme").onclick = () => {
+    window.__theme_clicks += 1;
+    const dark = $("theme").dataset.mode === "light";
+    $("theme").dataset.mode = dark ? "dark" : "light";
+    $("theme").setAttribute("aria-label", dark ? "Désactiver le mode sombre" : "Activer le mode sombre");
+  };
+}
+if (flag("sidebarselect")) {  // a listbox button of the sidebar that is no model button (click-targets-5)
+  $("search-entry").insertAdjacentHTML("beforebegin", '<button type="button" id="sidebar-select" aria-haspopup="listbox" '
+    + 'aria-label="Espace : Perso">Perso</button>');
+  $("sidebar-select").onclick = () => { window.__sidebar_select_clicks += 1; };
+}
+if (flag("clearbutton")) {  // a button that says « nouvelle conversation » and clears the screen (click-targets-8)
+  $("messages").insertAdjacentHTML("beforebegin", '<button type="button" id="clear" aria-label="Nouvelle conversation '
+    + '(efface l\'écran)">Effacer et démarrer une nouvelle conversation</button>');
+  $("clear").onclick = () => { window.__clear_clicks += 1; $("messages").innerHTML = ""; };
+}
 if (value("menuitems")) {  // the conversation menu's own entries
   $("conv-menu").innerHTML = "";
   for (const label of value("menuitems").split(",")) {
@@ -250,6 +321,9 @@ if (value("menuitems")) {  // the conversation menu's own entries
   }
 }
 for (const it of $("conv-menu").querySelectorAll("[role=menuitem]")) it.dataset.base = it.textContent;
+if (flag("menushortcut"))  // shadcn's DropdownMenuShortcut inside the delete entry (robustness-1)
+  for (const it of $("conv-menu").querySelectorAll('[role=menuitem][data-action="delete"]'))
+    it.insertAdjacentHTML("beforeend", '<span data-slot="dropdown-menu-shortcut">⌘⌫</span>');
 const NODETAILS = sessionStorage.getItem("bench-nodetails") === "1";
 const REVEALED = sessionStorage.getItem("bench-revealed") === "1";
 const CONTROLS = sessionStorage.getItem("bench-controls") === "1";
@@ -295,9 +369,12 @@ $("prompt").addEventListener("input", () => {
   }, 300);
 });
 $("prompt").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!flag("senddisabled")) send(); }
 });
 $("send").onclick = send;
+if (flag("senddisabled")) $("send").disabled = true;  // a document still processing, say (click-targets-3)
+if (flag("feedbackincomposer")) $("send").insertAdjacentElement("afterend", $("feedback"));  // in the composer box
+if (flag("modeldialog")) $("model").addEventListener("click", () => setTimeout(() => confirm("pendant le choix du modèle"), 0));
 $("stop").onclick = () => {
   if (state.generating) { state.generating.stopped = true; state.generating.controller.abort(); }
 };
@@ -412,10 +489,19 @@ function attach(name) {
 }
 
 // -- conversations, and the survey that follows a generation left in flight -------------
-function showSurvey() { window.__survey_shown += 1; $("avis").hidden = false; }
+function showSurvey() {
+  window.__survey_shown += 1;
+  $("avis").hidden = false;
+  if ($("avis-subject")) $("avis-subject").focus();  // as Radix does: the first field takes the focus
+}
 for (const r of $("avis").querySelectorAll("[role=radio]")) r.onclick = () => { window.__survey_answered = true; };
 $("avis-send").onclick = () => { window.__survey_answered = true; window.__survey_sent += 1; $("avis").hidden = true; };
-$("feedback").onclick = () => { window.__feedback_opens += 1; showSurvey(); };
+$("feedback").onclick = () => {
+  window.__feedback_opens += 1;
+  if (flag("surveyother")) { $("survey2").hidden = false; return; }  // a window that is not the known survey
+  showSurvey();
+};
+$("survey2-close").onclick = () => { $("survey2").hidden = true; };
 $("avis").querySelector("[data-slot=dialog-close]").onclick = () => { $("avis").hidden = true; };
 if (sessionStorage.getItem("survey-pending")) {
   sessionStorage.removeItem("survey-pending");
@@ -451,6 +537,8 @@ function addConversation(id, title) {
   const a = document.createElement("a");
   a.href = "/conversation/" + id;
   a.textContent = title;
+  if (flag("rowbadge")) a.insertAdjacentHTML("afterbegin", '<span class="sr-only">Épinglée </span>');
+  if (flag("rowtime")) a.insertAdjacentHTML("beforeend", '<span class="when"> 2 h</span>');
   const t = document.createElement("button");
   t.type = "button";
   t.className = "conv-menu";
@@ -469,7 +557,19 @@ function addConversation(id, title) {
     a.appendChild(pin);
   }
   if (flag("grouped")) {  // a row without a trigger, in a headed group that has its own menu (I7)
-    li.append(a);
+    if (flag("rowtrigger")) {  // or with its own span[role=button] trigger (registry-4)
+      const rt = document.createElement("span");
+      rt.setAttribute("role", "button");
+      rt.setAttribute("aria-haspopup", "menu");
+      rt.setAttribute("aria-expanded", "false");
+      rt.setAttribute("aria-label", "Options");
+      rt.className = "conv-menu";
+      rt.textContent = "⋯";
+      rt.onclick = (e) => { e.stopPropagation(); openMenu(li, rt); };
+      li.append(a, rt);
+    } else {
+      li.append(a);
+    }
     groupList().prepend(li);
     return li;
   }
@@ -482,7 +582,9 @@ function groupList() {
   if (!g) {
     g = document.createElement("li");
     g.className = "conv-group";
-    g.innerHTML = "<h3>Aujourd'hui</h3><button type=\"button\" class=\"group-menu\" aria-haspopup=\"menu\" "
+    const label = value("grouplabel") === "div" ? '<div data-sidebar="group-label">Aujourd\'hui</div>'
+      : "<h3>Aujourd'hui</h3>";  // shadcn draws its group label as a div (click-targets-2)
+    g.innerHTML = label + "<button type=\"button\" class=\"group-menu\" data-sidebar=\"group-action\" aria-haspopup=\"menu\" "
       + "aria-expanded=\"false\" aria-label=\"Options du dossier\">⋯</button><ul class=\"group-list\"></ul>";
     g.querySelector(".group-menu").onclick = (e) => { e.stopPropagation(); openGroupMenu(g, e.currentTarget); };
     $("conversations").prepend(g);
@@ -521,8 +623,24 @@ function openMenu(li, trigger) {
   window.__menu_opens.push(li.dataset.id);
   trigger.setAttribute("aria-expanded", "true");
   trigger.setAttribute("aria-controls", "conv-menu");
-  if (flag("menunames")) for (const it of $("conv-menu").querySelectorAll("[role=menuitem]"))
-    it.textContent = it.dataset.base + " « " + li.querySelector("a").textContent + " »";
+  if (flag("menunames")) {
+    const a = li.querySelector("a");  // the title alone: the link's own text, without a badge or a time
+    const own = [...a.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("").trim();
+    const shape = value("menutitle");
+    for (const it of $("conv-menu").querySelectorAll("[role=menuitem]")) {
+      if (shape === "split") {  // the title across two nodes
+        const words = own.split(" ");
+        it.innerHTML = "";
+        it.append(it.dataset.base + " « ");
+        const b = document.createElement("b");
+        b.textContent = words.slice(0, 2).join(" ");
+        it.append(b, " " + words.slice(2).join(" ") + " »");
+      } else {
+        it.textContent = it.dataset.base + " « " + (shape === "trunc" && own.length > 24 ? own.slice(0, 24) + "…" : own) + " »";
+      }
+    }
+    $("conv-menu").style.textTransform = shape === "upper" ? "uppercase" : "";
+  }
   $("conv-menu").hidden = false;
   if (flag("decoydialog")) $("decoy").hidden = false;  // an unrelated dialog, open before any delete click (m1)
 }
@@ -536,8 +654,23 @@ for (const item of $("conv-menu").querySelectorAll("[role=menuitem]")) item.oncl
   closeMenu();
   if (!li) return;
   window.__menu_picks.push([li.dataset.id, action]);
-  if (action === "rename" && !flag("renamenofield")) (RENAMEDIALOG ? openRenameDialog : renameInline)(li);
-  if (action === "delete" && !flag("noconfirm")) openConfirm(li);
+  if (action === "rename" && !flag("renamenofield")) {
+    if (flag("surveyonrename")) { showSurvey(); setTimeout(() => renameInline(li), 1000); }
+    else (RENAMEDIALOG ? openRenameDialog : renameInline)(li);
+  }
+  if (action === "delete") {
+    if (flag("deleteempties")) {  // the list emptied for a while, nothing deleted (registry-5)
+      const ul = $("conversations"), kept = [...ul.children];
+      for (const x of kept) x.remove();
+      setTimeout(() => { for (const x of kept) ul.appendChild(x); }, 4000);
+    } else if (flag("confirmnative")) {  // the app asks through window.confirm (robustness-6)
+      if (confirm("Supprimer cette conversation ?")) doDelete(li);
+    } else if (flag("deletedirect")) {
+      doDelete(li);
+    } else if (!flag("noconfirm")) {
+      openConfirm(li);
+    }
+  }
 };
 document.addEventListener("click", (e) => {
   if ((!$("conv-menu").hidden && !$("conv-menu").contains(e.target))
@@ -546,6 +679,11 @@ document.addEventListener("click", (e) => {
 function rename(li, title) {
   li.querySelector("a").textContent = title;
   window.__renamed[li.dataset.id] = title;
+}
+function saveTitle(li, title, then) {  // the server's PATCH first, then the title on screen
+  fetch("/api/conversation/" + encodeURIComponent(li.dataset.id), { method: "PATCH",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title }) })
+    .catch(() => null).then(() => { rename(li, title); if (then) then(); });
 }
 function renameInline(li) {
   const a = li.querySelector("a");
@@ -556,10 +694,19 @@ function renameInline(li) {
   li.insertBefore(input, a);
   input.focus();
   input.select();
-  const done = (keep) => { if (keep) rename(li, input.value.trim()); input.remove(); a.style.display = ""; };
+  const close = () => { input.remove(); a.style.display = ""; };
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); done(true); }
-    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); done(false); }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const title = input.value.trim();
+      if (flag("slowrename")) {  // the field stays while the server answers (verdicts-6)
+        input.disabled = true;
+        setTimeout(() => saveTitle(li, title, close), 3000);
+      } else {
+        saveTitle(li, title, close);
+      }
+    }
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(); }
   });
 }
 let renaming = null;
@@ -570,31 +717,65 @@ function openRenameDialog(li) {
   $("rename-input").focus();
 }
 function closeRenameDialog() { $("rename-dialog").hidden = true; renaming = null; }
-$("rename-save").onclick = () => { if (renaming) rename(renaming, $("rename-input").value.trim()); closeRenameDialog(); };
+$("rename-save").onclick = () => {
+  const li = renaming, title = $("rename-input").value.trim();
+  closeRenameDialog();
+  if (li) saveTitle(li, title);
+};
 $("rename-cancel").onclick = closeRenameDialog;
 $("rename-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("rename-save").click(); } });
 let deleting = null;
-function openConfirm(li) { deleting = li; $("confirm-delete").hidden = false; }
+function openConfirm(li) {
+  deleting = li;
+  const text = value("confirmtext");  // « {title} »: the row's title in place of the noun (registry-1)
+  if (text && text.includes("{title}")) $("confirm-delete").querySelector("p").textContent =
+    text.split("{title}").join(li.querySelector("a") ? li.querySelector("a").textContent : "");
+  $("confirm-delete").hidden = false;
+}
 function closeConfirm() { $("confirm-delete").hidden = true; deleting = null; }
 $("delete-cancel").onclick = closeConfirm;
 $("delete-confirm").onclick = () => {
   const li = deleting;
   closeConfirm();
   if (!li) return;
+  if (flag("confirmalert")) alert("Suppression en cours");  // the confirm's own handler opens an alert (registry-6)
+  doDelete(li);
+};
+function doDelete(li) {
   if (li.classList.contains("conv-group")) {  // the whole group, every row in it
     for (const row of li.querySelectorAll(".conv-item")) window.__deleted.push(row.dataset.id);
     li.remove();
     return;
   }
-  window.__deleted.push(li.dataset.id);
-  if (flag("staledelete")) return;  // deleted, yet still listed (a stale sidebar, m2)
-  li.remove();
-  if (state.conversation === li.dataset.id) {  // the page showed it: back to a new conversation
-    state.conversation = null;
-    $("messages").innerHTML = "";
-    history.pushState({}, "", "/new");
+  const id = li.dataset.id;
+  window.__deleted.push(id);
+  if (flag("cascade")) {  // another conversation goes with it (R2-2)
+    const other = [...document.querySelectorAll("#conversations .conv-item")].find((x) => x !== li);
+    if (other) { window.__deleted.push(other.dataset.id); other.remove(); }
   }
-};
+  const req = flag("nodeleterequest") ? Promise.resolve({ ok: true })
+    : fetch("/api/conversation/" + encodeURIComponent(id) + (flag("deletefail") ? "?fail=1" : ""), { method: "DELETE" })
+        .catch(() => ({ ok: false }));
+  if (flag("staledelete")) return;  // deleted, yet still listed (a stale sidebar, m2)
+  const gone = () => {
+    li.remove();
+    if (state.conversation === id) {  // the page showed it: back to a new conversation
+      state.conversation = null;
+      $("messages").innerHTML = "";
+      history.pushState({}, "", "/new");
+    }
+  };
+  if (flag("deletefail")) {  // optimistic: gone at once, back when the server refuses (registry-5)
+    const parent = li.parentElement, next = li.nextSibling;
+    li.remove();
+    req.then((r) => {
+      if (!r.ok) setTimeout(() => { parent.insertBefore(li, next); window.__deleted = window.__deleted.filter((x) => x !== id); }, 300);
+    });
+    return;
+  }
+  if (flag("slowdelete")) { req.then(() => setTimeout(gone, 3400)); return; }  // verdicts-6
+  gone();
+}
 let paletteTimer = null;
 function openPalette() {
   window.__palette_opens += 1;
@@ -607,8 +788,18 @@ function closePalette() { $("palette").hidden = true; clearTimeout(paletteTimer)
 function renderPalette(q) {  // the conversations whose title holds the query, as a server-side search would
   const items = $("palette-items");
   items.innerHTML = "";
-  const hits = [...document.querySelectorAll("#conversations .conv-item")].filter((li) =>
-    q && li.querySelector("a").textContent.toLowerCase().includes(q.toLowerCase()));
+  if (flag("echo") && q) {  // the only item echoes the query (verdicts-4)
+    const it = document.createElement("div");
+    it.setAttribute("cmdk-item", "");
+    it.setAttribute("role", "option");
+    it.textContent = "Rechercher « " + q + " » dans les messages";
+    items.appendChild(it);
+    $("palette").querySelector("[cmdk-empty]").hidden = true;
+    return;
+  }
+  const rows = [...document.querySelectorAll("#conversations .conv-item")];
+  const hits = !q && flag("recents") ? rows.slice(0, 5)  // recent conversations before any typing (robustness-7)
+    : rows.filter((li) => q && li.querySelector("a").textContent.toLowerCase().includes(q.toLowerCase()));
   for (const li of hits) {
     const it = document.createElement("div");
     it.setAttribute("cmdk-item", "");
@@ -623,9 +814,11 @@ $("palette").querySelector("[cmdk-input]").addEventListener("input", (e) => {
   const q = e.target.value;
   window.__palette_queries.push(q);
   clearTimeout(paletteTimer);
-  paletteTimer = setTimeout(() => renderPalette(q), 300);  // a debounced search
+  if (flag("searchfail")) return;  // the list never follows the typing
+  paletteTimer = setTimeout(() => renderPalette(q), flag("recents") ? 1500 : 300);  // a debounced search
 });
 if (SEARCHENTRY !== "link") $("search-entry").onclick = openPalette;
+if (flag("nonewlink")) document.querySelector('a[href="/new"]').remove();  // click-targets-8
 document.addEventListener("keydown", (e) => {
   if (NOKBD || !(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "k") return;
   e.preventDefault();
@@ -754,6 +947,17 @@ async function send() {
   }
   if (nocreate) setTimeout(() => window.__seed("Ancienne conversation du fondateur"), 200);
   addUser(text);
+  if (/TOAST_HOST/.test(text)) setTimeout(() => {  // a toast naming an internal host, 0.8 s in (leakage-1)
+    const toast = document.createElement("li");
+    toast.setAttribute("data-sonner-toast", "");
+    toast.textContent = "Erreur : connect ECONNREFUSED pii-guard:8443";
+    $("toaster").appendChild(toast);
+    setTimeout(() => toast.remove(), 6000);
+  }, 800);
+  if (flag("micdictation")) setTimeout(() => {  // the founder starts a dictation meanwhile (click-targets-4)
+    const m = $("mic");
+    if (m) { m.setAttribute("aria-label", "Stop dictation"); m.dataset.status = "listening"; m.setAttribute("aria-pressed", "true"); }
+  }, 1000);
   $("prompt").value = "";
   state.text = "";
   const ready = state.chips.filter((c) => c.state === "ready").map((c) => c.name);
@@ -800,7 +1004,11 @@ async function send() {
   // The page leaves for another host (the driver's list holds 127.0.0.1 only).
   if (/NAVIGATE_AWAY/.test(text)) location.assign(location.protocol + "//localhost:" + location.port + "/away");
   // A dialog nobody catalogued (the guard must refuse it, never close it).
+  if (/UNKNOWN_MODAL_TITLES/.test(text))  // one that lists the sidebar's titles (leakage-2)
+    $("mystery").textContent = "Récents : " + [...document.querySelectorAll("#conversations a")].map((a) => a.textContent).join(" | ");
   if (/UNKNOWN_MODAL/.test(text)) $("mystery").hidden = false;
+  // An alert naming an internal host (leakage-2).
+  if (/ALERT_HOST/.test(text)) alert("connect ECONNREFUSED pii-guard:8443");
   if (silent) {  // what the page says of it: the composer's status line, and a toast for 4 s
     $("chat-input-status").textContent = /502/.test(text) ? "Le service est momentanément indisponible (502)."
       : "Une erreur est survenue lors de l'analyse du message (pii-guard.internal:8443).";

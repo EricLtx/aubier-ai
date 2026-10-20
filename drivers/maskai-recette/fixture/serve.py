@@ -49,6 +49,10 @@ file name (« fail », « slowidx », « instant », and since v2.3 « faildb »
 a format refusal, a size refusal); gives each sidebar conversation a menu
 (rename, delete with a confirmation) and a ⌘K search palette.
 
+Fix round 2: PATCH and DELETE /api/conversation/<id> answer 204 (500 with `fail=1` in the query): the
+page's rename and delete send them before the screen changes. The page-side words TOAST_HOST, ALERT_HOST
+and UNKNOWN_MODAL_TITLES are read by index.html only.
+
 Other paths: /busy (requests, then a popup after 3 s; /stats says when the popup
 was announced and when its request arrived), /redirect-unreachable (a 302 to an
 unreachable host). Any page asked with `maintenance=1` in its query is MaskAI's
@@ -186,6 +190,17 @@ class Handler(BaseHTTPRequestHandler):
         else:
             with open(os.path.join(HERE, "index.html"), "rb") as f:
                 self.reply(200, f.read())
+
+    def conversation_write(self):
+        """PATCH (rename) and DELETE (delete) of a conversation: 204, or 500 with `fail=1` (fix round 2)."""
+        if not self.path.startswith("/api/conversation/"):
+            self.send_error(404)
+            return
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.reply(500 if "fail=1" in self.path.partition("?")[2] else 204, ctype="application/json")
+
+    do_PATCH = conversation_write
+    do_DELETE = conversation_write
 
     def do_POST(self):
         if not self.path.startswith("/chat/stream"):

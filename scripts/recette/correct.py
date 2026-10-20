@@ -29,7 +29,11 @@ config, sent_*, error_class…). Un cas inchangé n'a pas de ligne.
 
 Ce qui ne se rejoue pas, et le dit : un cas sans ligne en vigueur (verdict_oracle le journalisera), un
 cas jugé par une autre action (charge_concurrente, un abandon), un cas jugé sur une observation partagée
-(@load, @list, @model, @web) dont le pilote n'a pas gardé l'instantané (antérieur à la v2.3).
+(@load, @list, @model, @web) dont le pilote n'a pas gardé l'instantané (antérieur à la v2.3), et une
+observation qui n'est pas celle de la ligne en vigueur (revue de la v2.3, round 2, robustness-5) : depuis le
+round 2, le verdict noté sur l'observation porte l'empreinte de sa ligne (`line_sha256`), qui doit être celle
+de la ligne en vigueur ; une observation sans empreinte (antérieure) doit redonner le délai de la ligne. Une
+observation mise de côté à une reprise et jamais jugée n'est donc jamais rejouée en correction.
 
 Le script n'écrit jamais observations.json. Le driver garde ses observations en mémoire : arrêter
 (démonter) le driver avant --write. Code de retour : 0 ; 1 si un cas nommé ne peut pas être rejoué ;
@@ -39,6 +43,7 @@ est là, sans en avoir besoin ici).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -77,6 +82,26 @@ def in_force(events: list, cid: str) -> int | None:
     return found[-1] if found else None
 
 
+def line_texts(path: str) -> list[str]:
+    """Les lignes non vides du journal, telles qu'écrites (sans leur fin de ligne), dans l'ordre des index de
+    journal.load et de in_force."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [line.rstrip("\r\n") for line in f if line.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def line_sha256(text: str) -> str:
+    """L'empreinte d'une ligne de journal, comme le driver la note sur le verdict de l'observation
+    (`line_sha256`, revue de la v2.3, round 2, robustness-5)."""
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+NOT_THE_LINE = ("erreur : l'observation gardée du cas n'est pas celle de la ligne en vigueur ({why}) : rien n'est "
+                "rejoué ; à une reprise, rejouer sur le fichier d'observations qui la porte (--observations)")
+
+
 def reread_header(recette, drv, cid: str) -> bool:
     """L'en-tête gardé de la carte du cas relu avec les règles du driver d'aujourd'hui (parse_guard), dans
     l'observation en mémoire (celle du cas, ou l'instantané d'une observation partagée) ; rend True s'il y
@@ -95,6 +120,7 @@ def plan(recette, drv, cases: list, reason: str, reread: bool = False, evidence:
     """Pour chaque cas : la ligne remplacée et la ligne de correction (ou pourquoi il n'y en a pas). Le
     verdict et les ENF sont comparés ; la preuve aussi avec `evidence`."""
     events = drv.journal.load(str(recette.journal_path))
+    texts = line_texts(str(recette.journal_path))
     compared = COMPARED + (("evidence",) if evidence else ())
     out = []
     for cid in cases:
@@ -112,6 +138,11 @@ def plan(recette, drv, cases: list, reason: str, reread: bool = False, evidence:
         if case["kind"] == "concurrent":
             item["status"] = "erreur : jugé par charge_concurrente, pas par verdict_oracle"
             continue
+        # robustness-5: the observation replayed is the one that judged the line in force, never another
+        stamp = ((recette.observations.get(cid) or {}).get("verdict") or {}).get("line_sha256")
+        if stamp is not None and (idx >= len(texts) or stamp != line_sha256(texts[idx])):
+            item["status"] = NOT_THE_LINE.format(why="son verdict porte l'empreinte d'une autre ligne")
+            continue
         if reread:
             item["header_reread"] = reread_header(recette, drv, cid)
         try:
@@ -126,6 +157,10 @@ def plan(recette, drv, cases: list, reason: str, reread: bool = False, evidence:
                 "nfr": j["nfr"] or None, "supersedes": idx, "reason": reason,
                 "inputs_sha256": recette.inputs_sha256, "ui_profile_sha256": recette.ui_profile_sha256,
                 **drv.clean(j["extra"])}
+        if stamp is None and line["timing_s"] != events[idx].get("timing_s"):  # an observation of before round 2
+            item["status"] = NOT_THE_LINE.format(why=f"délai rejoué {line['timing_s']} s, délai de la ligne "
+                                                     f"{events[idx].get('timing_s')} s")
+            continue
         if all(line.get(k) == events[idx].get(k) for k in compared):
             item["status"] = "inchangé : rien à corriger"
             if not evidence and line.get("evidence") != events[idx].get("evidence"):
