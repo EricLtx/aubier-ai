@@ -2,21 +2,21 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Close what the founder decided on 2026-10-19 about the driver-learning chantier (merged at `22962c7`, tag `driver-learning`) — redaction tokens keyed by a per-learn salt (D-01), the vault cut down to what the plan uses before `generate` (D-02), the Office instance a learned driver starts named by its process, the only one whose dialog boxes it closes (D-03), and held in a kill-on-close Job so it dies with the driver (D-04), the qualification gate held again when a `kind: com` driver is respawned (D-31), the operator verb `vk driver act` (D-28) — and the final review's parked minors.
+**Goal:** Close what the founder decided on 2026-10-19 about the driver-learning chantier (merged at `22962c7`, tag `driver-learning`) — redaction tokens keyed by a per-learn salt (D-01), the vault cut down to what the plan uses before `generate` (D-02), the Office instance a learned driver starts identified by its process, the only one whose dialog boxes it closes (D-03), and held in a kill-on-close Job so it dies with the driver (D-04; its one strictly bounded exception, D-35 of 2026-10-20), the qualification gate held again when a `kind: com` driver is respawned (D-31), the operator verb `vk driver act` (D-28; its ledger kind, D-33 of 2026-10-20) — and the final review's parked minors.
 
-**Architecture:** Python changes stay inside `drivers/vkforge/`: `mine` and `qualify` take the learn's salt from a file the kernel writes (`--salt-file`), `plan` rewrites the vault in place (`--vault`), the vendored COM adapter (`runtime/com.py`) learns to name and hold the process it starts (ctypes Toolhelp32 and Job objects, stdlib only), `debrief` shows evidence by allowlist. The kernel side is three small seams: `vk-ipc/src/forge.rs` draws the salt and passes the two files, `vk-ipc/src/drivers.rs` runs the kernel's `check_qualified` before every spawn (a new `DriverFailure::Unqualified`), and — once the founder confirms its ledger kind — a human act `driver.operate` with its kernel halves, IPC arm and CLI verb.
+**Architecture:** Python changes stay inside `drivers/vkforge/`: `mine` and `qualify` take the learn's salt from a file the kernel writes (`--salt-file`), `plan` rewrites the vault in place (`--vault`), the vendored COM adapter (`runtime/com.py`) learns to identify and hold the process it starts (ctypes Toolhelp32, the service manager and Job objects, stdlib only), `debrief` shows evidence by allowlist. The kernel side is three small seams: `vk-ipc/src/forge.rs` draws the salt and passes the two files, `vk-ipc/src/drivers.rs` runs the kernel's `check_qualified` before every spawn (a new `DriverFailure::Unqualified`), and a human act `driver.operate` with its kernel halves, IPC arm and CLI verb, recorded under the ledger kind the founder took (D-33).
 
 **Tech Stack:** Python 3.13 (stdlib, `lxml==6.1.3`, `comtypes==1.4.17` on Windows only; `ctypes` for the process snapshot and the Job), Rust (MSVC) for `vk-contracts`, `vk-kernel`, `vk-ipc`, `vk-cli`; CI jobs `driver-browser` (Ubuntu, the vkforge suite), `driver-learn` (Windows, the vkforge suite under the virtualenv, `vk-kernel --test learn`, `vk-ipc --test forge`, `vk-cli --test smoke vk_forge_`).
 
-**Spec:** `docs/technical/specs/2026-10-17-driver-learning-office-design.md` (§4.4–§4.5 tokens and vault, §5.2 qualify, §6 dialogs, §11 TCB, §12 rulings at implementation). Decisions: the founder's register of 2026-10-19, rows D-01–D-05 and D-27–D-31 (private: `docs/strategy/decisions/2026-10-18-decisions-ouvertes.md`). Evidence: the chantier's final review and re-review, its SDD ledger (rulings L-P1…L-P58) and the Task 12 node run (private: `docs/archive/technical/reviews/2026-10-19-driver-learning-final-review.md`, `…-final-rereview.md`, `…-sdd-ledger.md`, `…-task-12-node-run.md`). The archived plan `docs/archive/technical/plans/2026-10-17-driver-learning-office.md` is the code map of what this plan changes.
+**Spec:** `docs/technical/specs/2026-10-17-driver-learning-office-design.md` (§4.4–§4.5 tokens and vault, §5.2 qualify, §6 dialogs, §11 TCB, §12 rulings at implementation). Decisions: the founder's register of 2026-10-19, rows D-01–D-05 and D-27–D-31 (private: `docs/strategy/decisions/2026-10-18-decisions-ouvertes.md`), and the founder's decisions of 2026-10-20, D-33 and D-35 (private: `docs/strategy/decisions/2026-10-20-journal-des-decisions.md`; see **Amendments of 2026-10-20**). Evidence: the chantier's final review and re-review, its SDD ledger (rulings L-P1…L-P58) and the Task 12 node run (private: `docs/archive/technical/reviews/2026-10-19-driver-learning-final-review.md`, `…-final-rereview.md`, `…-sdd-ledger.md`, `…-task-12-node-run.md`). The archived plan `docs/archive/technical/plans/2026-10-17-driver-learning-office.md` is the code map of what this plan changes.
 
-**Base:** master `22962c7`. Every `path:lines` below is a line range of `22962c7`. The tasks run in the order 1, 2, 3, 4, 6, then 5 once the founder has answered its ledger-kind question; a task that edits a function an earlier task already changed finds it by name, and its code blocks are written against the earlier task's result.
+**Base:** master `22962c7`. Every `path:lines` below is a line range of `22962c7`. The tasks run in the order 1, 2, 3, 4, 6, then 5 (its ledger kind answered by the founder, D-33); a task that edits a function an earlier task already changed finds it by name, and its code blocks are written against the earlier task's result.
 
 ## Global Constraints
 
 **Scope and contracts**
 
-- Contracts frozen: no change to `DriverPlan`, `DriverLearned` or `DriverQualified`, and none of the tasks below makes one. The one contract addition is Task 5's ledger kind `driver.operated` and its payload `DriverOperated`, **BLOCKED on the founder** (CLAUDE.md: ledger-kind decisions are the founder's); nothing else adds a kind to `ALLOWED_KINDS`.
+- Contracts frozen: no change to `DriverPlan`, `DriverLearned` or `DriverQualified`, and none of the tasks below makes one. The one contract addition is Task 5's ledger kind `driver.operated` and its payload `DriverOperated`, decided by the founder (D-33, 2026-10-20: the new kind, its author `by` mandatory; CLAUDE.md: ledger-kind decisions are the founder's); nothing else adds a kind to `ALLOWED_KINDS`.
 - New `vk` CLI surface: exactly `vk driver act NAME ACTION [--args JSON]` (with the global `--json`), founder decision D-28 (Task 5). The vkforge stage flags `mine --salt-file`, `qualify --salt-file` and `plan --vault` belong to the stages and come with D-01 and D-02.
 - `drivers/vkforge/` is Python 3.13 with the stdlib, `lxml==6.1.3` and `comtypes==1.4.17; sys_platform == "win32"` only (`drivers/vkforge/requirements.txt`); `comtypes` is imported lazily and on Windows only; no `psutil`: the process snapshot and the Job object go through `ctypes`. No network module anywhere in the package (`contracts/tcb.md`, pinned by `drivers/vkforge/tests/test_package.py`).
 - `drivers/vkforge/runtime/com.py` is vendored into every generated driver (`vendor/vkforge_runtime/com.py`) and so lies inside `files_sha256`: Task 3's change makes every later learn a new driver identity — intended. A driver learned before this chantier keeps the adapter it vendored until it is learned again; it also has no salt (Task 1), so it cannot be qualified again and is learned again (runbook §8).
@@ -33,7 +33,7 @@
 - Python tests run under the vkforge virtualenv that `drivers\vkforge\setup.ps1` makes, never the Microsoft Store Python (R27).
 - Rust tests that spawn vkforge run with `VK_FORGE_REQUIRED=1`, as CI's `driver-learn` job does (ruling L-P56): a missing interpreter fails the test instead of skipping it.
 - Before a commit that touches Rust: `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`. Before a commit that touches `docs/` or `contracts/`: `python -I scripts/docs/check_docs.py` exits 0.
-- Never run `vk` against the founder's daemon: every Rust test starts a daemon of its own over a temporary state directory. The real-Office steps of Task 3 start and kill a Word of their own; the controller runs them on the node when the founder's session allows it.
+- Never run `vk` against the founder's daemon: every Rust test starts a daemon of its own over a temporary state directory. The real-Office steps of Task 3 start and kill a Word of their own, and a PowerPoint of their own only when no `POWERPNT.EXE` runs beforehand (PF-5); the controller runs them on the node when the founder's session allows it.
 - No placeholder: every test a step names has its code in that step.
 - Model tiering (founder rule): **Opus** for Tasks 1, 3, 5; **Sonnet** for Tasks 2, 4, 6. One implementer at a time (node memory), one fresh reviewer per task before the next starts.
 - Commits: conventional prefix, one sentence of intent, and exactly these two trailer lines (no others):
@@ -64,11 +64,11 @@ MSG
 
 ## Review Focus
 
-1. **The user opens a document of their own in the Word the driver started** (a double-clicked `.docx` can land in a running automation instance; PowerPoint is single-instance). A clean end must not destroy it: no `Quit`, the Job disarmed, the instance left running with its `DisplayAlerts` back; only an unclean death of the driver takes it (the price of D-04, stated in the TCB). Task 3: `test_an_instance_that_holds_a_document_outlives_the_driver_its_job_disarmed` (stub) and the disarmed half of `test_a_held_process_dies_with_its_holder_and_a_disarmed_one_lives` (Windows).
-2. **A Word of the user's already running, or one started at the same moment as the driver's.** The adapter attaches, or sees two new `WINWORD.EXE`, or none (CreateObject handed back the running one): no Job, no dialog box closed, `dialog` refused with the box left open; the user's instance is never quit nor killed. Task 3: `test_only_a_start_that_added_one_process_owns_it`, `test_only_the_started_instance_s_boxes_are_closed`.
+1. **The user opens a document of their own in the Word the driver started** (a double-clicked `.docx` can land in a running automation instance; PowerPoint is single-instance). The instance outlives a clean end only inside the five bounds of founder decision D-35 (LF-7): the driver's own documents closed first without saving, the foreign one identified by a `FullName` absent from the driver's exact list, the instance handed to the user (`Visible`, `UserControl`, `DisplayAlerts` back) and its Job alone disarmed — in that order, inside `QUIT_WAIT_S`, before any other call (PF-2) — and one stderr line with the PID and the count. A failure, a timeout or a doubt before the disarm, or an unclean death, and the Job takes the instance (D-04). Task 3: one test per bound — `test_the_instance_survives_only_a_clean_end_inside_the_window`, `test_the_drivers_own_documents_are_closed_first_and_never_keep_the_instance`, `test_a_document_is_foreign_only_when_the_driver_never_opened_its_name`, `test_the_instance_kept_is_handed_to_the_user_and_only_its_job_is_disarmed`, `test_every_firing_is_one_stderr_line_with_the_pid_and_the_count` — the order, `test_the_end_closes_then_lists_then_hands_over_then_disarms` (PF-2), and on Windows `test_a_held_process_dies_with_its_holder_and_a_disarmed_one_lives`.
+2. **A Word or a PowerPoint of the user's already running, or one started at the same moment as the driver's.** The adapter attaches, or sees a start it cannot positively identify — none new (`CreateObject` handed back the running PowerPoint), two or more, or one whose parent is not the `DcomLaunch` service (the user's own start, from the shell) — and treats the instance as attached (PF-4): no Job, no dialog box closed, `dialog` refused with the box left open, one stderr line; the user's instance is never quit nor killed. Task 3: `test_only_a_positively_identified_process_is_owned`, `test_only_the_started_instance_s_boxes_are_closed`, and on the node (PF-5) `test_the_users_powerpoint_is_attached_never_quit_never_held_its_box_left_open`, `test_a_killed_driver_takes_the_powerpoint_it_started`.
 3. **The salt changed under a learned driver** — `forge\<name>\` emptied by hand, or a second `learn` of the same name (another `--out`) drew a new one. `qualify` of the first must refuse in one line before any copy, never record 0/10 as if the driver were broken. Task 1: `test_the_learns_salt_qualifies_and_any_other_fails_closed`, `qualify_reads_the_learns_salt_and_fails_closed_without_it`.
 4. **A corpus whose footers differ per document** (a client's name in each). Ten candidates enter the vault at `mine`; none may survive `plan` unless an arch resolved one, and then only that one. Task 2: `VaultTest`, `learn_leaves_no_purged_candidate_in_the_vault_before_generate`.
-5. **A `com` driver left mounted `Ready` while the ground moved** — the daemon restarted without `VK_FORGE_FIXTURES`, or `qualification.json` edited. The next act must be refused before any process starts, and the driver degraded with the gate's own sentence. Task 4: `the_gate_holds_again_when_an_act_respawns_a_com_driver`.
+5. **A `com` driver left mounted `Ready` while the ground moved** — the daemon restarted without `VK_FORGE_FIXTURES`, or `qualification.json` edited. The gate runs before every start of the driver's process — at mount, and at the first act after a restart or a degrade (D-31) — and is not re-checked per act while that process lives (PF-7): the act that would start the process is refused before it starts, and the driver degraded with the closed word `unqualified` on the ledger, the gate's sentence going to the act's refusal, the daemon's log and `driver.log` (PF-6). Task 4: `the_gate_holds_again_when_an_act_respawns_a_com_driver`, which also shows an act served by a live process after the record was edited.
 
 ## Plan rulings
 
@@ -78,14 +78,31 @@ These are the controller's, taken while writing the plan; each task that carries
 - **LF-2 (D-01, the unsalted form stays).** `mine.redact(text, salt=None)` keeps the pre-D-01 token `<redacted:sha256:HEX>`: the pinned fixtures were written with it, and the fake application compares like with like with it. `mine.tokens()` recognises both prefixes. The CLI requires `--salt-file`, so every token the pipeline writes from now on is `<redacted:hmac-sha256:HEX>`.
 - **LF-3 (D-01, fail closed).** `qualify` refuses, before any copy, a salt that does not give back from the (unchanged) corpus every token the plan's postconditions expect: `the salt does not give back the <id> token of invariants.json; remedy: vk driver learn again: the salt and invariants.json are one learn's`. A missing or short salt file is refused by `mine.read_salt` in one line.
 - **LF-4 (D-02, what the vault keeps).** After `plan`, exactly the tokens found at any depth of the value of every invariant an action keeps (its id among the action's `post`) and of every ambiguity the plan resolved; nothing else — a purged ambiguity's candidates, an excluded invariant's text (a custom style's name) — outlives the plan.
-- **LF-5 (D-03, whose instance it is).** The adapter owns an instance only when its start added exactly one process of the application's executable (snapshot before `GetActiveObject`/`CreateObject`, snapshot after). Zero added: `CreateObject` handed back an instance already running (PowerPoint is single-instance) — treated as attached: not quit, not held, its boxes never closed. Two or more added, or no snapshot (no executable named, a snapshot refused): started but unnamed — quit at a clean end as before (L-P46), never held, its boxes never closed.
-- **LF-6 (D-03, which boxes close).** Past a call's deadline the guard lists the `#32770` boxes of the application's executables with their process. A box of the owned process is closed (never answered) and the action refuses `dialog`. A box of another process is never touched: with no owned process (attached, unnamed) a box of the application still means `dialog`, said to be left open; with an owned process, a box elsewhere did not hold this call, so the action refuses `timeout`.
-- **LF-7 (D-04, the clean end).** After `Quit` the owned process gets `QUIT_WAIT_S = 3.0` s to end before the Job's handles close (whatever is left is then killed) — under the 5 s a kernel host (L-P49) and `qualify` (`END_WAIT_S`) give a driver to end by itself. A started instance that still holds a document at a clean end is left running as L-P46 says, **and its Job is disarmed first** (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` cleared): a clean end never destroys a document the adapter can see. An unclean death cannot see, and the Job takes the instance (D-04).
-- **LF-8 (D-04, a session that cannot begin).** A start held past its deadline (a first-run prompt, a repair dialog) whose new process can be named is held in a Job kept by the module, so it ends with the driver; a session whose `DisplayAlerts` cannot be read or set closes the Job of the instance it started at once.
-- **LF-9 (D-31, where the gate runs).** Boot spawns nothing (`RealKernel::boot` only degrades invalid rows, `crates/vk-kernel/src/lib.rs:1136-1141`, `crates/vk-kernel/src/drivers.rs:743-781`; the daemon's pool starts empty, `crates/vk-ipc/src/drivers.rs:123-127`), so a `Ready` row is respawned lazily by the first act (`run_act` → `DriverPool::act` → `ensure` → `spawn_host`, `crates/vk-ipc/src/drivers.rs:833-859, 241-263, 172-217, 438-456`). The gate therefore runs in `DriverPool::ensure`, before every spawn — mount and act alike — with the fixtures flag `serve_on` handed the kernel (final review I-1). Not at boot: the flag is not yet set there (`crates/vk-ipc/src/server.rs:450-457`), and a degrade at boot would write `driver.unmounted` for a driver nobody asked to run. A refusal is `DriverFailure::Unqualified(<the gate's sentence>)`, ledger word `unqualified: <sentence>` (kernel-composed: a driver id and a remedy, Ruling 28), degrading the driver like `tampered`.
-- **LF-10 (D-28, the ledger kind — for the founder).** A human act whose author must be on the record does not fit `driver.acted` (its `task_id`/`step_index` name a harness step, and it carries no `by`). Proposed: a new kind `driver.operated`, payload `DriverOperated` (Task 5's header). The act's evidence goes into a register created for it (`task.submitted`, label bottom), read with `vk artefact cat` (a release on the ledger). `--args` is passed as typed: paths in it are the operator's to give absolute.
+- **LF-5 (D-03, whose instance it is; rewritten by PF-4).** A process is the driver's only by positive identification: exactly one new process of the application's executable between a snapshot taken before `GetActiveObject`/`CreateObject` and one taken after, **and** its parent PID equal to the process id of the `DcomLaunch` service, read with `QueryServiceStatusEx` (the service that starts a COM local server). Anything else is attached: zero new (`CreateObject` handed back an instance already running — PowerPoint is single-instance), two or more, a parent other than `DcomLaunch` (a PowerPoint the user started at the same moment), a snapshot or the service query that failed, no executable named. An attached instance is never quit, never held in a Job, its dialog boxes never closed; a start the adapter cannot tell apart is one stderr line, `start: treated as attached: <why>`. There is no "started but unnamed" instance any more: it is attached.
+- **LF-6 (D-03, which boxes close).** Past a call's deadline the guard lists the `#32770` boxes of the application's executables with their process. A box of the owned process is closed (never answered) and the action refuses `dialog`. A box of another process is never touched: with no owned process (attached, PF-4) a box of the application still means `dialog`, said to be left open; with an owned process, a box elsewhere did not hold this call, so the action refuses `timeout`.
+- **LF-7 (D-04, the clean end) — founder decision D-35 (2026-10-20), which replaces the earlier text.** The exception is kept, strictly bounded. The Office instance the driver started survives the driver's end only if all five bounds hold: (1) a clean end, inside the clean-end window — `QUIT_WAIT_S = 3.0` s from the start of `quit()`, under the 5 s a kernel host (L-P49, `STOP_GRACE`) and `qualify` (`END_WAIT_S`) give a driver to end by itself; any unclean death leaves the Job to take the instance; (2) the driver first closes every document it opened, with `SaveChanges=False` (the binding's `close`; PowerPoint's `Close()` saves nothing); a document of its own that will not close does not protect the instance; (3) positive identification: a document is foreign only if its `FullName` is absent from the driver's exact list of the documents it opened (each `FullName` read back after its `Open`); any COM error, timeout or doubt during the inventory kills the instance — an `Open` whose document the driver never named is such a doubt; (4) the surviving instance is handed to the user (`Visible` and `UserControl` set true; `DisplayAlerts` restored) and the Job is disarmed for that instance only (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` cleared on its own Job); (5) every firing is recorded: one stderr line (`driver.log`) with the PID and the count of foreign documents, never a name or content. Outside these bounds, D-04 applies to the letter: the started instance dies with the driver — quit when nothing foreign is open, its process given what is left of the window, then its Job closed armed, which ends whatever remains. The order inside the window is PF-2's.
+- **LF-8 (D-04, a session that cannot begin; narrowed by PF-4).** A start held past its deadline (a first-run prompt, a repair dialog) is held in a Job kept by the module, so it ends with the driver — only when its new process is positively owned (PF-4); otherwise it is attached and left alone, one stderr line. A session whose `DisplayAlerts` cannot be read or set closes the Job of the instance it started at once.
+- **LF-9 (D-31, where the gate runs).** Boot spawns nothing (`RealKernel::boot` only degrades invalid rows, `crates/vk-kernel/src/lib.rs:1136-1141`, `crates/vk-kernel/src/drivers.rs:743-781`; the daemon's pool starts empty, `crates/vk-ipc/src/drivers.rs:123-127`), so a `Ready` row is respawned lazily by the first act (`run_act` → `DriverPool::act` → `ensure` → `spawn_host`, `crates/vk-ipc/src/drivers.rs:833-859, 241-263, 172-217, 438-456`). The gate therefore runs in `DriverPool::ensure`, before every spawn — mount and act alike — with the fixtures flag `serve_on` handed the kernel (final review I-1). Not at boot: the flag is not yet set there (`crates/vk-ipc/src/server.rs:450-457`), and a degrade at boot would write `driver.unmounted` for a driver nobody asked to run. A refusal is `DriverFailure::Unqualified(<the gate's sentence>)`, degrading the driver like `tampered`. As amended by PF-6: the ledger records the closed word `unqualified`, like `tampered` — on `driver.acted`, on `driver.unmounted` and on the degraded row — and the gate's sentence (a driver id and a remedy; when the record cannot be read, its path under the user's profile) goes to `detail()` (the daemon's log and `driver.log`) and to the act's RPC refusal (`unqualified: <sentence>`), never into the ledger (Ruling 28: hashes, never text; no path, no user name on the chain). As amended by PF-7: the gate runs before every start of the driver's process — at mount, and at the first act after a restart or a degrade — as founder decision D-31 says; it is not re-checked per act while the host lives.
+- **LF-10 (D-28, the ledger kind — decided by the founder, D-33, 2026-10-20).** A human act whose author must be on the record does not fit `driver.acted` (its `task_id`/`step_index` name a harness step, and it carries no `by`). The founder took the new kind `driver.operated`, payload `DriverOperated` (Task 5's header), its author `by` mandatory (D-33): Task 5 is no longer blocked. The act's evidence goes into a register created for it (`task.submitted`, label bottom), read with `vk artefact cat` (a release on the ledger). `--args` is passed as typed: paths in it are the operator's to give absolute.
 - **LF-11 (M-6, the copies go).** `qualify` deletes each pass's folder (`work/qualify/<i>/`: the copy, its PDF, its evidence) once `qualification.json` is written; a folder that cannot go (a copy still open in an attached Word) is one stderr line, never a failed stage — the record is already written.
 - **LF-12 (M-8, evidence by allowlist).** A journal line shown as evidence keeps `ts`, `step`, `case`, `verdict`, `timing_s`, `evidence`, `nfr`, `supersedes`, `pipeline_ms`, in that order (evidence early: `CLIP` cuts at 240 characters), and its `evidence` text is replaced by the structural notes the journal script writes in its own words (`réponse vide : échec silencieux`, `abandon à N s (3 × budget N s) : pas de fin de réponse`, `latence N s > budget N s`, `écart d'envoi N s`, `refus (<reason>)`, `· en direct`), or `[…]`. `texte envoyé non observé` is not among them: the L-P57 pin forbids `texte envoyé` in evidence.
+
+## Amendments of 2026-10-20
+
+The pre-flight scan of this plan (2026-10-20, at `6ac4480`) led to two founder decisions and ten controller rulings; the rulings above and the tasks below carry them, each where it applies. Task 1 was dispatched from the text as it stood and is not changed here.
+
+- **D-35** (founder; the scan's PF-1) replaces LF-7: the started instance survives the driver's end only if all five bounds hold; outside them, D-04 to the letter. Task 3.
+- **D-33** (founder): the new ledger kind `driver.operated`, its author `by` mandatory; Task 5 is unblocked (LF-10).
+- **PF-2**: inside `QUIT_WAIT_S`, before any other call — close own documents, inventory, hand-over, disarm; a failure, timeout or doubt before the disarm means no disarm; the `DisplayAlerts` restore and the release after it are best effort. Task 3.
+- **PF-3**: the `Job` docstring says what the code does under D-35. Task 3.
+- **PF-4**: a process is the driver's only by positive identification — one new process of the executable whose parent is the `DcomLaunch` service's process; anything else is attached, and "unnamed" is gone (LF-5, LF-6, LF-8). Task 3.
+- **PF-5**: two PowerPoint node steps for the controller — the user's PowerPoint attached, a started one ending with its killed driver — run only when no `POWERPNT.EXE` runs beforehand. Task 3.
+- **PF-6**: the ledger records the closed word `unqualified`; the gate's sentence goes to `detail()` and to the act's RPC refusal, never to the ledger (LF-9). Tasks 4 and 5.
+- **PF-7**: the gate runs before every start of the driver's process, not per act while the host lives, and the test says so (LF-9, Review Focus 5). Task 4.
+- **PF-8**: the readme's `qualify` row names the salt it reads — carried in Task 1's dispatch, not in this text. Task 1.
+- **PF-9**: Task 5 also corrects the runbook's « seul écart de supervision » and `contracts/README.md:15`'s « Five schemas came with the pilot ». Task 5.
+- **PF-10**: Task 6's Files entry for `debrief.py` is `:107-110`; `REMEDY` (`:104-106`) stays. Task 6.
+- **PF-11**: Task 3 corrects the L-P49 sentence of `contracts/tcb.md:252` and says that drivers learned before this chantier keep the old adapter until learned again; Task 2's docs say D-02 holds on the kernel path. Tasks 2 and 3.
 
 ## File Structure
 
@@ -94,14 +111,14 @@ These are the controller's, taken while writing the plan; each task that carries
 | `drivers/vkforge/mine.py` | 1 | `redact(text, salt)`, `read_salt`, `tokens`; mining under the learn's salt; `--salt-file` |
 | `drivers/vkforge/qualify.py` | 1, 3 (docstrings), 6 | re-mining under the salt and the salt check (LF-3); the pass-folder deletion (LF-11); the M-5 re-check |
 | `drivers/vkforge/plan.py` | 2 | `vault_tokens`, `reduce_vault`, `read_vault`; `--vault` |
-| `drivers/vkforge/runtime/com.py` | 3 | the process snapshot, `Job`, `Owned`, `own`, the owner-aware guard, the adapter that names and holds what it starts |
+| `drivers/vkforge/runtime/com.py` | 3 | the process snapshot and the `DcomLaunch` service's process (`dcom_launcher_pid`), `identified`, `Job`, `Owned`, `own`, the owner-aware guard, the adapter that identifies and holds what it starts and ends it within D-35's bounds |
 | `drivers/vkforge/runtime/fake.py` | 3 | the fake's dialog in a started or an attached instance (`fake.json` `"attached"`) |
 | `drivers/vkforge/debrief.py` | 6 | evidence by allowlist (LF-12) |
 | `drivers/vkforge/inventory.py` | 6 | a fixture without `types`/`enums` refused (M-14) |
 | `drivers/vkforge/tests/test_mine.py`, `test_qualify.py`, `test_plan.py`, `test_runtime.py`, `test_generate.py`, `test_debrief.py`, `test_inventory.py`, `test_package.py` | 1–3, 6 | the tests of each task |
 | `crates/vk-ipc/src/forge.rs` | 1, 2, 6 | the salt drawn and passed; the vault passed to `plan`; qualify's logs under `forge/.qualify/<name>/` |
 | `crates/vk-ipc/src/drivers.rs` | 4, 5 | the gate before every spawn; `driver.operate` |
-| `crates/vk-kernel/src/drivers.rs` | 4, 5 | `DriverFailure::Unqualified`; `driver_operate_begin`, `driver_operate_settle` |
+| `crates/vk-kernel/src/drivers.rs` | 4, 5 | `DriverFailure::Unqualified` and `DriverFailure::refusal`; `driver_operate_begin`, `driver_operate_settle` |
 | `crates/vk-ipc/src/server.rs` | 5 | the `driver.operate` arm, a human act |
 | `crates/vk-contracts/src/driver.rs`, `ledger.rs`, `lib.rs`; `contracts/schemas/driver_operated.schema.json`; `contracts/examples/driver_operated/valid/first.json` | 5 | `DriverOperated`, `driver.operated` |
 | `crates/vk-cli/src/main.rs`, `render.rs`, `man.rs` | 5 | `vk driver act`, its rendering, `vk man driver_operated` |
@@ -925,7 +942,7 @@ MSG
 
 ### Task 2: D-02 — the vault keeps only what the plan uses, before `generate` (Sonnet)
 
-**Model:** Sonnet (a stage flag and one kernel argument, on Task 1's `mine.tokens`). **Decision:** D-02. **Ruling:** LF-4.
+**Model:** Sonnet (a stage flag and one kernel argument, on Task 1's `mine.tokens`). **Decision:** D-02. **Rulings:** LF-4, PF-11 (the docs say D-02 holds on the kernel path).
 
 **Files:**
 - Modify: `drivers/vkforge/plan.py:20` (import `mine`), after `load_resolver` (`:295-311`: new `vault_tokens`, `read_vault`, `reduce_vault`), `:314-319` (`add_arguments`), `:322-335` (`run`)
@@ -1241,13 +1258,13 @@ cargo test --locked -p vk-cli --test smoke vk_forge_ -- --nocapture
 `contracts/tcb.md:241` — after the sentence Task 1 wrote, ending `… and the next `learn` of the name clears it.`, insert:
 
 ```markdown
-Between `plan` and `generate` the vault keeps only the clear values of the invariants the plan kept and of the ambiguities it resolved (founder decision D-02, ruling LF-4): a purged ambiguity's candidates — per-document footers, a client's name in each — and an excluded invariant's text are gone before `generate` reads it.
+Between `plan` and `generate` the vault keeps only the clear values of the invariants the plan kept and of the ambiguities it resolved (founder decision D-02, ruling LF-4): a purged ambiguity's candidates — per-document footers, a client's name in each — and an excluded invariant's text are gone before `generate` reads it. This holds on the kernel's path: `vk driver learn` passes `--vault` to the `plan` stage. The flag is optional, and a vkforge `plan` run by hand without it leaves the vault as `mine` wrote it.
 ```
 
 `docs/technical/technical-readme.md:711` — the `plan` row becomes:
 
 ```markdown
-| `plan` | invariants, binding, the arch's answers if any, and the vault | `plan.json` (the `DriverPlan`: one action, its steps, `pre`, `post`, `qualification` thresholds: `min_passes` ten, or the number of documents mined when fewer, `min_rate` 1), `plan-excluded.json`; and the vault rewritten in place (`plan --vault`) with only the values the plan uses — a purged ambiguity's candidates leave it before `generate` (founder decision D-02) |
+| `plan` | invariants, binding, the arch's answers if any, and the vault | `plan.json` (the `DriverPlan`: one action, its steps, `pre`, `post`, `qualification` thresholds: `min_passes` ten, or the number of documents mined when fewer, `min_rate` 1), `plan-excluded.json`; and the vault rewritten in place (`plan --vault`, which `vk driver learn` always passes) with only the values the plan uses — a purged ambiguity's candidates leave it before `generate` (founder decision D-02, on the kernel's path) |
 ```
 
 `docs/technical/runbooks/learn-office-driver.md:28` — the `.vault.json` row becomes:
@@ -1280,32 +1297,33 @@ MSG
 
 ---
 
-### Task 3: D-03 + D-04 — the Office instance the driver started: its dialogs only, and a kill-on-close Job (Opus)
+### Task 3: D-03 + D-04 + D-35 — the Office instance the driver started: identified by its process, its dialogs only, a kill-on-close Job, and a strictly bounded clean end (Opus)
 
-**Model:** Opus. **Decisions:** D-03, D-04. **Rulings:** LF-5, LF-6, LF-7, LF-8.
+**Model:** Opus. **Decisions:** D-03, D-04, D-35 (2026-10-20; it replaces the first LF-7). **Rulings:** LF-5 (as PF-4 rewrote it), LF-6, LF-7 (D-35), LF-8, PF-2, PF-3, PF-4, PF-5, PF-11.
 
 `runtime/com.py` is vendored into every generated driver: this task is a new driver identity for every later learn (intended); no pinned golden moves (`driver-word-maison.expected` is `render_driver`'s `driver.py`, whose text does not change here, and `test_the_generated_driver_imports_vkdriver_from_its_own_vendor` compares the vendored `com.py` with the repository's at run time).
 
 **Files:**
-- Modify: `drivers/vkforge/runtime/com.py:1-4` (docstring), `:15-19` (constants), new code after `executables()` (`:22-25`: structures, `processes`, `pids_of`, `started_pid`, `Job`, `Owned`, `_hold`, `own`), `:28-70` (`dialogs`), `:82-116` (`guarded`), `:184-305` (`Application`, whole class)
+- Modify: `drivers/vkforge/runtime/com.py:1-4` (docstring), `:5-11` (imports: `time`), `:15-19` (constants), new code after `executables()` (`:22-25`: structures, `processes`, `pids_of`, `dcom_launcher_pid`, `identified`, `Job`, `Owned`, `_hold`, `own`), `:28-70` (`dialogs`), `:82-116` (`guarded`), `:184-305` (`Application`, whole class)
 - Modify: `drivers/vkforge/runtime/fake.py:1-7` (docstring), `:21-23` (`FAKE_PROCESS`), `:64-70` (`FakeApplication.__init__`), `:98-105` (`__dialog__`)
 - Modify: `drivers/vkforge/qualify.py:20-21` and `:70-71` (two docstring sentences)
-- Test: `drivers/vkforge/tests/test_runtime.py` (imports `:1-22`; the `connect=` lambdas at `:231`, `:286`, `:292`, `:296`, `:309`, `:332`; new helpers and tests), `drivers/vkforge/tests/test_generate.py` (imports `:1-23`; `test_a_surviving_dialog_is_a_dialog_refusal` `:218-239`; new `driver_pid` and real-Office test)
-- Docs: `contracts/tcb.md:248`, `:250`; `docs/technical/runbooks/learn-office-driver.md:106`, `:116`, `:186-190`
+- Test: `drivers/vkforge/tests/test_runtime.py` (imports `:1-22`; `StubDocument.Close` `:83-85`; the two real-Word tests, `:189-190` and `:204-205`, given `VK_DRIVER_APPLICATIONS`; the `connect=` lambdas at `:231`, `:309`, `:332`; `test_the_users_instance_gets_its_display_alerts_back_and_only_a_started_one_is_quit` `:282-303`, rewritten; new helpers and tests), `drivers/vkforge/tests/test_generate.py` (imports `:1-23`; `test_a_surviving_dialog_is_a_dialog_refusal` `:218-239`; new `driver_pid`, `running`, `PPT`, `STARTER`, the real-Word kill test and the two PowerPoint node tests of PF-5)
+- Docs: `contracts/tcb.md:248`, `:250`, `:252` (the L-P49 sentence, PF-11); `docs/technical/runbooks/learn-office-driver.md:106`, `:116`, `:186-190`
 
 **Interfaces:**
 - Consumes: nothing from Tasks 1–2 (the adapter knows no salt).
 - Produces (`drivers/vkforge/runtime/com.py`):
-  - `QUIT_WAIT_S = 3.0`;
+  - `QUIT_WAIT_S = 3.0`, the clean-end window (D-35 (1)); `COM_TRUE = -1`, VARIANT_TRUE — also PowerPoint's `msoTrue`, so one value sets Word's `bool` and PowerPoint's `MsoTriState` (L-P31);
   - `processes() -> list[tuple[int, int, str]] | None` — `(pid, parent pid, EXE NAME)` from one Toolhelp32 snapshot; `None` off Windows or when the snapshot fails;
-  - `pids_of(exes: set) -> set[int] | None` — `None` when `exes` is empty or there is no snapshot;
-  - `started_pid(before, after) -> int | None` — the one id in `after` not in `before`, else `None`;
+  - `pids_of(exes: set) -> dict[int, int] | None` — `{pid: parent pid}` of the processes running one of `exes`; `None` when `exes` is empty or there is no snapshot;
+  - `dcom_launcher_pid() -> int | None` — the process id of the `DcomLaunch` service, read with `QueryServiceStatusEx`; `None` off Windows, when the service cannot be queried, or when it reports none (PF-4);
+  - `identified(before, after, launcher) -> tuple[int | None, str | None]` — `(pid, None)` for the one new process whose parent is `launcher`, else `(None, why)` (PF-4);
   - `class Job` — `Job.hold(pid: int) -> Job` (classmethod; `OSError` when Windows refuses a step, always off Windows), `wait(timeout_s: float) -> bool`, `disarm() -> None`, `close() -> None` (idempotent);
   - `class Owned(pid: int, job=None)` — attributes `pid`, `job`;
-  - `own(started: bool, before, after, hold=_hold) -> tuple[bool, Owned | None]`;
+  - `own(started: bool, before, after, launcher, hold=_hold) -> Owned | None` — `None` is attached, with one stderr line when a start could not be identified;
   - `dialogs(exes: set) -> list[tuple[hwnd, pid]]` (was a list of windows);
   - `guarded(fn, what, deadline_s=CALL_DEADLINE_S, find_dialogs=None, close=None, owner=None)` — `owner` a pid, a callable returning one, or `None`; `find_dialogs()` returns `(hwnd, pid)` pairs;
-  - `Application(binding, connect=None)` where `connect() -> (application, started: bool, owned: Owned | None)`; new property `Application.pid`; `Application.quit()` as LF-7.
+  - `Application(binding, connect=None)` where `connect() -> (application, owned: Owned | None)` — no `started` any more: an instance the adapter does not own is attached (PF-4); new property `Application.pid`; attributes `opened` (the `FullName` of every document the driver opened), `mine` (the documents it opened and has not closed) and `unnamed_opens` (its opens whose document it never named); `Application.quit()` as D-35 and PF-2.
 - Produces (`drivers/vkforge/runtime/fake.py`): `fake.json` key `"attached": true` — the fake's dialog box then belongs to an instance the driver did not start; `FAKE_PROCESS`, the token the fake's box carries as its process.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1340,19 +1358,55 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 DRIVERS = Path(__file__).resolve().parents[2]
 ```
 
-The `connect=` stubs now return the owned instance too (`connect() -> (application, started, owned)`): `:231` becomes `app = com.Application(self.binding, connect=lambda: (word, True, None))`; `:286` becomes `attached = com.Application(self.binding, connect=lambda: (user, False, None))`; `:292` becomes `started = com.Application(self.binding, connect=lambda: (ours, True, None))`; `:296` becomes `holding = com.Application(self.binding, connect=lambda: (busy, True, None))`; `:309` and `:332` become `app = com.Application(self.binding, connect=lambda: (word, True, None))`.
+The `connect=` stubs now return the instance and what the adapter owns of it (`connect() -> (application, owned)`; an instance it does not own is attached, PF-4): `:231` becomes `app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, StubJob())))` — a started instance, quit at its end; `:309` and `:332` become `app = com.Application(self.binding, connect=lambda: (word, None))` — their subject is the close, not the end. (`:286`, `:292` and `:296` go with the test rewritten below.)
+
+`StubDocument.Close` (`:83-85`) also writes the close into its Word's `log` when that Word keeps one (an `OrderedWord`, below):
+
+```python
+    def Close(self, **kw):
+        self.closed = kw
+        self.word.Documents.items.remove(self)
+        getattr(self.word, "log", []).append(f"Close {Path(self.FullName).name}")
+```
+
+The two real-Word tests (`test_the_adapter_applies_the_house_style_on_the_real_word`, `:189-190`, and `test_a_document_already_open_in_the_users_word_is_refused_and_left_open`, `:204-205`) run with the executable a host gives a driver: under PF-4 the Word they start is identified through `VK_DRIVER_APPLICATIONS`, and without it would be attached — never quit, a hidden `WINWORD.EXE` left on the node. Under each one's `@unittest.skipUnless(…)` add:
+
+```python
+    @mock.patch.dict(os.environ, {"VK_DRIVER_APPLICATIONS": "WINWORD.EXE"})
+```
+
+`test_the_users_instance_gets_its_display_alerts_back_and_only_a_started_one_is_quit` (`:282-303`) becomes the following; its third case, a started instance left running with the driver's own document in it, is D-35's now (`test_the_drivers_own_documents_are_closed_first_and_never_keep_the_instance`):
+
+```python
+    def test_the_users_instance_gets_its_display_alerts_back_and_only_a_started_one_is_quit(self):
+        # L-P47: DisplayAlerts is read, silenced, and put back whenever the instance is left running;
+        # L-P46 under D-04 and PF-4: only the instance the adapter started and identified is quit — the
+        # user's is attached, never quit.
+        user = StubWord()
+        attached = com.Application(self.binding, connect=lambda: (user, None))
+        self.assertEqual(user.DisplayAlerts, 0, "alerts_off while the driver works")
+        attached.quit()
+        attached.quit()
+        self.assertEqual((user.DisplayAlerts, user.quits, attached.app), (-1, 0, None))
+        ours = StubWord()
+        started = com.Application(self.binding, connect=lambda: (ours, com.Owned(4242, StubJob())))
+        started.quit()
+        self.assertEqual((ours.quits, ours.DisplayAlerts, started.app), (1, 0, None), "quit: nothing to put back")
+```
 
 After `StubRegistry` (it ends at `:136`), add:
 
 ```python
 class StubJob:
-    """A Job as the adapter uses one (D-04), off Windows: what was asked of it, in order."""
+    """A Job as the adapter uses one (D-04), off Windows: what was asked of it, in order — into `log`
+    when one is given, the list an OrderedWord writes to (ruling PF-2) — and how long it was waited for."""
 
-    def __init__(self, exits: bool = True):
-        self.calls, self.exits = [], exits
+    def __init__(self, exits: bool = True, log=None):
+        self.calls, self.exits, self.waited = ([] if log is None else log), exits, None
 
     def wait(self, timeout_s: float) -> bool:
-        self.calls.append(f"wait {timeout_s:g}")
+        self.calls.append("wait")
+        self.waited = timeout_s
         return self.exits
 
     def disarm(self) -> None:
@@ -1374,6 +1428,48 @@ class SilentWord(StubWord):
         raise OSError("the application is not answering")
 
 
+class OrderedWord(StubWord):
+    """A Word that writes into `log`, in order, what the end of a session asks of it (founder decision
+    D-35, ruling PF-2): each document closed (StubDocument.Close), each property set, each Quit. The
+    property `refuses` names cannot be set."""
+
+    def __init__(self, log: list):
+        super().__init__()
+        self.Visible = self.UserControl = False
+        self.log = log
+
+    def __setattr__(self, name, value):
+        if "log" in vars(self) and name in ("Visible", "UserControl", "DisplayAlerts"):
+            if name == vars(self).get("refuses"):
+                raise OSError(f"{name} cannot be set")
+            self.log.append(f"{name} {value}")
+        super().__setattr__(name, value)
+
+    def Quit(self):
+        self.log.append("Quit")
+        super().Quit()
+
+
+class Hung:
+    """A document whose FullName does not come back until `until` is set: a listing that hangs."""
+
+    def __init__(self, until: threading.Event):
+        self.until = until
+
+    @property
+    def FullName(self):
+        self.until.wait(30)
+        return "C:/stub/hung.docx"
+
+
+class Unreadable:
+    """A document whose FullName fails: a listing that cannot name what is open."""
+
+    @property
+    def FullName(self):
+        raise OSError("the object invoked has disconnected from its clients")
+
+
 # A process that holds another in a Job of the adapter's (D-04), then sleeps: argv = drivers/, the
 # pid to hold, and "arm" or "disarm" (disarm, then close the Job, before sleeping).
 HOLDER = """import sys, time
@@ -1391,26 +1487,35 @@ time.sleep(120)
 Add to `RuntimeTest`:
 
 ```python
-    def test_only_a_start_that_added_one_process_owns_it(self):
-        # D-03, D-04, ruling LF-5: the adapter owns, and holds in its Job, only the one process its
-        # start added; an attached instance, one handed back running, or two new ones, it never holds.
-        held = []
+    def test_only_a_positively_identified_process_is_owned(self):
+        # D-03, D-04, rulings LF-5 and PF-4: the adapter owns, and holds in its Job, only the process its
+        # start added when it is the one new process of the executable and its parent is the DcomLaunch
+        # service's process; anything else is attached — never held — and a start it cannot tell apart
+        # is one stderr line.
+        held, launcher = [], 900
 
         def hold(pid):
             held.append(pid)
             return f"job of {pid}"
 
-        started, owned = com.own(True, {1, 2}, {1, 2, 7}, hold)
-        self.assertEqual((started, owned.pid, owned.job, held), (True, 7, "job of 7", [7]))
-        for args, want in [((False, {1}, {1, 9}), (False, None)),      # attached: never held
-                           ((True, {1, 2}, {1, 2}), (False, None)),     # CreateObject handed back a running one
-                           ((True, {1}, {1, 7, 8}), (True, None)),      # two appeared: no telling which
-                           ((True, None, {1, 7}), (True, None))]:       # no snapshot
-            self.assertEqual(com.own(*args, hold), want, args)
+        owned = com.own(True, {1: 4}, {1: 4, 7: launcher}, launcher, hold)
+        self.assertEqual((owned.pid, owned.job, held), (7, "job of 7", [7]))
+        for args, why in [
+                # attached: GetActiveObject found it running
+                ((False, {1: 4}, {1: 4, 9: launcher}, launcher), None),
+                # CreateObject handed back a running PowerPoint
+                ((True, {1: 4}, {1: 4}, launcher), "0 new processes of the application"),
+                ((True, {1: 4}, {1: 4, 7: launcher, 8: launcher}, launcher), "2 new processes of the application"),
+                # the user's PowerPoint, started from the shell at the same moment
+                ((True, {1: 4}, {1: 4, 7: 33}, launcher), "process 7 was not started by the DCOM launcher"),
+                ((True, None, {1: 4, 7: launcher}, launcher), "no snapshot of the application's processes"),
+                ((True, {1: 4}, {1: 4, 7: launcher}, None), "the DcomLaunch service's process is unknown")]:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertIsNone(com.own(*args, hold), args)
+            self.assertEqual(err.getvalue(), "" if why is None else f"start: treated as attached: {why}\n", args)
         self.assertEqual(held, [7], "nothing else was held")
-        self.assertEqual([com.started_pid(*p) for p in [({1}, {1, 5}), ({1}, {1}), ({1}, {1, 5, 6}),
-                                                        (None, {5}), ({1}, None)]],
-                         [5, None, None, None, None])
+        self.assertEqual(com.identified({1: 4}, {1: 4, 5: launcher}, launcher), (5, None))
         self.assertIsNone(com.pids_of(set()), "no executable to look for: no snapshot, no owner")
 
     def test_only_the_started_instance_s_boxes_are_closed(self):
@@ -1441,8 +1546,8 @@ Add to `RuntimeTest`:
     def test_the_adapter_closes_the_boxes_of_the_instance_it_started_only(self):
         # D-03 through Application: the guard's owner is the session's started process.
         for connect, closed_want, words in [
-                (lambda: (StubWord(), True, com.Owned(4242, StubJob())), [7], "closed, never answered"),
-                (lambda: (StubWord(), False, None), [], "left open")]:
+                (lambda: (StubWord(), com.Owned(4242, StubJob())), [7], "closed, never answered"),
+                (lambda: (StubWord(), None), [], "left open")]:
             app = com.Application(self.binding, connect=connect)
             app.deadline_s = app.cleanup_deadline_s = 0.3
             doc = app.open("C:/stub/c.docx")
@@ -1459,44 +1564,161 @@ Add to `RuntimeTest`:
             self.assertIn(words, cm.exception.detail)
 
     def test_quit_waits_for_the_started_process_then_closes_its_job(self):
-        # D-04, ruling LF-7: a clean end quits the instance it started, gives its process QUIT_WAIT_S,
-        # then closes the Job, which ends whatever is left; an attached instance has no Job at all.
-        late = f"quit: process 4242 still running {com.QUIT_WAIT_S:g} s after Quit; its Job ends it\n"
+        # D-04, D-35: a clean end with nothing foreign quits the instance the adapter started, gives its
+        # process what is left of the clean-end window, then closes the Job, which ends whatever is
+        # left; an attached instance has no Job at all.
+        late = "quit: process 4242 still running at the end of the clean-end window; its Job ends it\n"
         for exits, said in ((True, ""), (False, late)):
             word, job = StubWord(), StubJob(exits)
-            app = com.Application(self.binding, connect=lambda: (word, True, com.Owned(4242, job)))
+            app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
             self.assertEqual(app.pid, 4242)
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 app.quit()
-            self.assertEqual((word.quits, job.calls, err.getvalue()),
-                             (1, [f"wait {com.QUIT_WAIT_S:g}", "close"], said))
+            self.assertEqual((word.quits, job.calls, err.getvalue()), (1, ["wait", "close"], said))
+            self.assertTrue(0 < job.waited <= com.QUIT_WAIT_S, job.waited)
             self.assertIsNone(app.pid, "the session let go of what it held")
         self.assertEqual(com.QUIT_WAIT_S, 3.0, "under the 5 s a host (L-P49) and qualify give a driver")
         user = StubWord()
-        attached = com.Application(self.binding, connect=lambda: (user, False, None))
+        attached = com.Application(self.binding, connect=lambda: (user, None))
         attached.quit()
         self.assertEqual((user.quits, user.DisplayAlerts, attached.pid), (0, -1, None))
 
-    def test_an_instance_that_holds_a_document_outlives_the_driver_its_job_disarmed(self):
-        # Ruling LF-7, Review Focus 1: a started instance still holding a document at a clean end (the
-        # user's own, opened in it) is neither quit nor killed: its Job is disarmed, then closed.
-        busy, job = StubWord(), StubJob()
-        holding = com.Application(self.binding, connect=lambda: (busy, True, com.Owned(4242, job)))
-        holding.open("C:/stub/the-users.docx")
+    def test_the_instance_survives_only_a_clean_end_inside_the_window(self):
+        # Founder decision D-35, bound (1): what may keep the started instance runs inside the clean-end
+        # window, QUIT_WAIT_S, under the host's 5 s grace (L-P49) — never on a call's 30 s. Past it (here
+        # a listing that hangs) there is no disarm, and the Job, closed, takes the instance. An unclean
+        # death never reaches this code: the Job takes the instance by itself
+        # (test_a_held_process_dies_with_its_holder_and_a_disarmed_one_lives).
+        word, job, hang = StubWord(), StubJob(), threading.Event()
+        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
+        word.Documents.items.append(Hung(hang))
+        err, began = io.StringIO(), time.monotonic()
+        try:
+            with mock.patch.object(com, "QUIT_WAIT_S", 0.5), contextlib.redirect_stderr(err):
+                app.quit()
+        finally:
+            hang.set()
+        self.assertLess(time.monotonic() - began, 2.0, "the window bounds the end, not a call's deadline")
+        self.assertEqual((job.calls, word.quits), (["close"], 0), "no disarm, no Quit: the Job takes it")
+        self.assertIn("quit: process 4242 not handed over (inventory: no answer within", err.getvalue())
+
+    def test_the_drivers_own_documents_are_closed_first_and_never_keep_the_instance(self):
+        # Founder decision D-35, bound (2): the driver first closes, without saving, every document it
+        # opened and still holds (its close after the action failed); holding nothing else, the instance
+        # is quit. A document of its own that will not close does not keep the instance: no Quit, no
+        # disarm, and the Job, closed, takes it.
+        word, job = StubWord(), StubJob()
+        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
+        left = app.open("C:/stub/left.docx")
+        app.quit()
+        self.assertEqual((left.closed, len(word.Documents.items), word.quits), ({"SaveChanges": False}, 0, 1))
+        self.assertEqual(job.calls, ["wait", "close"])
+        word, job = StubWord(), StubJob()
+        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
+        stuck = app.open("C:/stub/stuck.docx")
+        stuck.Close = lambda **kw: (_ for _ in ()).throw(OSError("the document is in use"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            app.quit()
+        self.assertEqual((word.quits, job.calls), (0, ["close"]), "no Quit, no disarm: the Job takes it")
+        self.assertEqual(err.getvalue(),
+                         "quit: process 4242 not handed over (the document is in use); its Job ends it\n")
+
+    def test_a_document_is_foreign_only_when_the_driver_never_opened_its_name(self):
+        # Founder decision D-35, bound (3): a document is foreign only when its FullName is absent from
+        # the exact list of those the driver opened — one it opened and closed, open again in its
+        # instance, is not. A listing that fails, or an open whose document the driver never named, is
+        # a doubt: no disarm, and the Job, closed, takes the instance.
+        word, job = StubWord(), StubJob()
+        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
+        app.close(app.open("C:/stub/a.docx"))
+        word.Documents.items.append(StubDocument(word, "C:/stub/a.docx"))       # its name is the driver's
+        app.quit()
+        self.assertEqual((word.quits, job.calls), (1, ["wait", "close"]), "not foreign: quit, never kept")
+        word, job = StubWord(), StubJob()
+        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
+        word.Documents.items += [StubDocument(word, "C:/stub/the-users.docx"), Unreadable()]
+        with contextlib.redirect_stderr(io.StringIO()):
+            app.quit()
+        self.assertEqual((word.quits, job.calls), (0, ["close"]), "a listing that fails: the Job takes it")
+        word, job, wedged = StubWord(), StubJob(), threading.Event()
+        app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
+        app.deadline_s = 0.2
+        word.Documents.Open = lambda path, **kw: wedged.wait(30)               # an Open refused by its guard
+        try:
+            with self.assertRaises(DriverRefusal):
+                app.open("C:/stub/slow.docx")
+        finally:
+            wedged.set()
+        word.Documents.items.append(StubDocument(word, "C:/stub/the-users.docx"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            app.quit()
+        self.assertEqual((word.quits, job.calls), (0, ["close"]), "an open never named is a doubt")
+        self.assertIn("(1 open(s) whose document the driver never named)", err.getvalue())
+
+    def test_the_instance_kept_is_handed_to_the_user_and_only_its_job_is_disarmed(self):
+        # Founder decision D-35, bound (4): with a foreign document identified, the instance is handed to
+        # the user — Visible and UserControl set true, DisplayAlerts put back — and its own Job alone is
+        # disarmed: it stays, the user's document in it, the driver's closed. Another started instance,
+        # holding nothing foreign, is quit and its Job closed armed.
+        self.assertEqual(com.COM_TRUE, -1, "VARIANT_TRUE, and PowerPoint's msoTrue")
+        busy, kept = StubWord(), StubJob()
+        holding = com.Application(self.binding, connect=lambda: (busy, com.Owned(4242, kept)))
+        own = holding.open("C:/stub/own.docx")
+        busy.Documents.items.append(StubDocument(busy, "C:/stub/the-users.docx"))
+        other, armed = StubWord(), StubJob()
+        idle = com.Application(self.binding, connect=lambda: (other, com.Owned(4343, armed)))
+        with contextlib.redirect_stderr(io.StringIO()):
+            holding.quit()
+            idle.quit()
+        self.assertEqual((busy.Visible, busy.UserControl, busy.DisplayAlerts, busy.quits),
+                         (com.COM_TRUE, com.COM_TRUE, -1, 0))
+        self.assertEqual(([d.FullName for d in busy.Documents.items], own.closed),
+                         (["C:/stub/the-users.docx"], {"SaveChanges": False}))
+        self.assertEqual((kept.calls, armed.calls, other.quits), (["disarm", "close"], ["wait", "close"], 1))
+
+    def test_every_firing_is_one_stderr_line_with_the_pid_and_the_count(self):
+        # Founder decision D-35, bound (5): an instance kept is recorded in one stderr line (driver.log),
+        # its process id and the count of foreign documents — never a name, never a content.
+        busy = StubWord()
+        holding = com.Application(self.binding, connect=lambda: (busy, com.Owned(4242, StubJob())))
+        holding.open("C:/stub/own.docx")
+        busy.Documents.items += [StubDocument(busy, "C:/stub/Contrat Dupont.docx"),
+                                 StubDocument(busy, "C:/stub/Bilan 2026.docx")]
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             holding.quit()
-        self.assertEqual((busy.quits, len(busy.Documents.items), busy.DisplayAlerts), (0, 1, -1))
-        self.assertEqual(job.calls, ["disarm", "close"])
-        self.assertEqual(err.getvalue(), "quit: Word.Application still holds documents; left running\n")
+        self.assertEqual(err.getvalue(),
+                         "quit: process 4242 handed to the user, 2 foreign document(s) open in it; its Job disarmed\n")
+
+    def test_the_end_closes_then_lists_then_hands_over_then_disarms(self):
+        # Ruling PF-2: inside QUIT_WAIT_S and before any other call — the driver's own documents closed,
+        # the instance's listed, the hand-over, then the disarm; DisplayAlerts and the release come after
+        # it, best effort. A failure before the disarm (here the hand-over refused): no disarm, nothing
+        # put back, and the Job, closed, takes the instance.
+        for refuses, want in [
+                (None, ["Close own.docx", f"Visible {com.COM_TRUE}", f"UserControl {com.COM_TRUE}", "disarm",
+                        "DisplayAlerts -1", "close"]),
+                ("Visible", ["Close own.docx", "close"])]:
+            log = []
+            word, job = OrderedWord(log), StubJob(log=log)
+            app = com.Application(self.binding, connect=lambda: (word, com.Owned(4242, job)))
+            app.open("C:/stub/own.docx")                              # its close after the action failed
+            word.Documents.items.append(StubDocument(word, "C:/stub/the-users.docx"))
+            word.refuses = refuses
+            log.clear()                                               # the session's start is not the subject
+            with contextlib.redirect_stderr(io.StringIO()):
+                app.quit()
+            self.assertEqual(log, want, refuses)
 
     def test_a_session_that_cannot_begin_ends_the_instance_it_started(self):
         # Ruling LF-8: DisplayAlerts cannot be read — the session refuses `precondition`, and the Job of
         # the instance it started is closed at once (an armed Job ends that instance).
         job = StubJob()
         with self.assertRaises(DriverRefusal) as cm:
-            com.Application(self.binding, connect=lambda: (SilentWord(), True, com.Owned(4242, job)))
+            com.Application(self.binding, connect=lambda: (SilentWord(), com.Owned(4242, job)))
         self.assertEqual(cm.exception.reason, "precondition")
         self.assertIn("cannot be started: the application is not answering", cm.exception.detail)
         self.assertEqual(job.calls, ["close"])
@@ -1505,6 +1727,7 @@ Add to `RuntimeTest`:
     def test_off_windows_there_is_no_snapshot_and_no_job(self):
         self.assertIsNone(com.processes())
         self.assertIsNone(com.pids_of({"WINWORD.EXE"}))
+        self.assertIsNone(com.dcom_launcher_pid())
         with self.assertRaises(OSError):
             com.Job.hold(os.getpid())
 
@@ -1512,13 +1735,17 @@ Add to `RuntimeTest`:
     def test_the_snapshot_sees_this_process_by_its_executable(self):
         me = next(p for p in com.processes() if p[0] == os.getpid())
         self.assertTrue(me[2].endswith(".EXE"), me)
-        self.assertIn(os.getpid(), com.pids_of({me[2]}))
+        self.assertEqual(com.pids_of({me[2]})[os.getpid()], me[1], "each process with its parent")
+        launcher = com.dcom_launcher_pid()
+        self.assertIn((launcher, "SVCHOST.EXE"), {(pid, exe) for pid, _, exe in com.processes()},
+                      "the DcomLaunch service runs in a svchost: the parent of what COM starts (PF-4)")
 
     @unittest.skipUnless(sys.platform == "win32", "Job objects are Windows'")
     def test_a_held_process_dies_with_its_holder_and_a_disarmed_one_lives(self):
         # D-04 without Office: a holder puts a sleeper in a kill-on-close Job of its own and is killed
-        # with TerminateProcess (os.kill on Windows): no atexit, no cleanup. The sleeper dies with it;
-        # a sleeper whose Job was disarmed first (ruling LF-7) lives on, and so does one never held.
+        # with TerminateProcess (os.kill on Windows): no atexit, no cleanup. The sleeper dies with it
+        # (D-35 (1): an unclean death leaves the Job to take the instance); a sleeper whose own Job was
+        # disarmed first (D-35 (4)) lives on, and so does one never held.
         base = getattr(sys, "_base_executable", sys.executable)     # the interpreter, not a venv launcher
         sleep = [base, "-I", "-c", "import time; time.sleep(120)"]
         held, disarmed, free = (subprocess.Popen(sleep) for _ in range(3))
@@ -1550,6 +1777,26 @@ def driver_pid(proc: subprocess.Popen) -> int:
     launcher on Windows — the interpreter the launcher started, its one python child."""
     children = [pid for pid, parent, exe in com.processes() or [] if parent == proc.pid and exe == "PYTHON.EXE"]
     return children[0] if children else proc.pid
+
+
+def running(exes: set) -> set:
+    """The ids of the processes running one of `exes` now; empty when there is no snapshot."""
+    return set(com.pids_of(exes) or ())
+
+
+# The PowerPoint of the node steps (ruling PF-5): the ontology's applications block, no verb.
+PPT = {"application": json.loads((DRIVERS / "vkforge" / "ontology" / "office-document.json")
+                                 .read_text(encoding="utf-8"))["applications"]["powerpoint"],
+       "verbs": []}
+# A driver's session in a process of its own (PF-5 (b)): argv = drivers/ and the application block. It
+# prints the process the adapter identified as its own ("None" when it could not), then sleeps until killed.
+STARTER = """import json, sys, time
+sys.path.insert(0, sys.argv[1])
+from vkforge.runtime import com
+app = com.Application({"application": json.loads(sys.argv[2]), "verbs": []})
+print(app.pid, flush=True)
+time.sleep(120)
+"""
 ```
 
 Replace `test_a_surviving_dialog_is_a_dialog_refusal` (`:218-239`) with:
@@ -1587,9 +1834,9 @@ After `test_no_word_the_driver_started_outlives_its_run` (`:312-325`) add:
 ```python
     @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("word"), "Word not installed")
     def test_a_killed_driver_takes_the_word_it_started_and_no_other(self):
-        # D-03/D-04 on the real Word: the driver starts Word (no Word of the user's to attach to), holds
-        # it in its Job, and is killed with TerminateProcess — no `_quit`, no atexit. The Word it
-        # started ends within 10 s; every WINWORD that ran before the test still runs.
+        # D-03/D-04 on the real Word: the driver starts Word (no Word of the user's to attach to),
+        # identifies it (PF-4), holds it in its Job, and is killed with TerminateProcess — no `_quit`,
+        # no atexit. The Word it started ends within 10 s; every WINWORD that ran before still runs.
         import comtypes
         import comtypes.client
         try:
@@ -1599,24 +1846,107 @@ After `test_no_word_the_driver_started_outlives_its_run` (`:312-325`) add:
         else:
             self.skipTest("a running Word would be attached to, not started: close Word to run this test")
         exes = {"WINWORD.EXE"}
-        before = com.pids_of(exes)
+        before = running(exes)
         doc = ooxml_fixtures.docx(Path(tempfile.mkdtemp()) / "c.docx", title_style="Normal", body_font=("Calibri", 12))
         s = Session(self.gen(), fake=False, extra_env={"VK_DRIVER_APPLICATIONS": "WINWORD.EXE"})
         try:
             s.act("appliquer_style_maison", {"document": str(doc), "pdf": str(doc.with_suffix(".pdf"))})
-            started = com.pids_of(exes) - before
+            started = running(exes) - before
             self.assertEqual(len(started), 1, f"the driver started one Word: {started}")
             (word,) = started
             os.kill(driver_pid(s.p), signal.SIGTERM)                  # TerminateProcess: no _quit, no atexit
             deadline = time.monotonic() + 10
-            while word in com.pids_of(exes) and time.monotonic() < deadline:
+            while word in running(exes) and time.monotonic() < deadline:
                 time.sleep(0.2)
-            self.assertNotIn(word, com.pids_of(exes), "the Word the driver started outlived it")
-            self.assertLessEqual(before, com.pids_of(exes), "a Word that ran before the test was touched")
+            self.assertNotIn(word, running(exes), "the Word the driver started outlived it")
+            self.assertLessEqual(before, running(exes), "a Word that ran before the test was touched")
         finally:
             s.p.kill()
             s.p.wait(timeout=10)
             s.p.stdout.close()
+```
+
+After it, the two PowerPoint tests of the node steps (ruling PF-5; Step 9 runs them). Each skips, saying so, when a `POWERPNT.EXE` runs before it starts: that PowerPoint is the founder's, never touched.
+
+```python
+    @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("powerpoint"), "PowerPoint not installed")
+    def test_the_users_powerpoint_is_attached_never_quit_never_held_its_box_left_open(self):
+        # D-03, D-04, ruling PF-4, node step PF-5 (a): a PowerPoint the user started — here the test, from
+        # the shell, on a fictitious deck — is attached: no process of the driver's, no Job, never quit;
+        # a dialog box it raises during a call (its Open dialog, a #32770 window) is left open and the
+        # call refused `dialog`.
+        import comtypes
+        import comtypes.client
+        exes = {"POWERPNT.EXE"}
+        if running(exes):
+            self.skipTest("a PowerPoint is running: never touched; close it to run this node step")
+        deck = ooxml_fixtures.pptx(Path(tempfile.mkdtemp()) / "fictif.pptx")
+        os.startfile(deck)                                          # the user's PowerPoint: the shell starts it
+        try:
+            deadline = time.monotonic() + 60
+            while True:
+                try:
+                    comtypes.client.GetActiveObject("PowerPoint.Application")
+                    break
+                except (OSError, comtypes.COMError):
+                    self.assertLess(time.monotonic(), deadline, "the PowerPoint the shell started never registered")
+                    time.sleep(0.5)
+            users = running(exes)
+            with mock.patch.dict(os.environ, {"VK_DRIVER_APPLICATIONS": "POWERPNT.EXE"}):
+                app = com.Application(PPT)
+                try:
+                    self.assertIsNone(app.pid, "attached: no process of the driver's, no Job")
+                    with self.assertRaises(DriverRefusal) as cm:    # msoFileDialogOpen: the common Open box
+                        com.guarded(lambda: app.app.FileDialog(1).Show(), "file dialog", 5, owner=app.pid)
+                    self.assertEqual(cm.exception.reason, "dialog")
+                    self.assertIn("left open", cm.exception.detail)
+                    boxes = com.dialogs(exes)
+                    self.assertTrue(boxes, "the box is still open")
+                    for hwnd, _ in boxes:                           # the user closes it
+                        com.close_window(hwnd)
+                finally:
+                    app.quit()
+            time.sleep(2)
+            self.assertLessEqual(users, running(exes), "the user's PowerPoint was quit or killed")
+        finally:
+            try:
+                comtypes.client.GetActiveObject("PowerPoint.Application").Quit()
+            except (OSError, comtypes.COMError):
+                pass
+            deadline = time.monotonic() + 10
+            while running(exes) and time.monotonic() < deadline:
+                time.sleep(0.5)
+            for pid in running(exes):                               # this test's own: none ran before it
+                os.kill(pid, signal.SIGTERM)
+
+    @unittest.skipUnless(sys.platform == "win32" and inventory.office_present("powerpoint"), "PowerPoint not installed")
+    def test_a_killed_driver_takes_the_powerpoint_it_started(self):
+        # D-04, ruling PF-4, node step PF-5 (b): no PowerPoint running, the adapter starts one, identifies
+        # it — one new POWERPNT.EXE, its parent the DcomLaunch service — and holds it in its Job; the
+        # process that holds the Job is killed with TerminateProcess (no quit, no atexit), and the
+        # POWERPNT.EXE ends within 10 s.
+        exes = {"POWERPNT.EXE"}
+        if running(exes):
+            self.skipTest("a PowerPoint is running: never touched; close it to run this node step")
+        proc = subprocess.Popen([sys.executable, "-I", "-c", STARTER, str(DRIVERS), json.dumps(PPT["application"])],
+                                stdout=subprocess.PIPE, text=True,
+                                env={**os.environ, "VK_DRIVER_APPLICATIONS": "POWERPNT.EXE"})
+        try:
+            said = proc.stdout.readline().strip()
+            self.assertTrue(said.isdigit(), f"the adapter did not identify the PowerPoint it started: {said!r}")
+            started = int(said)
+            self.assertIn(started, running(exes))
+            os.kill(driver_pid(proc), signal.SIGTERM)               # TerminateProcess: no quit, no atexit
+            deadline = time.monotonic() + 10
+            while started in running(exes) and time.monotonic() < deadline:
+                time.sleep(0.2)
+            self.assertNotIn(started, running(exes), "the PowerPoint the driver started outlived it")
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+            proc.stdout.close()
+            for pid in running(exes):                               # this test's own: none ran before it
+                os.kill(pid, signal.SIGTERM)
 ```
 
 - [ ] **Step 2: Run them, see them fail**
@@ -1626,7 +1956,7 @@ After `test_no_word_the_driver_started_outlives_its_run` (`:312-325`) add:
 & $PY -I -m unittest discover -s drivers/vkforge/tests -t . -p test_generate.py -k dialog -v
 ```
 
-Expected: `AttributeError: module 'vkforge.runtime.com' has no attribute 'own'` (and `Owned`, `QUIT_WAIT_S`, `processes`), `TypeError: guarded() got an unexpected keyword argument 'owner'`, `ValueError: too many values to unpack (expected 2)` from every three-element `connect`, and the attached fake closing its box (`"left open"` not in the detail).
+Expected: `AttributeError: module 'vkforge.runtime.com' has no attribute 'Owned'` (and `own`, `identified`, `COM_TRUE`, `QUIT_WAIT_S`, `processes`, `dcom_launcher_pid`) in every test that names them, `TypeError: guarded() got an unexpected keyword argument 'owner'`, and the attached fake closing its box (`"left open"` not in the detail). The real-Office tests skip off the node.
 
 - [ ] **Step 3: Implement the snapshot, the Job and the ownership** (`drivers/vkforge/runtime/com.py`)
 
@@ -1637,18 +1967,21 @@ Replace the docstring (`:1-4`) with:
 generated driver as vendor/vkforge_runtime/com.py (L-P19): the stdlib, vkdriver.protocol and, lazily
 and on Windows only, comtypes. It names no application (L-P31): what differs between Word and
 PowerPoint at this level is binding["application"], the ontology's applications block for the app.
-The instance it starts, it names by its process — a Toolhelp32 snapshot of the application's
-executables before the start and after (D-03) — and holds in a kill-on-close Job of its own (D-04):
-that instance's dialog boxes are the only ones it closes, and it ends with the driver however the
-driver ends. An instance it attached to, or could not name, it never closes a box of nor holds."""
+The instance it starts, it identifies by its process — the one new process of the application's
+executable between a Toolhelp32 snapshot before the start and one after, its parent the DcomLaunch
+service's process (D-03, PF-4) — and holds in a kill-on-close Job of its own (D-04): that instance's
+dialog boxes are the only ones it closes, and it ends with the driver however the driver ends, save
+the one strictly bounded exception of a clean end that hands it to the user (D-35). An instance it
+attached to, or could not identify, it never quits, holds, or closes a box of."""
 ```
 
-Replace the constants (`:15-19`) with:
+`import time` joins the imports (`:5-11`, after `import threading`). Replace the constants (`:15-19`) with:
 
 ```python
 CALL_DEADLINE_S = 30.0   # one COM call (L-P33); a qualification pass has 90 s (qualify.PASS_DEADLINE_S)
 CLEANUP_DEADLINE_S = 5.0  # the close that ends an action, and the end of the session: often after a timeout
-QUIT_WAIT_S = 3.0        # after Quit, the started process's own end (D-04, LF-7); under the 5 s grace of a host (L-P49) and of qualify
+QUIT_WAIT_S = 3.0        # the clean-end window (D-35 (1)), under the 5 s grace of a host (L-P49) and of qualify
+COM_TRUE = -1            # VARIANT_TRUE, also PowerPoint's msoTrue: true for a bool and an MsoTriState alike (L-P31)
 DIALOG_CLASS = "#32770"  # the Win32 dialog box class: a sign-in, an overwrite, a repair prompt
 WM_CLOSE = 0x0010
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -1660,6 +1993,9 @@ JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9           # JOBOBJECTINFOCLASS
 WAIT_OBJECT_0 = 0x00000000
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+SC_MANAGER_CONNECT = 0x0001
+SERVICE_QUERY_STATUS = 0x0004
+SC_STATUS_PROCESS_INFO = 0                          # SC_STATUS_TYPE
 ```
 
 After `executables()` (`:22-25`) add:
@@ -1685,6 +2021,12 @@ class _EXTENDED_LIMIT(ctypes.Structure):            # JOBOBJECT_EXTENDED_LIMIT_I
     _fields_ = [("BasicLimitInformation", _BASIC_LIMIT), ("IoInfo", ctypes.c_uint64 * 6),
                 ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
                 ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+class _SERVICE_STATUS_PROCESS(ctypes.Structure):    # SERVICE_STATUS_PROCESS: nine DWORDs
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "dwServiceType", "dwCurrentState", "dwControlsAccepted", "dwWin32ExitCode", "dwServiceSpecificExitCode",
+        "dwCheckPoint", "dwWaitHint", "dwProcessId", "dwServiceFlags")]
 
 
 _K32 = None
@@ -1737,19 +2079,64 @@ def processes():
 
 
 def pids_of(exes: set):
-    """The ids of the processes running one of `exes`; None when there is no executable to look for
-    or no snapshot — the process the adapter starts cannot then be named (LF-5)."""
+    """{process id: parent process id} of the processes running one of `exes`; None when there is no
+    executable to look for or no snapshot — the process the adapter starts cannot then be identified
+    (PF-4)."""
     listed = processes() if exes else None
-    return None if listed is None else {pid for pid, _, exe in listed if exe in exes}
+    return None if listed is None else {pid: parent for pid, parent, exe in listed if exe in exes}
 
 
-def started_pid(before, after):
-    """The process a start added (D-03): the one id in `after` not in `before`; None when there is no
-    snapshot, or when none or several appeared (another start at the same moment: no telling which)."""
-    if before is None or after is None:
+def dcom_launcher_pid():
+    """The process id of the DcomLaunch service — the parent of every local server COM starts, hence of
+    the instance a CreateObject starts (ruling PF-4) — read with QueryServiceStatusEx; None off
+    Windows, when the service cannot be queried, or when it reports no process."""
+    if sys.platform != "win32":
         return None
-    new = after - before
-    return next(iter(new)) if len(new) == 1 else None
+    from ctypes import wintypes
+
+    a = ctypes.WinDLL("advapi32", use_last_error=True)
+    a.OpenSCManagerW.restype = wintypes.HANDLE
+    a.OpenSCManagerW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+    a.OpenServiceW.restype = wintypes.HANDLE
+    a.OpenServiceW.argtypes = (wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD)
+    a.QueryServiceStatusEx.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                       ctypes.POINTER(wintypes.DWORD))
+    a.CloseServiceHandle.argtypes = (wintypes.HANDLE,)
+    manager = a.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+    if not manager:
+        return None
+    try:
+        service = a.OpenServiceW(manager, "DcomLaunch", SERVICE_QUERY_STATUS)
+        if not service:
+            return None
+        try:
+            status, needed = _SERVICE_STATUS_PROCESS(), wintypes.DWORD()
+            if not a.QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, ctypes.byref(status),
+                                          ctypes.sizeof(status), ctypes.byref(needed)):
+                return None
+            return status.dwProcessId or None
+        finally:
+            a.CloseServiceHandle(service)
+    finally:
+        a.CloseServiceHandle(manager)
+
+
+def identified(before, after, launcher) -> tuple:
+    """The process a start added, positively identified (D-03, ruling PF-4): (pid, None) when exactly
+    one process of the executable is in `after` and not in `before` (snapshots {pid: parent}) and its
+    parent is `launcher`, the DcomLaunch service's process; (None, why) for anything else — no
+    snapshot, no launcher, none or several new (another start at the same moment), a parent that is
+    not the launcher (a start from the shell: the user's)."""
+    if before is None or after is None:
+        return None, "no snapshot of the application's processes"
+    if launcher is None:
+        return None, "the DcomLaunch service's process is unknown"
+    new = sorted(set(after) - set(before))
+    if len(new) != 1:
+        return None, f"{len(new)} new processes of the application"
+    if after[new[0]] != launcher:
+        return None, f"process {new[0]} was not started by the DCOM launcher"
+    return new[0], None
 
 
 def _limit(job, flags: int) -> None:
@@ -1761,12 +2148,17 @@ def _limit(job, flags: int) -> None:
 
 
 class Job:
-    """A Job object of the adapter's own holding the Office process it started (founder decision D-04):
-    created with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, its handle not inheritable (no security
-    attributes) and held by this driver process alone, so when this process ends — a clean exit, a
-    qualification timeout's kill, the host's kill after its 5 s grace (L-P49), a crash — the OS closes
-    the handle and the process in the Job ends with it. Never made for an instance the adapter
-    attached to. `disarm` clears the limit, for an instance that must outlive the driver (LF-7)."""
+    """A Job object of the adapter's own holding the Office process it started and identified (founder
+    decisions D-04 and D-35): created with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, its handle not
+    inheritable (no security attributes) and held by this driver process alone. However this process
+    ends — a qualification pass killed at its deadline, the host's kill (a STOP, an act's deadline, an
+    umount during an act, the end of its 5 s grace), a crash — the OS closes the handle and the process
+    in the Job ends with it; a clean end closes it too, after Quit, and what is left of the process
+    ends the same way. The one exception is D-35's: at a clean end inside the clean-end window, the
+    driver's own documents closed and a foreign one positively identified, the instance is handed to
+    the user and `disarm` clears the limit of this instance's Job alone — its process then outlives the
+    handles. Any failure before that disarm leaves the Job armed. Never made for an instance the adapter
+    attached to or could not identify (PF-4)."""
 
     def __init__(self, job, process, pid: int):
         self.job, self.process, self.pid = job, process, pid
@@ -1799,7 +2191,7 @@ class Job:
         return _kernel32().WaitForSingleObject(self.process, int(timeout_s * 1000)) == WAIT_OBJECT_0
 
     def disarm(self) -> None:
-        """The kill-on-close limit cleared: the process outlives the handles (LF-7)."""
+        """The kill-on-close limit cleared, on this Job alone: its process outlives the handles (D-35 (4))."""
         _limit(self.job, 0)
 
     def close(self) -> None:
@@ -1813,14 +2205,14 @@ class Job:
 
 
 class Owned:
-    """The instance this adapter started and could name (D-03): its process id, and the Job that ends
-    it with the driver (D-04) — None when Windows refused the assignment (logged, tolerated)."""
+    """The instance this adapter started and identified (D-03, PF-4): its process id, and the Job that
+    ends it with the driver (D-04) — None when Windows refused the assignment (logged, tolerated)."""
 
     def __init__(self, pid: int, job=None):
         self.pid, self.job = pid, job
 
 
-_HELD = []    # the Jobs of instances whose start was refused (LF-8): they end with this process
+_HELD = []    # the Jobs of identified instances whose start was refused (LF-8, PF-4): they end with this process
 
 
 def _hold(pid: int):
@@ -1833,22 +2225,23 @@ def _hold(pid: int):
         return None
 
 
-def own(started: bool, before, after, hold=_hold) -> tuple:
-    """(started, owned) once the adapter has its application (D-03, ruling LF-5). Attached: (False,
-    None). Started, and exactly one process of the executable appeared: (True, Owned(pid, hold(pid))).
-    Started, and none appeared: CreateObject handed back an instance already running (PowerPoint is
-    single-instance) — (False, None): the user's, never quit, held, or its boxes closed. Started, and
-    two or more appeared, or no snapshot: (True, None) — a process the adapter cannot name: quit at a
-    clean end as before (L-P46), never held, its boxes never closed."""
+def own(started: bool, before, after, launcher, hold=_hold):
+    """What the adapter owns of the instance it has (D-03; rulings LF-5 and PF-4): Owned(pid, hold(pid))
+    only when it started the instance and identified its process positively (`identified`); None —
+    attached — otherwise: an instance it found running (GetActiveObject), or one it cannot tell from the
+    user's (CreateObject handed back a running PowerPoint, several new processes, a parent other than
+    the DcomLaunch service, no snapshot, no launcher). An attached instance is never quit, never held in
+    a Job, its dialog boxes never closed; a start that cannot be told apart is one stderr line."""
     if not started:
-        return False, None
-    if before is not None and after is not None and not (after - before):
-        return False, None
-    pid = started_pid(before, after)
-    return (True, None) if pid is None else (True, Owned(pid, hold(pid)))
+        return None
+    pid, why = identified(before, after, launcher)
+    if pid is None:
+        sys.stderr.write(f"start: treated as attached: {why}\n")
+        return None
+    return Owned(pid, hold(pid))
 ```
 
-In `dialogs` (`:28-70`): the docstring becomes `"""The visible top-level dialog boxes (class #32770) of the processes running one of `exes`, each as (window, process id): the guard closes only those of the instance the adapter started (D-03)."""` and `:66` becomes `found.append((hwnd, pid.value))`.
+In `dialogs` (`:28-70`): the docstring becomes `"""The visible top-level dialog boxes (class #32770) of the processes running one of `exes`, each as (window, process id): the guard closes only those of the instance the adapter started and identified (D-03, PF-4)."""` and `:66` becomes `found.append((hwnd, pid.value))`.
 
 Replace `guarded` (`:82-116`) with:
 
@@ -1858,7 +2251,7 @@ def guarded(fn, what: str, deadline_s: float = CALL_DEADLINE_S, find_dialogs=Non
     application's executables are listed with their process (D-03): those of `owner` — the process of
     the instance the adapter started, or a callable naming it at that moment — are closed, never
     answered, and the action refuses `dialog`. A box of any other process is never touched (LF-6):
-    with no owner known (an attached instance, or one the adapter could not name) a box of the
+    with no owner known (an attached instance: the user's, or one the adapter could not identify) a box of the
     application still means `dialog`, said to be left open; with an owner known, a box elsewhere did
     not hold this call, and the action refuses `timeout`, as it does with none open. A thread that
     finds comtypes loaded joins the multithreaded apartment that Application keeps alive, so the
@@ -1893,33 +2286,39 @@ def guarded(fn, what: str, deadline_s: float = CALL_DEADLINE_S, find_dialogs=Non
                                           "closed, never answered")
         if seen and pid is None:
             raise DriverRefusal("dialog", f"{what}: a dialog box of the application is open; left open: "
-                                          "the instance is not one the driver started")
+                                          "the instance is not one the driver owns")
         raise DriverRefusal("timeout", f"{what}: no answer within {deadline_s:g} s")
     if "error" in box:
         raise box["error"]
     return box.get("value")
 ```
 
-- [ ] **Step 4: Implement the adapter that names and holds what it starts** (replace `class Application`, `:184-305`, whole)
+- [ ] **Step 4: Implement the adapter that identifies and holds what it starts, and ends it within D-35's bounds** (replace `class Application`, `:184-305`, whole)
+
+Bound (4) and the type libraries: see Self-review notes, §5 — the controller settles it before this task is dispatched.
 
 ```python
 class Application:
     """The application binding["application"] names: the user's own instance when one is running
     (spike verdict 3), else one the adapter starts. The adapter changes only its DisplayAlerts, read
     first and put back by quit() whenever the instance is left running (L-P47). An instance it
-    started and named by its process (D-03, LF-5) is the only one whose dialog boxes it closes, and
-    is held in a kill-on-close Job of the adapter's (D-04): quit() ends it when it holds no document
-    (L-P46), and a driver that dies takes it along. `connect` returns (application, started, owned),
-    owned an Owned or None; the default is the running instance, else a new one."""
+    started and identified by its process (D-03, PF-4) is the only one whose dialog boxes it closes,
+    and is held in a kill-on-close Job of the adapter's (D-04): quit() ends it — save D-35's bounded
+    exception — and a driver that dies takes it along. Any other instance is attached: never quit,
+    never held. `connect` returns (application, owned), owned an Owned or None; the default is the
+    running instance, else a new one. What the driver opens is written down for the end (D-35):
+    `opened`, the FullName of every document it opened; `mine`, those it has not closed;
+    `unnamed_opens`, its opens whose document it never named."""
 
     def __init__(self, binding: dict, connect=None):
         self.binding, self.spec = binding, binding["application"]
         self.verbs = {v["verb"]: v for v in binding["verbs"]}
         self.deadline_s, self.cleanup_deadline_s = CALL_DEADLINE_S, CLEANUP_DEADLINE_S
-        self.app, self.started, self.owned, self.alerts_before, self.failed = None, False, None, None, None
+        self.app, self.owned, self.alerts_before, self.failed = None, None, None, None
+        self.opened, self.mine, self.unnamed_opens = set(), [], 0   # what the driver opened (D-35)
         progid = self.spec["progid"]
         try:
-            self.app, self.started, self.owned = (connect or self._connect)()
+            self.app, self.owned = (connect or self._connect)()
             self.alerts_before = self._guard(lambda: self.app.DisplayAlerts, "DisplayAlerts")
             self._guard(lambda: setattr(self.app, "DisplayAlerts", self.spec["alerts_off"]), "DisplayAlerts")
         except BaseException as e:
@@ -1931,7 +2330,7 @@ class Application:
 
     @property
     def pid(self):
-        """The process of the instance this adapter started and named (D-03); None otherwise."""
+        """The process of the instance this adapter started and identified (D-03, PF-4); None otherwise."""
         return None if self.owned is None else self.owned.pid
 
     def _guard(self, fn, what: str, deadline_s: float | None = None):
@@ -1948,7 +2347,7 @@ class Application:
         import comtypes
         import comtypes.client
 
-        exes = executables()
+        exes, launcher = executables(), dcom_launcher_pid()
         before = pids_of(exes)                          # before GetActiveObject: an attach starts nothing
 
         def start():
@@ -1958,16 +2357,16 @@ class Application:
                 return comtypes.client.CreateObject(progid), True
 
         try:
-            # A box raised while the instance starts (a first-run prompt) is closed when the new process
-            # can be named by then (D-03).
-            app, started = guarded(start, f"start {progid}", owner=lambda: started_pid(before, pids_of(exes)))
+            # A box raised while the instance starts (a first-run prompt) is closed only when the new
+            # process is positively identified by then (D-03, PF-4).
+            app, started = guarded(start, f"start {progid}",
+                                   owner=lambda: identified(before, pids_of(exes), launcher)[0])
         except DriverRefusal:
-            pid = started_pid(before, pids_of(exes))
-            if pid is not None:
-                _HELD.append(_hold(pid))                # LF-8: it ends with this driver
+            held = own(True, before, pids_of(exes), launcher)   # LF-8: a positively owned process only (PF-4)
+            if held is not None:
+                _HELD.append(held.job)                  # it ends with this driver
             raise
-        started, owned = own(started, before, pids_of(exes) if started else None)
-        return app, started, owned
+        return app, own(started, before, pids_of(exes) if started else None, launcher)
 
     def _documents(self):
         return getattr(self.app, self.spec["collection"])
@@ -1979,12 +2378,26 @@ class Application:
         """The document, opened. A failure while opening (no such file, a damaged one, the application's
         refusal) is `precondition`, as the fake's; a failure inside a verb is `internal` in both. The
         plan's "not open elsewhere" holds in this very instance too: there Open hands back a document the
-        user already has open, unsaved edits included; refused, and that document is not closed."""
+        user already has open, unsaved edits included; refused, and that document is not closed. What
+        the driver opens is written down for the end of the session (D-35): its FullName, read back after
+        the Open, in `opened`, and the document in `mine` until it is closed; an Open whose document is
+        never named — refused by its guard, or its name unreadable — stays counted in `unnamed_opens`,
+        a doubt that keeps the instance from being handed over."""
         self.failed = None                                  # a new action begins with its document
         try:
             open_before = self._guard(lambda: {d.FullName for d in _items(self._documents())}, "open")
-            doc = self._guard(lambda: self._documents().Open(path, **self.spec["open"]), "open")
-            already = self._guard(lambda: doc.FullName, "open") in open_before
+            self.unnamed_opens += 1                         # D-35 (3): until its document is named
+            try:
+                doc = self._guard(lambda: self._documents().Open(path, **self.spec["open"]), "open")
+            except _com_errors():
+                self.unnamed_opens -= 1                     # the application refused: it opened nothing
+                raise
+            name = self._guard(lambda: doc.FullName, "open")
+            self.unnamed_opens -= 1
+            already = name in open_before
+            if not already:
+                self.opened.add(name)                       # D-35 (3): the driver's exact list
+                self.mine.append(doc)                       # D-35 (2): closed at the end if still open
             read_only = not already and self._guard(lambda: bool(doc.ReadOnly), "open")
         except _com_errors() as e:
             raise DriverRefusal("precondition", f"document cannot be opened: {e}") from e
@@ -2010,69 +2423,106 @@ class Application:
         application that may be wedged: the short cleanup deadline, its own refusal written to stderr,
         never raised, so the action's first refusal is the one the host gets. After a successful action,
         the normal deadline, and a failure is `internal` "close failed: …": a document the driver opened
-        must not stay open, hidden, in the user's instance without the host hearing of it."""
+        must not stay open, hidden, in the user's instance without the host hearing of it. One that did
+        not close stays in `mine`, closed again at the end of the session (D-35 (2))."""
         if self.failed is not None:
             try:
                 self._guard(lambda: doc.Close(**self.spec["close"]), "close", self.cleanup_deadline_s)
             except (DriverRefusal, *_com_errors()) as e:
                 sys.stderr.write(f"close: {e}\n")
-            return
-        try:
-            self._guard(lambda: doc.Close(**self.spec["close"]), "close")
-        except (DriverRefusal, *_com_errors()) as e:
-            raise DriverRefusal("internal", f"close failed: {e}") from e
+                return
+        else:
+            try:
+                self._guard(lambda: doc.Close(**self.spec["close"]), "close")
+            except (DriverRefusal, *_com_errors()) as e:
+                raise DriverRefusal("internal", f"close failed: {e}") from e
+        self._closed(doc)
+
+    def _closed(self, doc) -> None:
+        """`doc` is closed: no longer the driver's to close at the end (D-35 (2))."""
+        self.mine = [d for d in self.mine if d is not doc]
 
     def quit(self) -> None:
-        """The end of the session (L-P46, L-P47, D-04), once. An instance this adapter started and that
-        holds no document (after the references this process dropped are collected) is quit; when the
-        adapter named its process, that process gets QUIT_WAIT_S to end before its Job closes, which
-        ends whatever is left (LF-7). Any other is left running with its DisplayAlerts put back: the
-        user's own instance, or a started one still holding a document (one the user opened there, or
-        one a failed close left; nothing is closed, stderr says so) — whose Job is disarmed first, so a
-        clean end never destroys a document the adapter can see. Every reference to the application is
-        released at the end. A failure is written to stderr, never raised: this runs when serve returns
-        and at exit."""
+        """The end of the session, once (L-P46, L-P47; founder decisions D-04 and D-35). An attached
+        instance — the user's, or one whose process the adapter could not identify (PF-4) — is never
+        quit and gets its DisplayAlerts back. The instance the adapter started and identified ends with
+        the driver unless D-35's five bounds all hold (`_end_started`, inside the clean-end window that
+        starts here); one handed to the user gets its DisplayAlerts back too, best effort, after the
+        disarm. Every reference to the application is then released, and the Job's handles closed:
+        armed, the Job ends what is left of the instance — after a Quit, once its process has had what
+        is left of the window; disarmed, the instance is the user's. A failure is written to stderr,
+        never raised: this runs when serve returns and at exit."""
         if self.app is None:
             return
-        left_running, holds = True, False
+        owned, end = self.owned, time.monotonic() + QUIT_WAIT_S
+        ending = "attached" if owned is None else self._end_started(owned, end)
         try:
-            if self.started:
-                self._guard(gc.collect, "quit", self.cleanup_deadline_s)
-                if self._guard(lambda: self._documents().Count, "quit", self.cleanup_deadline_s):
-                    holds = True
-                    sys.stderr.write(f"quit: {self.spec['progid']} still holds documents; left running\n")
-                else:
-                    self._guard(lambda: self.app.Quit(), "quit")
-                    left_running = False
-        except (DriverRefusal, *_com_errors()) as e:
-            sys.stderr.write(f"quit: {e}\n")
-        try:
-            if left_running and self.alerts_before is not None:
+            if ending in ("attached", "kept") and self.alerts_before is not None:
                 self._guard(lambda: setattr(self.app, "DisplayAlerts", self.alerts_before), "DisplayAlerts",
                             self.cleanup_deadline_s)
         except (DriverRefusal, *_com_errors()) as e:
             sys.stderr.write(f"quit: {e}\n")
         finally:
-            held, self.app = [self.app], None
+            held, self.app, self.owned = [self.app], None, None
             try:      # the last reference dropped in the apartment it was made in
                 self._guard(lambda: (held.clear(), gc.collect()), "release", self.cleanup_deadline_s)
             except DriverRefusal as e:
                 sys.stderr.write(f"quit: {e}\n")
-            self._let_go(holds, quitted=not left_running)
+            if owned is not None and owned.job is not None:
+                self._close_job(owned, end, ending)
 
-    def _let_go(self, holds: bool, quitted: bool) -> None:
-        """The started instance's Job, once every reference is released (D-04, LF-7): disarmed when the
-        instance holds a document and stays; after a Quit, its process waited for up to QUIT_WAIT_S;
-        then both handles closed — an armed Job ends what is left of the process."""
-        owned, self.owned = self.owned, None
-        if owned is None or owned.job is None:
-            return
+    def _bounded(self, fn, what: str, end: float):
+        """fn() under the guard, given what is left of the clean-end window that ends at `end` (D-35
+        (1)): the window over is refused like any timeout."""
+        left = end - time.monotonic()
+        if left <= 0:
+            raise DriverRefusal("timeout", f"{what}: the clean-end window is over")
+        return self._guard(fn, what, left)
+
+    def _end_started(self, owned, end: float) -> str:
+        """The bounded end of the instance this adapter started and identified (founder decision D-35,
+        ruling PF-2): inside the clean-end window, before any other call, in this order — (2) every
+        document the driver opened and still holds is closed without saving (the binding's close:
+        Word's SaveChanges=False; PowerPoint's Close saves nothing); (3) the instance's documents are
+        listed by FullName, one foreign only when its FullName is not in `opened`; (4) with a foreign
+        document, the instance is handed to the user — Visible and UserControl set true — and then,
+        only then, this instance's Job alone is disarmed; (5) one stderr line says so, the process id
+        and the count, never a name. Returns "kept" (handed over), "quit" (nothing foreign: Quit sent)
+        or "ended": a failure, a timeout or a doubt before the disarm — an open the driver never named,
+        a document of its own that will not close, a listing that fails, a hand-over refused, the window
+        over — means no disarm, and the Job, closed, takes the instance (D-04)."""
         try:
-            if holds:
+            if self.unnamed_opens:
+                raise DriverRefusal("internal",
+                                    f"{self.unnamed_opens} open(s) whose document the driver never named")
+            for doc in list(self.mine):                                                  # (2)
+                self._bounded(lambda d=doc: d.Close(**self.spec["close"]), "close", end)
+                self._closed(doc)
+            self._bounded(gc.collect, "quit", end)
+            names = self._bounded(lambda: [d.FullName for d in _items(self._documents())], "inventory", end)
+            foreign = sum(1 for name in names if name not in self.opened)                # (3)
+            if not foreign:
+                self._bounded(lambda: self.app.Quit(), "quit", end)
+                return "quit"
+            self._bounded(lambda: setattr(self.app, "Visible", COM_TRUE), "hand-over", end)      # (4)
+            self._bounded(lambda: setattr(self.app, "UserControl", COM_TRUE), "hand-over", end)
+            if owned.job is not None:
                 owned.job.disarm()
-            elif quitted and not owned.job.wait(QUIT_WAIT_S):
-                sys.stderr.write(f"quit: process {owned.pid} still running {QUIT_WAIT_S:g} s after Quit; "
-                                 "its Job ends it\n")
+        except Exception as e:  # noqa: BLE001 — any failure before the disarm: no disarm (PF-2)
+            sys.stderr.write(f"quit: process {owned.pid} not handed over ({e}); its Job ends it\n")
+            return "ended"
+        sys.stderr.write(f"quit: process {owned.pid} handed to the user, {foreign} foreign document(s) "
+                         "open in it; its Job disarmed\n")                                # (5)
+        return "kept"
+
+    def _close_job(self, owned, end: float, ending: str) -> None:
+        """The started instance's Job, once every reference is released (D-04): after a Quit, its
+        process waited for what is left of the clean-end window; then both handles closed — armed, the
+        Job ends what is left of the process; disarmed (D-35), the process is the user's."""
+        try:
+            if ending == "quit" and not owned.job.wait(max(0.0, end - time.monotonic())):
+                sys.stderr.write(f"quit: process {owned.pid} still running at the end of the clean-end "
+                                 "window; its Job ends it\n")
         except OSError as e:
             sys.stderr.write(f"quit: {e}\n")
         finally:
@@ -2112,9 +2562,9 @@ Replace `__dialog__` (`:98-105`) with:
 
 - [ ] **Step 6: The two qualify docstrings** (`drivers/vkforge/qualify.py`)
 
-`:20-21`, the sentence `A pass killed at its deadline never runs the driver's `_quit`: the Office instance it started stays running.` becomes `A pass killed at its deadline never runs the driver's `_quit`; the Office instance the driver started ends with it all the same, through the kill-on-close Job the adapter holds it in (D-04), while an instance it attached to is left as the kill found it.`
+`:20-21`, the sentence `A pass killed at its deadline never runs the driver's `_quit`: the Office instance it started stays running.` becomes `A pass killed at its deadline never runs the driver's `_quit`; the Office instance the driver started and identified ends with it all the same, through the kill-on-close Job the adapter holds it in (D-04), while an instance it attached to — or could not identify (PF-4) — is left as the kill found it.`
 
-`:70-71`, the sentence `An Office instance a COM call started is not in the tree (DCOM launches it): never killed here.` becomes `An Office instance a COM call started is not in the tree (DCOM launches it): never killed here — it ends through the adapter's own Job when the driver does (D-04).`
+`:70-71`, the sentence `An Office instance a COM call started is not in the tree (DCOM launches it): never killed here.` becomes `An Office instance a COM call started is not in the tree (DCOM launches it): never killed here — once the adapter has identified it (PF-4), it ends through the adapter's own Job when the driver does (D-04).`
 
 - [ ] **Step 7: Run the tests, see them pass**
 
@@ -2131,40 +2581,63 @@ Expected: all pass. On Windows `test_the_snapshot_sees_this_process_by_its_execu
 Close every Word window first (a running Word would be attached to, and the test skips saying so). Then:
 
 ```powershell
-& $PY -I -m unittest discover -s drivers/vkforge/tests -t . -p test_generate.py -k killed_driver -v
+& $PY -I -m unittest discover -s drivers/vkforge/tests -t . -p test_generate.py -k takes_the_word_it_started -v
 & $PY -I -m unittest discover -s drivers/vkforge/tests -t . -p test_generate.py -k outlives_its_run -v
 & $PY -I -m unittest discover -s drivers/vkforge/tests -t . -p test_runtime.py -k real_word -v
 Get-Process WINWORD -ErrorAction SilentlyContinue
 ```
 
-Expected: the three pass (`test_a_killed_driver_takes_the_word_it_started_and_no_other`, `test_no_word_the_driver_started_outlives_its_run`, `test_the_adapter_applies_the_house_style_on_the_real_word`) and `Get-Process` lists no `WINWORD`. The controller records the run in the chantier's ledger; a failure of the first (Word survives the kill) means Windows refused the Job assignment: the driver's stderr says `job: process … not held: …`, which goes to the ledger as a finding.
+Expected: the three pass (`test_a_killed_driver_takes_the_word_it_started_and_no_other`, `test_no_word_the_driver_started_outlives_its_run`, `test_the_adapter_applies_the_house_style_on_the_real_word`) and `Get-Process` lists no `WINWORD`. The controller records the run in the chantier's ledger; a failure of the first (Word survives the kill) means Windows refused the Job assignment (`job: process … not held: …`) or the start was not identified (`start: treated as attached: …`): the driver's stderr says which, and it goes to the ledger as a finding.
 
-- [ ] **Step 9: Docs**
+- [ ] **Step 9: On the node, the real PowerPoint (controller, ruling PF-5; only when no PowerPoint runs)**
+
+The founder's own PowerPoint is never touched. First:
+
+```powershell
+Get-Process POWERPNT -ErrorAction SilentlyContinue
+```
+
+If it lists a `POWERPNT`, both steps are skipped and the skip is reported in the chantier's ledger (the two tests skip too, saying so). Otherwise:
+
+```powershell
+& $PY -I -m unittest discover -s drivers/vkforge/tests -t . -p test_generate.py -k powerpoint -v
+Get-Process POWERPNT -ErrorAction SilentlyContinue
+```
+
+Expected: both pass, and `Get-Process` lists no `POWERPNT`. (a) `test_the_users_powerpoint_is_attached_never_quit_never_held_its_box_left_open`: the PowerPoint the test started from the shell on a fictitious deck is attached — no process of the driver's, no Job — its Open dialog box is left open and the call refused `dialog`, and it still runs once the session has ended (the test then quits it). (b) `test_a_killed_driver_takes_the_powerpoint_it_started`: the adapter starts PowerPoint, identifies it (its parent the `DcomLaunch` service) and holds it in its Job; the process holding the Job is killed with TerminateProcess and the `POWERPNT.EXE` ends within 10 s. The controller records both in the chantier's ledger; (b) reading something other than a process id means the start was not identified (`start: treated as attached: …` on the starter's stderr) — a finding for the ledger, never a test to loosen.
+
+- [ ] **Step 10: Docs**
 
 `contracts/tcb.md:248` — the bullet becomes:
 
 ```markdown
-- **A dialog box is closed, never answered (ruling L-P33) — and only in the Office instance the driver started (founder decision D-03).** A dialog raised during an action is dismissed by the adapter and the action refuses `dialog`; nothing is ever clicked through. The adapter names the instance it starts by its process — the one process of the application's executable that appeared when it started it, from a Toolhelp32 snapshot before and after — and `dialogs()` closes the `#32770` windows of that process only. Attached to the user's own instance, or when it could not name the process it started (none, or several, appeared), it closes nothing: a dialog box of the application still makes the action refuse `dialog`, and the box is left open for the user.
+- **A dialog box is closed, never answered (ruling L-P33) — and only in the Office instance the driver started (founder decision D-03).** A dialog raised during an action is dismissed by the adapter and the action refuses `dialog`; nothing is ever clicked through. The adapter identifies the instance it starts by its process — the one process of the application's executable that appeared when it started it, from a Toolhelp32 snapshot before and after, whose parent is the `DcomLaunch` service's process (ruling PF-4) — and `dialogs()` closes the `#32770` windows of that process only. Attached to the user's own instance, or when it cannot identify the process it started (none or several appeared, another parent, no snapshot), it treats the instance as attached and closes nothing: a dialog box of the application still makes the action refuse `dialog`, and the box is left open for the user.
 ```
 
 `contracts/tcb.md:250` — in **Known gaps of the learning path**, the last sentence `A qualification pass killed on its timeout orphans the Office instance the driver started (its `_quit` never ran) and the operator closes it.` becomes:
 
 ```markdown
-The Office instance the driver started and named is held in a Job object the adapter creates with kill-on-close, its handle held by the driver process alone and never inherited (founder decision D-04): however the driver ends — a qualification pass killed at its deadline, the host's kill after its 5 s grace, a crash — that instance ends with it, and an instance the driver attached to is never in it. A clean end quits it and waits up to 3 s for its process; one that still holds a document is left running, its Job disarmed first, because a clean end never destroys a document the adapter can see (ruling LF-7) — an unclean death cannot see, and takes the instance with whatever the user opened in it. When Windows refuses the assignment (said in the driver's `driver.log`) or the process could not be named, that instance outlives a killed driver, as before D-04.
+The Office instance the driver started and identified is held in a Job object the adapter creates with kill-on-close, its handle held by the driver process alone and never inherited (founder decision D-04): however the driver ends — a qualification pass killed at its deadline, the host's kill, a crash — that instance ends with it, and an instance the driver attached to is never in it. A clean end ends it too, save one strictly bounded exception (founder decision D-35): inside the clean-end window (3 s, under the host's 5 s grace) the driver closes without saving every document it opened, lists the instance's documents, and only when one is foreign — its `FullName` absent from the exact list of those the driver opened — hands the instance to the user (`Visible`, `UserControl`, `DisplayAlerts` put back) and disarms that instance's Job, one line of `driver.log` giving the process id and the count, never a name. Any failure, timeout or doubt before the disarm leaves the Job to take the instance, and an unclean death takes it with whatever the user opened in it. An instance whose process the adapter cannot identify (ruling PF-4) is treated as attached — never quit, never held, its boxes never closed — even when the driver started it, and outlives the driver, as does one whose assignment to the Job Windows refused (both said in `driver.log`). A driver learned before this chantier keeps the adapter it vendored, without a Job, until it is learned again.
 ```
 
-`docs/technical/runbooks/learn-office-driver.md:106` — after `… (d'où la réserve 3 du §8).` add: `Le Word qu'il lance, il le reconnaît à son processus et le tient dans un Job « tuer à la fermeture » : ce Word ne survit pas au driver.`
+`contracts/tcb.md:252` — in **Failure leaves the driver degraded, and the operator remounts (pilot ruling R12).**, the sentence `Since ruling L-P49 the host first closes the driver's stdin and gives it 5 s to exit on its own (a learned driver quits the Office instance it started), then kills the tree: for every driver — a browser driver mid-action under a human STOP or `vk driver umount` included — the kill comes up to 5 s later.` becomes (ruling PF-11; the code gives a STOP or an umount during an act no grace):
 
-`:116` — `Le driver ferme les boîtes de dialogue sans jamais répondre (le §8 en dit les limites).` becomes `Le driver ferme, sans jamais répondre, les boîtes de dialogue du Word qu'il a lancé, et seulement celles-là (le §8 en dit les limites).`
+```markdown
+Since ruling L-P49 a host dropped while its driver is idle — an idle `vk driver umount`, a host `ensure` replaces, the process of a refused mount — first closes the driver's stdin and gives it 5 s to exit on its own (a learned driver ends the Office instance it started on its way out, founder decision D-35), then kills the tree. A STOP, an act's deadline, a protocol fault or a `vk driver umount` during an act gets no grace: the host kills the tree at once (`DriverHost::kill`, `kill_pid_tree`), and a learned driver's Office ends through its Job (D-04).
+```
+
+`docs/technical/runbooks/learn-office-driver.md:106` — after `… (d'où la réserve 3 du §8).` add: `Le Word qu'il lance, il le reconnaît à son processus (un seul nouveau WINWORD.EXE, lancé par le service DcomLaunch) et le tient dans un Job « tuer à la fermeture » : ce Word ne survit pas au driver, sauf l'exception bornée de la réserve 2.`
+
+`:116` — `Le driver ferme les boîtes de dialogue sans jamais répondre (le §8 en dit les limites).` becomes `Le driver ferme, sans jamais répondre, les boîtes de dialogue du Word qu'il a lancé et reconnu, et seulement celles-là (le §8 en dit les limites).`
 
 `:189-190` — reserves 2 and 3 become:
 
 ```markdown
-2. **Un rejeu tué à son délai n'abandonne plus le Word qu'il a lancé.** Le driver tient ce Word dans un Job « tuer à la fermeture » : tué, il l'emporte. Si Windows a refusé de le mettre dans le Job, `driver.log` le dit (`job: process … not held`) et ce Word reste : on le ferme à la main, sans enregistrer. Un Word que vous aviez ouvert vous-même n'est jamais dans ce Job, et un document à vous ouvert dans le Word du driver survit à une fin normale du driver (le Job est alors désarmé), pas à sa mort.
-3. **Les boîtes de dialogue de votre propre Word ne sont jamais fermées.** Le driver ne ferme que celles du Word qu'il a lancé lui-même. Attaché à votre Word, il refuse `dialog` et laisse la boîte ouverte : on y répond soi-même, puis on requalifie.
+2. **Un rejeu tué à son délai n'abandonne plus le Word qu'il a lancé.** Le driver reconnaît le Word qu'il lance (un seul nouveau `WINWORD.EXE`, lancé par le service `DcomLaunch`) et le tient dans un Job « tuer à la fermeture » : tué, il l'emporte ; à une fin normale, il le ferme aussi. Si Windows a refusé de le mettre dans le Job (`driver.log` : `job: process … not held`), ou si le driver n'a pas pu le reconnaître (`start: treated as attached: …`), il le traite comme le vôtre et ce Word reste : on le ferme à la main, sans enregistrer. Un Word que vous aviez ouvert vous-même n'est jamais dans ce Job. Une seule exception, bornée (décision D-35) : à une fin normale, si le driver trouve dans son Word un document que vous y avez ouvert vous-même, il ferme d'abord les siens sans enregistrer, vous rend ce Word visible et le laisse ouvert ; `driver.log` le dit (`quit: process N handed to the user, K foreign document(s) open in it; its Job disarmed`), sans nom de document. Au moindre doute, ou si le driver meurt, ce Word part avec votre document. Un driver appris avant cette version garde l'ancien adaptateur, sans Job, jusqu'à ce qu'on le réapprenne (§3).
+3. **Les boîtes de dialogue de votre propre Word ne sont jamais fermées.** Le driver ne ferme que celles du Word qu'il a lancé et reconnu. Attaché à votre Word, il refuse `dialog` et laisse la boîte ouverte : on y répond soi-même, puis on requalifie.
 ```
 
-- [ ] **Step 10: The whole suite and the docs check**
+- [ ] **Step 11: The whole suite and the docs check**
 
 ```powershell
 & $PY -I -m unittest discover -s drivers/vkforge/tests -t .
@@ -2172,12 +2645,12 @@ git diff --exit-code drivers/vkforge/tests/fixtures
 python -I scripts/docs/check_docs.py
 ```
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
 git add drivers/vkforge/runtime/com.py drivers/vkforge/runtime/fake.py drivers/vkforge/qualify.py drivers/vkforge/tests/test_runtime.py drivers/vkforge/tests/test_generate.py contracts/tcb.md docs/technical/runbooks/learn-office-driver.md
 git commit -F - <<'MSG'
-feat(vkforge): the Office a learned driver starts is named by its process, the only one whose dialogs it closes, and held in a kill-on-close Job (D-03, D-04)
+feat(vkforge): the Office a learned driver starts is identified by its process and its DCOM parent, the only one whose dialogs it closes, held in a kill-on-close Job, and kept at a clean end only within D-35's bounds (D-03, D-04, D-35)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01UUDLpkwxsZXmLptqCeNL2R
@@ -2188,14 +2661,14 @@ MSG
 
 ### Task 4: D-31 (final re-review F-1) — the qualification gate before every spawn of a `kind: com` driver (Sonnet)
 
-**Model:** Sonnet (one closure, one failure variant, one test; the kernel's `check_qualified` is unchanged). **Decision:** D-31. **Ruling:** LF-9.
+**Model:** Sonnet (one closure, one failure variant, one test; the kernel's `check_qualified` is unchanged). **Decision:** D-31. **Rulings:** LF-9, PF-6 (the ledger keeps the word `unqualified`), PF-7 (the gate holds per start of the process, not per act).
 
 **Where the drivers come back after a restart (the finding LF-9 rests on).** `RealKernel::boot` restores nothing that runs: `degrade_invalid_drivers` (`crates/vk-kernel/src/drivers.rs:743-781`, called at `crates/vk-kernel/src/lib.rs:1141`) only degrades rows whose manifest no longer validates — "Nothing is spawned here — the daemon owns the processes". The daemon's `DriverPool` starts empty (`crates/vk-ipc/src/drivers.rs:123-127`: "A daemon that has just restarted holds none"). A `Ready` row is respawned lazily by the first `driver.act`: `act` → `run_act` (`:833-859`) → `DriverPool::act` (`:241-263`) → `ensure` (`:172-217`) → `spawn_host` (`:438-456`). `mount` also reaches the same `ensure` (`:723-726`) after its own gate (`:656-661`, `:674-678`). So the gate goes into `ensure`, right before `spawn_host`: one place for mount and act, run only when a process is about to start, with the fixtures flag the daemon's `serve_on` set (final review I-1) — which is why it is not run at boot, where the flag is not set yet (`crates/vk-ipc/src/server.rs:450-457`).
 
 **How the test restarts the daemon.** As the pipe tests already do (`act_round_trip_through_the_daemon`, `crates/vk-ipc/tests/drivers.rs:577`; the tampered tree, `crates/vk-ipc/tests/capital.rs:793`): `pool.drop_host` leaves the pool as a restart leaves it, and `set_forge_fixtures(false)` is what `serve_on` sets on a daemon started without the seam (`crates/vk-ipc/src/server.rs:454-457`, the I-1 test does the same, `crates/vk-ipc/tests/forge.rs:279`). The kernel's tables live in the store and come back unchanged from a restart; nothing else the act path reads is in memory.
 
 **Files:**
-- Modify: `crates/vk-kernel/src/drivers.rs:137-170` (`DRIVER_FAILURE_REASONS` and its doc), `:366-422` (`DriverFailure`: new `Unqualified`, `reason`, `detail`), `:1321-1335` (the vocabulary test)
+- Modify: `crates/vk-kernel/src/drivers.rs:137-170` (`DRIVER_FAILURE_REASONS` and its doc), `:366-422` (`DriverFailure`: new `Unqualified`, `reason`, `detail`, new `refusal`), `:1081` (`driver_act_settle`'s refusal), `:1321-1335` (the vocabulary test)
 - Modify: `crates/vk-ipc/src/drivers.rs:22-34` (imports), `:156-217` (`ensure`: a `gate`), `:219-263` (`act`: a `gate`, the error mapping), `:525-541` (after `Tampered`: `Unqualified`, `qualification_gate`), `:723-726` (`mount`), `:822-859` (`run_act`)
 - Modify: `crates/vk-ipc/tests/drivers.rs:1173`, `:1229-1237` (the two direct calls of `ensure` and `act`)
 - Modify: `crates/vk-ipc/tests/common/mod.rs:256-299` (`token` → `token_for`)
@@ -2204,7 +2677,7 @@ MSG
 
 **Interfaces:**
 - Consumes: `RealKernel::check_qualified(&self, manifest: &DriverManifest) -> Result<(), KernelError>` (unchanged, `crates/vk-kernel/src/learn.rs:228-283`); `RealKernel::set_forge_fixtures(&mut self, on: bool)`.
-- Produces: `vk_kernel::drivers::DriverFailure::Unqualified(String)` — `reason()` = `"unqualified: <sentence>"`, `detail()` = the sentence; `DRIVER_FAILURE_REASONS` gains `"unqualified"`; `vk_ipc::drivers::DriverPool::ensure(&self, row: &DriverRow, dirs: &DriverDirs, gate: &dyn Fn(&DriverRow) -> anyhow::Result<()>) -> anyhow::Result<bool>`; `DriverPool::act(&self, row, dirs, action, args, deadline, caps, should_stop, gate: &dyn Fn(&DriverRow) -> anyhow::Result<()>) -> Result<ActOutcome, DriverFailure>`; private `qualification_gate(kernel: &Shared) -> impl Fn(&DriverRow) -> anyhow::Result<()> + '_` and `struct Unqualified(String)`; test helper `common::Node::token_for(&self, drivers: &[&str]) -> String` (Task 5 does not use it; Task 4's test does).
+- Produces: `vk_kernel::drivers::DriverFailure::Unqualified(String)` — `reason()` = `"unqualified"`, the closed word, like `tampered` (PF-6), `detail()` = the sentence; `DriverFailure::refusal(&self) -> String` — what the act's caller is told: `reason()`, and for `Unqualified` `"unqualified: <sentence>"`; `DRIVER_FAILURE_REASONS` gains `"unqualified"`; `vk_ipc::drivers::DriverPool::ensure(&self, row: &DriverRow, dirs: &DriverDirs, gate: &dyn Fn(&DriverRow) -> anyhow::Result<()>) -> anyhow::Result<bool>`; `DriverPool::act(&self, row, dirs, action, args, deadline, caps, should_stop, gate: &dyn Fn(&DriverRow) -> anyhow::Result<()>) -> Result<ActOutcome, DriverFailure>`; private `qualification_gate(kernel: &Shared) -> impl Fn(&DriverRow) -> anyhow::Result<()> + '_` and `struct Unqualified(String)`; test helper `common::Node::token_for(&self, drivers: &[&str]) -> String` (Task 5 does not use it; Task 4's test does).
 
 - [ ] **Step 1: The test helper** (`crates/vk-ipc/tests/common/mod.rs:256-299`)
 
@@ -2271,8 +2744,10 @@ Replace `token` with:
 /// spawn of a `kind: com` driver's process, not at mount alone. Boot spawns nothing, so after a
 /// restart the first act spawns the driver: here a pool emptied as a restart leaves it, and the
 /// fixtures flag a daemon started without the seam sets. The act is refused before any process
-/// starts and the driver degraded with the gate's sentence; so is one whose `qualification.json`
-/// changed since `vk driver qualify`.
+/// starts, its refusal carrying the gate's sentence, and the driver degraded with the closed word
+/// `unqualified`: the sentence goes to `driver.log`, never to the ledger (ruling PF-6). The gate runs
+/// before every start of the process, not at each act (ruling PF-7): a `qualification.json` changed
+/// since `vk driver qualify` does not stop an act its live process serves, and refuses the next start.
 #[tokio::test]
 async fn the_gate_holds_again_when_an_act_respawns_a_com_driver() {
     if !forge_available() {
@@ -2318,41 +2793,59 @@ async fn the_gate_holds_again_when_an_act_respawns_a_com_driver() {
     // The restart without the seam, as the act path meets it: no process, the flag off.
     node.pool.drop_host("word-maison");
     node.k.lock().unwrap().set_forge_fixtures(false);
-    let reason = format!(
-        "unqualified: driver {id} was qualified on the fake application; remedy: vk driver \
-         qualify on the real one"
+    let sentence = format!(
+        "driver {id} was qualified on the fake application; remedy: vk driver qualify on the \
+         real one"
     );
     let e = node.c.call("driver.act", act.clone(), None).await.unwrap_err();
-    assert!(call_error(&e).message.ends_with(&reason), "{e}");
+    assert!(
+        call_error(&e).message.ends_with(&format!("unqualified: {sentence}")),
+        "the act's refusal carries the gate's sentence: {e}"
+    );
     assert!(
         !node.pool.has_host("word-maison"),
         "refused before any process started"
     );
+    // The ledger and the row keep the closed word alone; the sentence — a driver id, a remedy —
+    // goes to the refusal above and to driver.log, never to the chain (PF-6, Ruling 28).
     let row = node.listed("word-maison").await;
     assert_eq!(
         (
             row["state"]["state"].as_str(),
             row["state"]["reason"].as_str()
         ),
-        (Some("degraded"), Some(reason.as_str())),
+        (Some("degraded"), Some("unqualified")),
         "{row}"
     );
     assert_eq!(
         node.events("driver.unmounted").last().unwrap().payload_hash,
         hash_canonical(&DriverUnmounted {
             driver_id: id.clone(),
-            reason: reason.clone(),
+            reason: "unqualified".into(),
         })
     );
+    let log = std::fs::read_to_string(node.dir().join("drivers/word-maison/work/driver.log"))
+        .unwrap();
+    assert!(log.contains(&format!("failed: unqualified: {sentence}")), "{log}");
 
-    // With the seam back a remount opens; then a record edited since qualify bites at the next spawn.
+    // With the seam back a remount opens and starts the process. The gate runs before every start
+    // of the driver's process (D-31), not at each act (PF-7): a record edited while that process
+    // lives does not stop the next act, which the live process serves; the next start is refused.
     node.k.lock().unwrap().set_forge_fixtures(true);
     node.call_human("driver.mount", mount).await.unwrap();
+    assert!(node.pool.has_host("word-maison"), "the remount started the process");
     let record = PathBuf::from(q["record"].as_str().unwrap());
     let edited = std::fs::read_to_string(&record)
         .unwrap()
         .replacen("\"passes\": 10", "\"passes\": 3", 1);
     std::fs::write(&record, edited).unwrap();
+    let answered = node.c.call("driver.act", act.clone(), None).await.unwrap();
+    assert_eq!(answered["ok"], json!(true), "{answered}");
+    assert!(
+        node.pool.has_host("word-maison"),
+        "a live process serves the act: no start, so no gate"
+    );
+    // A restart, an idle death or a degrade leaves no process: the next act starts one.
     node.pool.drop_host("word-maison");
     let e = node.c.call("driver.act", act, None).await.unwrap_err();
     assert!(
@@ -2377,7 +2870,7 @@ Expected: FAIL at `call_error(&e)` of the second act — today the act after `dr
 
 - [ ] **Step 4: The failure variant** (`crates/vk-kernel/src/drivers.rs`)
 
-In the doc comment of `DRIVER_FAILURE_REASONS` (`:137-152`), after the sentence about `evidence too large`, add: `` `unqualified` is followed by `: <the qualification gate's sentence>` — kernel-composed, a driver id and a remedy, never a third party's text (founder decision D-31). `` and append `"unqualified",` after `"tampered",` in the list (`:169`).
+In the doc comment of `DRIVER_FAILURE_REASONS` (`:137-152`), after the sentence about `evidence too large`, add: `` `unqualified` is the qualification gate's refusal of a spawn (founder decision D-31), a bare word like `tampered`: the gate's sentence — a driver id, a remedy, and when the record cannot be read its path — is the failure's [`DriverFailure::detail`] and the act's refusal ([`DriverFailure::refusal`]), never the record (ruling PF-6). `` and append `"unqualified",` after `"tampered",` in the list (`:169`).
 
 In `enum DriverFailure` (`:372-388`), after `Tampered`, add:
 
@@ -2386,24 +2879,38 @@ In `enum DriverFailure` (`:372-388`), after `Tampered`, add:
     /// D-31): the kernel's own sentence from `RealKernel::check_qualified` — no record, a record
     /// changed since `vk driver qualify`, a replay on the fake application on a daemon without the
     /// seam, a replay under the plan's thresholds. Found by the daemon before a spawn, as
-    /// [`Self::Tampered`] is; the driver is degraded with it and never started.
+    /// [`Self::Tampered`] is; the driver is degraded with the word `unqualified` and never started.
+    /// The sentence names the driver's id and, when the record cannot be read, its path under the
+    /// user's profile: it goes to [`Self::detail`] and to [`Self::refusal`], never to the ledger
+    /// (ruling PF-6, Ruling 28).
     Unqualified(String),
 ```
 
-In `reason()` (`:398-405`) add the arm `DriverFailure::Unqualified(sentence) => format!("unqualified: {sentence}"),` and in `detail()` (`:410-421`) the arm `DriverFailure::Unqualified(sentence) => sentence.clone(),`.
+In `reason()` (`:398-405`) add the arm `DriverFailure::Unqualified(_) => "unqualified".into(),` and in `detail()` (`:410-421`) the arm `DriverFailure::Unqualified(sentence) => sentence.clone(),`. After `detail()` add:
+
+```rust
+    /// What the act's caller is told when the act failed: the ledger's word, and after it, for the
+    /// qualification gate, the gate's sentence (founder decision D-31, ruling PF-6) — an answer on the
+    /// pipe to the caller who asked, never the record.
+    pub fn refusal(&self) -> String {
+        match self {
+            DriverFailure::Unqualified(sentence) => format!("unqualified: {sentence}"),
+            other => other.reason(),
+        }
+    }
+```
+
+In `driver_act_settle`'s failure branch, `return Err(KernelError::Gate(reason));` (`:1081`) becomes `return Err(KernelError::Gate(failure.refusal()));`: the record and the degrade just above keep `reason`, the word; the caller is told the sentence too.
 
 In the test `host_error_reasons_are_a_closed_vocabulary` (`:1321-1335`), before the final loop add:
 
 ```rust
-        let gate = "driver sha256:1 was qualified on the fake application; remedy: vk driver \
-                    qualify on the real one";
-        let unqualified = DriverFailure::Unqualified(gate.into());
-        assert_eq!(unqualified.reason(), format!("unqualified: {gate}"));
-        assert_eq!(unqualified.detail(), gate, "the detail is the gate's sentence");
-        let listed = DRIVER_FAILURE_REASONS
-            .iter()
-            .any(|w| unqualified.reason().starts_with(&format!("{w}: ")));
-        assert!(listed, "unqualified is in the vocabulary, followed by its sentence");
+        // The gate's sentence as `leak` says it — a path, a hash, words: none of it on the record.
+        let unqualified = DriverFailure::Unqualified(leak.into());
+        assert_eq!(unqualified.reason(), "unqualified", "the closed word alone (PF-6)");
+        assert_eq!(unqualified.detail(), leak, "the sentence is the detail, for the logs");
+        assert_eq!(unqualified.refusal(), format!("unqualified: {leak}"), "and the refusal");
+        assert_eq!(DriverFailure::Tampered.refusal(), "tampered", "any other is refused by its word");
 ```
 
 and the final loop's list becomes `["would not start", "panicked", "tampered", "unqualified"]`.
@@ -2417,7 +2924,8 @@ After `impl std::error::Error for Tampered {}` (`:541`) add:
 ```rust
 /// The qualification gate refused to start a `kind: com` driver's process (founder decision D-31):
 /// the kernel's sentence. The act that needed the process is refused and the kernel degrades the
-/// driver with `unqualified: <sentence>` ([`DriverFailure::Unqualified`]).
+/// driver with the word `unqualified` ([`DriverFailure::Unqualified`]); the sentence goes to the logs
+/// and to the act's refusal, never to the ledger (ruling PF-6).
 #[derive(Debug)]
 pub(crate) struct Unqualified(pub(crate) String);
 
@@ -2524,24 +3032,26 @@ Expected: green; `the_gate_holds_again_when_an_act_respawns_a_com_driver` passes
 `contracts/tcb.md:246` — at the end of **The qualification gate at mount (ruling L-P4).**, before `There is no override (ruling L-P16).`, insert:
 
 ```markdown
-The gate is held again before every spawn of the driver's process, not at mount alone (founder decision D-31): boot spawns nothing, so the first act after a daemon restart, the act after an idle death and the act on a replaced identity each check it — with the fixtures flag this daemon set when it started — and a driver that fails there is never started: its act is refused and it is degraded with `unqualified: <the gate's sentence>`, which a remount clears once the record is right again.
+The gate is held again before every start of the driver's process, not at mount alone (founder decision D-31): boot spawns nothing, so the first act after a daemon restart, after a degrade or an idle death, and the act on a replaced identity each check it — with the fixtures flag this daemon set when it started. It is not checked again at each act while that process lives: a `qualification.json` edited under a running driver is caught at the next start of its process. A driver that fails there is never started: its act is refused with the gate's sentence (`unqualified: <sentence>`), and it is degraded with the word `unqualified` alone — the sentence names the driver's id and, when the record cannot be read, its path, so it goes to the daemon's log and `driver.log`, never to the ledger (Ruling 28) — which a remount clears once the record is right again.
 ```
 
 `docs/technical/technical-readme.md` — at the end of the **The mount gate.** paragraph (`:733-741`), after `… it is mounted from its learn directory.`, add:
 
 ```markdown
-The gate is checked again before every start of the driver's process (founder decision D-31):
-a daemon restarted without `VK_FORGE_FIXTURES=1`, or a `qualification.json` edited while the
-driver stayed mounted, refuses the next act before the process starts, and the driver is
-degraded with `unqualified: <the gate's sentence>`.
+The gate is checked again before every start of the driver's process (founder decision D-31)
+— at mount, and at the first act after a daemon restart or a degrade — not at each act while
+the process lives: a daemon restarted without `VK_FORGE_FIXTURES=1`, or a `qualification.json`
+edited while the driver stayed mounted, refuses the act that would start the process, before
+it starts. The act's refusal carries the gate's sentence; the driver is degraded with the word
+`unqualified`, and the sentence goes to the daemon's log and `driver.log`, never to the ledger.
 ```
 
-`docs/technical/runbooks/learn-office-driver.md:61` — after `… un démon relancé sans la prise refuse de monter ce driver (`was qualified on the fake application; remedy: vk driver qualify on the real one`)` insert `, et s'il était déjà monté, refuse son prochain acte avant de relancer son processus et le dégrade (`unqualified: …`)`.
+`docs/technical/runbooks/learn-office-driver.md:61` — after `… un démon relancé sans la prise refuse de monter ce driver (`was qualified on the fake application; remedy: vk driver qualify on the real one`)` insert `, et s'il était déjà monté, refuse l'acte qui relancerait son processus (le premier après la relance du démon ou une dégradation), avant de le relancer, et le dégrade (`unqualified`)`.
 
 A row added to the §8 table, after the `was qualified on the fake application` row (`:181`):
 
 ```markdown
-| `unqualified: driver <id> …; remedy: …` (sur un acte, le driver passe `degraded`) | la porte de qualification rejouée avant de relancer le processus d'un driver monté a refusé : démon relancé sans la prise, ou `qualification.json` modifié | requalifier (§5.1), puis remonter (§5.2) |
+| `unqualified: driver <id> …; remedy: …` (le refus d'un acte ; le driver passe `degraded`, raison `unqualified` : la phrase est dans `driver.log`, jamais dans le grand-livre) | la porte de qualification, rejouée avant de relancer le processus d'un driver monté, a refusé : démon relancé sans la prise, ou `qualification.json` modifié (vu au prochain lancement du processus, pas à chaque acte) | requalifier (§5.1), puis remonter (§5.2) |
 ```
 
 - [ ] **Step 9: The whole workspace, the docs check**
@@ -2569,14 +3079,13 @@ MSG
 
 ### Task 5: D-28 — `vk driver act NAME ACTION [--args JSON]`, one action by hand under a presence proof (Opus)
 
-> **BLOCKED on a founder decision (ledger kind).** Proposed kind: **`driver.operated`**. Proposed payload **`DriverOperated`**:
+> **Decided by the founder (D-33, 2026-10-20): the new kind `driver.operated`, its author `by` mandatory.** Task 5 is no longer blocked. Kind: **`driver.operated`**. Payload **`DriverOperated`**:
 > `{ task_id: String, driver_id: String, action: String, args_hash: String, result_hash: String, ok: bool, reason?: String, duration_ms: u64, evidence: [String], evidence_bytes: u64, hosts_seen: [String], by: String }`
-> — the hashes-only shape of `driver.acted`, without its `step_index` (there is no harness step) and with `by`, the device key that signed the act; `task_id` names the register the act's evidence went into.
+> — the hashes-only shape of `driver.acted`, without its `step_index` (there is no harness step) and with `by`, the device key that signed the act, never optional; `task_id` names the register the act's evidence went into. `driver.acted` is unchanged.
 > **Why `driver.acted` does not fit** (ruling LF-10): its `task_id` and `step_index` name the running `Harness` step whose lease token authorised the act (`RealKernel::driver_act_begin`, `crates/vk-kernel/src/drivers.rs:827-951`), and it carries no author. A human's act recorded there would either invent a step or leave off the ledger the person who changed a firm's document — when every other human act on a driver names its device (`driver.mounted.by`, `driver.learned.by`).
-> **The alternative the controller can put beside it:** keep `driver.acted`, add an optional `by` (`skip_serializing_if = "Option::is_none"`, so every existing row keeps its hash) and record the act as `step_index: 0` of the register-only task this task creates — a payload change of an existing kind, also the founder's. If the founder picks it, Step 1 changes (no new kind; `DriverActed` gains `by`) and Step 3's `DriverOperated` becomes that `DriverActed`; the rest stands.
-> The controller asks before dispatching this task; it is dispatched last, after Task 6.
+> It is dispatched last, after Task 6: it consumes Task 4's `run_act` and `DriverFailure::refusal`.
 
-**Model:** Opus. **Decision:** D-28 (CLI surface decided; ledger kind pending). **Ruling:** LF-10.
+**Model:** Opus. **Decisions:** D-28 (the CLI surface), D-33 (the ledger kind `driver.operated`, `by` mandatory). **Rulings:** LF-10, PF-6 (the act's refusal), PF-9 (two stale sentences).
 
 **Files:**
 - Modify: `crates/vk-contracts/src/driver.rs` (after `DriverActed`, `:471-491`: `DriverOperated`), `crates/vk-contracts/src/lib.rs:69` (the schema registry), `crates/vk-contracts/src/ledger.rs:296-301` (`ALLOWED_KINDS`), `:458-463` (a test)
@@ -2587,10 +3096,10 @@ MSG
 - Modify: `crates/vk-ipc/src/server.rs:731-766` (`takes_presence`), after the `driver.act` arm (`:1030-1035`: the `driver.operate` arm)
 - Modify: `crates/vk-cli/src/main.rs:104-111` (the `Driver` command's doc), `:528-625` (`DriverCmd::Act`), after the `Umount` arm (`:1272-1282`: the `Act` arm); `crates/vk-cli/src/render.rs` (after `unmounted_driver`, `:1359-1361`: `operated`; a test in `mod tests`)
 - Test: `crates/vk-kernel/tests/drivers.rs` (imports `:24-27`; two tests), `crates/vk-ipc/tests/drivers.rs` (two tests), `crates/vk-cli/tests/smoke.rs` (`vk_forge_learn_then_qualify_then_mount_from_the_cli`, `:2738-2803`)
-- Docs: `contracts/tcb.md:249` (the supervision bullet, and a new bullet after it), `contracts/README.md:18`, `docs/technical/technical-readme.md:373-379`, `:422-431`, `docs/technical/runbooks/learn-office-driver.md` (a new §5.3 after `:126`)
+- Docs: `contracts/tcb.md:249` (the supervision bullet, and a new bullet after it), `contracts/README.md:15`, `:18`, `docs/technical/technical-readme.md:373-379`, `:422-431`, `docs/technical/runbooks/learn-office-driver.md:126` (the « seul écart de supervision » sentence) and a new §5.3 after it
 
 **Interfaces:**
-- Consumes: `run_act(kernel: &Shared, pool: &DriverPool, plan: &DriverActPlan, should_stop) -> Result<ActOutcome, DriverFailure>` with the qualification gate inside (Task 4); `report_failure(plan: &DriverActPlan, failure: &DriverFailure)`; `DriverPool::clear_acting(&self, name: &str)`; `RealKernel::{submit_task, read_register, attach_artefact_labelled, degrade_driver, touch_driver, driver_dirs, driver}`; in `server.rs`, `ctx_for` and `invariant`; in `main.rs`, `presence(&Client)` and `show`.
+- Consumes: `run_act(kernel: &Shared, pool: &DriverPool, plan: &DriverActPlan, should_stop) -> Result<ActOutcome, DriverFailure>` with the qualification gate inside (Task 4); `DriverFailure::refusal()` (Task 4: the word, and for the gate its sentence); `report_failure(plan: &DriverActPlan, failure: &DriverFailure)`; `DriverPool::clear_acting(&self, name: &str)`; `RealKernel::{submit_task, read_register, attach_artefact_labelled, degrade_driver, touch_driver, driver_dirs, driver}`; in `server.rs`, `ctx_for` and `invariant`; in `main.rs`, `presence(&Client)` and `show`.
 - Produces: `vk_contracts::driver::DriverOperated` (the payload above); ledger kind `driver.operated`; `vk_kernel::drivers::DriverOperatePlan { act: DriverActPlan, register: RegisterId, by: String }`; `RealKernel::driver_operate_begin(&mut self, ctx: &Ctx, name: &str, action: &str, args: &serde_json::Value) -> Result<DriverOperatePlan, KernelError>`; `RealKernel::driver_operate_settle(&mut self, ctx: &Ctx, now_ms: u64, plan: &DriverOperatePlan, outcome: Result<ActOutcome, DriverFailure>) -> Result<serde_json::Value, KernelError>` → `{task_id, ok, reason, result, evidence: [{name, hash, bytes}]}`; IPC method `driver.operate`, params `{driver: String, action: String, args?: Value}` (`deny_unknown_fields`, `args` defaults to `{}`), a human act (presence proof), answer = the settle's object plus `driver` and `action`; CLI `vk driver act NAME ACTION [--args JSON]` (+ the global `--json`); `render::operated(v: &Value) -> String`.
 
 - [ ] **Step 1: The contract** (`crates/vk-contracts`)
@@ -3019,7 +3528,8 @@ In `impl RealKernel`, after `driver_act_settle` (it ends at `:1238`) add:
                     }
                 }
                 self.touch_driver(&act.name, now_ms)?;
-                return Err(KernelError::Gate(reason));
+                // The record keeps the word; the operator is told the gate's sentence too (PF-6).
+                return Err(KernelError::Gate(failure.refusal()));
             }
         };
         let total: u64 = outcome.evidence.iter().map(|e| e.bytes.len() as u64).sum();
@@ -3497,7 +4007,7 @@ cargo test --locked -p vk-cli --test smoke vk_forge_ -- --nocapture
 - **An operator may act on a mounted driver by hand (founder decision D-28).** `vk driver act NAME ACTION [--args JSON]` is a human act under a presence proof: one action the manifest lists, with no harness and no arch, held to the refusals of `driver.act` that need no harness step — a driver mounted and not degraded, the action's argument schema, the cadence, a STOP, one act at a time — and to the qualification gate before any spawn (D-31). Its evidence goes into a register created for the act (`task.submitted`), at that register's label plus the third-party origin, read with `vk artefact cat` (a release on the ledger); `driver.operated` records the act by hashes, with the device key that signed it.
 ```
 
-`contracts/README.md:18` becomes:
+`contracts/README.md:15`, `Five schemas came with the pilot, all generated like the rest:`, becomes `` Five schemas came with the pilot, and a sixth, `driver_operated`, with `vk driver act` (founder decisions D-28 and D-33); all are generated like the rest: `` — ruling PF-9: `driver_operated` is not counted among the pilot's schemas. `:18` becomes:
 
 ```markdown
 - `driver_mounted`, `driver_acted`, `driver_operated`, `driver_unmounted` — the payloads of the `driver.mounted`, `driver.acted`, `driver.operated` and `driver.unmounted` ledger events (`driver_acted` and `driver_operated` carry hashes and sizes, never text; `driver_operated`, an operator's act by hand, also the device that signed it);
@@ -3509,7 +4019,7 @@ cargo test --locked -p vk-cli --test smoke vk_forge_ -- --nocapture
 | `driver.operated` | an operator's act by hand (`vk driver act`, founder decision D-28): `task_id` (the register the evidence went into), `driver_id`, `action`, `args_hash`, `result_hash`, `ok`, `reason` when it failed (the words of `driver.acted`), `duration_ms`, `evidence`, `evidence_bytes`, `hosts_seen`, and `by`, the device key that signed it — a human act |
 ```
 
-`docs/technical/runbooks/learn-office-driver.md` — after §5.2 (`:126`) add:
+`docs/technical/runbooks/learn-office-driver.md:126` — the sentence `` Seul le rejeu de `qualify` tourne hors harnais, comme enfant de son étage, dans le Job (c'est le seul écart de supervision, `contracts/tcb.md`). `` becomes `` Deux chemins tournent hors harnais : le rejeu de `qualify`, comme enfant de son étage, dans le Job, et `vk driver act` (§5.3), l'acte humain d'un opérateur qui le signe de sa clé d'appareil, enregistré `driver.operated` (`contracts/tcb.md`). `` (ruling PF-9). After §5.2 (`:126`) add:
 
 ````markdown
 **5.3 Agir à la main : `vk driver act`** (acte humain, décision D-28). Une action du driver monté, sans harnais ni arch — par exemple pour essayer un driver appris sur un vrai document avant de le confier à une recette :
@@ -3533,7 +4043,7 @@ python -I scripts/docs/check_docs.py
 ```bash
 git add crates/vk-contracts/src/driver.rs crates/vk-contracts/src/lib.rs crates/vk-contracts/src/ledger.rs contracts/schemas/driver_operated.schema.json contracts/examples/driver_operated/valid/first.json crates/vk-cli/src/man.rs crates/vk-kernel/src/drivers.rs crates/vk-kernel/tests/drivers.rs crates/vk-ipc/src/drivers.rs crates/vk-ipc/src/server.rs crates/vk-ipc/tests/drivers.rs crates/vk-cli/src/main.rs crates/vk-cli/src/render.rs crates/vk-cli/tests/smoke.rs contracts/tcb.md contracts/README.md docs/technical/technical-readme.md docs/technical/runbooks/learn-office-driver.md
 git commit -F - <<'MSG'
-feat(drivers): vk driver act — one action on a mounted driver by hand, under a presence proof, recorded as driver.operated (D-28)
+feat(drivers): vk driver act — one action on a mounted driver by hand, under a presence proof, recorded as driver.operated (D-28, D-33)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01UUDLpkwxsZXmLptqCeNL2R
@@ -3544,11 +4054,11 @@ MSG
 
 ### Task 6: the parked minors — M-5, M-6, M-7, M-8, M-14, qualify's log directory, the import walk (Sonnet)
 
-**Model:** Sonnet (seven small, separate fixes; each with its test). Runs after Task 3 (M-7 describes the attached instance once D-04 holds the started one) and after Task 1 (`_prepare` and `_post` carry the salt). **Rulings:** LF-11, LF-12.
+**Model:** Sonnet (seven small, separate fixes; each with its test). Runs after Task 3 (M-7 describes the attached instance once D-04 holds the started one) and after Task 1 (`_prepare` and `_post` carry the salt). **Rulings:** LF-11, LF-12, PF-10 (the Files entry of `debrief.py`).
 
 **Files:**
 - Modify: `drivers/vkforge/qualify.py` — module docstring (one sentence), `_prepare` (`:385-404`, M-5), `_post` (`:424-442`: split into `_held` and `_post`), new `_discard` (M-6), `qualify` (`:474-508`: the folders discarded after the record)
-- Modify: `drivers/vkforge/debrief.py:19-24` (docstring), `:104-110` (`CUT` gives way to `SHOWN_FIELDS` and `STRUCTURAL`), `:226-232` (`_shown_line`) — M-8
+- Modify: `drivers/vkforge/debrief.py:19-24` (docstring), `:107-110` (`CUT` gives way to `SHOWN_FIELDS` and `STRUCTURAL`; `REMEDY`, at `:104-106`, stays: every debrief refusal names it — ruling PF-10), `:226-232` (`_shown_line`) — M-8
 - Modify: `drivers/vkforge/inventory.py:166-181` (`catalogue_from_fixture`) — M-14
 - Modify: `crates/vk-ipc/src/forge.rs` (`qualify`'s doc comment and its `logs`, `:841-843`, `:902`) — qualify's log directory
 - Modify: `drivers/vkforge/tests/test_package.py:99-103`, `:112-119`, `:128-149` — the import walk
@@ -3946,23 +4456,26 @@ MSG
 |---|---|---|
 | D-01 | a random 32-byte salt per learn; `<redacted:hmac-sha256:HEX>` tokens; `--salt-file` required on `mine` and `qualify`, `salt=None` in Python for the pinned fixtures (named and proven unchanged); the kernel draws the salt in `forge/<name>/` and passes it to `mine`, `driver.qualify` passes the same file; the salt survives the vault (LF-1); a missing salt is one refusal line; every caller of `mine.redact` accounted for; tests: two salts two tokens, one salt one token, no unsalted token through the kernel, a wrong or missing salt fails closed | 1 |
 | D-02 | `plan --vault` rewrites the vault in place with only the tokens of the kept invariants and the resolved ambiguities; the kernel passes it between `plan` and `generate`; test with per-document footers | 2 |
-| D-03 | the started instance named by a Toolhelp32 diff (exactly one new PID, else unknown); its `#32770` boxes only; attached or unknown → closes nothing, refuses `dialog` when a box of the executable is seen, `dialog` and `timeout` still told apart; stub tests off Windows | 3 |
-| D-04 | the started instance in a kill-on-close Job the adapter creates, its handle held by the driver and never inherited; never an attached instance; a failed assignment logged and tolerated; after `Quit`, the PID waited for before the handle closes; the fake's same behaviour where it applies; the real-Office kill test on the node; TCB and runbook sentences | 3 |
-| D-31 (F-1) | where drivers come back after a restart found (they do not at boot; lazily at the first act); `check_qualified` there with the fixtures flag; a failure degrades like `tampered` with the gate's sentence and never spawns; test through the daemon | 4 |
-| D-28 | `vk driver act NAME ACTION [--args JSON]` (+ `--json`), a human act under presence, no harness or arch; IPC method `driver.operate {driver, action, args}`; the render line; tests for the refusals, the answer and the ledger row — **BLOCKED** on the ledger kind `driver.operated` (LF-10) | 5 |
+| D-03 | the started instance identified by a Toolhelp32 diff and its parent (exactly one new PID whose parent is the `DcomLaunch` service's process, PF-4; anything else attached); its `#32770` boxes only; attached → closes nothing, refuses `dialog` when a box of the executable is seen, `dialog` and `timeout` still told apart; stub tests off Windows; on the node, a PowerPoint attached and one started (PF-5) | 3 |
+| D-04 | the started instance in a kill-on-close Job the adapter creates, its handle held by the driver and never inherited; never an attached instance; a failed assignment logged and tolerated; after `Quit`, the PID waited for what is left of the clean-end window before the handle closes; the fake's same behaviour where it applies; the real-Office kill tests on the node (Word; PowerPoint, PF-5); TCB and runbook sentences | 3 |
+| D-35 (2026-10-20) | LF-7 replaced: the started instance survives only within five bounds — a clean end inside `QUIT_WAIT_S`, the driver's own documents closed first without saving, a foreign document identified by a `FullName` absent from the exact list, the hand-over (`Visible`, `UserControl`, `DisplayAlerts`) and its own Job alone disarmed, one stderr line with the PID and the count — in PF-2's order; else D-04 to the letter; one test per bound and one for the order | 3 |
+| D-31 (F-1) | where drivers come back after a restart found (they do not at boot; lazily at the first act); `check_qualified` there with the fixtures flag; a failure degrades like `tampered` — the word `unqualified` on the ledger, the gate's sentence in the logs and the act's refusal (PF-6) — and never spawns; held per start of the process, not per act (PF-7); test through the daemon | 4 |
+| D-28, D-33 | `vk driver act NAME ACTION [--args JSON]` (+ `--json`), a human act under presence, no harness or arch; IPC method `driver.operate {driver, action, args}`; the render line; tests for the refusals, the answer and the ledger row; the ledger kind `driver.operated`, `by` mandatory, decided by the founder (D-33, LF-10) | 5 |
 | M-5, M-6, M-7, M-8, M-14, qualify's log directory, the import walk | the minors batch | 6 |
+| PF-2 … PF-11 | the pre-flight scan's rulings (**Amendments of 2026-10-20**) | 2, 3, 4, 5, 6 (PF-8: Task 1's dispatch) |
 
-Not a task: spec §12 gains one line per decision (D-01, D-02, D-03/D-04, D-28, D-31) at the merge, by the controller, as the chantier's own rulings were added; the plan is archived then.
+Not a task: spec §12 gains one line per decision (D-01, D-02, D-03/D-04/D-35, D-28/D-33, D-31) at the merge, by the controller, as the chantier's own rulings were added; the plan is archived then.
 
 **2. Placeholder scan.** No `TBD`, no "similar to Task N", no test without its code. The `…` that remain are literal: French runbook prose, the `[…]` evidence marker of LF-12, the `<redacted:…>` token families, and the elided private paths of the header.
 
-**3. Names across tasks.** `mine.tokens` (Task 1) is what Task 2's `plan.vault_tokens` walks; `mine.redact(text, salt=None)`, `mine.read_salt(path)`, `mine.mine_file(path, salt=None)` keep one signature from Task 1 to Task 6; `qualify._post(post, copy, expected, salt=None)` keeps its signature when Task 6 splits out `_held(post, obs, copy, expected)`; `qualify._prepare(…, salt=None)` is the same function Task 6 rewrites; `DriverPool::ensure(row, dirs, gate)` and `DriverPool::act(…, should_stop, gate)` (Task 4) are reached by Task 5 only through `run_act(kernel, pool, &plan.act, &should_stop)`, unchanged; `DriverFailure::Unqualified(String)` (Task 4) is matched by `driver_act_settle`'s generic arm and by `driver_operate_settle`'s (Task 5); `DriverOperatePlan.act: DriverActPlan` is what `run_act` and `report_failure` take; `Node::token_for(&self, drivers: &[&str])` has the same shape in `tests/common/mod.rs` (Task 4) as in `tests/drivers.rs`'s own `Node`; `com.Application`'s `connect` returns a 3-tuple everywhere (the six test stubs are rewritten in Task 3).
+**3. Names across tasks.** `mine.tokens` (Task 1) is what Task 2's `plan.vault_tokens` walks; `mine.redact(text, salt=None)`, `mine.read_salt(path)`, `mine.mine_file(path, salt=None)` keep one signature from Task 1 to Task 6; `qualify._post(post, copy, expected, salt=None)` keeps its signature when Task 6 splits out `_held(post, obs, copy, expected)`; `qualify._prepare(…, salt=None)` is the same function Task 6 rewrites; `DriverPool::ensure(row, dirs, gate)` and `DriverPool::act(…, should_stop, gate)` (Task 4) are reached by Task 5 only through `run_act(kernel, pool, &plan.act, &should_stop)`, unchanged; `DriverFailure::Unqualified(String)` (Task 4) is matched by `driver_act_settle`'s generic arm and by `driver_operate_settle`'s (Task 5), both recording `reason()` and answering `refusal()` (Task 4, PF-6); `DriverOperatePlan.act: DriverActPlan` is what `run_act` and `report_failure` take; `Node::token_for(&self, drivers: &[&str])` has the same shape in `tests/common/mod.rs` (Task 4) as in `tests/drivers.rs`'s own `Node`; `com.Application`'s `connect` returns a 2-tuple `(application, owned)` everywhere (the test stubs are rewritten in Task 3); `com.own(started, before, after, launcher, hold)` returns an `Owned` or `None`, and `com.pids_of` a `{pid: parent}` map, wherever a test reads them.
 
-**4. Review Focus.** Each line has its test in the task that owns the code: 1 → Task 3 (`test_an_instance_that_holds_a_document_outlives_the_driver_its_job_disarmed`, `test_a_held_process_dies_with_its_holder_and_a_disarmed_one_lives`); 2 → Task 3 (`test_only_a_start_that_added_one_process_owns_it`, `test_only_the_started_instance_s_boxes_are_closed`); 3 → Task 1 (`test_the_learns_salt_qualifies_and_any_other_fails_closed`, `qualify_reads_the_learns_salt_and_fails_closed_without_it`); 4 → Task 2 (`VaultTest`, `learn_leaves_no_purged_candidate_in_the_vault_before_generate`); 5 → Task 4 (`the_gate_holds_again_when_an_act_respawns_a_com_driver`).
+**4. Review Focus.** Each line has its test in the task that owns the code: 1 → Task 3 (one per bound of D-35: `test_the_instance_survives_only_a_clean_end_inside_the_window`, `test_the_drivers_own_documents_are_closed_first_and_never_keep_the_instance`, `test_a_document_is_foreign_only_when_the_driver_never_opened_its_name`, `test_the_instance_kept_is_handed_to_the_user_and_only_its_job_is_disarmed`, `test_every_firing_is_one_stderr_line_with_the_pid_and_the_count`; PF-2's `test_the_end_closes_then_lists_then_hands_over_then_disarms`; `test_a_held_process_dies_with_its_holder_and_a_disarmed_one_lives`); 2 → Task 3 (`test_only_a_positively_identified_process_is_owned`, `test_only_the_started_instance_s_boxes_are_closed`, and on the node `test_the_users_powerpoint_is_attached_never_quit_never_held_its_box_left_open`, `test_a_killed_driver_takes_the_powerpoint_it_started`); 3 → Task 1 (`test_the_learns_salt_qualifies_and_any_other_fails_closed`, `qualify_reads_the_learns_salt_and_fails_closed_without_it`); 4 → Task 2 (`VaultTest`, `learn_leaves_no_purged_candidate_in_the_vault_before_generate`); 5 → Task 4 (`the_gate_holds_again_when_an_act_respawns_a_com_driver`).
 
 **5. For the reviewers.**
-- Task 3 keeps L-P46 at a clean end — a started instance holding a document is left running — and therefore *disarms* its Job (LF-7); D-04's « quelle que soit la façon dont le pilote meurt » is honoured for every unclean end. If the founder wants the clean end to take that instance too, it is one line in `_let_go` (close instead of disarm) and the TCB sentence.
-- Task 3 also treats a `CreateObject` that added no process as an attach (LF-5): today's code would `Quit` a PowerPoint the user had open with no presentation.
-- Task 4 gates every spawn, mount included (the mount already checked under the lock just before: the second check costs one hash of a small file).
+- Task 3 applies D-35 (LF-7): the started instance outlives a clean end only within the five bounds, in PF-2's order — the disarm comes before the `DisplayAlerts` restore and the release, so a slow restore can no longer leave an armed Job on an instance the end decided to keep; anything short of the disarm leaves the Job to take the instance, and the driver's own documents never keep it.
+- Task 3 treats anything short of positive identification as an attach (PF-4): no new process (today's code would `Quit` a PowerPoint the user had open with no presentation), several, or a parent other than `DcomLaunch` (a PowerPoint the user starts at the same moment). The price: an Office the driver started but cannot identify is never quit and outlives the driver (`start: treated as attached: …` in `driver.log`); the in-process real-Word tests therefore run with `VK_DRIVER_APPLICATIONS`, as a host gives it.
+- **Bound (4) against the type libraries — for the controller, before Task 3 is dispatched.** The catalogues pinned in `drivers/vkforge/tests/fixtures/` (`catalogue-word.json`, `catalogue-powerpoint.json`) give Word's `Application.UserControl` a get accessor only (the put is `Document.UserControl`'s) and PowerPoint's `Application` no `UserControl` at all; PowerPoint's `Visible` is an `MsoTriState`, hence `COM_TRUE = -1`. As written, the hand-over's `UserControl` put fails on the real Word, so there the exception never fires and the Job always takes the instance — fail closed, D-04 to the letter — and on PowerPoint it names a member the application does not have. The stub tests cannot see this. If the exception must fire on the real applications, the wording of bound (4) is the founder's to adjust (for instance, `UserControl` only where the application has a writable one).
+- Task 4 gates every spawn, mount included (the mount already checked under the lock just before: the second check costs one hash of a small file), and nothing else: an act a live process serves is not gated (PF-7), and the test shows it.
 - Task 5's evidence goes to a register with no task row: `vk task show` does not list it; `vk artefact cat HASH` reads its files, and the `artefact.released` it writes names the register's task id.
 - `vk driver act --args` is passed as typed; the runbook gives the Windows PowerShell 5.1 quoting (`\"`).
