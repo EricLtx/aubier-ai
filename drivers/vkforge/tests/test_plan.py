@@ -3,6 +3,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,24 +12,14 @@ from vkforge import __main__ as entry
 from vkforge import canon, generate, inventory, mine, ontology, plan
 from vkforge.errors import Refusal
 from vkforge.tests import ooxml_fixtures
-from vkforge.tests.ooxml_fixtures import FOOTER
+from vkforge.tests.ooxml_fixtures import FOOTER, FOOTERS
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 ARCH = "arch:sha256:" + "a" * 64
 TIE = {"invariant": "body_font", "kind": "font_run", "candidates": [
     {"value": {"name": "Calibri", "size": 12}, "support": 0.5},
     {"value": {"name": "Garamond", "size": 11}, "support": 0.5}]}
-FOOTERS = [f"Contrat client {n}" for n in range(10)]
 VAULT_SALT = bytes(32)
-
-
-def footer_corpus() -> Path:
-    """Ten contracts whose footers all differ — a client's name in each: the footer is an ambiguity
-    of ten token candidates (founder decision D-02's case)."""
-    d = Path(tempfile.mkdtemp())
-    for n, footer in enumerate(FOOTERS):
-        ooxml_fixtures.docx(d / f"c{n}.docx", footer=footer, pdf=True)
-    return d
 
 
 def house_invariants() -> dict:
@@ -259,7 +250,9 @@ class VaultTest(unittest.TestCase):
     def setUp(self):
         self.ont = ontology.load()
         self.binding = json.loads((FIXTURES / "binding-word.json").read_text(encoding="utf-8"))
-        self.inv, self.vault = mine.mine_corpus(footer_corpus(), salt=VAULT_SALT)
+        # Ten contracts whose footers all differ, a client's name in each: the footer is an ambiguity of
+        # ten token candidates (founder decision D-02's case).
+        self.inv, self.vault = mine.mine_corpus(ooxml_fixtures.footers(tempfile.mkdtemp()), salt=VAULT_SALT)
         (self.amb,) = self.inv["ambiguities"]
         self.assertEqual((self.amb["invariant"], len(self.amb["candidates"]), sorted(self.vault.values())),
                          ("footer_text", 10, sorted(FOOTERS)))
@@ -269,6 +262,20 @@ class VaultTest(unittest.TestCase):
         path = self.dir / ".vault.json"
         canon.write(self.vault, path)
         return path
+
+    def plan_stage(self, *extra: str, out: str = "out") -> tuple:
+        """(exit code, stdout, stderr) of `vkforge plan` over this test's invariants and the Word binding."""
+        canon.write(self.inv, self.dir / "invariants.json")
+        printed, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(err):
+            code = entry.main(["plan", "--invariants", str(self.dir / "invariants.json"),
+                               "--binding", str(FIXTURES / "binding-word.json"), "--out", str(self.dir / out), *extra])
+        return code, printed.getvalue(), err.getvalue()
+
+    def resolver(self, chosen) -> str:
+        """resolver.json in which an arch chose `chosen` for the footer."""
+        canon.write({"footer_text": {"value": chosen, "resolved_by": ARCH}}, self.dir / "resolver.json")
+        return str(self.dir / "resolver.json")
 
     def test_a_purged_ambiguity_leaves_none_of_its_candidates_in_the_vault(self):
         p, _ = plan.build(self.inv, self.binding, self.ont)
@@ -307,7 +314,7 @@ class VaultTest(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {footer: FOOTER},
                          "the custom style's name is gone, the footer stays")
 
-    def reduced(self, inv: dict, vault: dict, p: dict) -> tuple:
+    def cut_down(self, inv: dict, vault: dict, p: dict) -> tuple:
         """((kept, of), the bytes left in the file) after the vault is cut down to what `p` uses."""
         path = self.dir / "reduced.vault.json"
         canon.write(vault, path)
@@ -338,7 +345,7 @@ class VaultTest(unittest.TestCase):
                          "build keeps what the arch chose: it is vault_tokens that sees the plan does not use it")
         footer = mine.redact(FOOTER, VAULT_SALT)
         self.assertEqual(plan.vault_tokens(p, inv), {footer})
-        counts, left = self.reduced(inv, vault, p)
+        counts, left = self.cut_down(inv, vault, p)
         self.assertEqual(counts, (1, 2))
         self.assertEqual(json.loads(left.decode("utf-8")), {footer: FOOTER})
         self.assertNotIn(b"Clause Dupont", left)
@@ -354,7 +361,7 @@ class VaultTest(unittest.TestCase):
         self.assertEqual(p["ambiguities"], [{"invariant": "body_style", "resolved_by": ARCH, "value": custom}])
         footer = mine.redact(FOOTER, VAULT_SALT)
         self.assertEqual(plan.vault_tokens(p, inv), {footer})
-        counts, left = self.reduced(inv, vault, p)
+        counts, left = self.cut_down(inv, vault, p)
         self.assertEqual(counts, (1, 3))
         self.assertEqual(json.loads(left.decode("utf-8")), {footer: FOOTER})
         self.assertNotIn(b"Corps Dupont", left)
@@ -375,7 +382,7 @@ class VaultTest(unittest.TestCase):
         self.assertEqual(p["ambiguities"], [{"invariant": "footer_text", "resolved_by": ARCH, "value": chosen}])
         self.assertNotIn("footer_text", p["actions"][0]["post"])
         self.assertEqual(plan.vault_tokens(p, self.inv), set())
-        counts, left = self.reduced(self.inv, self.vault, p)
+        counts, left = self.cut_down(self.inv, self.vault, p)
         self.assertEqual(counts, (0, 10))
         self.assertEqual(left, canon.dumps({}))
 
@@ -399,6 +406,7 @@ class VaultTest(unittest.TestCase):
         path = self.written_vault()
         chosen = self.amb["candidates"][0]["value"]
         canon.write({"footer_text": {"value": chosen, "resolved_by": ARCH}}, self.dir / "resolver.json")
+        before = os.stat(path)
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
             self.assertEqual(entry.main(["plan", "--invariants", str(self.dir / "invariants.json"),
@@ -407,22 +415,53 @@ class VaultTest(unittest.TestCase):
                                          "--vault", str(path)]), 0)
         self.assertIn(f"; vault kept 1 of 10 -> {self.dir / 'out' / 'plan.json'}\n", printed.getvalue())
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {chosen: self.vault[chosen]})
+        after = os.stat(path)
+        self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino),
+                         "rewritten in place: the same file, so the private directory's ACL still covers it")
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()),
+                         [".vault.json", "invariants.json", "out", "resolver.json"],
+                         "no temporary copy of the clear values is left beside it")
         for clear in FOOTERS:
             if clear != self.vault[chosen]:
                 self.assertNotIn(clear.encode("utf-8"), path.read_bytes())
 
     def test_a_vault_that_is_not_an_object_of_clear_strings_is_refused_before_the_plan(self):
         path = self.dir / ".vault.json"
-        path.write_text(json.dumps({"<redacted:sha256:aa>": 3}), encoding="utf-8")
-        canon.write(self.inv, self.dir / "invariants.json")
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            self.assertEqual(entry.main(["plan", "--invariants", str(self.dir / "invariants.json"),
-                                         "--binding", str(FIXTURES / "binding-word.json"),
-                                         "--out", str(self.dir / "out"), "--vault", str(path)]), 2)
-        self.assertEqual(err.getvalue(), f"vkforge plan: vault {path} is not an object of clear strings; "
-                                         "remedy: run vkforge mine again\n")
-        self.assertFalse((self.dir / "out").exists(), "refused before the plan was written")
+        for label, content in (("a list", [1, 2]), ("a string", "x"), ("null", None),
+                               ("a value that is no string", {"<redacted:hmac-sha256:aa>": 3})):
+            with self.subTest(label):
+                path.write_text(json.dumps(content), encoding="utf-8")
+                code, _, err = self.plan_stage("--vault", str(path))
+                self.assertEqual(code, 2)
+                self.assertEqual(err, f"vkforge plan: vault {path} is not an object of clear strings; "
+                                      "remedy: run vkforge mine again\n")
+                self.assertFalse((self.dir / "out").exists(), "refused before the plan was written")
+
+    def test_a_vault_that_lacks_a_value_the_plan_uses_is_refused_before_the_plan_and_left_alone(self):
+        # A hand run twice: the first, with no resolver, purged every candidate and cut the vault down
+        # to nothing; the second names the footer an arch chose, which the vault no longer holds. The
+        # stage says so now, not one stage later in generate with a remedy that hides the cause.
+        path = self.written_vault()
+        code, said, _ = self.plan_stage("--vault", str(path))
+        self.assertEqual((code, path.read_bytes()), (0, canon.dumps({})))
+        self.assertIn("; vault kept 0 of 10 -> ", said)
+        code, said, err = self.plan_stage("--vault", str(path), "--resolver", self.resolver(self.amb["candidates"][0]["value"]),
+                                          out="second")
+        self.assertEqual((code, said), (2, ""))
+        self.assertEqual(err, f"vkforge plan: vault {path} holds no clear value for 1 token(s) the plan uses; "
+                              "remedy: run vkforge mine again\n")
+        self.assertEqual(path.read_bytes(), canon.dumps({}), "the vault is left as it was found")
+        self.assertFalse((self.dir / "second").exists(), "refused before the plan was written")
+
+    def test_the_vault_is_cut_down_only_once_the_plan_is_written(self):
+        # `--out` names a file, so writing the plan fails: the vault must still hold the ten candidates,
+        # for the hand run that comes next with the answer of an arch.
+        path = self.written_vault()
+        before = path.read_bytes()
+        (self.dir / "out").write_bytes(b"not a directory")
+        with self.assertRaises(OSError):
+            self.plan_stage("--vault", str(path))
+        self.assertEqual(path.read_bytes(), before)
 
     def test_without_the_flag_the_vault_is_left_as_mine_wrote_it(self):
         # contracts/tcb.md: the flag is optional, and a plan run by hand without it reduces nothing.

@@ -4,6 +4,8 @@ import hmac
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -202,6 +204,19 @@ class MineTest(unittest.TestCase):
         inv, _ = mine.mine_corpus(d)
         self.assertEqual([a["invariant"] for a in inv["ambiguities"]], ["body_font"])
 
+    def test_the_fixture_script_builds_the_footer_corpus_the_rust_test_mines(self):
+        # The command line the Rust tests spawn (`ooxml_fixtures.py DIR footers`): ten contracts whose
+        # footers all differ, a client's name in each, so that the footer is an ambiguity of ten
+        # candidates (founder decision D-02's case). The Rust test's "0 of 10" counts these.
+        d = Path(tempfile.mkdtemp()) / "corpus"
+        subprocess.run([sys.executable, "-I", ooxml_fixtures.__file__, str(d), "footers"], check=True)
+        self.assertEqual(sorted(p.name for p in d.glob("*.docx")), sorted(f"c{i}.docx" for i in range(10)))
+        self.assertEqual(len(list(d.glob("*.pdf"))), 10)
+        inv, vault = mine.mine_corpus(d, salt=SALT)
+        (amb,) = inv["ambiguities"]
+        self.assertEqual((amb["invariant"], len(amb["candidates"]), sorted(vault.values())),
+                         ("footer_text", 10, sorted(ooxml_fixtures.FOOTERS)))
+
 
 def _rewrite(doc: Path, member: str, old: bytes, new: bytes) -> None:
     with zipfile.ZipFile(doc) as zf:
@@ -365,3 +380,35 @@ class SaltTest(unittest.TestCase):
                                "--salt-file", str(salt_file(b"short"))])
         self.assertEqual(code, 2)
         self.assertIn("vkforge mine: salt file ", err.getvalue())
+
+
+class ReadVaultTest(unittest.TestCase):
+    """The vault's one reader, `mine.read_vault`, next to its writer: `plan` reads the vault to cut it
+    down (D-02) and `generate` to resolve the plan's secrets, and both refuse alike."""
+
+    def test_the_vault_mine_wrote_is_read_back_whole(self):
+        inv, vault = mine.mine_corpus(a_corpus(5, footer=FOOTER), salt=SALT)
+        path = mine.write_invariants(inv, vault, Path(tempfile.mkdtemp()) / "out")
+        self.assertEqual(mine.read_vault(path), {mine.redact(FOOTER, SALT): FOOTER})
+
+    def test_a_vault_that_is_not_an_object_of_clear_strings_is_refused_in_one_line(self):
+        for label, content in (("a list", "[1, 2]"), ("a string", '"x"'), ("null", "null"),
+                               ("a value that is no string", '{"<redacted:hmac-sha256:aa>": 3}')):
+            with self.subTest(label):
+                path = Path(tempfile.mkdtemp()) / ".vault.json"
+                path.write_text(content, encoding="utf-8")
+                with self.assertRaises(Refusal) as cm:
+                    mine.read_vault(path)
+                self.assertEqual(str(cm.exception),
+                                 f"vault {path} is not an object of clear strings; remedy: run vkforge mine again")
+
+    def test_a_vault_that_is_absent_or_not_json_is_refused_by_name(self):
+        gone = Path(tempfile.mkdtemp()) / ".vault.json"
+        with self.assertRaises(Refusal) as cm:
+            mine.read_vault(gone)
+        self.assertEqual(str(cm.exception), f"vault {gone} not found; remedy: run vkforge mine again")
+        broken = Path(tempfile.mkdtemp()) / ".vault.json"
+        broken.write_text("{", encoding="utf-8")
+        with self.assertRaises(Refusal) as cm:
+            mine.read_vault(broken)
+        self.assertEqual(str(cm.exception), f"vault {broken} is not JSON; remedy: run vkforge mine again")

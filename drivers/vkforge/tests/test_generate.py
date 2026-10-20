@@ -286,6 +286,26 @@ class GenerateTest(unittest.TestCase):
         files_sha256 = json.loads((out / "manifest.json").read_text(encoding="utf-8"))["program"]["files_sha256"]
         self.assertEqual(printed.getvalue(), f"generate: word-maison {files_sha256} -> {out}\n")
 
+    def test_the_cli_refuses_a_vault_that_is_not_an_object_of_clear_strings(self):
+        # The vault has one reader, mine.read_vault, which plan uses too: the same line from both stages,
+        # before anything is written.
+        work = Path(tempfile.mkdtemp())
+        vault, out = work / ".vault.json", work / "driver"
+        for label, content in (("a list", [1, 2]), ("a value that is no string", {mine.redact(FOOTER): 3})):
+            with self.subTest(label):
+                vault.write_text(json.dumps(content), encoding="utf-8")
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    code = entry.main(["generate", "--plan", str(FIXTURES / "plan-word-maison.json"),
+                                       "--binding", str(FIXTURES / "binding-word.json"),
+                                       "--invariants", str(FIXTURES / "invariants-word-maison.json"),
+                                       "--vault", str(vault), "--out", str(out), "--name", "word-maison",
+                                       "--venv", str(fake_venv())])
+                self.assertEqual(code, 2)
+                self.assertEqual(err.getvalue(), f"vkforge generate: vault {vault} is not an object of clear strings; "
+                                                 "remedy: run vkforge mine again\n")
+                self.assertFalse(out.exists())
+
     def test_render_driver_is_the_reviewed_text(self):
         # The plan's byte-exact driver.py (the brief's text, amended by L-P46/L-P47): _quit registered
         # with atexit inside app(), once the application exists, and called again when serve returns.

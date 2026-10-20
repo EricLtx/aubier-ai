@@ -8,8 +8,10 @@ the HMAC-SHA256 of the text keyed by the learn's salt (`--salt-file`, founder de
 guessed footer cannot be confirmed from `invariants.json` without that salt; its clear value goes
 to the vault (`--vault FILE`, by default `<out>/.vault.json`), which stays on the node. The daemon
 names the salt and the vault under its own private forge directory, never under `--out` (final
-review I-2): on Windows a mode is no ACL, so the directory's ACL is the protection. The vault is
-deleted after `generate`; the salt is not, because `qualify` re-mines the copies under it (LF-1).
+review I-2): on Windows a mode is no ACL, so the directory's ACL is the protection. `plan --vault`
+cuts the vault down to the values the plan uses (D-02) and `generate` reads it, both through
+`read_vault`; it is deleted after `generate`. The salt is not, because `qualify` re-mines the copies
+under it (LF-1).
 
 A value is an invariant when the share of mined files carrying it (its support) reaches the
 threshold; below it, two values or more are an ambiguity listed with their candidates, and a lone
@@ -21,7 +23,7 @@ import hmac
 import os
 from pathlib import Path
 
-from . import canon, ooxml
+from . import canon, ontology, ooxml
 from .errors import Refusal
 from .ooxml import NS, q
 
@@ -375,6 +377,16 @@ def write_invariants(inv: dict, vault: dict, out: Path, vault_path: Path | None 
         pass
     canon.write(vault, sidecar)
     return sidecar
+
+
+def read_vault(path) -> dict:
+    """The vault `write_invariants` wrote: a JSON object of clear strings, or the refusal (one line,
+    L-P15). The one reader of its shape: `plan` reads it to cut it down (D-02), `generate` to resolve
+    the plan's secrets, and both refuse a file that is not that alike."""
+    vault, _ = ontology.read_json(path, "vault", "run vkforge mine again")
+    if not (isinstance(vault, dict) and all(isinstance(v, str) for v in vault.values())):
+        raise Refusal(f"vault {path} is not an object of clear strings", "run vkforge mine again")
+    return vault
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:

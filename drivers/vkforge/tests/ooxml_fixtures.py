@@ -3,6 +3,7 @@
 Used by test_mine.py and, as a script, to build the corpus the Rust tests and CI mine:
 
     python -I drivers/vkforge/tests/ooxml_fixtures.py DIR GARAMOND [CALIBRI]
+    python -I drivers/vkforge/tests/ooxml_fixtures.py DIR footers [N]
 
 Stdlib only and no import from vkforge, so that it runs under -I as a script. The archives are
 byte-identical on every platform (members stored, not deflated, with a fixed date, creator system
@@ -198,7 +199,29 @@ def corpus(dir, garamond: int, calibri: int = 0) -> Path:
     return dir
 
 
+def client_footer(n: int) -> str:
+    """The footer of the n-th contract of the footers corpus: a client's name in each."""
+    return f"Contrat client {n}"
+
+
+FOOTERS = [client_footer(n) for n in range(10)]      # the footers of `footers(dir)`, written in this one place
+
+
+def footers(dir, n: int = 10) -> Path:
+    """c0.docx … : `n` contracts, each with its PDF, whose footers all differ — a client's name in each
+    (`client_footer`): the footer is an ambiguity of `n` token candidates, founder decision D-02's case."""
+    dir = Path(dir)
+    dir.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        docx(dir / f"c{i}.docx", footer=client_footer(i), pdf=True)
+    return dir
+
+
 if __name__ == "__main__":
-    if not 3 <= len(sys.argv) <= 4:
-        sys.exit("usage: ooxml_fixtures.py DIR GARAMOND [CALIBRI]")
-    corpus(Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else 0)
+    args = sys.argv[1:]
+    if len(args) in (2, 3) and args[1] == "footers":
+        footers(Path(args[0]), int(args[2]) if len(args) > 2 else 10)
+    elif 2 <= len(args) <= 3:
+        corpus(Path(args[0]), int(args[1]), int(args[2]) if len(args) > 2 else 0)
+    else:
+        sys.exit("usage: ooxml_fixtures.py DIR GARAMOND [CALIBRI] | ooxml_fixtures.py DIR footers [N]")

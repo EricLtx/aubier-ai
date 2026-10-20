@@ -21,7 +21,7 @@ from pathlib import Path
 from vkdriver import protocol as vkdriver_protocol
 from vkdriver.hash_dir import hash_dir
 
-from . import canon, inventory, ontology
+from . import canon, inventory, mine, ontology
 from . import plan as planner
 from .errors import Refusal
 from .runtime import com
@@ -334,7 +334,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--plan", required=True, type=Path, help="plan.json written by vkforge plan")
     parser.add_argument("--binding", required=True, type=Path, help="binding-<app>.json the plan was built from")
     parser.add_argument("--invariants", required=True, type=Path, help="invariants.json the plan was built from")
-    parser.add_argument("--vault", required=True, type=Path, help=".vault.json written by vkforge mine (read, never deleted)")
+    parser.add_argument("--vault", required=True, type=Path,
+                        help=".vault.json written by vkforge mine and cut down by vkforge plan (read, never deleted)")
     parser.add_argument("--out", required=True, type=Path, help="new or empty directory that receives the driver")
     parser.add_argument("--name", required=True, help="the driver's name: 1 to 32 characters of a-z, 0-9 and -")
     parser.add_argument("--venv", type=Path, default=VKFORGE_VENV,
@@ -347,9 +348,9 @@ def run(ns: argparse.Namespace) -> int:
         raise Refusal("plan.json is not in canonical form", "run vkforge plan again")
     binding, _ = ontology.read_json(ns.binding, "binding", "run vkforge bind again")
     invariants, _ = ontology.read_json(ns.invariants, "invariants", "run vkforge mine again")
-    vault, _ = ontology.read_json(ns.vault, "vault", "run vkforge mine again")
-    if not all(isinstance(x, dict) for x in (p, binding, invariants, vault)):
-        raise Refusal("plan, binding, invariants and vault must each be a JSON object", "run vkforge learn again")
+    if not all(isinstance(x, dict) for x in (p, binding, invariants)):
+        raise Refusal("plan, binding and invariants must each be a JSON object", "run vkforge learn again")
+    vault = mine.read_vault(ns.vault)
     generate(p, binding, invariants, vault, ns.out, ns.name, ns.venv)
     manifest = json.loads((Path(ns.out) / "manifest.json").read_text(encoding="utf-8"))
     print(f"generate: {ns.name} {manifest['program']['files_sha256']} -> {ns.out}")

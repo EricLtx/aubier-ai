@@ -7,7 +7,10 @@ one verify step per invariant — with the post-conditions a qualification repla
 text never crosses into the plan: a footer or a header is named `$secret.<id>` and the generator
 resolves it from the vault. An ambiguity is applied only when an arch chose one of the miner's own
 candidates; otherwise it is purged (spec §6: never applied in part). What cannot be driven goes to
-plan-excluded.json, with why.
+plan-excluded.json, with why. Given the vault (`--vault`), the stage then cuts it down in place to
+the values the plan uses — the tokens of the invariants it keeps and of the ambiguities it resolved
+on one of them — so that a purged candidate, or the text of what the plan leaves out, never reaches
+`generate` (founder decision D-02, rulings LF-4 and PF-15).
 
 `validate` mirrors `DriverPlan::validate` (crates/vk-contracts/src/plan.rs): same refusals, same
 sentences, same order, so a plan this stage writes is one the kernel parses.
@@ -334,14 +337,6 @@ def vault_tokens(plan: dict, invariants: dict) -> set:
     return {token for value in values for token in mine.tokens(value)}
 
 
-def read_vault(path: Path) -> dict:
-    """The vault mine wrote: a JSON object of clear strings, or the refusal (one line, L-P15)."""
-    vault, _ = ontology.read_json(path, "vault", "run vkforge mine again")
-    if not (isinstance(vault, dict) and all(isinstance(v, str) for v in vault.values())):
-        raise Refusal(f"vault {path} is not an object of clear strings", "run vkforge mine again")
-    return vault
-
-
 def reduce_vault(path: Path, vault: dict, plan: dict, invariants: dict) -> tuple[int, int]:
     """Founder decision D-02: the vault at `path` rewritten in place — the same file, so the same
     private directory and ACL, by canon.write — keeping only vault_tokens(plan, invariants).
@@ -369,8 +364,15 @@ def run(ns: argparse.Namespace) -> int:
         raise Refusal("invariants.json is not in canonical form", "run vkforge mine again")
     binding, _ = ontology.read_json(ns.binding, "binding", "run vkforge bind again")
     resolve = None if ns.resolver is None else load_resolver(ns.resolver)
-    vault = None if ns.vault is None else read_vault(ns.vault)
+    vault = None if ns.vault is None else mine.read_vault(ns.vault)
     p, excluded = build(invariants, binding, ont, resolve)
+    if vault is not None:
+        # A vault that lacks a value the plan uses is a consumed one (a second hand run) or another
+        # learn's: say so here, with the cause, not one stage later in generate.
+        missing = vault_tokens(p, invariants) - vault.keys()
+        if missing:
+            raise Refusal(f"vault {ns.vault} holds no clear value for {len(missing)} token(s) the plan uses",
+                          "run vkforge mine again")
     path = write_plan(p, excluded, ns.out)
     a = p["actions"][0]
     purged = sum(x["resolved_by"] == "purged" for x in p["ambiguities"])
