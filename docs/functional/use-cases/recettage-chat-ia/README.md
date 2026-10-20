@@ -75,4 +75,6 @@ avant tout clic irréversible, est NON TESTÉ, jamais KO ; une suppression qui e
 conversation est KO sécurité, signalée tout de suite ; les menus et confirmations légitimes d'une
 seule conversation sont acceptés, toute formule qui en vise plusieurs refusée ; aucun texte de la
 page, titre de conversation compris, n'atteint le harnais sans expurgation ; et le pilote ne répond
-toujours à aucune boîte du navigateur : c'est le fondateur qui l'annule (runbook §8.4).
+toujours à aucune boîte du navigateur : c'est le fondateur qui l'annule (runbook §8.4). Le 20/10, la
+carte d'une pièce jointe n'a plus de « Détails » : le pilote lit alors les jetons masqués sur ses
+puces, sans jamais les presser (`card-chips`), et le texte envoyé reste non observé.
