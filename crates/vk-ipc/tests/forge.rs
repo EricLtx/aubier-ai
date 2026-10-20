@@ -1075,3 +1075,111 @@ async fn qualify_reads_the_learns_salt_and_fails_closed_without_it() {
     );
     node.shutdown().await;
 }
+
+/// Every file under `dir`; a link (the generated driver's `.venv` junction) is not followed.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let (mut files, mut dirs) = (Vec::new(), vec![dir.to_path_buf()]);
+    while let Some(d) = dirs.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if kind.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files
+}
+
+/// Founder decision D-01 (task review quality-1, secrecy-1, tests-2): every learn draws a fresh
+/// salt. The same corpus learned twice under one name into two outs, as Review Focus 3 has it: two
+/// salts of 32 bytes, neither all zeros, that differ; two footer tokens, `invariants_sha256`,
+/// `plan_sha256` and `driver_id` that differ (spec §12, PF-8); no `.salt` and no salt bytes under
+/// either out. The first driver, whose salt the second learn replaced, refuses to qualify in LF-3's
+/// line; the second qualifies.
+#[tokio::test]
+async fn a_second_learn_of_the_name_draws_a_new_salt_and_the_first_driver_no_longer_qualifies() {
+    if !forge_available() {
+        return;
+    }
+    let node = Node::start().await;
+    let corpus = ooxml_corpus(&node.dir().join("corpus"), 10, 0);
+    let salt = node.dir().join("forge").join("word-maison").join(".salt");
+    let (a, b) = (
+        node.dir().join("a").join("word-maison"),
+        node.dir().join("b").join("word-maison"),
+    );
+    node.call_human("driver.learn", learn_params(&corpus, &a))
+        .await
+        .unwrap();
+    let first = std::fs::read(&salt).unwrap();
+    node.call_human("driver.learn", learn_params(&corpus, &b))
+        .await
+        .unwrap();
+    let second = std::fs::read(&salt).unwrap();
+    for drawn in [&first, &second] {
+        assert_eq!(drawn.len(), 32);
+        assert!(drawn.iter().any(|&x| x != 0), "a drawn salt, not zeros");
+    }
+    assert_ne!(first, second, "each learn draws its own salt");
+    let footer = |out: &Path| {
+        let inv: Value =
+            serde_json::from_slice(&std::fs::read(out.join("invariants.json")).unwrap()).unwrap();
+        inv["invariants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == "footer_text")
+            .unwrap()["value"]
+            .clone()
+    };
+    assert_ne!(footer(&a), footer(&b), "the same footer, another token");
+    let ((plan_a, bytes_a), (plan_b, bytes_b)) = (read_plan(&a), read_plan(&b));
+    assert_ne!(plan_a.invariants_sha256, plan_b.invariants_sha256);
+    assert_ne!(plan_sha256(&bytes_a), plan_sha256(&bytes_b));
+    assert_ne!(
+        manifest_of(&a.join("driver")).driver_id(),
+        manifest_of(&b.join("driver")).driver_id()
+    );
+    for out in [&a, &b] {
+        for file in files_under(out) {
+            assert_ne!(file.file_name().unwrap(), ".salt", "{}", file.display());
+            let bytes = std::fs::read(&file).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            for drawn in [&first, &second] {
+                let hex: String = drawn.iter().map(|x| format!("{x:02x}")).collect();
+                assert!(
+                    !bytes.windows(drawn.len()).any(|w| w == &drawn[..]) && !text.contains(&hex),
+                    "the salt in {}",
+                    file.display()
+                );
+            }
+        }
+    }
+    let e = node
+        .call(
+            "driver.qualify",
+            json!({"driver": a.join("driver"), "corpus": corpus}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        call_error(&e).message,
+        "vkforge qualify: the salt does not give back the footer_text token of invariants.json; \
+         remedy: vk driver learn again: the salt and invariants.json are one learn's"
+    );
+    let q = node
+        .call(
+            "driver.qualify",
+            json!({"driver": b.join("driver"), "corpus": corpus}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (q["passes"].as_u64(), q["failures"].as_u64()),
+        (Some(10), Some(0))
+    );
+    node.shutdown().await;
+}

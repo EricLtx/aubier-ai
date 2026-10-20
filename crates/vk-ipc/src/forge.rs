@@ -302,18 +302,30 @@ impl Drop for Vault {
 /// re-mines the replayed copies under it. The next `learn` of the name clears it with the directory.
 const SALT_FILE: &str = ".salt";
 
-/// The salt's bytes from the OS generator, written to a new file at `path` (the learn cleared the
-/// directory first, so the file is new).
+/// The salt's length: `mine.SALT_BYTES` on the stages' side (`drivers/vkforge/mine.py`), which
+/// refuses a salt file of any other size.
+const SALT_BYTES: usize = 32;
+
+/// The learn directory of a driver name, `<state_dir>/forge/<name>`: its stages' logs, the vault
+/// from `mine` to `generate`, and the salt [`learn`] writes and [`qualify`] reads back — one path
+/// for both, so that the salt's writer and its reader always name the same file.
+fn learn_dir(state_dir: &Path, name: &str) -> PathBuf {
+    state_dir.join("forge").join(name)
+}
+
+/// The salt, drawn by the OS generator into the store's wiped-on-drop container
+/// (`vk_store::keys::fresh`), written to a new file at `path` that is born private: `0600` on Unix,
+/// as the vault and `secrets.json` are; on Windows it takes its private directory's ACL. The learn
+/// cleared the directory first, so the file is new.
 fn write_salt(path: &Path) -> Result<(), RpcError> {
-    use rand::RngCore;
     use std::io::Write;
-    let mut salt = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
-    std::fs::OpenOptions::new()
+    let drawn = vk_store::keys::fresh();
+    let salt: &[u8; SALT_BYTES] = &drawn;
+    vk_store::paths::private_file_options()
         .write(true)
         .create_new(true)
         .open(path)
-        .and_then(|mut file| file.write_all(&salt))
+        .and_then(|mut file| file.write_all(salt))
         .map_err(|e| io_failed("write the learn's salt", &e))
 }
 
@@ -448,7 +460,7 @@ pub fn learn(
 
     // One request per driver name at a time (L-P55), held to the end of this function.
     let _claim = Claim::take(state_dir, &name, "learn")?;
-    let logs = state_dir.join("forge").join(&name);
+    let logs = learn_dir(state_dir, &name);
     if logs.exists() {
         // The daemon's own scratch: the logs of an earlier learning under this name.
         std::fs::remove_dir_all(&logs)
@@ -929,7 +941,7 @@ pub fn qualify(
     let logs = state_dir.join("forge").join(format!("qualify-{name}"));
     // The learn's salt (D-01): the stage re-mines the copies under it, and refuses one that does not
     // give back the plan's tokens (ruling LF-3) — or that is gone — in its own line.
-    let salt = state_dir.join("forge").join(&name).join(SALT_FILE);
+    let salt = learn_dir(state_dir, &name).join(SALT_FILE);
     let mut args = vec![
         "--driver".into(),
         arg(&driver),
@@ -1523,5 +1535,48 @@ mod tests {
         }
         std::fs::create_dir(t.path().join("sub.docx")).unwrap();
         assert_eq!(documents_in(t.path()).unwrap(), 3);
+    }
+
+    /// D-01's salt (task review secrecy-2 and quality-3): `SALT_BYTES` drawn bytes, a new draw
+    /// each time, in a new file never written over an existing one, and private as the vault beside
+    /// it is: `0600` on Unix; on Windows the file has no mode and takes its directory's ACL, which
+    /// names no group of other accounts.
+    #[test]
+    fn the_salt_is_a_new_private_file_of_drawn_bytes() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = learn_dir(state.path(), "word-maison");
+        vk_store::paths::private_dir(&dir).unwrap();
+        let (one, two) = (dir.join(SALT_FILE), dir.join("second.salt"));
+        write_salt(&one).unwrap();
+        write_salt(&two).unwrap();
+        let (a, b) = (std::fs::read(&one).unwrap(), std::fs::read(&two).unwrap());
+        assert_eq!((a.len(), b.len()), (SALT_BYTES, SALT_BYTES));
+        assert!(a.iter().any(|&x| x != 0) && a != b, "two draws, two salts");
+        assert!(write_salt(&one).is_err(), "never written over a salt");
+        assert_eq!(std::fs::read(&one).unwrap(), a);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&one).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "born owner-only, as the vault and secrets.json are"
+            );
+        }
+        #[cfg(windows)]
+        {
+            use vk_store::win_acl::{
+                AUTHENTICATED_USERS_SID, EVERYONE_SID, INTERACTIVE_SID, USERS_SID,
+            };
+            let view = vk_store::win_acl::path_dacl(&one).unwrap();
+            for group in [
+                EVERYONE_SID,
+                USERS_SID,
+                AUTHENTICATED_USERS_SID,
+                INTERACTIVE_SID,
+            ] {
+                assert!(!view.sids().contains(&group), "{group} in {view:?}");
+            }
+        }
     }
 }
