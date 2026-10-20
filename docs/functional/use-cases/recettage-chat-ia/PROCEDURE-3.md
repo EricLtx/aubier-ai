@@ -1,7 +1,8 @@
 # Procédure Aubier — troisième recette de MaskAI, « de bout en bout »
 
-Version 2, 2026-10-19 (la version 1 est du 18/10 ; la version 2 suit le pilote v2.3, qui joue M8-4 à
-M8-8 et livre le §6). Ce document est un **delta** de `PROCEDURE-2.md` (version 1, 2026-10-17),
+Version 2, 2026-10-19, revue le 20/10 (la version 1 est du 18/10 ; la version 2 suit le pilote v2.3,
+qui joue M8-4 à M8-8 et livre le §6 ; la revue du 20/10 en a durci les gardes avant le passage réel,
+§6). Ce document est un **delta** de `PROCEDURE-2.md` (version 1, 2026-10-17),
 lui-même delta de `PROCEDURE.md` (version 2, 2026-10-13), et il ne les recopie pas. Tout ce qu'il
 ne dit pas reste valable : les six ENF, les règles de conduite, les sept étapes, le barème, les
 leçons et les annexes de `PROCEDURE.md` ; la grille M0–M7, ses budgets, ses réglages remis et ses
@@ -118,8 +119,8 @@ seule qui le peut) et sont joués.
 | M8-2 | `list` | joué | `lister_conversations` juste après M8-1 | le titre de M8-1 figure dans la barre latérale | disponibilité |
 | M8-3 | `attach_question` | joué | la facture scannée en JPEG (`corpus/03b_facture_berthod_scan.jpg`), oracle DOC-03 | l'état de la puce ; les valeurs de DOC-03, comme M2-3 | disponibilité, véracité |
 | M8-4 | `list` | joué (v2.3, E2) | recherche ⌘K (Ctrl+K) du titre connu, `lister_conversations` M8-4 | le titre de M8-1 parmi les résultats (l'oracle ne lit que les titres trouvés, après « résultats : ») | disponibilité |
-| M8-5 | `list` | joué (v2.3, E1, E3) | renommer la conversation de M8-1, créée par la recette, `renommer_conversation` M8-5 | le nouveau titre est relu et listé | disponibilité |
-| M8-6 | `list` | joué (v2.3, E1, E3) | supprimer cette même conversation, créée par la recette, et aucune autre, `supprimer_conversation` M8-6 | le titre renommé n'est plus listé | disponibilité |
+| M8-5 | `list` | joué (v2.3, E1, E3) | renommer la conversation de M8-1, créée par la recette, `renommer_conversation` M8-5 | le nouveau titre, relu sur cette conversation à son adresse (« titre relu « Recette trois renommée » ») ; jamais lu dans la liste entière, où une autre conversation peut porter ce titre (revue du 20/10) | disponibilité |
+| M8-6 | `list` | joué (v2.3, E1, E3) | supprimer cette même conversation, créée par la recette, et aucune autre, `supprimer_conversation` M8-6 | cette conversation, à son adresse, n'est plus listée (« plus listée », jamais « encore listée ») ; jamais jugé sur la liste entière (revue du 20/10) | disponibilité |
 | M8-7 | `model` | joué (v2.3, E4) | relire le bouton de dictée avec le sélecteur de modèle, sans jamais le presser | « micro : idle » | disponibilité |
 | M8-8 | `message` | joué (v2.3, E5) | ouvrir « Votre avis » depuis son entrée, puis le fermer par sa croix, `ouvrir_avis` M8-8 | « fermé par : croix ; envoyé : non » | disponibilité |
 
@@ -138,7 +139,9 @@ seule qui le peut) et sont joués.
   modèle (E4) : c'est M8-7.
 - **« Votre avis ».** Le pilote ferme cette enquête par sa croix quand elle apparaît (le 17/10,
   après chaque abandon ; débriefing D2), et chaque ligne compte ces apparitions (`modals_closed`).
-  M8-8 l'ouvre exprès depuis son entrée, le bouton « Send feedback » de la barre latérale (E5).
+  M8-8 l'ouvre exprès depuis son entrée, le bouton « Send feedback » de la barre latérale (E5). Le
+  pilote ne clique cette entrée que reconnue par son libellé exact, jamais une note 👍/👎 d'une carte
+  de réponse (un envoi) : sinon il refuse avant tout clic, et M8-8 reste à faire.
 - **Types de fichiers.** Une pièce jointe par famille, comptée sur toute la recette. La liste
   `accept` du champ de fichier n'était pas relevée avant le pilote v2.3 : E6 la fait lire. Chaque
   ligne de pièce jointe la porte (`attach.accept`), et la sonde de M0 la relève ; une famille
@@ -270,17 +273,17 @@ nouvelle action écrit l'observation que lit déjà le verdict de cette sorte (`
 
 | # | Exigence | Débloque |
 |---|---|---|
-| E1 | **Registre des conversations créées.** Le pilote retient, dans son dossier de travail, l'adresse de chaque conversation qu'il crée, avec le cas qui l'a créée. `same_conversation_as` s'y résout. Renommer ou supprimer une conversation absente de ce registre est un refus `precondition`. | M8-5, M8-6 |
-| E2 | **Recherche ⌘K.** `lister_conversations` prend un argument facultatif `case`. Si ce cas porte une `question`, le pilote ouvre la recherche (`ControlOrMeta+K`), tape la question, lit les titres des résultats, puis ferme par Échap. Il écrit `@list` avec le texte « recherche « q » : n résultats : t1 \| t2 … ». Sans `case`, rien ne change (N7, M8-2). | M8-4 |
-| E3 | **Renommer, supprimer.** Deux actions irréversibles (`reversible: false` au manifeste), `renommer_conversation {case}` et `supprimer_conversation {case}`, sur la seule conversation de `same_conversation_as`, si E1 la connaît. Le renommage donne pour titre la `question` du cas. La suppression valide la confirmation de l'application par son bouton documenté (une modale `own` de `KNOWN_MODALS`). Les deux relisent ensuite la barre latérale dans `@list`. Le rapport liste la conversation comme créée, puis supprimée. | M8-5, M8-6 |
+| E1 | **Registre des conversations créées.** Le pilote retient, dans son dossier de travail, l'adresse de chaque conversation qu'il crée, avec le cas qui l'a créée. `same_conversation_as` s'y résout. Renommer ou supprimer une conversation absente de ce registre est un refus `precondition`. Revue du 20/10 (I6, m13) : une conversation n'y entre que si la page arrive, après la question ou le téléversement, sur l'adresse d'une conversation qui n'était pas listée avant ; une ligne apparue dans la barre latérale n'y entre jamais, même seule. | M8-5, M8-6 |
+| E2 | **Recherche ⌘K.** `lister_conversations` prend un argument facultatif `case`. Si ce cas porte une `question`, le pilote ouvre la recherche (`ControlOrMeta+K`), tape la question, lit les titres des résultats, puis ferme par Échap. Il écrit `@list` avec le texte « recherche « q » : n résultats : t1 \| t2 … ». Sans `case`, rien ne change (N7, M8-2). Revue du 20/10 (I4) : quand le clavier n'ouvre rien, l'entrée de la barre latérale n'est cliquée qu'identifiée (dans la barre latérale, son texte ou son libellé disant « search » ou « recherch », jamais le bouton de dictée, une commande du compositeur ni un bouton d'une carte) ; sinon refus `precondition` avant tout clic, sans observation (le cas reste à faire), qui nomme les candidats vus. | M8-4 |
+| E3 | **Renommer, supprimer.** Deux actions irréversibles (`reversible: false` au manifeste), `renommer_conversation {case}` et `supprimer_conversation {case}`, sur la seule conversation de `same_conversation_as`, si E1 la connaît. Le renommage donne pour titre la `question` du cas. La suppression valide la confirmation de l'application par son bouton documenté (une modale `own` de `KNOWN_MODALS`). Les deux relisent ensuite la barre latérale dans `@list`. Le rapport liste la conversation comme créée, puis supprimée. Revue du 20/10 (I7, m1, m2, m14, m15) : le déclencheur du menu annonce un menu (`aria-haspopup`) et n'est jamais pris au-dessus de la ligne dans un élément qui porte un titre de groupe ; les entrées cliquées sont en liste blanche sur leur texte entier (« Renommer », « Supprimer », « … la conversation », « Delete chat »…), seules de leur sorte, et aucune entrée du menu ne vise plusieurs conversations (« tous », « all », « every », « sélection »…) ; le champ du titre et la confirmation doivent être ouverts par le clic ; la confirmation doit parler de supprimer une conversation, une seule, sinon elle est annulée par Échap ; son clic est noté aussitôt au registre (« suppression confirmée ») et n'est jamais refait. | M8-5, M8-6 |
 | E4 | **Bouton de dictée.** Le résultat de `choisir_modele` (observation `@model`) se termine par « ; micro : <data-status> », ou « ; micro : absent ». Le bouton est lu par `mic_button`, jamais pressé. La `config` de chaque ligne porte aussi cet état. | M8-7 |
-| E5 | **« Votre avis ».** La sonde d'interface relève l'entrée de l'enquête (barre latérale ou menu du compte). Une action `ouvrir_avis {case}` l'ouvre depuis cette entrée, la ferme par sa croix (`KNOWN_MODALS`, « avis »), jamais par « Envoyer », et écrit l'observation du cas : « avis : ouvert (entrée : X) ; fermé par : croix ; envoyé : non ». Chaque ligne porte aussi `modals_closed`, les modales connues fermées pendant l'action, pour que le juge compte les apparitions spontanées. | M8-8 |
+| E5 | **« Votre avis ».** La sonde d'interface relève l'entrée de l'enquête (barre latérale ou menu du compte). Une action `ouvrir_avis {case}` l'ouvre depuis cette entrée, la ferme par sa croix (`KNOWN_MODALS`, « avis »), jamais par « Envoyer », et écrit l'observation du cas : « avis : ouvert (entrée : X) ; fermé par : croix ; envoyé : non ». Chaque ligne porte aussi `modals_closed`, les modales connues fermées pendant l'action, pour que le juge compte les apparitions spontanées. Revue du 20/10 (I5) : l'entrée n'est cliquée que reconnue par son libellé exact (`Send feedback`, `Votre avis`…), hors carte de réponse et compositeur ; sinon refus `precondition` avant tout clic, sans observation (le cas reste à faire), qui nomme les candidats vus. | M8-8 |
 | E6 | **Liste `accept`.** `joindre_document` lit l'attribut `accept` du champ de fichier caché, le rend dans son résultat et le met dans l'`attach` de la ligne. Le juge compare familles acceptées et familles jointes (§3, M8). | les cas de familles à écrire |
-| E7 | **Ligne de journal au service du contrat.** Chaque ligne porte `sent_source` (`card-details`, `composer-popover` ou nul, avec la raison du rejet), `sent_tokens` (les types des jetons du texte envoyé, numérotation repliée, par exemple `{"PERSON": 2, "IBAN": 1}`) et le nombre de données identifiantes que déclare le panneau de garde. Le juge compare ainsi les ensembles masqués des passages a et b (§7, point 5) sans lire `sent.json`. Avec la v2.2, il s'en tient à `sent_sha256` (texte envoyé à la numérotation des jetons près) et à la note de passage a. | jugement de M1 |
-| E8 | **Lignes de correction.** Une ligne `supersedes` porte `inputs_sha256` et `ui_profile_sha256` comme une ligne d'exécution (le 18/10, celles de 18:43 n'en portaient aucun). | traçabilité |
-| E9 | **Classe d'erreur de la puce.** Une puce en échec donne à la ligne une `error_class` sans nom d'hôte ni pile, par exemple « service documentaire injoignable ». Le libellé brut reste dans les preuves, privées. Avant la v2.3, il passait dans la note de la ligne, et donc dans ce que lisent le juge et la rédaction. | règle des pièces jointes, confidentialité |
-| E10 | **Diagnostic de l'échec silencieux.** Une question sans nouvelle carte de réponse, ou avec une carte vide : le pilote relève la ligne d'état du compositeur (`#chat-input-status`), les alertes et les toasts, le statut HTTP du flux et ses derniers événements, avec la charge utile d'une erreur. La ligne porte une `error_class` et un extrait expurgé de 80 caractères au plus (`error_excerpt`), sans nom d'hôte, chemin ni pile ; la capture brute ne va qu'à la preuve `failure.json`. | disponibilité (la nuit du 18 au 19/10, 12 modèles sur 14 sans réponse après `detect_pii`, « échec silencieux » sans autre indice) |
-| E11 | **Sonde d'interface.** `sonder_interface`, en lecture seule, jouée en M0 : chaque sélecteur résolu, l'entrée de la recherche ⌘K et sa palette, l'entrée de « Votre avis », le bouton de dictée, la liste `accept`, et le menu de la première conversation de la barre latérale (ouvert, lu, refermé par Échap, aucune entrée cliquée, ni son titre ni son adresse gardés) ; preuve `probe.json`. Elle ne refuse rien. | confirmer le balisage réel avant que M8 en ait besoin |
+| E7 | **Ligne de journal au service du contrat.** Chaque ligne porte `sent_source` (`card-details`, `composer-popover` ou nul, avec la raison du rejet), `sent_tokens` (les types des jetons du texte envoyé, numérotation repliée, par exemple `{"PERSON": 2, "IBAN": 1}`) et le nombre de données identifiantes que déclare le panneau de garde. La note d'un passage b compare les entités masquées des deux passages, lues dans leurs textes envoyés contre leurs questions : « entités masquées identiques », ou « entités masquées différentes : +X −Y », les types des entités en plus puis en moins, jamais leurs valeurs ; sans l'un des deux textes, les types seuls, et la note dit « types masqués » (revue du 20/10, m6 : des types identiques ne prouvent pas des entités identiques). Le juge applique ainsi le §7, point 5, sans lire `sent.json`. Avec la v2.2, il s'en tient à `sent_sha256` (texte envoyé à la numérotation des jetons près) et à la note de passage a. | jugement de M1 |
+| E8 | **Lignes de correction.** Une ligne `supersedes` porte `inputs_sha256` et `ui_profile_sha256` comme une ligne d'exécution (le 18/10, celles de 18:43 n'en portaient aucun). Revue du 20/10 (m8, m9) : `correct.py --observations FICHIER` rejoue sur les observations mises de côté à une reprise ; une preuve seule changée n'est corrigée qu'avec `--evidence` ; `journal.py stats` compte les lignes en vigueur, corrections comprises. | traçabilité |
+| E9 | **Classe d'erreur de la puce.** Une puce en échec donne à la ligne une `error_class` sans nom d'hôte ni pile, par exemple « service documentaire injoignable ». Le libellé brut reste dans les preuves, privées. Avant la v2.3, il passait dans la note de la ligne, et donc dans ce que lisent le juge et la rédaction. Revue du 20/10 (I2, I3) : la ligne porte aussi `internal_error_shown`, dans `attach` et sur la ligne ; une puce en échec qui montre un hôte, un chemin, une pile ou un service injoignable le met à vrai ; son libellé, même expurgé, ne quitte plus les preuves (`chip.json`). | règle des pièces jointes, confidentialité |
+| E10 | **Diagnostic de l'échec silencieux.** Une question sans nouvelle carte de réponse, ou avec une carte vide : le pilote relève la ligne d'état du compositeur (`#chat-input-status`), les alertes et les toasts, le statut HTTP du flux et ses derniers événements, avec la charge utile d'une erreur. La ligne porte une `error_class` et `internal_error_shown` : vrai quand la ligne d'état, une alerte ou un toast a montré à l'utilisateur un hôte, un chemin, une pile ou un service injoignable (ce que dit le flux, que l'utilisateur ne voit pas, n'y compte pas). Une réponse qui affiche une erreur interne le met aussi à vrai, et la preuve de sa ligne est expurgée. L'extrait expurgé, 80 caractères au plus, et la capture brute ne vont qu'à la preuve `failure.json` : l'expurgation est une heuristique, la ligne n'en porte rien (revue du 20/10, I2, I3, m11). Seuls une alerte, un toast ou un texte d'état qui dit une erreur font « erreur affichée par l'application » (m7). | disponibilité (la nuit du 18 au 19/10, 12 modèles sur 14 sans réponse après `detect_pii`, « échec silencieux » sans autre indice) |
+| E11 | **Sonde d'interface.** `sonder_interface`, en lecture seule, jouée en M0 : chaque sélecteur résolu, l'entrée de la recherche ⌘K et sa palette, l'entrée de « Votre avis », le bouton de dictée, la liste `accept`, et le menu de la première conversation de la barre latérale (ouvert, lu, refermé par Échap, aucune entrée cliquée, ni son titre ni son adresse gardés) ; preuve `probe.json`. Elle ne refuse rien. Revue du 20/10 (I4, m10, m15) : elle relève les entrées telles que les actions les prendraient (identifiées, sinon les candidats vus), ne presse que le déclencheur qui annonce un menu (`aria-haspopup`), et le menu qu'elle garde ne porte aucun mot du titre de cette conversation. | confirmer le balisage réel avant que M8 en ait besoin |
 
 **Livraison.** Les neuf cas de M8 et M9 jouables avec le pilote v2.2 sont entrés dans `cases.json`
 à sa fusion, les cinq autres avec le pilote v2.3. `drivers/maskai-recette/tests/test_recipe_cases.py`
@@ -291,20 +294,39 @@ dans le dossier haché du driver : `files_sha256` est régénéré, et `inputs_s
 `scripts/recette/correct.py` écrit les lignes de correction (E8) : il rejoue hors ligne le jugement
 du driver sur l'observation gardée, à blanc par défaut.
 
-**Choix du pilote v2.3, à relire au premier passage réel :**
+**Choix du pilote v2.3 et de sa revue du 20/10, à relire au premier passage réel :**
 - l'oracle de M8-4 ne lit les titres qu'après « résultats : » (`resultats? : .*recette trois`) : la
   ligne recopie la requête en tête, et l'oracle proposé le 18/10 (`recette trois`) passait même sans
   aucun résultat ;
-- un menu n'est celui d'une conversation que s'il porte exactement une entrée de renommage et une de
-  suppression, et aucune qui viserait plus d'une conversation (« tout », « all », « historique ») :
-  sinon rien n'est cliqué ;
+- un menu n'est celui d'une conversation que si ses entrées de renommage et de suppression sont en
+  liste blanche, sur leur texte entier, seules de leur sorte, et qu'aucune entrée ne vise plus d'une
+  conversation (« tous », « all », « every », « sélection », « historique ») : sinon rien n'est
+  cliqué. Ce refus peut tomber sur le vrai menu de MaskAI : `probe.json` de M0 le dit avant M8 ;
+- la confirmation de suppression doit parler de supprimer une conversation, une seule, sinon elle est
+  annulée par Échap. « Tous ses messages » y vise cette conversation ; un nom de conversation au
+  pluriel, l'historique (hors celui de cette conversation), une sélection en visent plusieurs. La sonde
+  ne clique aucune entrée : ce texte ne se lit qu'au clic de M8-6, et un refus laisse la conversation en
+  place, son texte dans `conversation.json` ;
+- M8-5 et M8-6 se jugent sur l'état de la conversation de M8-1, relu à son adresse (« titre relu
+  « … » », « plus listée »), jamais sur la liste entière : avant la revue, une suppression refusée
+  était journalisée OK, et un titre « Recette trois renommée » laissé par un essai antérieur rendait
+  M8-5 OK sans renommage ;
+- une entrée (recherche ⌘K, « Votre avis ») que le pilote n'identifie pas n'est jamais cliquée : refus
+  `precondition`, sans observation, et le cas reste à faire, NON TESTÉ, plutôt qu'un KO sur un bouton
+  que le pilote n'a pas su reconnaître ;
 - une observation partagée (`@load`, `@list`, `@model`, `@web`) ne juge qu'un cas, celui qui la lit
   le premier, sauf un cas sondé avant qu'elle soit faite (N7-1 et N7-2 sur une même liste) : la sonde
-  de M8-4 ne se juge pas sur la liste de M8-2, ni celle de M8-7 sur le choix de modèle de M8-1 ;
+  de M8-4 ne se juge pas sur la liste de M8-2, ni celle de M8-7 sur le choix de modèle de M8-1 ; une
+  observation faite pour un cas qui nomme son action (M8-4 à M8-6) ne juge que lui, et un dialogue
+  pendant cette action est noté sous le cas, qui le lit (revue du 20/10, m4, m5) ;
 - la palette ⌘K, la fenêtre de renommage et la confirmation de suppression sont des modales `own` :
   laissées ouvertes par une action coupée, la garde suivante les ferme par Échap, sans jamais valider ;
 - `sent_tokens` compte chaque occurrence d'un type de jeton, à la numérotation près, comme
-  `sent_sha256` ; nul quand le texte envoyé n'est pas observé.
+  `sent_sha256` ; nul quand le texte envoyé n'est pas observé ;
+- `internal_error_shown`, sur les lignes et les résultats, dit qu'une erreur interne a été montrée à
+  l'utilisateur ; chaque niveau qui pose des questions la note une fois avec `vk_log` (revue du 20/10,
+  I3). Les motifs qui la détectent (hôte, `nom:port`, le mot qui suit `ENOTFOUND`, `lookup`, `connect
+  to`, `host`…) sont des heuristiques : ils penchent vers le signalement, et la preuve brute tranche.
 
 ## 7. Contrat de masquage, opposable au juge
 
@@ -336,8 +358,10 @@ Elles sont inchangées depuis la recette 2.
   - aucun fichier, aucune signature, aucune décision.
 - Chaque niveau commence par la configuration de la recette, même quand tous ses cas sont déjà
   journalisés. Il finit par `capture_ecran` puis `exporter_journal`, toujours.
-- Seul ajout, propre à chaque niveau (M1, M2, M8) et hors du bloc de règles : une erreur interne
-  affichée dans la puce se note une fois avec `vk_log`, sans recopier le message.
+- Seuls ajouts, hors du bloc de règles : en M1, M2 et M8, une erreur interne affichée dans la puce
+  se note une fois avec `vk_log`, sans recopier le message ; depuis la revue du 20/10, chaque niveau
+  qui pose des questions (M1 à M9) note de même, une fois, un résultat qui porte
+  `"internal_error_shown": true`.
 - Le runbook (`docs/technical/runbooks/recette-maskai.md`, §6 à §12) s'applique tel quel. La tâche
   a seize lignes : plan, dix harnais, juge, signature, rédaction, signature, publication. La
   publication va sous `recettage-chat-ia/runs/2026-10-3` dans les exports du nœud.

@@ -65,4 +65,8 @@ fermées, la liste des types de fichiers acceptés, et la classe d'une erreur (p
 restée sans réponse) sans nom d'hôte ni pile, le message brut restant dans les preuves privées. Une
 sonde en lecture seule relève le balisage de la page en M0, avant que M8 en ait besoin, et
 `scripts/recette/correct.py` écrit les lignes de correction en rejouant hors ligne le jugement du
-pilote.
+pilote. La revue du 20/10 en a durci les gardes avant le passage réel : une entrée que le pilote
+n'identifie pas (recherche, « Votre avis ») n'est jamais cliquée, le menu d'une conversation et sa
+confirmation de suppression sont lus en liste blanche, M8-5 et M8-6 se jugent sur l'état de la
+conversation de M8-1 et non sur la liste entière, et chaque ligne dit si une erreur interne a été
+montrée à l'utilisateur (`internal_error_shown`), l'extrait restant dans les preuves.
