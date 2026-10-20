@@ -252,8 +252,9 @@ class PlanTest(unittest.TestCase):
 
 
 class VaultTest(unittest.TestCase):
-    """Founder decision D-02, ruling LF-4: after plan, the vault keeps the values the plan uses and
-    nothing else — here, none of ten per-document footers unless an arch chose one."""
+    """Founder decision D-02, rulings LF-4 and PF-15: after plan, the vault keeps the values the plan
+    uses and nothing else — none of ten per-document footers unless an arch chose one, and not even
+    that one when the plan then leaves its invariant out."""
 
     def setUp(self):
         self.ont = ontology.load()
@@ -305,6 +306,93 @@ class VaultTest(unittest.TestCase):
         self.assertEqual(plan.reduce_vault(path, vault, p, inv), (1, 2))
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {footer: FOOTER},
                          "the custom style's name is gone, the footer stays")
+
+    def reduced(self, inv: dict, vault: dict, p: dict) -> tuple:
+        """((kept, of), the bytes left in the file) after the vault is cut down to what `p` uses."""
+        path = self.dir / "reduced.vault.json"
+        canon.write(vault, path)
+        return plan.reduce_vault(path, vault, p, inv), path.read_bytes()
+
+    def styled(self, first: dict, second: dict) -> tuple:
+        """(invariants, vault) of ten contracts with the house footer, five written with the `first`
+        docx keywords and five with the `second`: the style they differ by is one ambiguity."""
+        d = Path(tempfile.mkdtemp())
+        for n in range(10):
+            ooxml_fixtures.docx(d / f"c{n}.docx", footer=FOOTER, **(first if n < 5 else second))
+        return mine.mine_corpus(d, salt=VAULT_SALT)
+
+    def chosen_custom(self, inv: dict) -> dict:
+        """The custom-style candidate of the one ambiguity of `inv`."""
+        (amb,) = inv["ambiguities"]
+        return next(c["value"] for c in amb["candidates"] if "custom" in c["value"])
+
+    def test_a_custom_title_style_an_arch_chose_is_excluded_and_its_name_leaves_the_vault(self):
+        # PF-15, route (a): the arch's answer is a candidate, so build records it, and the rule then
+        # excludes the invariant — no step uses the style's name, so the vault must not keep it.
+        inv, vault = self.styled(dict(title_style="Clause Dupont", style_id="ClauseId7"), {})
+        custom = self.chosen_custom(inv)
+        p, excluded = plan.build(inv, self.binding, self.ont,
+                                 resolve=lambda amb: {"value": custom, "resolved_by": ARCH})
+        self.assertIn({"invariant": "title_style", "why": "a custom style has no built-in anchor (v1)"}, excluded)
+        self.assertEqual(p["ambiguities"], [{"invariant": "title_style", "resolved_by": ARCH, "value": custom}],
+                         "build keeps what the arch chose: it is vault_tokens that sees the plan does not use it")
+        footer = mine.redact(FOOTER, VAULT_SALT)
+        self.assertEqual(plan.vault_tokens(p, inv), {footer})
+        counts, left = self.reduced(inv, vault, p)
+        self.assertEqual(counts, (1, 2))
+        self.assertEqual(json.loads(left.decode("utf-8")), {footer: FOOTER})
+        self.assertNotIn(b"Clause Dupont", left)
+
+    def test_a_resolved_body_style_has_no_rule_and_its_name_leaves_the_vault(self):
+        # PF-15, route (b): plan.RULES has no rule for body_style, yet the kernel asks the arch about
+        # every ambiguity the miner found.
+        inv, vault = self.styled(dict(body_style="Corps Dupont"), dict(body_style="Corps Martin"))
+        custom = self.chosen_custom(inv)
+        p, excluded = plan.build(inv, self.binding, self.ont,
+                                 resolve=lambda amb: {"value": custom, "resolved_by": ARCH})
+        self.assertIn({"invariant": "body_style", "why": "no rule for body_style in plan.RULES (v1)"}, excluded)
+        self.assertEqual(p["ambiguities"], [{"invariant": "body_style", "resolved_by": ARCH, "value": custom}])
+        footer = mine.redact(FOOTER, VAULT_SALT)
+        self.assertEqual(plan.vault_tokens(p, inv), {footer})
+        counts, left = self.reduced(inv, vault, p)
+        self.assertEqual(counts, (1, 3))
+        self.assertEqual(json.loads(left.decode("utf-8")), {footer: FOOTER})
+        self.assertNotIn(b"Corps Dupont", left)
+        self.assertNotIn(b"Corps Martin", left)
+
+    def test_a_resolved_footer_the_binding_cannot_drive_loses_its_clear_text(self):
+        # PF-15, route (c): the arch chose a footer, but the catalogue leaves set_footer unbound, so
+        # the plan has no footer step and generate never asks the vault for it.
+        binding = copy.deepcopy(self.binding)
+        for v in binding["verbs"]:
+            if v["verb"] == "set_footer":
+                v.update(status="unbound", member=None, constants=None, why="Section.Footers matched nothing")
+        chosen = self.amb["candidates"][3]["value"]
+        p, excluded = plan.build(self.inv, binding, self.ont,
+                                 resolve=lambda amb: {"value": chosen, "resolved_by": ARCH})
+        self.assertEqual(excluded, [{"invariant": "footer_text",
+                                     "why": "verb set_footer is unbound on word: Section.Footers matched nothing"}])
+        self.assertEqual(p["ambiguities"], [{"invariant": "footer_text", "resolved_by": ARCH, "value": chosen}])
+        self.assertNotIn("footer_text", p["actions"][0]["post"])
+        self.assertEqual(plan.vault_tokens(p, self.inv), set())
+        counts, left = self.reduced(self.inv, self.vault, p)
+        self.assertEqual(counts, (0, 10))
+        self.assertEqual(left, canon.dumps({}))
+
+    def test_vault_tokens_reads_the_post_back_to_invariants_and_finds_tokens_at_any_depth(self):
+        # LF-4's "at any depth", PF-15's filter, and the one place that maps an invariant to its post
+        # id: the export is checked as `pdf_exists`, yet its invariant is `export_format`.
+        t1, t2, t3, t4, t5, t6 = (mine.redact(c, VAULT_SALT) for c in "abcdef")
+        invariants = {"invariants": [
+            {"id": "x", "value": {"a": {"b": [t1]}}},                  # kept: a token two levels down, in a list
+            {"id": "export_format", "value": {"format": "pdf", "by": t2}},     # kept, under the post id pdf_exists
+            {"id": "z", "value": t3}]}                                 # not among the post: left out
+        p = {"actions": [{"post": ["x", "y", "pdf_exists"]}],
+             "ambiguities": [{"invariant": "y", "resolved_by": ARCH, "value": {"a": [t4]}},     # resolved, kept
+                             {"invariant": "w", "resolved_by": ARCH, "value": t5},               # resolved, left out
+                             {"invariant": "export_format", "resolved_by": ARCH, "value": {"format": "pdf", "by": t6}},
+                             {"invariant": "v", "resolved_by": "purged"}]}
+        self.assertEqual(plan.vault_tokens(p, invariants), {t1, t2, t4, t6})
 
     def test_the_cli_rewrites_the_vault_in_place_and_says_what_it_kept(self):
         canon.write(self.inv, self.dir / "invariants.json")

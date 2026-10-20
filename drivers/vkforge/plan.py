@@ -40,7 +40,8 @@ RULES = [
                     lambda v: step("verify_footer", text="$secret.footer_text")),
 ]
 EXPORT = ("export_format", lambda v: [step("export", format=v["format"], path="$arg.pdf")],
-                           lambda v: step("verify_pdf", path="$arg.pdf"))   # post id: pdf_exists
+                           lambda v: step("verify_pdf", path="$arg.pdf"))   # its post id: EXPORT_POST
+EXPORT_POST = "pdf_exists"      # what verify_pdf checks, among an action's `post`: the PDF beside the document
 EMITTED_VERBS = frozenset({"open", "apply_paragraph_style", "set_font_run", "set_header", "set_footer", "save", "export",
                            "verify_paragraph_style", "verify_font_run", "verify_header", "verify_footer", "verify_pdf"})
 ACTION = {"word": "appliquer_style_maison", "powerpoint": "appliquer_style_presentation"}
@@ -56,6 +57,14 @@ def qualification(invariants: dict) -> dict:
     if isinstance(files, bool) or not isinstance(files, int) or files < 1:
         raise Refusal("invariants.json names no corpus.files count", "run vkforge mine again")
     return {"min_passes": min(QUALIFICATION["min_passes"], files), "min_rate": QUALIFICATION["min_rate"]}
+
+
+def post_id(ident: str) -> str:
+    """The id an invariant has among an action's `post`: its own, except the export's (`pdf_exists`).
+    `build` writes the post through it and `vault_tokens` reads the post back through it, so the
+    correspondence between an invariant and its post entry is written in this one place."""
+    return EXPORT_POST if ident == EXPORT[0] else ident
+
 
 _DRIVEN = ("bound", "partial")
 _ONTOLOGY_REMEDY = "fix its projection in drivers/vkforge/ontology/office-document.json"
@@ -153,7 +162,7 @@ def build(invariants: dict, binding: dict, ontology: dict, resolve=None) -> tupl
               "reversible": all(reversible[s["verb"]] for s in steps),
               "steps": steps,
               "pre": [f"document is .{kind}", "not open elsewhere"],
-              "post": ["pdf_exists" if ident == export else ident for ident, _, _ in kept]}
+              "post": [post_id(ident) for ident, _, _ in kept]}
     if partial:
         action["note"] = "; ".join(f"{verb} partial ({member})" for verb, member in partial.items())
     plan = {"family": ontology["family"],
@@ -312,13 +321,16 @@ def load_resolver(path: Path):
 
 
 def vault_tokens(plan: dict, invariants: dict) -> set:
-    """The tokens the generator may resolve (founder decision D-02, ruling LF-4): those at any depth
-    of the value of every invariant an action of the plan keeps (its id among the action's `post`)
-    and of every ambiguity the plan resolved. A purged ambiguity's candidates — per-document footers,
-    a client's name in each — and an excluded invariant's text are not among them."""
-    kept = {ident for action in plan["actions"] for ident in action["post"]}
-    values = [i["value"] for i in invariants["invariants"] if i["id"] in kept]
-    values += [a["value"] for a in plan["ambiguities"] if a.get("value") is not None]
+    """The tokens the generator may resolve (founder decision D-02, rulings LF-4 and PF-15): those at
+    any depth of the value of every invariant an action of the plan keeps (its post id among the
+    action's `post`) and of every ambiguity the plan resolved on an invariant it keeps. A purged
+    ambiguity's candidates — per-document footers, a client's name in each — and the text of an
+    invariant the plan leaves out are not among them, even when an arch chose it: a custom style's
+    name, a footer whose verbs the binding leaves unbound. `generate` reads none of those."""
+    posted = {ident for action in plan["actions"] for ident in action["post"]}
+    values = [i["value"] for i in invariants["invariants"] if post_id(i["id"]) in posted]
+    values += [a["value"] for a in plan["ambiguities"]
+               if a.get("value") is not None and post_id(a["invariant"]) in posted]
     return {token for value in values for token in mine.tokens(value)}
 
 
